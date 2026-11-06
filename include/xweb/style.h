@@ -35,7 +35,15 @@ struct Length {
     static Length pixels(float v) noexcept { Length l; l.px = v; return l; }
 };
 
-enum class Display { None, Inline, Block, InlineBlock, ListItem };
+enum class Display {
+    None, Inline, Block, InlineBlock, ListItem, FlowRoot,
+    Table, InlineTable, TableCaption, TableRowGroup, TableRow, TableCell, TableColumn,
+    Flex, InlineFlex,
+};
+enum class Float { None, Left, Right };
+enum class Clear { None, Left, Right, Both };
+enum class VerticalAlign { Baseline, Top, Middle, Bottom, Sub, Super };
+enum class FlexAlign { Auto, Start, End, Center, Stretch, Baseline, SpaceBetween, SpaceAround, SpaceEvenly };
 enum class Position { Static, Relative, Absolute, Fixed };
 enum class TextAlign { Left, Right, Center };
 enum class WhiteSpace { Normal, Pre, NoWrap, PreWrap, PreLine };
@@ -56,7 +64,7 @@ struct ComputedStyle {
     float font_keyword = 1;            // share of "medium" if the size came from a keyword, else 0
     int font_weight = 400;
     bool italic = false;
-    std::string font_family;           // the first family listed
+    std::string font_family = "sans-serif"; // as listed, comma separated
     float line_height = 0;             // px; 0 with a zero factor means "normal"
     float line_height_factor = 0;      // a unitless line-height inherits as the number
     TextAlign text_align = TextAlign::Left;
@@ -65,6 +73,8 @@ struct ComputedStyle {
     ListStyle list_style = ListStyle::Disc;
     Length text_indent;
     std::shared_ptr<const std::map<std::string, std::vector<css::Token>>> custom;
+    float border_spacing = 0;
+    bool border_collapse = false;
 
     // Not inherited, though underlines reach descendants' text
     Color background{0, 0, 0, 0};
@@ -75,6 +85,24 @@ struct ComputedStyle {
     Length min_width, min_height;
     Length max_width = Length::autoLength(), max_height = Length::autoLength();
     int z_index = 0;
+    bool ua_margin_top = true, ua_margin_bottom = true;   // not set by the page
+    Float float_side = Float::None;
+    Clear clear = Clear::None;
+    bool overflow_clip = false;        // overflow other than visible; we don't draw scrollbars
+    float border_radius = 0;
+    VerticalAlign vertical_align = VerticalAlign::Baseline;
+    bool table_fixed = false;
+    // Flexbox
+    bool flex_column = false, flex_reverse = false, flex_wrap = false;
+    FlexAlign justify_content = FlexAlign::Start, align_items = FlexAlign::Stretch;
+    FlexAlign align_self = FlexAlign::Auto, align_content = FlexAlign::Stretch;
+    float flex_grow = 0, flex_shrink = 1;
+    Length flex_basis = Length::autoLength();
+    int order = 0;
+    float row_gap = 0, column_gap = 0;
+    // ::before and ::after
+    bool has_content = false;
+    std::string content;
     bool underline = false, line_through = false;   // includes those of ancestors
 
     [[nodiscard]] float usedLineHeight() const noexcept {
@@ -91,15 +119,24 @@ public:
     // A stylesheet's text for a <link rel=stylesheet> or @import, or empty.
     using SheetLoader = std::function<std::string(const std::string& href)>;
 
-    StyledDocument(const Document& doc, css::MediaContext media, const SheetLoader& loader = {});
+    // The width of "0" in a style's font: what the ch unit means. Style knows nothing of
+    // fonts, so someone has to say; without an answer it's taken as half an em.
+    using ChMeasure = std::function<float(const ComputedStyle&)>;
+
+    StyledDocument(const Document& doc, css::MediaContext media, const SheetLoader& loader = {}, const ChMeasure& measure_ch = {});
 
     // Nullptr for anything that has no box-generating style (or is too deep).
     [[nodiscard]] const ComputedStyle* styleOf(const Node* element) const;
+    // The element's ::before or ::after, if it has one with content.
+    [[nodiscard]] const ComputedStyle* beforeOf(const Node* element) const;
+    [[nodiscard]] const ComputedStyle* afterOf(const Node* element) const;
     [[nodiscard]] const css::MediaContext& media() const noexcept { return media_; }
 
 private:
     css::MediaContext media_;
+    ChMeasure measure_ch_;
     std::unordered_map<const Node*, const ComputedStyle*> styles_;
+    std::unordered_map<const Node*, const ComputedStyle*> before_, after_;
     std::deque<ComputedStyle> storage_;
     friend class StyleResolver;
 };

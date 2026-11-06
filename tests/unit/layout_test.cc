@@ -225,3 +225,111 @@ TEST(Page, GrowsWithContentAndKeepsTheTitle) {
     EXPECT_EQ(r.page.title, " T ");
     EXPECT_FLOAT_EQ(layout("x").page.height, 300);
 }
+
+TEST(Floats, TextWrapsAroundThem) {
+    const auto r = layout("<div style=width:100px><div id=f style='float:left;width:50px;height:15px'></div>aaaaaaaaaa bbbbbbbbbb cccccccccc</div>");
+    // 5px a character: ten fit beside the float's 50px, then the float ends at 15px.
+    ASSERT_GE(r.page.ops.size(), 2u);
+    EXPECT_FLOAT_EQ(r.box("f").x, 0);
+    float first_x = -1;
+    for (const auto& op : r.page.ops)
+        if (op.kind == PaintKind::Text && first_x < 0) first_x = op.x;
+    EXPECT_FLOAT_EQ(first_x, 50);
+}
+
+TEST(Floats, SideBySideThenBelow) {
+    const auto r = layout("<div style=width:100px><div id=a style='float:left;width:40px;height:10px'></div><div id=b style='float:left;width:40px;height:10px'></div>"
+                          "<div id=c style='float:left;width:40px;height:10px'></div><div id=d style='float:right;width:10px;height:10px'></div></div>");
+    EXPECT_FLOAT_EQ(r.box("b").x, 40);
+    EXPECT_FLOAT_EQ(r.box("b").y, 0);
+    EXPECT_FLOAT_EQ(r.box("c").x, 0);
+    EXPECT_FLOAT_EQ(r.box("c").y, 10);
+    EXPECT_FLOAT_EQ(r.box("d").x, 90);
+}
+
+TEST(Floats, ClearAndContainment) {
+    const auto r = layout("<style>.cf::after{content:'';display:table;clear:both}</style>"
+                          "<div id=none><div style='float:left;width:9px;height:30px'></div></div><div id=c style='clear:both;height:1px'></div>"
+                          "<div id=fix class=cf><div style='float:left;width:9px;height:30px'></div></div>"
+                          "<div id=ov style=overflow:hidden><div style='float:left;width:9px;height:30px'></div></div>");
+    EXPECT_FLOAT_EQ(r.box("none").h, 0);   // a plain block doesn't contain its float
+    EXPECT_FLOAT_EQ(r.box("c").y, 30);
+    EXPECT_FLOAT_EQ(r.box("fix").h, 30);   // the clearfix does
+    EXPECT_FLOAT_EQ(r.box("ov").h, 30);    // so does a new formatting context
+}
+
+TEST(Floats, NewFormattingContextsSitBeside) {
+    const auto r = layout("<div style='float:left;width:100px;height:50px'></div><div id=b style='overflow:hidden;height:10px'></div>");
+    EXPECT_FLOAT_EQ(r.box("b").x, 100);
+    EXPECT_FLOAT_EQ(r.box("b").w, 300);
+}
+
+TEST(Tables, RowsColumnsAndSpacing) {
+    const auto r = layout("<table style=border-spacing:2px><tr><td id=a style=padding:0>aa</td><td id=b style=padding:0>bbbb</td></tr>"
+                          "<tr><td id=c style=padding:0>cccc</td><td id=d style=padding:0>b</td></tr></table>");
+    EXPECT_FLOAT_EQ(r.box("a").w, 20);    // the column's widest: "cccc"
+    EXPECT_FLOAT_EQ(r.box("b").x, 24);
+    EXPECT_FLOAT_EQ(r.box("b").w, 20);
+    EXPECT_FLOAT_EQ(r.box("c").y, 14);    // spacing, a 10px line, spacing
+}
+
+TEST(Tables, SpansAndWidths) {
+    const auto r = layout("<table id=t style='width:200px;border-spacing:0'><tr><td id=s colspan=2 style=padding:0>x</td></tr><tr><td id=a style='padding:0;width:50%'>a</td><td id=b style=padding:0>b</td></tr></table>"
+                          "<table style=border-spacing:0><tr><td id=r rowspan=2 style=padding:0>y</td><td style=padding:0>1</td></tr><tr><td id=n style=padding:0>2</td></tr></table>");
+    EXPECT_FLOAT_EQ(r.box("t").w, 200);
+    EXPECT_FLOAT_EQ(r.box("s").w, 200);
+    EXPECT_FLOAT_EQ(r.box("a").w, 100);
+    EXPECT_FLOAT_EQ(r.box("b").w, 100);
+    EXPECT_FLOAT_EQ(r.box("r").h, 20);
+}
+
+TEST(Tables, MalformedTablesStillLayOut) {
+    const auto r = layout("<div style=display:table-cell id=orphan>x</div><table><tr><td colspan=99999 rowspan=99999>y</td></tr></table><table></table><table><caption>c</caption></table>");
+    EXPECT_FLOAT_EQ(r.box("orphan").h, 10);
+}
+
+TEST(Flex, GrowsAndJustifies) {
+    const auto r = layout("<div style=display:flex><div id=a style=flex:1></div><div id=b style=flex:3></div></div>"
+                          "<div style='display:flex;justify-content:space-between;width:100px'><i id=c style=width:10px></i><i id=d style=width:10px></i></div>"
+                          "<div style='display:flex;justify-content:center;width:100px'><i id=e style=width:10px></i></div>");
+    EXPECT_FLOAT_EQ(r.box("a").w, 100);
+    EXPECT_FLOAT_EQ(r.box("b").x, 100);
+    EXPECT_FLOAT_EQ(r.box("b").w, 300);
+    EXPECT_FLOAT_EQ(r.box("d").x, 90);
+    EXPECT_FLOAT_EQ(r.box("e").x, 45);
+}
+
+TEST(Flex, ShrinksStretchesAndWraps) {
+    const auto r = layout("<div style='display:flex;width:100px'><div id=a style='flex-basis:100px;min-width:0'></div><div id=b style='flex-basis:100px;flex-shrink:3;min-width:0'></div></div>"
+                          "<div style='display:flex;height:40px'><div id=c></div></div>"
+                          "<div style='display:flex;flex-wrap:wrap;width:50px'><div id=d style='width:30px;height:10px'></div><div id=e style='width:30px;height:10px'></div></div>"
+                          "<div style='display:flex;flex-direction:column;height:30px'><div id=f style=flex:1></div><div id=g style=height:10px></div></div>");
+    EXPECT_FLOAT_EQ(r.box("a").w, 75);
+    EXPECT_FLOAT_EQ(r.box("b").w, 25);
+    EXPECT_FLOAT_EQ(r.box("c").h, 40);
+    EXPECT_FLOAT_EQ(r.box("e").x, 0);
+    EXPECT_FLOAT_EQ(r.box("e").y - r.box("d").y, 10);
+    EXPECT_FLOAT_EQ(r.box("f").h, 20);
+}
+
+TEST(Generated, BeforeAndAfter) {
+    const auto r = layout("<style>#a::before{content:'x'}#a::after{content:attr(data-v)}#b::before{content:none}#c::before{color:red}</style>"
+                          "<div id=a data-v=y>m</div><div id=b>n</div><div id=c>o</div>");
+    EXPECT_EQ(r.texts(), (std::vector<std::string>{"x", "m", "y", "n", "o"}));
+}
+
+TEST(Clip, OverflowHiddenWrapsItsContent) {
+    const auto r = layout("<div style='overflow:hidden;height:10px'>x</div>");
+    int begins = 0, ends = 0;
+    for (const auto& op : r.page.ops) {
+        begins += op.kind == PaintKind::ClipBegin;
+        ends += op.kind == PaintKind::ClipEnd;
+    }
+    EXPECT_EQ(begins, 1);
+    EXPECT_EQ(ends, 1);
+}
+
+TEST(Intrinsic, PercentWidthsDontExplodeMeasuring) {
+    const auto r = layout("<div style=display:flex><nav id=n><img src=wide.png style=width:50%></nav><div id=m style=flex:1>x</div></div>");
+    EXPECT_LE(r.box("n").w, 200);
+}

@@ -38,7 +38,7 @@ Styled style(const std::string& html, const StyledDocument::SheetLoader& loader 
     return s;
 }
 
-constexpr Color kRed{255, 0, 0, 255}, kGreen{0, 128, 0, 255}, kBlue{0, 0, 255, 255};
+constexpr Color kRed{255, 0, 0, 255}, kBlue{0, 0, 255, 255};
 
 }  // namespace
 
@@ -210,4 +210,39 @@ TEST(FontSize, MonospaceKeywordsAreSmaller) {
     EXPECT_FLOAT_EQ(s.of("x").font_size, 20);
     EXPECT_FLOAT_EQ(s.of("o").font_size, 18);
     EXPECT_FLOAT_EQ(s.of("p").font_size, 13);
+}
+
+TEST(Sheets, ImportsAreRelativeToTheirSheet) {
+    const auto loader = [](const std::string& href) -> std::string {
+        if (href == "css/a.css") return "@import 'b.css';";
+        if (href == "css/b.css") return "#a{color:red}";
+        return {};
+    };
+    EXPECT_EQ(style("<link rel=stylesheet href=css/a.css><div id=a></div>", loader).of("a").color, kRed);
+}
+
+TEST(Hints, OldPresentationalAttributes) {
+    const auto s = style("<img id=i align=right hspace=3><table id=t cellspacing=7 cellpadding=5><tr><td id=c valign=top nowrap>x</td></tr></table>");
+    EXPECT_EQ(s.of("i").float_side, Float::Right);
+    EXPECT_FLOAT_EQ(s.of("i").margin[Left].px, 3);
+    EXPECT_FLOAT_EQ(s.of("t").border_spacing, 7);
+    EXPECT_FLOAT_EQ(s.of("c").padding[Top].px, 5);
+    EXPECT_EQ(s.of("c").vertical_align, VerticalAlign::Top);
+    EXPECT_EQ(s.of("c").white_space, WhiteSpace::NoWrap);
+}
+
+TEST(FontFamily, KeepsTheWholeList) {
+    const auto s = style("<div id=a style='font-family:\"No Such\", Other Name ,serif'></div><div id=b></div>");
+    EXPECT_EQ(s.of("a").font_family, "No Such,Other Name,serif");
+    EXPECT_EQ(s.of("b").font_family, "sans-serif");
+}
+
+TEST(Pseudo, GetTheirOwnStyle) {
+    const auto s = style("<style>#a::before{content:'x';color:red;display:block}#b::after{color:red}</style><div id=a></div><div id=b></div>");
+    const ComputedStyle* before = s.styles->beforeOf(s.byId("a"));
+    ASSERT_NE(before, nullptr);
+    EXPECT_EQ(before->color, kRed);
+    EXPECT_EQ(before->display, Display::Block);
+    EXPECT_EQ(before->content, "x");
+    EXPECT_EQ(s.styles->afterOf(s.byId("b")), nullptr);   // no content, no box
 }

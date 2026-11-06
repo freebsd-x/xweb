@@ -40,12 +40,13 @@ public:
     [[nodiscard]] virtual std::optional<std::pair<float, float>> imageSize(const std::string& src) = 0;
 };
 
-enum class PaintKind { Rect, Text, Image };
+enum class PaintKind { Rect, Text, Image, ClipBegin, ClipEnd };
 
 struct PaintOp {
     PaintKind kind = PaintKind::Rect;
     float x = 0, y = 0, w = 0, h = 0;
     Color color;
+    float radius = 0;      // Rect: rounded corners
     std::string text;      // Text: the run. Image: its source.
     FontSpec font;
 };
@@ -69,6 +70,9 @@ struct PageLayout {
     std::vector<ElementBox> boxes;
     std::string title;
 };
+
+// A StyledDocument::ChMeasure that asks `text`.
+[[nodiscard]] float chWidth(TextMeasurer& text, const ComputedStyle& style);
 
 // `images` may be null: an image then takes its size from attributes and style only.
 [[nodiscard]] PageLayout layoutPage(const Document& doc, const StyledDocument& styles, TextMeasurer& text,

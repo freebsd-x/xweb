@@ -1,0 +1,22 @@
+<!doctype html><html><head><style>
+body{margin:8px;font:14px/20px monospace}table{margin-bottom:12px}td,th{padding:4px}
+.b td,.b th{border:1px solid}.c{border-collapse:collapse}.s0{border-spacing:0}.s5{border-spacing:5px}.w{width:500px}.p{width:100%}.fx{table-layout:fixed;width:400px}
+</style></head><body>
+<table><tr><td>a</td><td>bb</td><td>ccc</td></tr><tr><td>dddd</td><td>e</td><td>f</td></tr></table>
+<table class=b><thead><tr><th>Head one</th><th>Two</th></tr></thead><tbody><tr><td>body</td><td>cell</td></tr></tbody><tfoot><tr><td>foot</td><td>x</td></tr></tfoot></table>
+<table class="b c"><tr><td>collapsed</td><td>cells</td></tr><tr><td>row two</td><td>here</td></tr></table>
+<table class="b s0"><tr><td>no</td><td>spacing</td></tr></table><table class="b s5"><tr><td>five</td><td>spacing</td></tr></table>
+<table class="b w"><tr><td>wide</td><td>table</td></tr></table><table class="b p"><tr><td>full</td><td>width</td></tr></table>
+<table class=b><tr><td colspan=2>spans two</td></tr><tr><td>one</td><td>two</td></tr></table>
+<table class=b><tr><td rowspan=2>spans rows</td><td>top</td></tr><tr><td>bottom</td></tr></table>
+<table class=b><tr><td style=width:200px>fixed cell</td><td>other</td></tr></table>
+<table class="b w"><tr><td style=width:25%>quarter</td><td>rest</td></tr></table>
+<table class="b fx"><tr><td style=width:100px>fixed</td><td>layout</td></tr><tr><td>long long long long text in here</td><td>y</td></tr></table>
+<table class="b w"><caption>Caption</caption><tr><td>under the caption</td></tr></table>
+<table class=b style=width:200px><tr><td>This cell has quite a lot of text so it has to wrap inside this narrow table width</td><td>and this one too wraps</td></tr></table>
+<table class=b><tr style=height:60px><td>tall row</td><td style=vertical-align:top>top</td><td style=vertical-align:bottom>bot</td></tr></table>
+<div style=display:table><div style=display:table-row><div style=display:table-cell>css</div><div style=display:table-cell>table</div></div></div>
+<div style=display:table-cell>orphan cell</div>
+<table class=b style=margin:0px auto><tr><td>centered</td></tr></table>
+<p>a <span style=display:inline-table>inline table</span> b</p><table class=b><tr><td><table class=b><tr><td>nested</td></tr></table></td></tr></table>
+</body></html>

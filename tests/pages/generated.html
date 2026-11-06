@@ -1,0 +1,9 @@
+<!doctype html><html><head><style>
+body{margin:0;font:14px/20px monospace}.b::before{content:"before ";}.a::after{content:" after"}
+.blk::before{content:"";display:block;height:30px}.ib::after{content:"x";display:inline-block;width:40px;height:25px}.at::before{content:attr(data-x)}
+.none::before{content:none}.nocontent::before{height:100px;display:block}.sup{font-size:20px}
+.cl>div{overflow:hidden;height:40px;margin:2px}.cl p{margin:0;height:200px}
+</style></head><body>
+<div class=b>one</div><div class=a>two</div><div class=blk>three</div><div class=ib>four</div><div class=at data-x=attribute>five</div><div class=none>six</div><div class=nocontent>seven</div>
+<div class=cl><div><p>clipped</p></div></div><div>a<sup>sup</sup>b<sub>sub</sub>c</div><div><img width=20 height=20 style=vertical-align:middle> mid</div>
+</body></html>

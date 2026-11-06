@@ -8,6 +8,7 @@
 #include <unordered_set>
 
 #include "ua_stylesheet.h"
+#include "xweb/url.h"
 
 namespace fbx::xweb {
 
@@ -199,6 +200,7 @@ struct LengthContext {
     float font_size = 16;
     float root_font_size = 16;
     float viewport_w = 0, viewport_h = 0;
+    float ch = 0;   // the width of "0" in this font, if known
 };
 
 bool dimensionPx(const Token& t, const LengthContext& c, float& out) {
@@ -207,7 +209,8 @@ bool dimensionPx(const Token& t, const LengthContext& c, float& out) {
     if (u == "px") out = v;
     else if (u == "em") out = v * c.font_size;
     else if (u == "rem") out = v * c.root_font_size;
-    else if (u == "ex" || u == "ch") out = v * c.font_size * 0.5f;
+    else if (u == "ch") out = v * (c.ch > 0 ? c.ch : c.font_size * 0.5f);
+    else if (u == "ex") out = v * c.font_size * 0.5f;
     else if (u == "pt") out = v * 96.0f / 72.0f;
     else if (u == "pc") out = v * 16.0f;
     else if (u == "in") out = v * 96.0f;
@@ -470,6 +473,12 @@ struct IndexedSelector {
     size_t order;
 };
 
+struct Buckets {
+    std::unordered_map<std::string, std::vector<IndexedSelector>> by_id, by_class, by_type;
+    std::vector<IndexedSelector> universal;
+    [[nodiscard]] bool empty() const { return by_id.empty() && by_class.empty() && by_type.empty() && universal.empty(); }
+};
+
 class StyleResolver {
 public:
     StyleResolver(const Document& doc, StyledDocument& out, const StyledDocument::SheetLoader& loader)
@@ -477,6 +486,7 @@ public:
         lengths_.viewport_w = out.media_.width;
         lengths_.viewport_h = out.media_.height;
         addSheet(css::parseStylesheet(detail::kUserAgentStyle), Origin::UserAgent, 0);
+        if (doc.quirks) addSheet(css::parseStylesheet(detail::kQuirksStyle), Origin::UserAgent, 0);
         collectSheets();
         indexSiblings();
     }
@@ -490,11 +500,13 @@ public:
     }
 
 private:
-    void addSheet(css::Stylesheet sheet, Origin origin, int depth) {
+    // `url` is where the sheet came from: its @imports are relative to that.
+    void addSheet(css::Stylesheet sheet, Origin origin, int depth, const std::string& url = {}) {
         if (loader_ && depth < kMaxImportDepth) {
-            for (const std::string& url : sheet.imports) {
+            for (const std::string& ref : sheet.imports) {
                 if (++import_count_ > kMaxImports) break;
-                addSheet(css::parseStylesheet(loader_(url)), origin, depth + 1);
+                const std::string target = resolveUrl(url, ref);
+                addSheet(css::parseStylesheet(loader_(target)), origin, depth + 1, target);
             }
         }
         sheets_.push_back(std::make_unique<css::Stylesheet>(std::move(sheet)));
@@ -513,20 +525,24 @@ private:
 
     void index(const ComplexSelector& sel, const css::Rule& rule, Origin origin) {
         const CompoundSelector& last = sel.parts.back();
-        // Generated content and the like: no box to style yet.
-        for (const SimpleSelector& s : last.simple)
-            if (s.kind == SimpleKind::PseudoElement) return;
+        Buckets* buckets = &normal_;
+        for (const SimpleSelector& s : last.simple) {
+            if (s.kind != SimpleKind::PseudoElement) continue;
+            if (s.name == "before") buckets = &before_;
+            else if (s.name == "after") buckets = &after_;
+            else return;   // ::marker, ::placeholder and so on: nothing to style yet
+        }
         const IndexedSelector entry{&sel, &rule, origin, ++order_};
         for (const SimpleSelector& s : last.simple) {
-            if (s.kind == SimpleKind::Id) { by_id_[s.name].push_back(entry); return; }
+            if (s.kind == SimpleKind::Id) { buckets->by_id[s.name].push_back(entry); return; }
         }
         for (const SimpleSelector& s : last.simple) {
-            if (s.kind == SimpleKind::Class) { by_class_[s.name].push_back(entry); return; }
+            if (s.kind == SimpleKind::Class) { buckets->by_class[s.name].push_back(entry); return; }
         }
         for (const SimpleSelector& s : last.simple) {
-            if (s.kind == SimpleKind::Type) { by_type_[s.name].push_back(entry); return; }
+            if (s.kind == SimpleKind::Type) { buckets->by_type[s.name].push_back(entry); return; }
         }
-        universal_.push_back(entry);
+        buckets->universal.push_back(entry);
     }
 
     void collectSheets() {
@@ -544,7 +560,7 @@ private:
                 if (rel && href && hasWord(lower(*rel), "stylesheet") && !hasWord(lower(*rel), "alternate")) {
                     const std::string* media = n->attr("media");
                     if (!media || css::mediaMatches(css::tokenize(*media), out_.media_))
-                        addSheet(css::parseStylesheet(loader_(*href)), Origin::Author, 0);
+                        addSheet(css::parseStylesheet(loader_(*href)), Origin::Author, 0, *href);
                 }
             }
             todo.insert(todo.end(), n->children.rbegin(), n->children.rend());
@@ -596,7 +612,7 @@ private:
             }
             case SimpleKind::Attribute: return matchAttribute(el, s);
             case SimpleKind::PseudoClass: return matchPseudo(el, s);
-            case SimpleKind::PseudoElement: return false;
+            case SimpleKind::PseudoElement: return true;   // the bucket it's in decides
         }
         return false;
     }
@@ -755,6 +771,54 @@ private:
                     css_text += std::string("font-size:") + kSizes[(*v)[0] - '1'] + ";";
             }
         }
+        if (n == "img" || n == "object" || n == "embed" || n == "iframe") {
+            if (const std::string* v = el->attr("align")) {
+                const std::string a = lower(*v);
+                if (a == "left" || a == "right") css_text += "float:" + a + ";";
+                else if (a == "middle" || a == "absmiddle" || a == "center") css_text += "vertical-align:middle;";
+                else if (a == "top" || a == "texttop") css_text += "vertical-align:top;";
+            }
+            const auto spacing = [&](const char* attr_name, const char* a, const char* b) {
+                if (const std::string* v = el->attr(attr_name))
+                    css_text += std::string(a) + ":" + *v + "px;" + b + ":" + *v + "px;";
+            };
+            spacing("hspace", "margin-left", "margin-right");
+            spacing("vspace", "margin-top", "margin-bottom");
+        }
+        if (n == "table") {
+            if (const std::string* v = el->attr("cellspacing")) css_text += "border-spacing:" + *v + "px;";
+            if (const std::string* v = el->attr("align")) {
+                const std::string a = lower(*v);
+                if (a == "center") css_text += "margin-left:auto;margin-right:auto;";
+                else if (a == "left" || a == "right") css_text += "float:" + a + ";";
+            }
+        }
+        if (n == "td" || n == "th" || n == "tr" || n == "tbody" || n == "thead" || n == "tfoot") {
+            if (const std::string* v = el->attr("valign")) {
+                const std::string a = lower(*v);
+                if (a == "top" || a == "middle" || a == "bottom" || a == "baseline") css_text += "vertical-align:" + a + ";";
+            }
+            if (n != "tr" && el->attr("nowrap")) css_text += "white-space:nowrap;";
+        }
+        if (n == "td" || n == "th") {
+            // Set on the table, meant for its cells.
+            const Node* table = el->parent;
+            while (table && !table->isHtml("table")) table = table->parent;
+            if (table) {
+                if (const std::string* v = table->attr("cellpadding")) css_text += "padding:" + *v + "px;";
+                if (const std::string* v = table->attr("border"); v && *v != "0") css_text += "border:1px inset gray;";
+            }
+        }
+        if (n == "hr") {
+            if (const std::string* v = el->attr("size")) css_text += "height:" + *v + "px;";
+            if (el->attr("noshade")) css_text += "border-style:solid;";
+        }
+        if (n == "body") {
+            if (const std::string* v = el->attr("leftmargin")) css_text += "margin-left:" + *v + "px;";
+            if (const std::string* v = el->attr("topmargin")) css_text += "margin-top:" + *v + "px;";
+            if (const std::string* v = el->attr("marginwidth")) css_text += "margin-left:" + *v + "px;margin-right:" + *v + "px;";
+            if (const std::string* v = el->attr("marginheight")) css_text += "margin-top:" + *v + "px;margin-bottom:" + *v + "px;";
+        }
         if (const std::string* v = el->attr("align")) {
             const std::string a = lower(*v);
             if ((n == "div" || n == "p" || n == "h1" || n == "h2" || n == "h3" || n == "h4" || n == "h5" || n == "h6" ||
@@ -821,6 +885,7 @@ private:
     [[nodiscard]] LengthContext lengthContext(const ComputedStyle& s) const {
         LengthContext c = lengths_;
         c.font_size = s.font_size;
+        if (out_.measure_ch_) c.ch = out_.measure_ch_(s);
         return c;
     }
 
@@ -940,20 +1005,27 @@ private:
         else if (k == "lighter") s.font_weight = parent >= 800 ? 700 : (parent >= 550 ? 400 : 100);
     }
 
+    // The whole list: which of them is installed is for whoever measures text to say.
     static void setFontFamily(ComputedStyle& s, const Tokens& v, size_t i) {
-        // The first family; we can't tell yet whether a later one is the installed one.
-        std::string name;
+        std::string list, name;
+        const auto finish = [&] {
+            while (!name.empty() && name.back() == ' ') name.pop_back();
+            if (name.empty()) return;
+            if (!list.empty()) list += ',';
+            list += name;
+            name.clear();
+        };
         for (; i < v.size(); ++i) {
             const Token& t = v[i];
-            if (t.type == TokenType::Comma) break;
-            if (t.type == TokenType::Whitespace) {
+            if (t.type == TokenType::Comma) finish();
+            else if (t.type == TokenType::Whitespace) {
                 if (!name.empty()) name += ' ';
             } else if (t.type == TokenType::Ident || t.type == TokenType::String) {
                 name += t.text;
             }
         }
-        while (!name.empty() && name.back() == ' ') name.pop_back();
-        if (!name.empty()) s.font_family = name;
+        finish();
+        if (!list.empty()) s.font_family = list;
     }
 
     static void setLineHeight(ComputedStyle& s, const Token& t, const LengthContext& c, const Tokens& v, size_t i) {
@@ -1023,16 +1095,86 @@ private:
     }
 
     static void setDisplay(ComputedStyle& s, const std::string& k) {
-        if (k == "none") s.display = Display::None;
-        else if (k == "inline" || k == "contents" || k == "ruby" || k == "ruby-text") s.display = Display::Inline;
-        else if (k == "inline-block" || k == "inline-flex" || k == "inline-grid" || k == "inline-table" ||
-                 k == "table-cell")
-            s.display = Display::InlineBlock;
-        else if (k == "list-item") s.display = Display::ListItem;
-        else if (k == "block" || k == "flex" || k == "grid" || k == "flow-root" || k == "table" || k == "table-row" ||
-                 k == "table-row-group" || k == "table-header-group" || k == "table-footer-group" ||
-                 k == "table-caption" || k == "flow")
-            s.display = Display::Block;
+        static const std::map<std::string, Display> kDisplays = {
+            {"none", Display::None}, {"inline", Display::Inline}, {"contents", Display::Inline}, {"ruby", Display::Inline},
+            {"ruby-text", Display::Inline}, {"inline-block", Display::InlineBlock}, {"inline-grid", Display::InlineBlock},
+            {"inline-table", Display::InlineTable}, {"inline-flex", Display::InlineFlex}, {"list-item", Display::ListItem},
+            {"block", Display::Block}, {"grid", Display::Block}, {"flow", Display::Block}, {"flow-root", Display::FlowRoot},
+            {"table", Display::Table}, {"table-caption", Display::TableCaption}, {"table-row-group", Display::TableRowGroup},
+            {"table-header-group", Display::TableRowGroup}, {"table-footer-group", Display::TableRowGroup},
+            {"table-row", Display::TableRow}, {"table-cell", Display::TableCell}, {"table-column", Display::TableColumn},
+            {"table-column-group", Display::TableColumn}, {"flex", Display::Flex},
+        };
+        const auto it = kDisplays.find(k);
+        if (it != kDisplays.end()) s.display = it->second;
+    }
+
+    static FlexAlign flexAlign(const std::string& k, FlexAlign keep) {
+        if (k == "flex-start" || k == "start" || k == "self-start" || k == "left" || k == "normal") return k == "normal" ? keep : FlexAlign::Start;
+        if (k == "flex-end" || k == "end" || k == "self-end" || k == "right") return FlexAlign::End;
+        if (k == "center") return FlexAlign::Center;
+        if (k == "stretch") return FlexAlign::Stretch;
+        if (k == "baseline") return FlexAlign::Baseline;
+        if (k == "space-between") return FlexAlign::SpaceBetween;
+        if (k == "space-around") return FlexAlign::SpaceAround;
+        if (k == "space-evenly") return FlexAlign::SpaceEvenly;
+        if (k == "auto") return FlexAlign::Auto;
+        return keep;
+    }
+
+    void setFlexShorthand(ComputedStyle& s, const Tokens& v, const LengthContext& c) {
+        const std::string kw = keyword(v);
+        if (kw == "none") {
+            s.flex_grow = 0;
+            s.flex_shrink = 0;
+            s.flex_basis = Length::autoLength();
+            return;
+        }
+        if (kw == "auto") {
+            s.flex_grow = 1;
+            s.flex_shrink = 1;
+            s.flex_basis = Length::autoLength();
+            return;
+        }
+        float grow = -1, shrink = -1;
+        Length basis = Length::pixels(0);
+        for (size_t start : valueStarts(v)) {
+            const Token& t = v[start];
+            if (t.type == TokenType::Number && t.number != 0 && grow >= 0 && shrink >= 0) continue;
+            if (t.type == TokenType::Number && (grow < 0 || shrink < 0)) {
+                (grow < 0 ? grow : shrink) = std::max(0.0f, static_cast<float>(t.number));
+                continue;
+            }
+            size_t k = start;
+            Length l;
+            if (lengthAt(v, k, c, l, true)) basis = l;
+            else if (t.type == TokenType::Ident && lower(t.text) == "content") basis = Length::autoLength();
+        }
+        s.flex_grow = std::max(grow, 0.0f);
+        s.flex_shrink = shrink < 0 ? 1 : shrink;
+        s.flex_basis = basis;
+    }
+
+    void setContent(ComputedStyle& s, const Tokens& v) {
+        const std::string kw = keyword(v);
+        s.content.clear();
+        s.has_content = kw != "none" && kw != "normal" && !v.empty();
+        if (!s.has_content) return;
+        for (size_t i = 0; i < v.size(); ++i) {
+            const Token& t = v[i];
+            if (t.type == TokenType::String) {
+                s.content += t.text;
+            } else if (t.type == TokenType::Ident) {
+                const std::string k = lower(t.text);
+                if (k == "open-quote") s.content += "\xE2\x80\x9C";
+                else if (k == "close-quote") s.content += "\xE2\x80\x9D";
+            } else if (t.type == TokenType::Function) {
+                if (t.text == "attr" && i + 1 < v.size() && current_element_) {
+                    if (const std::string* value = current_element_->attr(lower(v[i + 1].text))) s.content += *value;
+                }
+                while (i < v.size() && v[i].type != TokenType::RightParen) ++i;
+            }
+        }
     }
 
     static bool copyInherited(ComputedStyle& to, const ComputedStyle& from, const std::string& p) {
@@ -1057,6 +1199,8 @@ private:
         else if (p == "list-style-type" || p == "list-style") to.list_style = from.list_style;
         else if (p == "text-indent") to.text_indent = from.text_indent;
         else if (p == "visibility") to.hidden = from.hidden;
+        else if (p == "border-spacing") to.border_spacing = from.border_spacing;
+        else if (p == "border-collapse") to.border_collapse = from.border_collapse;
         else return false;
         return true;
     }
@@ -1073,6 +1217,9 @@ private:
         sides(to.margin, from.margin, "margin");
         sides(to.padding, from.padding, "padding");
         if (p == "display") to.display = from.display;
+        else if (p == "vertical-align") to.vertical_align = from.vertical_align;
+        else if (p == "float") to.float_side = from.float_side;
+        else if (p == "clear") to.clear = from.clear;
         else if (p == "position") to.position = from.position;
         else if (p == "width") to.width = from.width;
         else if (p == "height") to.height = from.height;
@@ -1149,6 +1296,79 @@ private:
         };
 
         if (p == "display") { if (!kw.empty()) setDisplay(s, kw); return; }
+        if (p == "float") {
+            s.float_side = kw == "left" || kw == "inline-start" ? Float::Left : kw == "right" || kw == "inline-end" ? Float::Right : Float::None;
+            return;
+        }
+        if (p == "clear") {
+            s.clear = kw == "left" ? Clear::Left : kw == "right" ? Clear::Right : kw == "both" ? Clear::Both : Clear::None;
+            return;
+        }
+        if (p == "overflow" || p == "overflow-x" || p == "overflow-y") {
+            const auto starts = valueStarts(v);
+            bool clip = false;
+            for (size_t start : starts)
+                if (v[start].type == TokenType::Ident && lower(v[start].text) != "visible") clip = true;
+            if (p == "overflow" || clip) s.overflow_clip = clip;
+            return;
+        }
+        if (p == "border-radius") {
+            Length l;
+            size_t k = i;
+            if (lengthAt(v, k, c, l, false)) s.border_radius = std::max(0.0f, l.px);
+            return;
+        }
+        if (p == "vertical-align") {
+            if (kw == "top" || kw == "text-top") s.vertical_align = VerticalAlign::Top;
+            else if (kw == "middle") s.vertical_align = VerticalAlign::Middle;
+            else if (kw == "bottom" || kw == "text-bottom") s.vertical_align = VerticalAlign::Bottom;
+            else if (kw == "sub") s.vertical_align = VerticalAlign::Sub;
+            else if (kw == "super") s.vertical_align = VerticalAlign::Super;
+            else s.vertical_align = VerticalAlign::Baseline;
+            return;
+        }
+        if (p == "table-layout") { s.table_fixed = kw == "fixed"; return; }
+        if (p == "border-collapse") { s.border_collapse = kw == "collapse"; return; }
+        if (p == "border-spacing") {
+            Length l;
+            size_t k = i;
+            if (lengthAt(v, k, c, l, false)) s.border_spacing = std::max(0.0f, l.px);
+            return;
+        }
+        if (p == "content") { setContent(s, v); return; }
+        if (p == "flex") { setFlexShorthand(s, v, c); return; }
+        if (p == "flex-grow") { if (i < v.size() && v[i].type == TokenType::Number) s.flex_grow = std::max(0.0f, static_cast<float>(v[i].number)); return; }
+        if (p == "flex-shrink") { if (i < v.size() && v[i].type == TokenType::Number) s.flex_shrink = std::max(0.0f, static_cast<float>(v[i].number)); return; }
+        if (p == "flex-basis") { oneLength(s.flex_basis, true); return; }
+        if (p == "flex-direction" || p == "flex-wrap" || p == "flex-flow") {
+            for (size_t start : valueStarts(v)) {
+                if (v[start].type != TokenType::Ident) continue;
+                const std::string k = lower(v[start].text);
+                if (k == "row") { s.flex_column = false; s.flex_reverse = false; }
+                else if (k == "row-reverse") { s.flex_column = false; s.flex_reverse = true; }
+                else if (k == "column") { s.flex_column = true; s.flex_reverse = false; }
+                else if (k == "column-reverse") { s.flex_column = true; s.flex_reverse = true; }
+                else if (k == "wrap" || k == "wrap-reverse") s.flex_wrap = true;
+                else if (k == "nowrap") s.flex_wrap = false;
+            }
+            return;
+        }
+        if (p == "justify-content") { s.justify_content = flexAlign(kw, s.justify_content); return; }
+        if (p == "align-items") { s.align_items = flexAlign(kw, s.align_items); return; }
+        if (p == "align-self") { s.align_self = flexAlign(kw, s.align_self); return; }
+        if (p == "align-content") { s.align_content = flexAlign(kw, s.align_content); return; }
+        if (p == "order") { if (i < v.size() && v[i].type == TokenType::Number) s.order = static_cast<int>(std::clamp(v[i].number, -1e6, 1e6)); return; }
+        if (p == "gap" || p == "row-gap" || p == "column-gap" || p == "grid-gap") {
+            Length first, second;
+            size_t k = i;
+            if (!lengthAt(v, k, c, first, false)) return;
+            skipWs(v, k);
+            second = first;
+            if (k < v.size()) (void)lengthAt(v, k, c, second, false);
+            if (p != "column-gap") s.row_gap = std::max(0.0f, first.px);
+            if (p != "row-gap") s.column_gap = std::max(0.0f, p == "column-gap" ? first.px : second.px);
+            return;
+        }
         if (p == "position") {
             if (kw == "static" || kw == "sticky") s.position = Position::Static;
             else if (kw == "relative") s.position = Position::Relative;
@@ -1357,8 +1577,7 @@ private:
         }
     }
 
-    void resolveInto(const Node* el, const ComputedStyle& parent, ComputedStyle& s) {
-        // Start from what inherits.
+    static void inherit(const ComputedStyle& parent, ComputedStyle& s) {
         s.color = parent.color;
         s.font_size = parent.font_size;
         s.font_keyword = parent.font_keyword;
@@ -1374,30 +1593,14 @@ private:
         s.text_indent = parent.text_indent;
         s.hidden = parent.hidden;
         s.custom = parent.custom;
+        s.border_spacing = parent.border_spacing;
+        s.border_collapse = parent.border_collapse;
+    }
 
-        fuel_ = kSelectorFuel;
+    void resolveInto(const Node* el, const ComputedStyle& parent, ComputedStyle& s) {
+        inherit(parent, s);
         std::vector<MatchedDecl> matched;
-        const auto lookup = [&](const auto& table, const std::string& key) {
-            const auto it = table.find(key);
-            if (it != table.end()) gather(el, it->second, matched);
-        };
-        if (const std::string* id = el->attr("id")) lookup(by_id_, *id);
-        if (const std::string* cls = el->attr("class")) {
-            std::string_view list = *cls;
-            std::set<std::string> seen;
-            size_t i = 0;
-            while (i < list.size()) {
-                while (i < list.size() && isWsChar(list[i])) ++i;
-                const size_t b = i;
-                while (i < list.size() && !isWsChar(list[i])) ++i;
-                if (i > b) {
-                    std::string word(list.substr(b, i - b));
-                    if (seen.insert(word).second) lookup(by_class_, word);
-                }
-            }
-        }
-        lookup(by_type_, el->ns == Namespace::Html ? el->name : lower(el->name));
-        gather(el, universal_, matched);
+        collect(el, normal_, matched);
 
         std::string hint_text;
         hints(el, hint_text);
@@ -1409,6 +1612,36 @@ private:
         if (const std::string* style_attr = el->attr("style")) inline_decls = css::parseDeclarations(*style_attr);
         for (const Declaration& d : inline_decls) matched.push_back({&d, d.important, Origin::Inline, 0, 0});
 
+        applyMatched(el, parent, s, matched);
+    }
+
+    void collect(const Node* el, const Buckets& buckets, std::vector<MatchedDecl>& matched) {
+        fuel_ = kSelectorFuel;
+        const auto lookup = [&](const auto& table, const std::string& key) {
+            const auto it = table.find(key);
+            if (it != table.end()) gather(el, it->second, matched);
+        };
+        if (const std::string* id = el->attr("id")) lookup(buckets.by_id, *id);
+        if (const std::string* cls = el->attr("class")) {
+            std::string_view list = *cls;
+            std::set<std::string> seen;
+            size_t i = 0;
+            while (i < list.size()) {
+                while (i < list.size() && isWsChar(list[i])) ++i;
+                const size_t b = i;
+                while (i < list.size() && !isWsChar(list[i])) ++i;
+                if (i > b) {
+                    std::string word(list.substr(b, i - b));
+                    if (seen.insert(word).second) lookup(buckets.by_class, word);
+                }
+            }
+        }
+        lookup(buckets.by_type, el->ns == Namespace::Html ? el->name : lower(el->name));
+        gather(el, buckets.universal, matched);
+    }
+
+    void applyMatched(const Node* el, const ComputedStyle& parent, ComputedStyle& s, std::vector<MatchedDecl>& matched) {
+        current_element_ = el;
         const auto rank = [](const MatchedDecl& m) {
             // Normal: UA < hints < author < inline. Important reverses UA vs author.
             if (m.important) return m.origin == Origin::UserAgent ? 6 : 5;
@@ -1420,6 +1653,16 @@ private:
             if (a.specificity != b.specificity) return a.specificity < b.specificity;
             return a.order < b.order;
         });
+
+        // Old pages' <p> at the top of the body has no top margin: the quirk applies only
+        // to margins the page didn't ask for itself.
+        const auto setByPage = [&](const char* longhand) {
+            return std::any_of(matched.begin(), matched.end(), [&](const MatchedDecl& m) {
+                return m.origin != Origin::UserAgent && (m.decl->name == longhand || m.decl->name == "margin");
+            });
+        };
+        s.ua_margin_top = !setByPage("margin-top");
+        s.ua_margin_bottom = !setByPage("margin-bottom");
 
         // Custom properties first, everything can refer to them.
         std::map<std::string, Tokens> custom;
@@ -1507,7 +1750,7 @@ private:
             }
         }
         finishFontSize(s);
-        if (el->parent && el->parent->type == NodeType::Document) lengths_.root_font_size = s.font_size;
+        if (!resolving_pseudo_ && el->parent && el->parent->type == NodeType::Document) lengths_.root_font_size = s.font_size;
 
         // Borders default to the text's colour, medium, and no style: a width only
         // shows once there's a style, and setting one doesn't change the other.
@@ -1524,14 +1767,42 @@ private:
         for (int side = 0; side < 4; ++side)
             if (border_none_[side]) s.border_width[side] = 0;
 
-        // Absolute and fixed boxes are blocks, whatever they said.
-        if ((s.position == Position::Absolute || s.position == Position::Fixed) &&
-            (s.display == Display::Inline || s.display == Display::InlineBlock))
-            s.display = Display::Block;
+        // Absolute, fixed and floated boxes are blocks, whatever they said.
+        const bool out_of_flow = s.position == Position::Absolute || s.position == Position::Fixed;
+        if (out_of_flow) s.float_side = Float::None;
+        if (out_of_flow || s.float_side != Float::None) {
+            switch (s.display) {
+                case Display::Inline:
+                case Display::InlineBlock:
+                case Display::TableCaption:
+                case Display::TableRowGroup:
+                case Display::TableRow:
+                case Display::TableCell: s.display = Display::Block; break;
+                case Display::InlineTable: s.display = Display::Table; break;
+                case Display::InlineFlex: s.display = Display::Flex; break;
+                default: break;
+            }
+        }
 
         // Lines drawn by an ancestor run through its descendants' text regardless.
         s.underline = s.underline || parent.underline;
         s.line_through = s.line_through || parent.line_through;
+    }
+
+    void resolvePseudo(const Node* el, const ComputedStyle& s, const Buckets& buckets,
+                       std::unordered_map<const Node*, const ComputedStyle*>& into) {
+        if (buckets.empty()) return;
+        std::vector<MatchedDecl> matched;
+        collect(el, buckets, matched);
+        if (matched.empty()) return;
+        ComputedStyle pseudo;
+        inherit(s, pseudo);
+        resolving_pseudo_ = true;
+        applyMatched(el, s, pseudo, matched);
+        resolving_pseudo_ = false;
+        if (!pseudo.has_content || pseudo.display == Display::None) return;
+        out_.storage_.push_back(std::move(pseudo));
+        into[el] = &out_.storage_.back();
     }
 
     void walk(const Node* el, const ComputedStyle& parent, size_t depth) {
@@ -1541,6 +1812,8 @@ private:
         resolveInto(el, parent, s);
         out_.styles_[el] = &s;
         if (s.display == Display::None) return;   // nothing below gets a box
+        resolvePseudo(el, s, before_, out_.before_);
+        resolvePseudo(el, s, after_, out_.after_);
         for (const Node* c : el->children)
             if (c->isElement()) walk(c, s, depth + 1);
     }
@@ -1549,8 +1822,9 @@ private:
     StyledDocument& out_;
     const StyledDocument::SheetLoader& loader_;
     std::vector<std::unique_ptr<css::Stylesheet>> sheets_;
-    std::unordered_map<std::string, std::vector<IndexedSelector>> by_id_, by_class_, by_type_;
-    std::vector<IndexedSelector> universal_;
+    Buckets normal_, before_, after_;
+    const Node* current_element_ = nullptr;
+    bool resolving_pseudo_ = false;
     std::unordered_map<const Node*, SiblingInfo> siblings_;
     LengthContext lengths_;
     size_t order_ = 0;
@@ -1559,9 +1833,20 @@ private:
     bool border_none_[4] = {true, true, true, true};
 };
 
-StyledDocument::StyledDocument(const Document& doc, css::MediaContext media, const SheetLoader& loader) : media_(media) {
+StyledDocument::StyledDocument(const Document& doc, css::MediaContext media, const SheetLoader& loader, const ChMeasure& measure_ch)
+    : media_(media), measure_ch_(measure_ch) {
     StyleResolver resolver(doc, *this, loader);
     resolver.run();
+}
+
+const ComputedStyle* StyledDocument::beforeOf(const Node* element) const {
+    const auto it = before_.find(element);
+    return it == before_.end() ? nullptr : it->second;
+}
+
+const ComputedStyle* StyledDocument::afterOf(const Node* element) const {
+    const auto it = after_.find(element);
+    return it == after_.end() ? nullptr : it->second;
 }
 
 const ComputedStyle* StyledDocument::styleOf(const Node* element) const {

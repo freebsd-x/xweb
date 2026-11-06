@@ -6,6 +6,7 @@ xweb_inc = include_directories('include')
 
 libxweb = static_library('xweb',
   'src/dom.cc',
+  'src/url.cc',
   'src/html_tokenizer.cc',
   'src/html_parser.cc',
   'src/css_parser.cc',
@@ -41,7 +42,7 @@ test('xweb html5lib',
   suite : 'unit',
 )
 
-foreach unit : [['css', 'css_parser_test.cc'], ['style', 'style_test.cc'], ['layout', 'layout_test.cc'], ['fuzz', 'fuzz_test.cc'], ['html', 'html_parser_test.cc']]
+foreach unit : [['css', 'css_parser_test.cc'], ['style', 'style_test.cc'], ['layout', 'layout_test.cc'], ['fuzz', 'fuzz_test.cc'], ['html', 'html_parser_test.cc'], ['url', 'url_test.cc']]
   test('xweb ' + unit[0],
     executable('xweb_' + unit[0] + '_test', 'tests/unit' / unit[1], dependencies : [xweb_dep, gtest_dep]),
     suite : 'unit',

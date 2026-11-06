@@ -1,0 +1,25 @@
+<!doctype html><html><head><style>
+body{margin:8px;font:14px/20px monospace}.f{display:flex;margin-bottom:10px}.i{width:60px;height:30px}
+.g1>div{flex:1}.g2>div:first-child{flex:2}.g2>div:last-child{flex:1}.col{flex-direction:column}.rev{flex-direction:row-reverse}
+.w{flex-wrap:wrap;width:200px}.cb{justify-content:space-between}.cc{justify-content:center}.ce{justify-content:flex-end}.ca{justify-content:space-around}.cv{justify-content:space-evenly}
+.ac{align-items:center;height:80px}.ae{align-items:flex-end;height:80px}.as{align-items:flex-start;height:80px}.gap{gap:10px}.ml{margin-left:auto}
+</style></head><body>
+<div class=f><div class=i></div><div class=i></div><div class=i></div></div>
+<div class="f g1"><div>a</div><div>bb</div><div>ccc</div></div><div class="f g2"><div>two</div><div>one</div></div>
+<div class="f col"><div class=i></div><div class=i></div></div><div class="f rev"><div class=i></div><div class=i></div></div>
+<div class="f w"><div class=i></div><div class=i></div><div class=i></div><div class=i></div></div>
+<div class="f cb"><div class=i></div><div class=i></div><div class=i></div></div><div class="f cc"><div class=i></div><div class=i></div></div><div class="f ce"><div class=i></div></div>
+<div class="f ca"><div class=i></div><div class=i></div></div><div class="f cv"><div class=i></div><div class=i></div></div>
+<div class="f ac"><div class=i></div><div>text</div></div><div class="f ae"><div class=i></div></div><div class="f as"><div class=i></div></div>
+<div class=f style=height:80px><div style=width:60px>stretches</div><div class=i></div></div>
+<div class="f gap"><div class=i></div><div class=i></div></div><div class="f"><div class="i ml"></div></div><div class="f"><div class=i style=margin:0px auto></div></div>
+<div class=f style=width:200px><div style=flex-basis:150px;flex-shrink:1>shrinks</div><div style=flex-basis:150px;flex-shrink:3>more</div></div>
+<div class=f style=width:300px><div style=flex-grow:1;max-width:50px>max</div><div style=flex-grow:1>rest</div></div>
+<div class=f><div class=i style=order:2></div><div class=i style=order:1></div></div>
+<div class=f style=width:100px><div style=flex:none;width:200px>none</div></div>
+<div class="f col" style=height:200px><div style=flex:1>grow</div><div style=height:30px>fixed</div></div>
+<div class=f>loose text<span>span item</span></div><span class=f style=width:200px>block from span</span>
+<div class=f><div style=flex:1;padding:5px;border:2px;border-style:solid;margin:3px>framed</div><div style=flex:1>plain</div></div>
+<span style=display:inline-flex>inline <b>flex</b></span>
+<div class=f style=width:300px><div style="flex:0 0 50%">half</div><div style="flex:1 1 0">other</div></div>
+</body></html>

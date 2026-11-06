@@ -119,14 +119,44 @@ public:
 
     void paintSelf(fbx::xrender::DisplayList& dl, Offset at) noexcept override {
         fill(dl, at.x_, at.y_, size_.width_, size_.height_, page_.canvas);
+        // Clips nest, but the engine only has "set" and "reset": each is set to what it
+        // and its parents leave, and a pop goes back to the one before.
+        std::vector<web::PaintOp> clips;
+        const auto applyClip = [&] {
+            if (clips.empty()) {
+                dl.addCommand(fbx::shared::CommandType::ResetScissor, {});
+                return;
+            }
+            float l = clips[0].x, t = clips[0].y, r = l + clips[0].w, b = t + clips[0].h;
+            for (const auto& c : clips) {
+                l = std::max(l, c.x);
+                t = std::max(t, c.y);
+                r = std::min(r, c.x + c.w);
+                b = std::min(b, c.y + c.h);
+            }
+            fbx::shared::ScissorData sd{l + at.x_, std::max(t + at.y_, 0.0f), std::max(0.0f, r - l),
+                                        std::max(0.0f, std::min(b - t, b + at.y_))};
+            dl.addCommand(fbx::shared::CommandType::SetScissor, {reinterpret_cast<const uint8_t*>(&sd), sizeof(sd)});
+        };
         for (size_t i = 0; i < page_.ops.size(); ++i) {
             const web::PaintOp& op = page_.ops[i];
+            if (op.kind == web::PaintKind::ClipBegin) {
+                clips.push_back(op);
+                applyClip();
+                continue;
+            }
+            if (op.kind == web::PaintKind::ClipEnd) {
+                if (!clips.empty()) clips.pop_back();
+                applyClip();
+                continue;
+            }
             const float y = op.y + at.y_;
             if (y > kMaxWindowHeight + kOffscreenMargin || y + op.h < -kOffscreenMargin) continue;
             switch (op.kind) {
-                case web::PaintKind::Rect: fill(dl, op.x + at.x_, y, op.w, op.h, op.color); break;
+                case web::PaintKind::Rect: fill(dl, op.x + at.x_, y, op.w, op.h, op.color, op.radius); break;
                 case web::PaintKind::Text: text(dl, op, op.x + at.x_, text_y_[i] + at.y_); break;
                 case web::PaintKind::Image: image(dl, op, op.x + at.x_, y); break;
+                default: break;
             }
         }
     }
@@ -135,10 +165,13 @@ public:
 
 private:
     void relayout(float width, float height) {
-        const web::StyledDocument styles(*doc_, {width, height}, [this](const std::string& href) {
-            const auto it = sheets_.find(href);
-            return it == sheets_.end() ? std::string{} : it->second;
-        });
+        const web::StyledDocument styles(
+            *doc_, {width, height},
+            [this](const std::string& href) {
+                const auto it = sheets_.find(href);
+                return it == sheets_.end() ? std::string{} : it->second;
+            },
+            [this](const web::ComputedStyle& s) { return web::chWidth(measurer_, s); });
         page_ = web::layoutPage(*doc_, styles, measurer_, &images_, width, height);
         // The engine puts a run's baseline 0.8em below where it's told: answer in those
         // terms, for the baseline the font's own ascent put it on.
@@ -150,7 +183,7 @@ private:
             }
     }
 
-    static void fill(fbx::xrender::DisplayList& dl, float x, float y, float w, float h, web::Color c) {
+    static void fill(fbx::xrender::DisplayList& dl, float x, float y, float w, float h, web::Color c, float radius = 0) {
         fbx::shared::RectData r{};
         r.x_ = x;
         r.y_ = y;
@@ -160,6 +193,7 @@ private:
         r.g_ = static_cast<float>(c.g) / 255;
         r.b_ = static_cast<float>(c.b) / 255;
         r.a_ = static_cast<float>(c.a) / 255;
+        r.border_radius_ = radius;
         dl.addCommand(fbx::shared::CommandType::DrawRect, {reinterpret_cast<const uint8_t*>(&r), sizeof(r)});
     }
 

@@ -1,0 +1,16 @@
+<!doctype html><html><head><style>
+body{margin:10px;font:14px/20px monospace}.l{float:left;width:100px;height:60px}.r{float:right;width:80px;height:40px}
+.box{margin-bottom:20px}.cf::after{content:"";display:table;clear:both}.c{clear:both}.cl{clear:left}.ov{overflow:hidden}.fr{display:flow-root}
+.m{float:left;width:50px;height:50px;margin:5px 10px}.nar{width:300px}.w{width:150px}.s{float:left;padding:4px}
+</style></head><body>
+<div class=box><div class=l></div><p>Text beside a left float that wraps around it because it is long enough to need more than two lines of text in this box here.</p></div>
+<div class=box style=clear:both><div class=r></div><p>Text beside a right float, also long enough to need wrapping around the float at the right edge of the box over here.</p></div>
+<div class="box cf"><div class=l></div></div><div class=box><div class=l></div><div class=c>cleared</div></div>
+<div class="box ov"><div class=l></div></div><div class="box fr"><div class=r></div></div><div style=clear:both></div>
+<div class="box nar"><div class=l></div><div class=l></div><div class=l></div><div class=l></div></div><div style=clear:both></div>
+<div class=box><div class=m></div><div class=m></div>tail text</div><div style=clear:both></div>
+<div class=box><div class=l></div><div class=ov style=height:30px>beside</div></div><div style=clear:both></div>
+<div class="box w"><span class=s>shrink</span>text after the shrunk float wraps at the narrow width</div><div style=clear:both></div>
+<div class=box><span style=float:right>right word</span>line text comes first in the source but sits to the left</div>
+<div class=box style=height:20px><div class=l style=height:100px></div></div><p>below tall float</p>
+</body></html>
