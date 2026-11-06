@@ -1,0 +1,18 @@
+<!doctype html><html><head><style>
+body{margin:0;font:14px/18px monospace}div{height:10px;margin:1px}
+#i{height:20px}.c{height:21px}div.c.d{height:22px}[data-x]{height:23px}[data-y="v"]{height:24px}[data-z^=ab]{height:25px}[data-z$=yz]{height:26px}[data-z*=mm]{height:27px}[data-w~=two]{height:28px}[data-l|=en]{height:29px}
+section>div{height:30px}section div div{height:31px}h1+div{height:32px}h2~div{height:33px}
+ul li:first-child{height:34px}ul li:last-child{height:35px}ul li:nth-child(2){height:36px}ul li:nth-child(3n+4){height:37px}ol li:nth-last-child(1){height:38px}ol li:only-child{height:39px}
+p:first-of-type{height:40px}p:last-of-type{height:41px}p:nth-of-type(2){height:42px}
+:not(.x)>span.t{display:block;height:43px}:is(article,aside) b{display:block;height:44px}:where(.a,.b) i{display:block;height:45px}
+.imp{height:46px!important}#imp{height:47px}.var{--h:48px;height:var(--h)}.fb{height:var(--none,49px)}.rs{height:50px}.rs{height:bad}.late{height:1px}.late{height:51px}
+@media (min-width:500px){.mq{height:52px}}@media (max-width:100px){.mq{height:1px}}@media print{.mq{height:2px}}@media screen and (min-width:1px),print{.mq2{height:53px}}@media not screen{.mq2{height:3px}}
+.inh{height:54px}.inh>div{height:inherit}
+</style></head><body>
+<div id=i></div><div class=c></div><div class="c d"></div><div data-x></div><div data-y=v></div><div data-z=abc></div><div data-z=xyz></div><div data-z=mmm></div><div data-w="one two"></div><div data-l=en-us></div>
+<section><div><div></div></div></section><h1>h</h1><div></div><h2>h</h2><div></div><div></div>
+<ul><li>a</li><li>b</li><li>c</li><li>d</li><li>e</li></ul><ol><li>o</li></ol>
+<p>1</p><p>2</p><p>3</p><span class=t>t</span><article><b>b</b></article><div class=a style="height:auto"><i>i</i></div>
+<div class=imp style="height:1px" id=imp></div><div class=var></div><div class=fb></div><div class=rs></div><div class=late></div><div class=mq></div><div class=mq2></div><div class=inh><div></div></div>
+<div style="height:55px;height:bad"></div><div style="color:red;;;height:56px;"></div><div style="garbage;height:57px"></div>
+</body></html>
