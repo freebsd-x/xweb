@@ -333,3 +333,12 @@ TEST(Intrinsic, PercentWidthsDontExplodeMeasuring) {
     const auto r = layout("<div style=display:flex><nav id=n><img src=wide.png style=width:50%></nav><div id=m style=flex:1>x</div></div>");
     EXPECT_LE(r.box("n").w, 200);
 }
+
+TEST(Links, ABlockLinkIsClickableAllOver) {
+    const auto r = layout("<a href=/x style='display:block;width:50px;height:20px'></a><a href=/y style='display:inline-block;width:30px;height:9px'></a>");
+    ASSERT_GE(r.page.links.size(), 2u);
+    EXPECT_EQ(r.page.links[0].href, "/x");
+    EXPECT_FLOAT_EQ(r.page.links[0].w, 50);
+    EXPECT_FLOAT_EQ(r.page.links[0].h, 20);
+    EXPECT_EQ(r.page.links[1].href, "/y");
+}

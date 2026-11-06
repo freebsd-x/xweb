@@ -2350,6 +2350,9 @@ private:
         const float opacity = opacity_in * s.opacity;
         paintFrame(b, x, y, opacity);
         max_bottom_ = std::max(max_bottom_, y + b.outerHeight());
+        // A link that's a box: all of it can be clicked.
+        if (b.node && b.node->isHtml("a"))
+            if (const std::string* href = b.node->attr("href")) out_->links.push_back({x, y, b.outerWidth(), b.outerHeight(), *href});
         const float cx = x + b.border[Left] + b.padding[Left];
         const float cy = y + b.border[Top] + b.padding[Top];
         // Positioned descendants measure from this box's padding box, if it's positioned.

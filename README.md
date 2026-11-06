@@ -13,8 +13,10 @@ repo sync
 
 ## Where it stands
 
-The Browser app still runs Chromium. This engine isn't a browser yet: try it with
-`out/xwebview page.html`, which shows a local page.
+The Browser app still runs Chromium. `out/xwebview [address or file]` is a small browser
+on this engine: it follows links and redirects, has history and an address bar, and
+fetches pages, stylesheets and images through the compositor's broker from inside its
+sandbox. Many simple sites work; anything needing scripts or CSS grid doesn't yet.
 
 | Works | Not yet |
 |---|---|
@@ -23,7 +25,8 @@ The Browser app still runs Chromium. This engine isn't a browser yet: try it wit
 | Block and inline layout, margin collapsing, inline-block, lists | **grid** (lays out as blocks) |
 | **Floats, tables (auto and fixed), flexbox**, positioning | sticky, z-index stacking contexts, collapsed-border conflict resolution |
 | Backgrounds (colours), borders, rounded corners, overflow clipping, text, images beside the page | background images, gradients, shadows, per-corner radii, dashed borders |
-| Scrolling with the wheel | **network, following links, forms, JavaScript** |
+| Network (http, https), links, redirects, history, fragments, UTF-8, UTF-16, Latin-1 | **JavaScript, forms, cookies**, other encodings (Shift_JIS, EUC-KR...), SVG images, HTTP cache |
+| Refuses to reach this machine or the local network | so a LAN device's page can't be opened either |
 
 ## Layers
 
@@ -31,6 +34,7 @@ The Browser app still runs Chromium. This engine isn't a browser yet: try it wit
 - `css.h`: CSS Syntax 3 tokenizer, rules, selectors, media queries.
 - `style.h`: matching, cascade, computed values.
 - `layout.h`: boxes and paint operations, asking a `TextMeasurer` about text.
+- `url.h`, `encoding.h`: addresses and character sets.
 - `text_measurer.h`, `tools/xweb_view.cc`: the only parts that know about xrender and xkit.
 
 Pages are untrusted input. Depth, selector matching, `var()` expansion and imports all
@@ -45,4 +49,5 @@ have limits, and nothing a page does can make the parsers fail.
   in an ASan build after changing the engine.
 - `scripts/xweb-compare.py sdk/xweb/tests/pages/*.html`: every element's box against
   headless Chromium. Needs Chromium, so it isn't in the unit suite.
-- `headless-e2e.py webview`: a page in a real window, checked pixel by pixel.
+- `headless-e2e.py webview webnav`: a page in a real window checked pixel by pixel, and
+  browsing a local test site, including that nobody else may browse.
