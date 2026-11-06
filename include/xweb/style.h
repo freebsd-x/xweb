@@ -10,6 +10,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "xweb/css.h"
@@ -38,7 +39,8 @@ struct Length {
 enum class Display {
     None, Inline, Block, InlineBlock, ListItem, FlowRoot,
     Table, InlineTable, TableCaption, TableRowGroup, TableRow, TableCell, TableColumn,
-    Flex, InlineFlex,
+    Flex, InlineFlex, Grid, InlineGrid,
+    Contents,   // no box of its own: its children go where it would have
 };
 enum class Float { None, Left, Right };
 enum class Clear { None, Left, Right, Both };
@@ -50,6 +52,46 @@ enum class WhiteSpace { Normal, Pre, NoWrap, PreWrap, PreLine };
 enum class TextTransform { None, Uppercase, Lowercase, Capitalize };
 enum class ListStyle { None, Disc, Circle, Square, Decimal, LowerAlpha, UpperAlpha, LowerRoman, UpperRoman };
 enum Side { Top = 0, Right = 1, Bottom = 2, Left = 3 };
+
+// Grid tracks, as specified: both ends of a track's minmax().
+struct GridSize {
+    enum Kind { Auto, MinContent, MaxContent, Fixed, Fr } kind = Auto;
+    Length length;   // Fixed
+    float fr = 0;    // Fr
+};
+
+struct GridTrack {
+    GridSize min, max;
+    bool fit_content = false;
+    Length fit_limit;
+};
+
+// A template's tracks, with the one repeat(auto-fill | auto-fit) it may hold still folded
+// up: how many times it runs depends on the room there turns out to be.
+struct GridTrackList {
+    std::vector<GridTrack> tracks;
+    std::vector<std::vector<std::string>> names;   // of the lines: tracks.size() + 1
+    std::vector<GridTrack> repeat;
+    std::vector<std::vector<std::string>> repeat_names;   // repeat.size() + 1
+    std::vector<std::string> names_after_repeat;
+    size_t repeat_at = 0;
+    bool auto_fit = false;
+};
+
+struct GridAreaRect { int row_start = 0, row_end = 0, column_start = 0, column_end = 0; };
+
+struct GridAreas {
+    std::map<std::string, GridAreaRect> areas;
+    int rows = 0, columns = 0;
+};
+
+// One end of a placement: `auto`, a line by number and/or name, or a span.
+struct GridLine {
+    int line = 0;       // 0 is none; negative counts from the end
+    int span = 0;       // nonzero for "span n"
+    std::string name;
+    [[nodiscard]] bool isAuto() const noexcept { return line == 0 && span == 0 && name.empty(); }
+};
 
 struct ComputedStyle {
     Display display = Display::Inline;
@@ -78,9 +120,11 @@ struct ComputedStyle {
 
     // Not inherited, though underlines reach descendants' text
     Color background{0, 0, 0, 0};
+    bool masked = false;   // shaped by a mask we can't draw
     Length margin[4], padding[4], offset[4] = {Length::autoLength(), Length::autoLength(), Length::autoLength(), Length::autoLength()};
     float border_width[4] = {0, 0, 0, 0};
     Color border_color[4];
+    enum class WidthKeyword { None, MinContent, MaxContent, FitContent } width_keyword = WidthKeyword::None;   // width is auto then
     Length width = Length::autoLength(), height = Length::autoLength();
     Length min_width, min_height;
     Length max_width = Length::autoLength(), max_height = Length::autoLength();
@@ -94,12 +138,19 @@ struct ComputedStyle {
     bool table_fixed = false;
     // Flexbox
     bool flex_column = false, flex_reverse = false, flex_wrap = false;
-    FlexAlign justify_content = FlexAlign::Start, align_items = FlexAlign::Stretch;
+    FlexAlign justify_content = FlexAlign::Auto, align_items = FlexAlign::Stretch;
     FlexAlign align_self = FlexAlign::Auto, align_content = FlexAlign::Stretch;
     float flex_grow = 0, flex_shrink = 1;
     Length flex_basis = Length::autoLength();
     int order = 0;
     float row_gap = 0, column_gap = 0;
+    // Grid
+    std::shared_ptr<const GridTrackList> grid_columns, grid_rows;
+    std::shared_ptr<const std::vector<GridTrack>> grid_auto_columns, grid_auto_rows;
+    std::shared_ptr<const GridAreas> grid_areas;
+    bool grid_flow_column = false, grid_dense = false;
+    GridLine grid_row_start, grid_row_end, grid_column_start, grid_column_end;
+    FlexAlign justify_items = FlexAlign::Auto, justify_self = FlexAlign::Auto;
     // ::before and ::after
     bool has_content = false;
     std::string content;
@@ -109,6 +160,15 @@ struct ComputedStyle {
         if (line_height_factor > 0) return line_height_factor * font_size;
         return line_height > 0 ? line_height : font_size * 1.2f;
     }
+};
+
+// An @font-face, in the terms choosing a font needs.
+struct WebFontFace {
+    std::string family;           // lower case
+    int weight_min = 400, weight_max = 400;
+    bool italic = false;
+    std::vector<std::string> sources;   // in order of preference, of formats we can read
+    std::vector<std::pair<uint32_t, uint32_t>> ranges;   // empty is everything
 };
 
 // Limits what one page can make us do. Past them things stop matching or nesting.
@@ -131,6 +191,9 @@ public:
     [[nodiscard]] const ComputedStyle* beforeOf(const Node* element) const;
     [[nodiscard]] const ComputedStyle* afterOf(const Node* element) const;
     [[nodiscard]] const css::MediaContext& media() const noexcept { return media_; }
+    // The page's @font-face rules, those applying. Sources are as absolute as the sheet's
+    // address was: those in a <style> are still relative to the page.
+    [[nodiscard]] const std::vector<WebFontFace>& fontFaces() const noexcept { return font_faces_; }
 
 private:
     css::MediaContext media_;
@@ -138,6 +201,7 @@ private:
     std::unordered_map<const Node*, const ComputedStyle*> styles_;
     std::unordered_map<const Node*, const ComputedStyle*> before_, after_;
     std::deque<ComputedStyle> storage_;
+    std::vector<WebFontFace> font_faces_;
     friend class StyleResolver;
 };
 

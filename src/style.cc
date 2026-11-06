@@ -168,6 +168,23 @@ bool colorFromTokens(const Tokens& v, size_t& i, const Color& current, Color& ou
         return false;
     }
     if (t.type != TokenType::Function) return false;
+    if (lower(t.text) == "light-dark") {
+        // We're always in light mode. The nesting the grammar would allow isn't followed.
+        ++i;
+        while (i < v.size() && v[i].type == TokenType::Whitespace) ++i;
+        if (i >= v.size() || (v[i].type == TokenType::Function && lower(v[i].text) == "light-dark")) return false;
+        Color light;
+        if (!colorFromTokens(v, i, current, light)) return false;
+        // An rgb() or hsl() leaves us on its own first token, so its brackets are counted too.
+        int nesting = 1;
+        for (; i < v.size() && nesting > 0; ++i) {
+            if (v[i].type == TokenType::Function || v[i].type == TokenType::LeftParen) ++nesting;
+            else if (v[i].type == TokenType::RightParen) --nesting;
+        }
+        if (nesting != 0) return false;
+        out = light;
+        return true;
+    }
     const bool rgb = t.text == "rgb" || t.text == "rgba";
     const bool hsl = t.text == "hsl" || t.text == "hsla";
     if (!rgb && !hsl) return false;
@@ -400,6 +417,226 @@ void skipWs(const Tokens& v, size_t& i) {
     while (i < v.size() && v[i].type == TokenType::Whitespace) ++i;
 }
 
+// ── Grid values ───────────────────────────────────────────────────────────────
+
+constexpr size_t kMaxGridListTracks = 1000;   // what one template may spell out
+
+bool gridSizeAt(const Tokens& v, size_t& i, const LengthContext& c, GridSize& out) {
+    skipWs(v, i);
+    if (i >= v.size()) return false;
+    const Token& t = v[i];
+    if (t.type == TokenType::Ident) {
+        const std::string k = lower(t.text);
+        if (k == "auto") out.kind = GridSize::Auto;
+        else if (k == "min-content") out.kind = GridSize::MinContent;
+        else if (k == "max-content") out.kind = GridSize::MaxContent;
+        else return false;
+        ++i;
+        return true;
+    }
+    if (t.type == TokenType::Dimension && lower(t.text) == "fr") {
+        if (t.number < 0) return false;
+        out.kind = GridSize::Fr;
+        out.fr = static_cast<float>(std::min(t.number, 1e6));
+        ++i;
+        return true;
+    }
+    Length l;
+    if (!lengthAt(v, i, c, l, false) || l.px < 0 || l.percent < 0) return false;
+    out.kind = GridSize::Fixed;
+    out.length = l;
+    return true;
+}
+
+bool closesFunction(const Tokens& v, size_t& i) {
+    skipWs(v, i);
+    if (i >= v.size() || v[i].type != TokenType::RightParen) return false;
+    ++i;
+    return true;
+}
+
+bool gridTrackAt(const Tokens& v, size_t& i, const LengthContext& c, GridTrack& out) {
+    skipWs(v, i);
+    if (i >= v.size()) return false;
+    if (v[i].type == TokenType::Function && lower(v[i].text) == "minmax") {
+        ++i;
+        if (!gridSizeAt(v, i, c, out.min) || out.min.kind == GridSize::Fr) return false;
+        skipWs(v, i);
+        if (i >= v.size() || v[i].type != TokenType::Comma) return false;
+        ++i;
+        if (!gridSizeAt(v, i, c, out.max)) return false;
+        return closesFunction(v, i);
+    }
+    if (v[i].type == TokenType::Function && lower(v[i].text) == "fit-content") {
+        ++i;
+        skipWs(v, i);
+        out.min.kind = GridSize::Auto;
+        out.max.kind = GridSize::MaxContent;
+        out.fit_content = true;
+        if (!lengthAt(v, i, c, out.fit_limit, false)) return false;
+        return closesFunction(v, i);
+    }
+    GridSize size;
+    if (!gridSizeAt(v, i, c, size)) return false;
+    out.max = size;
+    out.min = size;
+    if (size.kind == GridSize::Fr) out.min = GridSize{};
+    return true;
+}
+
+// [ name name ], adding to what a line is already called.
+bool lineNamesAt(const Tokens& v, size_t& i, std::vector<std::string>& into) {
+    skipWs(v, i);
+    if (i >= v.size() || v[i].type != TokenType::LeftBracket) return false;
+    ++i;
+    while (i < v.size() && v[i].type != TokenType::RightBracket) {
+        if (v[i].type == TokenType::Ident) into.push_back(v[i].text);
+        ++i;
+    }
+    if (i < v.size()) ++i;
+    return true;
+}
+
+bool isSlash(const Token& t) { return t.type == TokenType::Delim && t.text == "/"; }
+
+// A track list up to `end` or a slash.
+bool trackListAt(const Tokens& v, size_t& i, const LengthContext& c, GridTrackList& out) {
+    out.names.assign(1, {});
+    bool any = false, have_repeat = false;
+    while (true) {
+        skipWs(v, i);
+        if (i >= v.size() || isSlash(v[i])) break;
+        std::vector<std::string>& line = have_repeat && out.repeat_at == out.tracks.size() ? out.names_after_repeat : out.names.back();
+        if (lineNamesAt(v, i, line)) continue;
+        if (v[i].type == TokenType::Function && lower(v[i].text) == "repeat") {
+            ++i;
+            skipWs(v, i);
+            if (i >= v.size()) return false;
+            int count = 0;
+            bool automatic = false;
+            if (v[i].type == TokenType::Ident && (lower(v[i].text) == "auto-fill" || lower(v[i].text) == "auto-fit")) {
+                automatic = true;
+                out.auto_fit = lower(v[i].text) == "auto-fit";
+            } else if (v[i].type == TokenType::Number && v[i].is_integer && v[i].number >= 1) {
+                count = static_cast<int>(std::min(v[i].number, 1e6));
+            } else {
+                return false;
+            }
+            ++i;
+            skipWs(v, i);
+            if (i >= v.size() || v[i].type != TokenType::Comma) return false;
+            ++i;
+            std::vector<GridTrack> tracks;
+            std::vector<std::vector<std::string>> names(1);
+            while (true) {
+                skipWs(v, i);
+                if (i >= v.size()) return false;
+                if (v[i].type == TokenType::RightParen) { ++i; break; }
+                if (lineNamesAt(v, i, names.back())) continue;
+                GridTrack t;
+                if (!gridTrackAt(v, i, c, t)) return false;
+                tracks.push_back(std::move(t));
+                names.emplace_back();
+                if (tracks.size() > kMaxGridListTracks) return false;
+            }
+            if (tracks.empty()) return false;
+            if (automatic) {
+                if (have_repeat) return false;   // only one may be automatic
+                have_repeat = true;
+                out.repeat = std::move(tracks);
+                out.repeat_names = std::move(names);
+                out.repeat_at = out.tracks.size();
+            } else {
+                for (int n = 0; n < count && out.tracks.size() < kMaxGridListTracks; ++n) {
+                    for (size_t t = 0; t < tracks.size() && out.tracks.size() < kMaxGridListTracks; ++t) {
+                        auto& before = out.names.back();
+                        before.insert(before.end(), names[t].begin(), names[t].end());
+                        out.tracks.push_back(tracks[t]);
+                        out.names.emplace_back();
+                    }
+                    auto& after = out.names.back();
+                    after.insert(after.end(), names.back().begin(), names.back().end());
+                }
+            }
+            any = true;
+            continue;
+        }
+        GridTrack t;
+        if (!gridTrackAt(v, i, c, t)) return false;
+        out.tracks.push_back(std::move(t));
+        out.names.emplace_back();
+        any = true;
+        if (out.tracks.size() > kMaxGridListTracks) return false;
+    }
+    return any;
+}
+
+// The rows of grid-template-areas. A name has to make a rectangle.
+bool addAreaRow(const std::string& row, GridAreas& out, std::map<std::string, int>& cells) {
+    int column = 0;
+    size_t pos = 0;
+    while (pos < row.size()) {
+        const unsigned char ch = static_cast<unsigned char>(row[pos]);
+        if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\f' || ch == '\r') { ++pos; continue; }
+        if (ch == '.') {
+            while (pos < row.size() && row[pos] == '.') ++pos;
+            ++column;
+            continue;
+        }
+        const size_t from = pos;
+        while (pos < row.size() && row[pos] != ' ' && row[pos] != '\t' && row[pos] != '\n' && row[pos] != '\f' && row[pos] != '\r' && row[pos] != '.') ++pos;
+        const std::string name = row.substr(from, pos - from);
+        auto [it, fresh] = out.areas.try_emplace(name, GridAreaRect{out.rows, out.rows + 1, column, column + 1});
+        if (!fresh) {
+            it->second.row_end = out.rows + 1;
+            it->second.column_start = std::min(it->second.column_start, column);
+            it->second.column_end = std::max(it->second.column_end, column + 1);
+        }
+        ++cells[name];
+        ++column;
+    }
+    if (column == 0) return false;
+    if (out.rows > 0 && column != out.columns) return false;
+    out.columns = column;
+    ++out.rows;
+    return static_cast<size_t>(out.rows) * static_cast<size_t>(out.columns) <= kMaxGridListTracks * 10;
+}
+
+bool areasAreRectangles(const GridAreas& a, const std::map<std::string, int>& cells) {
+    for (const auto& [name, r] : a.areas)
+        if ((r.row_end - r.row_start) * (r.column_end - r.column_start) != cells.at(name)) return false;
+    return true;
+}
+
+// One end of a placement, up to a slash.
+bool gridLineAt(const Tokens& v, size_t& i, GridLine& out) {
+    out = GridLine{};
+    bool span = false, any = false;
+    int number = 0;
+    for (; i < v.size() && !isSlash(v[i]); ++i) {
+        const Token& t = v[i];
+        if (t.type == TokenType::Whitespace) continue;
+        any = true;
+        if (t.type == TokenType::Number && t.is_integer && t.number != 0) {
+            number = static_cast<int>(std::clamp(t.number, -100000.0, 100000.0));
+        } else if (t.type == TokenType::Ident) {
+            const std::string k = lower(t.text);
+            if (k == "span") span = true;
+            else if (k != "auto") out.name = t.text;
+        } else {
+            return false;
+        }
+    }
+    if (!any) return false;
+    if (span) {
+        out.span = number > 0 ? number : 1;
+    } else {
+        out.line = number;
+    }
+    return true;
+}
+
+
 // Top-level values of a declaration, without whitespace, functions kept whole by
 // index (start of each value in `v`).
 std::vector<size_t> valueStarts(const Tokens& v) {
@@ -422,6 +659,139 @@ std::string keyword(const Tokens& v) {
     ++i;
     skipWs(v, i);
     return i == v.size() ? w : std::string{};
+}
+
+// ── @font-face ────────────────────────────────────────────────────────────────
+
+constexpr size_t kMaxFontFaces = 512;
+
+std::vector<std::pair<uint32_t, uint32_t>> parseUnicodeRange(std::string_view in) {
+    std::vector<std::pair<uint32_t, uint32_t>> out;
+    size_t i = 0;
+    const auto hex = [](char ch) { return ch >= '0' && ch <= '9' ? ch - '0' : (ch | 0x20) >= 'a' && (ch | 0x20) <= 'f' ? (ch | 0x20) - 'a' + 10 : -1; };
+    while (i < in.size() && out.size() < 4096) {
+        while (i < in.size() && (in[i] == ' ' || in[i] == ',' || in[i] == '\n' || in[i] == '\t' || in[i] == '\r')) ++i;
+        if (i + 1 >= in.size() || (in[i] | 0x20) != 'u' || in[i + 1] != '+') {
+            // Not a range: on to the next comma.
+            while (i < in.size() && in[i] != ',') ++i;
+            continue;
+        }
+        i += 2;
+        uint32_t lo = 0, hi = 0;
+        int digits = 0, wild = 0;
+        while (i < in.size() && digits + wild < 6) {
+            if (in[i] == '?') {
+                lo <<= 4;
+                hi = (hi << 4) | 0xF;
+                ++wild;
+            } else if (hex(in[i]) >= 0 && wild == 0) {
+                const auto d = static_cast<uint32_t>(hex(in[i]));
+                lo = (lo << 4) | d;
+                hi = (hi << 4) | d;
+                ++digits;
+            } else {
+                break;
+            }
+            ++i;
+        }
+        if (digits + wild == 0) continue;
+        if (wild == 0 && i < in.size() && in[i] == '-') {
+            ++i;
+            hi = 0;
+            int n = 0;
+            while (i < in.size() && hex(in[i]) >= 0 && n < 6) {
+                hi = (hi << 4) | static_cast<uint32_t>(hex(in[i]));
+                ++i;
+                ++n;
+            }
+            if (n == 0) hi = lo;
+        }
+        if (lo <= hi && lo <= 0x10FFFF) out.emplace_back(lo, std::min(hi, 0x10FFFFu));
+    }
+    return out;
+}
+
+// The sources of a src: list that we could read.
+std::vector<std::string> fontSources(const Tokens& v, const std::string& base) {
+    std::vector<std::string> out;
+    size_t i = 0;
+    while (i < v.size() && out.size() < 16) {
+        std::string url;
+        bool usable = true, has_url = false;
+        for (; i < v.size() && v[i].type != TokenType::Comma; ++i) {
+            const Token& t = v[i];
+            if (t.type == TokenType::Url) {
+                url = t.text;
+                has_url = true;
+            } else if (t.type == TokenType::Function) {
+                const std::string name = lower(t.text);
+                size_t j = i + 1;
+                skipWs(v, j);
+                const bool has_arg = j < v.size() && (v[j].type == TokenType::String || v[j].type == TokenType::Ident);
+                if (name == "url" && has_arg) {
+                    url = v[j].text;
+                    has_url = true;
+                } else if (name == "format" && has_arg) {
+                    const std::string f = lower(v[j].text);
+                    usable = f == "woff" || f == "woff2" || f == "truetype" || f == "opentype" || f == "woff-variations" ||
+                             f == "woff2-variations" || f == "truetype-variations" || f == "opentype-variations";
+                }
+                // Skip to the end of the function.
+                int depth = 1;
+                while (i + 1 < v.size() && depth > 0) {
+                    ++i;
+                    if (v[i].type == TokenType::Function || v[i].type == TokenType::LeftParen) ++depth;
+                    else if (v[i].type == TokenType::RightParen) --depth;
+                }
+            }
+        }
+        if (i < v.size()) ++i;
+        if (!has_url || !usable) continue;
+        const std::string file = lower(url.substr(0, url.find_first_of("?#")));
+        if (file.ends_with(".eot") || file.ends_with(".svg")) continue;
+        out.push_back(resolveUrl(base, url));
+    }
+    return out;
+}
+
+// Only a rule that can really be used comes back.
+std::optional<WebFontFace> webFontFrom(const css::FontFaceRule& rule, const std::string& base) {
+    WebFontFace face;
+    for (const css::Declaration& d : rule.declarations) {
+        const Tokens& v = d.value;
+        if (d.name == "font-family") {
+            std::string name;
+            for (const Token& t : v) {
+                if (t.type == TokenType::String) {
+                    name = t.text;
+                } else if (t.type == TokenType::Ident) {
+                    if (!name.empty()) name += ' ';
+                    name += t.text;
+                }
+            }
+            face.family = lower(name);
+        } else if (d.name == "src") {
+            face.sources = fontSources(v, base);
+        } else if (d.name == "font-weight") {
+            std::vector<int> weights;
+            for (const Token& t : v) {
+                if (t.type == TokenType::Number) weights.push_back(std::clamp(static_cast<int>(t.number), 1, 1000));
+                else if (t.type == TokenType::Ident && lower(t.text) == "bold") weights.push_back(700);
+                else if (t.type == TokenType::Ident && lower(t.text) == "normal") weights.push_back(400);
+            }
+            if (!weights.empty()) {
+                face.weight_min = std::min(weights.front(), weights.back());
+                face.weight_max = std::max(weights.front(), weights.back());
+            }
+        } else if (d.name == "font-style") {
+            const std::string k = keyword(v);
+            const bool oblique = !v.empty() && std::any_of(v.begin(), v.end(), [](const Token& t) { return t.type == TokenType::Ident && lower(t.text) == "oblique"; });
+            face.italic = k == "italic" || oblique;
+        }
+    }
+    if (!rule.unicode_range.empty()) face.ranges = parseUnicodeRange(rule.unicode_range);
+    if (face.family.empty() || face.sources.empty()) return std::nullopt;
+    return face;
 }
 
 float borderWidthFrom(const Token& t, const LengthContext& c, bool& ok) {
@@ -508,6 +878,11 @@ private:
                 const std::string target = resolveUrl(url, ref);
                 addSheet(css::parseStylesheet(loader_(target)), origin, depth + 1, target);
             }
+        }
+        for (const css::FontFaceRule& rule : sheet.font_faces) {
+            if (out_.font_faces_.size() >= kMaxFontFaces) break;
+            if (!std::all_of(rule.media.begin(), rule.media.end(), [&](const Tokens& q) { return css::mediaMatches(q, out_.media_); })) continue;
+            if (auto face = webFontFrom(rule, url)) out_.font_faces_.push_back(std::move(*face));
         }
         sheets_.push_back(std::make_unique<css::Stylesheet>(std::move(sheet)));
         const css::Stylesheet& kept = *sheets_.back();
@@ -1096,10 +1471,10 @@ private:
 
     static void setDisplay(ComputedStyle& s, const std::string& k) {
         static const std::map<std::string, Display> kDisplays = {
-            {"none", Display::None}, {"inline", Display::Inline}, {"contents", Display::Inline}, {"ruby", Display::Inline},
-            {"ruby-text", Display::Inline}, {"inline-block", Display::InlineBlock}, {"inline-grid", Display::InlineBlock},
+            {"none", Display::None}, {"inline", Display::Inline}, {"contents", Display::Contents}, {"ruby", Display::Inline},
+            {"ruby-text", Display::Inline}, {"inline-block", Display::InlineBlock}, {"inline-grid", Display::InlineGrid},
             {"inline-table", Display::InlineTable}, {"inline-flex", Display::InlineFlex}, {"list-item", Display::ListItem},
-            {"block", Display::Block}, {"grid", Display::Block}, {"flow", Display::Block}, {"flow-root", Display::FlowRoot},
+            {"block", Display::Block}, {"grid", Display::Grid}, {"flow", Display::Block}, {"flow-root", Display::FlowRoot},
             {"table", Display::Table}, {"table-caption", Display::TableCaption}, {"table-row-group", Display::TableRowGroup},
             {"table-header-group", Display::TableRowGroup}, {"table-footer-group", Display::TableRowGroup},
             {"table-row", Display::TableRow}, {"table-cell", Display::TableCell}, {"table-column", Display::TableColumn},
@@ -1120,6 +1495,269 @@ private:
         if (k == "space-evenly") return FlexAlign::SpaceEvenly;
         if (k == "auto") return FlexAlign::Auto;
         return keep;
+    }
+
+    // The keyword at each side of a slash or space, for place-*.
+    static std::pair<std::string, std::string> twoKeywords(const Tokens& v) {
+        std::vector<std::string> words;
+        for (const Token& t : v)
+            if (t.type == TokenType::Ident) words.push_back(lower(t.text));
+        if (words.empty()) return {};
+        return {words.front(), words.back()};
+    }
+
+    static void clearGridTemplate(ComputedStyle& s) {
+        s.grid_rows.reset();
+        s.grid_columns.reset();
+        s.grid_areas.reset();
+    }
+
+    static std::shared_ptr<const GridTrackList> trackList(const Tokens& v, size_t& i, const LengthContext& c, bool& ok) {
+        auto list = std::make_shared<GridTrackList>();
+        ok = trackListAt(v, i, c, *list);
+        return list;
+    }
+
+    // grid-template: rows / columns, or the form with strings of area names in it.
+    static bool setGridTemplate(ComputedStyle& s, const Tokens& v, const LengthContext& c) {
+        size_t i = 0;
+        const bool has_strings = std::any_of(v.begin(), v.end(), [](const Token& t) { return t.type == TokenType::String; });
+        if (!has_strings) {
+            bool ok = false;
+            auto rows = trackList(v, i, c, ok);
+            if (!ok) return false;
+            skipWs(v, i);
+            std::shared_ptr<const GridTrackList> columns;
+            if (i < v.size() && isSlash(v[i])) {
+                ++i;
+                columns = trackList(v, i, c, ok);
+                if (!ok) return false;
+            }
+            clearGridTemplate(s);
+            s.grid_rows = std::move(rows);
+            s.grid_columns = std::move(columns);
+            return true;
+        }
+        auto areas = std::make_shared<GridAreas>();
+        std::map<std::string, int> cells;
+        auto rows = std::make_shared<GridTrackList>();
+        rows->names.assign(1, {});
+        while (true) {
+            skipWs(v, i);
+            if (i >= v.size() || isSlash(v[i])) break;
+            if (lineNamesAt(v, i, rows->names.back())) continue;
+            if (v[i].type != TokenType::String || !addAreaRow(v[i].text, *areas, cells)) return false;
+            ++i;
+            skipWs(v, i);
+            GridTrack track;
+            if (i < v.size() && v[i].type != TokenType::String && v[i].type != TokenType::LeftBracket && !isSlash(v[i])) {
+                if (!gridTrackAt(v, i, c, track)) return false;
+            }
+            rows->tracks.push_back(std::move(track));
+            rows->names.emplace_back();
+        }
+        if (!areasAreRectangles(*areas, cells)) return false;
+        std::shared_ptr<const GridTrackList> columns;
+        if (i < v.size() && isSlash(v[i])) {
+            ++i;
+            bool ok = false;
+            columns = trackList(v, i, c, ok);
+            if (!ok) return false;
+        }
+        clearGridTemplate(s);
+        s.grid_areas = std::move(areas);
+        s.grid_rows = std::move(rows);
+        s.grid_columns = std::move(columns);
+        return true;
+    }
+
+    static bool autoTracksAt(const Tokens& v, size_t& i, const LengthContext& c, std::shared_ptr<const std::vector<GridTrack>>& into) {
+        auto tracks = std::make_shared<std::vector<GridTrack>>();
+        while (true) {
+            skipWs(v, i);
+            if (i >= v.size() || isSlash(v[i])) break;
+            GridTrack t;
+            if (!gridTrackAt(v, i, c, t)) return false;
+            tracks->push_back(std::move(t));
+            if (tracks->size() > kMaxGridListTracks) return false;
+        }
+        if (!tracks->empty()) into = std::move(tracks);
+        return true;
+    }
+
+    // [ dense ] after auto-flow, in the grid shorthand or on its own.
+    static bool setAutoFlow(ComputedStyle& s, const Tokens& v, size_t& i, bool column) {
+        s.grid_flow_column = column;
+        s.grid_dense = false;
+        skipWs(v, i);
+        if (i < v.size() && v[i].type == TokenType::Ident && lower(v[i].text) == "dense") {
+            s.grid_dense = true;
+            ++i;
+        }
+        return true;
+    }
+
+    // Grid's properties, and the alignment ones only it has. False if it isn't one.
+    static bool applyGrid(ComputedStyle& s, const std::string& p, const Tokens& v, const std::string& kw, const LengthContext& c) {
+        size_t i = 0;
+        bool ok = false;
+        if (p == "grid-template-columns" || p == "grid-template-rows") {
+            auto& into = p == "grid-template-rows" ? s.grid_rows : s.grid_columns;
+            if (kw == "none" || kw == "subgrid" || kw == "masonry") {
+                into.reset();
+                return true;
+            }
+            auto list = trackList(v, i, c, ok);
+            if (ok) into = std::move(list);
+            return true;
+        }
+        if (p == "grid-template-areas") {
+            if (kw == "none") {
+                s.grid_areas.reset();
+                return true;
+            }
+            auto areas = std::make_shared<GridAreas>();
+            std::map<std::string, int> cells;
+            for (const Token& t : v) {
+                if (t.type == TokenType::Whitespace) continue;
+                if (t.type != TokenType::String || !addAreaRow(t.text, *areas, cells)) return true;
+            }
+            if (areas->rows > 0 && areasAreRectangles(*areas, cells)) s.grid_areas = std::move(areas);
+            return true;
+        }
+        if (p == "grid-template") {
+            if (kw == "none") clearGridTemplate(s);
+            else (void)setGridTemplate(s, v, c);
+            return true;
+        }
+        if (p == "grid") {
+            // Everything it doesn't mention goes back to its initial value.
+            const auto reset = [&s] {
+                clearGridTemplate(s);
+                s.grid_auto_rows.reset();
+                s.grid_auto_columns.reset();
+                s.grid_flow_column = false;
+                s.grid_dense = false;
+            };
+            if (kw == "none") {
+                reset();
+                return true;
+            }
+            const auto auto_flow = std::find_if(v.begin(), v.end(), [](const Token& t) { return t.type == TokenType::Ident && lower(t.text) == "auto-flow"; });
+            if (auto_flow == v.end()) {
+                ComputedStyle trial = s;
+                if (setGridTemplate(trial, v, c)) {
+                    reset();
+                    s.grid_rows = trial.grid_rows;
+                    s.grid_columns = trial.grid_columns;
+                    s.grid_areas = trial.grid_areas;
+                }
+                return true;
+            }
+            ComputedStyle trial = s;
+            clearGridTemplate(trial);
+            trial.grid_auto_rows.reset();
+            trial.grid_auto_columns.reset();
+            const auto slash = std::find_if(v.begin(), v.end(), isSlash);
+            if (auto_flow < slash) {
+                // auto-flow [dense] [auto rows] / columns
+                i = static_cast<size_t>(auto_flow - v.begin()) + 1;
+                (void)setAutoFlow(trial, v, i, false);
+                if (!autoTracksAt(v, i, c, trial.grid_auto_rows)) return true;
+                if (i < v.size() && isSlash(v[i])) {
+                    ++i;
+                    trial.grid_columns = trackList(v, i, c, ok);
+                    if (!ok) return true;
+                }
+            } else {
+                // rows / auto-flow [dense] [auto columns]
+                trial.grid_rows = trackList(v, i, c, ok);
+                if (!ok) return true;
+                i = static_cast<size_t>(auto_flow - v.begin()) + 1;
+                (void)setAutoFlow(trial, v, i, true);
+                if (!autoTracksAt(v, i, c, trial.grid_auto_columns)) return true;
+            }
+            s = std::move(trial);
+            return true;
+        }
+        if (p == "grid-auto-columns" || p == "grid-auto-rows") {
+            std::shared_ptr<const std::vector<GridTrack>> tracks;
+            if (autoTracksAt(v, i, c, tracks)) (p == "grid-auto-rows" ? s.grid_auto_rows : s.grid_auto_columns) = std::move(tracks);
+            return true;
+        }
+        if (p == "grid-auto-flow") {
+            bool column = false, dense = false;
+            for (const Token& t : v) {
+                if (t.type != TokenType::Ident) continue;
+                const std::string k = lower(t.text);
+                column = column || k == "column";
+                dense = dense || k == "dense";
+            }
+            s.grid_flow_column = column;
+            s.grid_dense = dense;
+            return true;
+        }
+        if (p == "grid-row-start" || p == "grid-row-end" || p == "grid-column-start" || p == "grid-column-end") {
+            GridLine line;
+            if (gridLineAt(v, i, line)) {
+                (p == "grid-row-start" ? s.grid_row_start : p == "grid-row-end" ? s.grid_row_end : p == "grid-column-start" ? s.grid_column_start : s.grid_column_end) = line;
+            }
+            return true;
+        }
+        if (p == "grid-row" || p == "grid-column") {
+            GridLine start, end;
+            if (!gridLineAt(v, i, start)) return true;
+            if (i < v.size() && isSlash(v[i])) {
+                ++i;
+                if (!gridLineAt(v, i, end)) return true;
+            } else if (!start.name.empty() && start.span == 0 && start.line == 0) {
+                end = start;   // a lone name is both ends
+            }
+            (p == "grid-row" ? s.grid_row_start : s.grid_column_start) = start;
+            (p == "grid-row" ? s.grid_row_end : s.grid_column_end) = end;
+            return true;
+        }
+        if (p == "grid-area") {
+            GridLine parts[4];
+            int n = 0;
+            while (n < 4) {
+                if (!gridLineAt(v, i, parts[n])) return true;
+                ++n;
+                if (i >= v.size()) break;
+                ++i;   // the slash
+            }
+            const auto is_name = [](const GridLine& l) { return !l.name.empty() && l.span == 0 && l.line == 0; };
+            if (n < 2 && is_name(parts[0])) parts[1] = parts[0];
+            if (n < 3 && is_name(parts[0])) parts[2] = parts[0];
+            if (n < 4 && is_name(parts[1])) parts[3] = parts[1];
+            s.grid_row_start = parts[0];
+            s.grid_column_start = parts[1];
+            s.grid_row_end = parts[2];
+            s.grid_column_end = parts[3];
+            return true;
+        }
+        if (p == "justify-content") { s.justify_content = kw == "normal" ? FlexAlign::Auto : flexAlign(kw, s.justify_content); return true; }
+        if (p == "justify-items") { s.justify_items = kw == "normal" || kw == "legacy" ? FlexAlign::Auto : flexAlign(kw, s.justify_items); return true; }
+        if (p == "justify-self") { s.justify_self = kw == "normal" ? FlexAlign::Auto : flexAlign(kw, s.justify_self); return true; }
+        if (p == "place-items") {
+            const auto [a, b] = twoKeywords(v);
+            s.align_items = a == "normal" ? FlexAlign::Stretch : flexAlign(a, s.align_items);
+            s.justify_items = b == "normal" ? FlexAlign::Auto : flexAlign(b, s.justify_items);
+            return true;
+        }
+        if (p == "place-self") {
+            const auto [a, b] = twoKeywords(v);
+            s.align_self = a == "normal" ? FlexAlign::Auto : flexAlign(a, s.align_self);
+            s.justify_self = b == "normal" ? FlexAlign::Auto : flexAlign(b, s.justify_self);
+            return true;
+        }
+        if (p == "place-content") {
+            const auto [a, b] = twoKeywords(v);
+            s.align_content = a == "normal" ? FlexAlign::Stretch : flexAlign(a, s.align_content);
+            s.justify_content = b == "normal" ? FlexAlign::Auto : flexAlign(b, s.justify_content);
+            return true;
+        }
+        return false;
     }
 
     void setFlexShorthand(ComputedStyle& s, const Tokens& v, const LengthContext& c) {
@@ -1206,6 +1844,19 @@ private:
     }
 
     static void copyAny(ComputedStyle& to, const ComputedStyle& from, const std::string& p) {
+        if (p == "grid-template-columns") { to.grid_columns = from.grid_columns; return; }
+        if (p == "grid-template-rows") { to.grid_rows = from.grid_rows; return; }
+        if (p == "grid-template-areas") { to.grid_areas = from.grid_areas; return; }
+        if (p == "grid-auto-columns") { to.grid_auto_columns = from.grid_auto_columns; return; }
+        if (p == "grid-auto-rows") { to.grid_auto_rows = from.grid_auto_rows; return; }
+        if (p == "grid-auto-flow") { to.grid_flow_column = from.grid_flow_column; to.grid_dense = from.grid_dense; return; }
+        if (p == "grid-row-start" || p == "grid-row") to.grid_row_start = from.grid_row_start;
+        if (p == "grid-row-end" || p == "grid-row") to.grid_row_end = from.grid_row_end;
+        if (p == "grid-column-start" || p == "grid-column") to.grid_column_start = from.grid_column_start;
+        if (p == "grid-column-end" || p == "grid-column") to.grid_column_end = from.grid_column_end;
+        if (p.starts_with("grid-row") || p.starts_with("grid-column")) return;
+        if (p == "justify-items") { to.justify_items = from.justify_items; return; }
+        if (p == "justify-self") { to.justify_self = from.justify_self; return; }
         if (copyInherited(to, from, p)) return;
         const auto sides = [&](auto& dst, const auto& src, std::string_view base) {
             if (p == base) std::copy(std::begin(src), std::end(src), std::begin(dst));
@@ -1221,7 +1872,7 @@ private:
         else if (p == "float") to.float_side = from.float_side;
         else if (p == "clear") to.clear = from.clear;
         else if (p == "position") to.position = from.position;
-        else if (p == "width") to.width = from.width;
+        else if (p == "width") { to.width = from.width; to.width_keyword = from.width_keyword; }
         else if (p == "height") to.height = from.height;
         else if (p == "min-width") to.min_width = from.min_width;
         else if (p == "min-height") to.min_height = from.min_height;
@@ -1336,6 +1987,13 @@ private:
             return;
         }
         if (p == "content") { setContent(s, v); return; }
+        if (p == "mask" || p == "mask-image" || p == "-webkit-mask" || p == "-webkit-mask-image") {
+            s.masked = kw != "none";
+            return;
+        }
+        if (p.starts_with("grid") || p.starts_with("justify-") || p.starts_with("place-")) {
+            if (applyGrid(s, p, v, kw, c)) return;
+        }
         if (p == "flex") { setFlexShorthand(s, v, c); return; }
         if (p == "flex-grow") { if (i < v.size() && v[i].type == TokenType::Number) s.flex_grow = std::max(0.0f, static_cast<float>(v[i].number)); return; }
         if (p == "flex-shrink") { if (i < v.size() && v[i].type == TokenType::Number) s.flex_shrink = std::max(0.0f, static_cast<float>(v[i].number)); return; }
@@ -1353,11 +2011,16 @@ private:
             }
             return;
         }
-        if (p == "justify-content") { s.justify_content = flexAlign(kw, s.justify_content); return; }
-        if (p == "align-items") { s.align_items = flexAlign(kw, s.align_items); return; }
-        if (p == "align-self") { s.align_self = flexAlign(kw, s.align_self); return; }
-        if (p == "align-content") { s.align_content = flexAlign(kw, s.align_content); return; }
+        if (p == "align-items") { s.align_items = kw == "normal" ? FlexAlign::Stretch : flexAlign(kw, s.align_items); return; }
+        if (p == "align-self") { s.align_self = kw == "normal" ? FlexAlign::Auto : flexAlign(kw, s.align_self); return; }
+        if (p == "align-content") { s.align_content = kw == "normal" ? FlexAlign::Stretch : flexAlign(kw, s.align_content); return; }
         if (p == "order") { if (i < v.size() && v[i].type == TokenType::Number) s.order = static_cast<int>(std::clamp(v[i].number, -1e6, 1e6)); return; }
+        if (p == "grid-row-gap" || p == "grid-column-gap") {
+            Length l;
+            size_t k = i;
+            if (lengthAt(v, k, c, l, false)) (p == "grid-row-gap" ? s.row_gap : s.column_gap) = std::max(0.0f, l.px);
+            return;
+        }
         if (p == "gap" || p == "row-gap" || p == "column-gap" || p == "grid-gap") {
             Length first, second;
             size_t k = i;
@@ -1445,7 +2108,23 @@ private:
             s.padding[Bottom] = pair[Right];
             return;
         }
-        if (p == "width") { oneLength(s.width, true); noNegative(s.width); return; }
+        if (p == "width") {
+            using Keyword = ComputedStyle::WidthKeyword;
+            const Keyword keyword_width = kw == "max-content" ? Keyword::MaxContent : kw == "min-content" ? Keyword::MinContent : kw == "fit-content" ? Keyword::FitContent : Keyword::None;
+            if (keyword_width != Keyword::None) {
+                s.width = Length::autoLength();
+                s.width_keyword = keyword_width;
+                return;
+            }
+            size_t k = i;
+            Length l;
+            if (lengthAt(v, k, c, l, true)) {
+                s.width = l;
+                s.width_keyword = Keyword::None;
+            }
+            noNegative(s.width);
+            return;
+        }
         if (p == "height") { oneLength(s.height, true); noNegative(s.height); return; }
         if (p == "min-width") { oneLength(s.min_width, true); if (s.min_width.is_auto) s.min_width = Length{}; noNegative(s.min_width); return; }
         if (p == "min-height") { oneLength(s.min_height, true); if (s.min_height.is_auto) s.min_height = Length{}; noNegative(s.min_height); return; }
@@ -1692,6 +2371,17 @@ private:
                     if (!substitute(*v, s, sub, 0, budget)) continue;
                     v = &sub;
                 }
+                const std::string kw = keyword(*v);
+                if (kw == "inherit" || kw == "unset" || kw == "revert") {
+                    s.font_size = parent.font_size;
+                    s.font_keyword = parent.font_keyword;
+                    s.font_weight = parent.font_weight;
+                    s.italic = parent.italic;
+                    s.font_family = parent.font_family;
+                    s.line_height = parent.line_height;
+                    s.line_height_factor = parent.line_height_factor;
+                    continue;
+                }
                 setFontShorthand(s, *v, parent);
             } else if (p == "font-size") {
                 Tokens sub;
@@ -1766,6 +2456,9 @@ private:
 
         for (int side = 0; side < 4; ++side)
             if (border_none_[side]) s.border_width[side] = 0;
+        // Its colour only exists to show through the mask, usually as an icon. A block of it
+        // isn't that icon, and nothing where an icon goes reads better.
+        if (s.masked) s.background = Color{0, 0, 0, 0};
 
         // Absolute, fixed and floated boxes are blocks, whatever they said.
         const bool out_of_flow = s.position == Position::Absolute || s.position == Position::Fixed;
@@ -1780,6 +2473,7 @@ private:
                 case Display::TableCell: s.display = Display::Block; break;
                 case Display::InlineTable: s.display = Display::Table; break;
                 case Display::InlineFlex: s.display = Display::Flex; break;
+                case Display::InlineGrid: s.display = Display::Grid; break;
                 default: break;
             }
         }

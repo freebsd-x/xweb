@@ -246,3 +246,76 @@ TEST(Pseudo, GetTheirOwnStyle) {
     EXPECT_EQ(before->content, "x");
     EXPECT_EQ(s.styles->afterOf(s.byId("b")), nullptr);   // no content, no box
 }
+
+namespace {
+std::vector<WebFontFace> facesOf(const std::string& css, float width = 800) {
+    const auto doc = parseHtml("<!doctype html><style>" + css + "</style><p>x");
+    const StyledDocument styles(*doc, {width, 600});
+    return styles.fontFaces();
+}
+}  // namespace
+
+TEST(FontFace, ReadsItsDescriptors) {
+    const auto f = facesOf("@font-face{font-family:\"My Font\";font-weight:100 900;font-style:italic;"
+                           "src:local(x),url(a.eot) format('embedded-opentype'),url(b.svg),url(c.woff2?v=1) format('woff2'),url('d.ttf')}");
+    ASSERT_EQ(f.size(), 1u);
+    EXPECT_EQ(f[0].family, "my font");
+    EXPECT_EQ(f[0].weight_min, 100);
+    EXPECT_EQ(f[0].weight_max, 900);
+    EXPECT_TRUE(f[0].italic);
+    EXPECT_EQ(f[0].sources, (std::vector<std::string>{"c.woff2?v=1", "d.ttf"}));
+}
+
+TEST(FontFace, UnicodeRanges) {
+    const auto f = facesOf("@font-face{font-family:a;src:url(a);unicode-range:U+26,u+0-7F,U+0025-00FF,U+4??,U+110000-120000,bad}");
+    ASSERT_EQ(f.size(), 1u);
+    const std::vector<std::pair<uint32_t, uint32_t>> want{{0x26, 0x26}, {0, 0x7F}, {0x25, 0xFF}, {0x400, 0x4FF}};
+    EXPECT_EQ(f[0].ranges, want);
+}
+
+TEST(FontFace, WhatCantBeUsedIsDropped) {
+    EXPECT_TRUE(facesOf("@font-face{src:url(a)}").empty());
+    EXPECT_TRUE(facesOf("@font-face{font-family:a}").empty());
+    EXPECT_TRUE(facesOf("@font-face{font-family:a;src:local(b)}").empty());
+    EXPECT_TRUE(facesOf("@font-face{font-family:a;src:url(a.eot)}").empty());
+}
+
+TEST(FontFace, ObeysMedia) {
+    const std::string css = "@media (max-width:500px){@font-face{font-family:a;src:url(a)}}";
+    EXPECT_TRUE(facesOf(css, 800).empty());
+    EXPECT_EQ(facesOf(css, 400).size(), 1u);
+}
+
+TEST(FontFace, ManyAreCapped) {
+    std::string css;
+    for (int i = 0; i < 2000; ++i) css += "@font-face{font-family:a;src:url(a)}";
+    EXPECT_LE(facesOf(css).size(), 512u);
+}
+
+TEST(Color, LightDarkTakesTheLight) {
+    Color c;
+    EXPECT_TRUE(parseColor(css::tokenize("light-dark(#102030, rgb(1,2,3))"), Color{}, c));
+    EXPECT_EQ(c, (Color{0x10, 0x20, 0x30, 255}));
+    EXPECT_TRUE(parseColor(css::tokenize("light-dark(rgb(1,2,3), red)"), Color{}, c));
+    EXPECT_EQ(c, (Color{1, 2, 3, 255}));
+    EXPECT_FALSE(parseColor(css::tokenize("light-dark(red"), Color{}, c));
+    EXPECT_FALSE(parseColor(css::tokenize("light-dark(light-dark(red,blue),blue)"), Color{}, c));
+}
+
+TEST(Mask, AMaskedColourIsntPaintedAsABlock) {
+    const auto doc = parseHtml("<!doctype html><div id=a style='background:red;mask-image:url(x.svg)'></div><div id=b style='background:red;mask:none'></div><div id=c style='background:red'></div>");
+    const StyledDocument styles(*doc, {800, 600});
+    const auto find = [&](const char* id) {
+        std::vector<const Node*> todo{doc->root()};
+        while (!todo.empty()) {
+            const Node* n = todo.back();
+            todo.pop_back();
+            if (const std::string* v = n->attr("id"); v && *v == id) return n;
+            todo.insert(todo.end(), n->children.begin(), n->children.end());
+        }
+        return static_cast<const Node*>(nullptr);
+    };
+    EXPECT_FALSE(styles.styleOf(find("a"))->background.visible());
+    EXPECT_TRUE(styles.styleOf(find("b"))->background.visible());
+    EXPECT_TRUE(styles.styleOf(find("c"))->background.visible());
+}

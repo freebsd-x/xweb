@@ -150,3 +150,71 @@ TEST(MediaQueries, Match) {
     EXPECT_FALSE(m("(some-future-feature: 3)"));
     EXPECT_TRUE(m("(orientation: landscape)"));
 }
+
+namespace {
+bool media(const std::string& q, float w = 800, float h = 600) {
+    return mediaMatches(tokenize(q), MediaContext{w, h});
+}
+size_t rulesUnderSupports(const std::string& q) {
+    return parseStylesheet("@supports " + q + "{a{color:red}}").rules.size();
+}
+}  // namespace
+
+TEST(Media, RangeSyntax) {
+    EXPECT_TRUE(media("(width <= 800px)"));
+    EXPECT_FALSE(media("(width < 800px)"));
+    EXPECT_TRUE(media("(width >= 800px)"));
+    EXPECT_FALSE(media("(width > 800px)"));
+    EXPECT_TRUE(media("(width = 800px)"));
+    EXPECT_TRUE(media("(800px >= width)"));
+    EXPECT_FALSE(media("(801px <= width)"));
+    EXPECT_TRUE(media("(400px < width < 900px)"));
+    EXPECT_FALSE(media("(400px < width < 700px)"));
+    EXPECT_TRUE(media("(height<=600px)"));
+    EXPECT_TRUE(media("not (width <= 769px)"));
+    EXPECT_TRUE(media("screen and (width > 10px)"));
+    EXPECT_FALSE(media("print and (width > 10px)"));
+    EXPECT_TRUE(media("(width > 49em)"));
+    EXPECT_FALSE(media("(width > 50em)"));
+}
+
+TEST(Media, Calc) {
+    EXPECT_TRUE(media("(width >= calc(1rem * 2 + 15rem + 2rem + 31rem))"));    // 800
+    EXPECT_TRUE(media("(width < calc(1rem * 2 + (15rem + 2rem) * 2 + 31rem))"));   // 1072
+    EXPECT_TRUE(media("(min-width: calc(100px + 100px))"));
+    EXPECT_FALSE(media("(max-width: calc(100px + 100px))"));
+    EXPECT_FALSE(media("(width > calc(1px / 0))"));
+}
+
+TEST(Media, BracketsAndOr) {
+    EXPECT_TRUE(media("((width > 10px) and (height > 10px))"));
+    EXPECT_FALSE(media("((width > 10px) and (height > 10000px))"));
+    EXPECT_TRUE(media("(width > 10000px) or (height > 10px)"));
+    EXPECT_FALSE(media("(not (width > 10px))"));
+    std::string deep = "(width > 10px)";
+    for (int i = 0; i < 5000; ++i) deep = "(" + deep + ")";
+    (void)media(deep);   // just mustn't overflow the stack
+}
+
+TEST(Media, RangeNonsenseMatchesNothing) {
+    EXPECT_FALSE(media("(width <)"));
+    EXPECT_FALSE(media("(< width)"));
+    EXPECT_FALSE(media("(width < 1px < 2px < 3px)"));
+    EXPECT_FALSE(media("(color > 3)"));
+    EXPECT_FALSE(media("(10px < 20px)"));
+    EXPECT_FALSE(media("(width < height)"));
+}
+
+TEST(Supports, AnswersForThisEngine) {
+    EXPECT_EQ(rulesUnderSupports("(display:grid)"), 1u);
+    EXPECT_EQ(rulesUnderSupports("not (display:grid)"), 0u);
+    EXPECT_EQ(rulesUnderSupports("(color:oklab(0% 0 0%))"), 0u);
+    EXPECT_EQ(rulesUnderSupports("not (color:oklab(0% 0 0%))"), 1u);
+    EXPECT_EQ(rulesUnderSupports("(color:light-dark(red,red))"), 1u);
+    EXPECT_EQ(rulesUnderSupports("(color:light-dark(red,red)) and (color:oklab(0% 0 0%))"), 0u);
+    EXPECT_EQ(rulesUnderSupports("(color:oklab(0% 0 0%)) or (display:flex)"), 1u);
+    EXPECT_EQ(rulesUnderSupports("(-moz-appearance:none)"), 0u);
+    EXPECT_EQ(rulesUnderSupports("selector(a > b)"), 1u);
+    EXPECT_EQ(rulesUnderSupports("((display:grid) and (display:flex))"), 1u);
+    EXPECT_EQ(rulesUnderSupports("nonsense"), 0u);
+}

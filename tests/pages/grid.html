@@ -1,0 +1,112 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>
+body { margin: 8px; font: 14px/1.4 sans-serif; }
+.g { display: grid; margin-bottom: 12px; }
+.g > div { background: #def; }
+.fixed { grid-template-columns: 100px 200px 50px; grid-template-rows: 40px 60px; gap: 10px; }
+.fr { grid-template-columns: 1fr 2fr 1fr; column-gap: 8px; }
+.mix { grid-template-columns: 100px auto 1fr minmax(50px, 120px); }
+.content { grid-template-columns: min-content max-content auto; justify-content: start; }
+.rep { grid-template-columns: repeat(3, 1fr 20px); }
+.fill { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 6px; }
+.fit { grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 6px; }
+.span { grid-template-columns: repeat(4, 80px); grid-auto-rows: 30px; }
+.span > :nth-child(1) { grid-column: span 2; }
+.span > :nth-child(2) { grid-row: span 2; }
+.span > :nth-child(5) { grid-column: 2 / 5; }
+.span > :nth-child(6) { grid-column: -2 / -1; grid-row: 4; }
+.areas { grid-template: "h h h" 40px "n m a" 1fr "f f f" auto / 120px 1fr 90px; height: 300px; }
+.areas > .h { grid-area: h; } .areas > .n { grid-area: n; } .areas > .m { grid-area: m; }
+.areas > .a { grid-area: a; } .areas > .f { grid-area: f; }
+.names { grid-template-columns: [side-start] 100px [side-end main-start] 1fr [main-end]; }
+.names > .s { grid-column: side-start / side-end; } .names > .m { grid-column: main; }
+.col { grid-auto-flow: column; grid-template-rows: repeat(2, 30px); grid-auto-columns: 70px; }
+.dense { grid-template-columns: repeat(3, 60px); grid-auto-flow: row dense; grid-auto-rows: 20px; }
+.dense > :nth-child(1) { grid-column: span 2; } .dense > :nth-child(2) { grid-column: span 2; }
+.align { grid-template-columns: 200px 200px; grid-template-rows: 100px; align-items: center; justify-items: end; }
+.align2 { grid-template-columns: 200px 200px; grid-template-rows: 100px; place-items: start center; }
+.self { grid-template-columns: 200px 200px 200px; grid-template-rows: 100px; }
+.self > :nth-child(1) { align-self: end; justify-self: start; } .self > :nth-child(2) { place-self: center; }
+.self > :nth-child(3) { margin: auto; }
+.jc { grid-template-columns: repeat(3, 60px); justify-content: space-between; }
+.jc2 { grid-template-columns: repeat(3, 60px); justify-content: center; align-content: end; height: 100px; }
+.jc3 { grid-template-columns: repeat(3, 60px); justify-content: space-evenly; align-content: space-around; grid-template-rows: 20px 20px; height: 120px; }
+.minh { min-height: 240px; grid-template-rows: auto 1fr auto; }
+.autostretch { grid-template-columns: auto auto; height: 90px; }
+.percent { grid-template-columns: 25% 50% 25%; grid-template-rows: 30px; }
+.fitc { grid-template-columns: fit-content(100px) fit-content(400px) 1fr; }
+.neg { grid-template-columns: 50px 50px; grid-auto-columns: 30px; }
+.neg > :nth-child(1) { grid-column: 4; } .neg > :nth-child(2) { grid-column: -5; }
+.short { grid: 50px 60px / auto-flow 90px; }
+.short2 { grid: auto-flow dense 25px / 40px 80px; }
+.nest { grid-template-columns: 1fr 1fr; gap: 4px; }
+.nest > div { display: grid; grid-template-columns: 1fr 40px; }
+.inl { display: inline-grid; grid-template-columns: 50px 50px; margin-right: 5px; }
+.pad { grid-template-columns: 1fr 1fr; padding: 10px; border: 2px solid; width: 300px; }
+.pad > div { padding: 5px; margin: 3px; border: 1px solid; }
+.bb { box-sizing: border-box; width: 400px; padding: 20px; grid-template-columns: 1fr 1fr; }
+.size > :nth-child(1) { width: 50px; height: 20px; } .size > :nth-child(2) { height: 50%; }
+.size { grid-template-columns: 100px 100px; grid-template-rows: 80px; }
+.ovf { grid-template-columns: 1fr 1fr; width: 300px; }
+.ovf > :nth-child(1) { overflow: hidden; white-space: nowrap; }
+.wide { grid-template-columns: 1fr 1fr; width: 300px; }
+.wide > :nth-child(1) { white-space: nowrap; }
+.mincol { grid-template-columns: minmax(0, 1fr) 1fr; width: 200px; }
+.order > :nth-child(1) { order: 2; } .order { grid-template-columns: 50px 50px 50px; }
+.abs { position: relative; grid-template-columns: 100px; height: 60px; }
+.abs > .p { position: absolute; left: 10px; top: 5px; width: 20px; height: 20px; }
+.tall { grid-template-columns: 100px 100px; }
+.tall > :nth-child(1) { grid-row: span 2; height: 200px; }
+.gapspan { grid-template-columns: auto auto; gap: 20px; width: 500px; justify-content: start; }
+.gapspan > :nth-child(1) { grid-column: span 2; width: 300px; }
+.flexin { display: flex; } .flexin > .g { flex: 1; grid-template-columns: 1fr 1fr; }
+</style>
+<div class="g fixed"><div>a</div><div>b</div><div>c</div><div>d</div><div>e</div></div>
+<div class="g fr"><div>a</div><div>some longer text in here</div><div>c</div><div>d</div></div>
+<div class="g mix"><div>a</div><div>auto track text</div><div>c</div><div>d</div></div>
+<div class="g content"><div>two words here</div><div>some more words</div><div>c</div></div>
+<div class="g rep"><div>1</div><div>2</div><div>3</div><div>4</div><div>5</div><div>6</div><div>7</div></div>
+<div class="g fill"><div>1</div><div>2</div><div>3</div></div>
+<div class="g fit"><div>1</div><div>2</div><div>3</div></div>
+<div class="g span"><div>1</div><div>2</div><div>3</div><div>4</div><div>5</div><div>6</div></div>
+<div class="g areas"><div class="h">h</div><div class="n">nav</div><div class="m">main</div><div class="a">aside</div><div class="f">footer<br>two lines</div></div>
+<div class="g names"><div class="s">side</div><div class="m">main</div></div>
+<div class="g col"><div>1</div><div>2</div><div>3</div><div>4</div><div>5</div></div>
+<div class="g dense"><div>1</div><div>2</div><div>3</div><div>4</div></div>
+<div class="g align"><div>a</div><div>b</div></div>
+<div class="g align2"><div>a</div><div>b</div></div>
+<div class="g self"><div>a</div><div>b</div><div>c</div></div>
+<div class="g jc"><div>a</div><div>b</div><div>c</div></div>
+<div class="g jc2"><div>a</div><div>b</div><div>c</div></div>
+<div class="g jc3"><div>a</div><div>b</div><div>c</div><div>d</div></div>
+<div class="g minh"><div>head</div><div>body</div><div>foot</div></div>
+<div class="g autostretch"><div>a</div><div>b</div><div>c</div><div>d</div></div>
+<div class="g percent"><div>a</div><div>b</div><div>c</div></div>
+<div class="g fitc"><div>a very long string of words that wants more than one hundred pixels</div><div>short</div><div>c</div></div>
+<div class="g neg"><div>a</div><div>b</div><div>c</div></div>
+<div class="g short"><div>a</div><div>b</div><div>c</div></div>
+<div class="g short2"><div>a</div><div>b</div><div>c</div></div>
+<div class="g nest"><div><p style="margin:0">x</p><p style="margin:0">y</p></div><div><p style="margin:0">z</p></div></div>
+<div><span class="inl"><b>a</b><b>b</b></span><span class="inl"><b>c</b></span> text after</div>
+<div class="g pad"><div>a</div><div>b</div><div>c</div></div>
+<div class="g bb"><div>a</div><div>b</div></div>
+<div class="g size"><div>a</div><div>b</div></div>
+<div class="g ovf"><div>this text is much too wide to fit but it is hidden anyway ok</div><div>b</div></div>
+<div class="g wide"><div>this text is much too wide to fit and it pushes the column</div><div>b</div></div>
+<div class="g mincol"><div>wordwordwordwordwordwordwordwordwordwordword</div><div>b</div></div>
+<div class="g order"><div>1</div><div>2</div><div>3</div></div>
+<div class="g abs"><div class="p"></div><div>a</div></div>
+<div class="g tall"><div>a</div><div>b</div><div>c</div></div>
+<div class="g gapspan"><div>a</div><div>b</div><div>c</div></div>
+<div class="flexin"><div class="g"><div>a</div><div>b</div></div><div>side</div></div>
+<div class="g fixed"><svg width="40" height="20"></svg><svg viewBox="0 0 2 1"></svg><svg></svg></div>
+<a><svg width="83" height="24" viewBox="0 0 83 24"><path d="M0 0h1"/></svg></a>
+<svg width="40" viewBox="0 0 2 1"></svg><svg height="40" viewBox="0 0 2 1"></svg><svg style="width:32px" viewBox="0 0 2 1"></svg><svg style="height:32px" viewBox="0 0 2 1"></svg>
+<div style="width:200px"><svg viewBox="0 0 10 5" style="display:block"></svg><svg viewBox="0 0 10 5"></svg></div>
+<div class="g" style="grid-template-areas:'a . b' 'a . c';grid-template-columns:100px 20px 1fr"><div style="grid-area:a">a</div><section style="display:contents;width:5px;border:9px solid"><div style="grid-area:b">b</div><div style="grid-area:c"><section style="display:contents">deep</section></div></section></div>
+<div style="display:flex;gap:4px"><span style="display:contents"><b>one</b><b>two</b>loose text</span><div style="flex:1">rest</div></div>
+<ul><li>a</li><div style="display:contents"><li>b</li><li>c</li></div></ul>
+<p>Text <span style="display:contents;color:red;font-size:30px">bigger <b>bold</b></span> after</p>
+<div style="display:contents"><div style="height:7px"></div></div>
+<button style="font:inherit">inherits font</button><button>ua font</button><img style="display:contents" src="none.png" alt="z"><button style="display:contents;">btn</button>

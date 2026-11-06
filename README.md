@@ -16,16 +16,17 @@ repo sync
 The Browser app still runs Chromium. `out/xwebview [address or file]` is a small browser
 on this engine: it follows links and redirects, has history and an address bar, and
 fetches pages, stylesheets and images through the compositor's broker from inside its
-sandbox. Many simple sites work; anything needing scripts or CSS grid doesn't yet.
+sandbox. Many simple sites work; anything needing scripts doesn't yet.
 
 | Works | Not yet |
 |---|---|
 | HTML5 parsing, including error recovery, templates, SVG/MathML trees | `<selectedcontent>` mirroring |
-| CSS parsing, selectors (not `:has()`), cascade, `@media`, `@import`, `var()`, `calc()`, `::before`/`::after` | **`@font-face`**, animations, transforms, `@supports` properly |
-| Block and inline layout, margin collapsing, inline-block, lists | **grid** (lays out as blocks) |
-| **Floats, tables (auto and fixed), flexbox**, positioning | sticky, z-index stacking contexts, collapsed-border conflict resolution |
-| Backgrounds (colours), borders, rounded corners, overflow clipping, text, images beside the page | background images, gradients, shadows, per-corner radii, dashed borders |
-| Network (http, https), links, redirects, history, fragments, UTF-8, UTF-16, Latin-1 | **JavaScript, forms, cookies**, other encodings (Shift_JIS, EUC-KR...), SVG images, HTTP cache |
+| CSS parsing, selectors (not `:has()`), cascade, `@media` with range syntax and `calc()`, `@supports`, `@import`, `var()`, `calc()`, `::before`/`::after`, `display: contents`, `light-dark()` | animations, transforms, `@container`, masks (a masked box shows nothing) |
+| Block and inline layout, margin collapsing, inline-block, lists, `width: max-content` and friends | form controls' widths are approximate, especially with an inherited font |
+| **Floats, tables (auto and fixed), flexbox, grid** (areas, named lines, `repeat`, `minmax`, `fr`, auto-placement), positioning | subgrid, masonry, baseline alignment and absolute positioning within grid areas; sticky, z-index stacking contexts, collapsed-border conflict resolution |
+| **Web fonts**: `@font-face`, WOFF, WOFF2, TTF, OTF, variable weights, `unicode-range`, fonts in `data:` URLs, swapped in as they arrive | synthetic bold and italic, cross-origin checks on fonts, `font-display`, other variation axes, lines mixing fonts growing to fit all of them under `line-height: normal` |
+| Backgrounds (colours), borders, rounded corners, overflow clipping, text, images beside the page, the size of an inline `<svg>` | drawing `<svg>`, background images, gradients, shadows, per-corner radii, dashed borders |
+| Network (http, https, `data:`), links, redirects, history, fragments, UTF-8, UTF-16, Latin-1 | **JavaScript, forms, cookies**, other encodings (Shift_JIS, EUC-KR...), SVG images, HTTP cache |
 | Refuses to reach this machine or the local network | so a LAN device's page can't be opened either |
 
 ## Layers
@@ -37,8 +38,8 @@ sandbox. Many simple sites work; anything needing scripts or CSS grid doesn't ye
 - `url.h`, `encoding.h`: addresses and character sets.
 - `text_measurer.h`, `tools/xweb_view.cc`: the only parts that know about xrender and xkit.
 
-Pages are untrusted input. Depth, selector matching, `var()` expansion and imports all
-have limits, and nothing a page does can make the parsers fail.
+Pages are untrusted input. Depth, selector matching, `var()` expansion, imports, grid
+placement and fonts all have limits, font files reach only FreeType inside the sandbox, and nothing a page does can make the parsers fail.
 
 ## Tests
 
@@ -49,5 +50,10 @@ have limits, and nothing a page does can make the parsers fail.
   in an ASan build after changing the engine.
 - `scripts/xweb-compare.py sdk/xweb/tests/pages/*.html`: every element's box against
   headless Chromium. Needs Chromium, so it isn't in the unit suite.
-- `headless-e2e.py webview webnav`: a page in a real window checked pixel by pixel, and
-  browsing a local test site, including that nobody else may browse.
+- `headless-e2e.py webview webnav webfont`: a page in a real window checked pixel by
+  pixel, browsing a local test site, including that nobody else may browse, and a page's
+  own fonts arriving through the sandbox.
+- `tests/make_webfonts.py`: makes the WOFF fonts `tests/pages/webfont.html` uses from
+  installed ones, as the fonts aren't ours to keep here. `xweb-compare.py` runs it. WOFF2 has
+  no repeatable test: it's FreeType's to decode, and was checked by hand against Chromium
+  with fonts from Google Fonts, including a variable one.

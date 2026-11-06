@@ -29,4 +29,7 @@ struct Url {
 // relative path): the result then is too.
 [[nodiscard]] std::string resolveUrl(std::string_view base, std::string_view reference);
 
+// What a data: URL holds. False if it isn't one, or is damaged.
+[[nodiscard]] bool decodeDataUrl(std::string_view url, std::string& body, std::string& content_type);
+
 }  // namespace fbx::xweb

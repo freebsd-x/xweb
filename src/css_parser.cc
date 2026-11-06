@@ -56,8 +56,11 @@ public:
     std::vector<Token> run() {
         std::vector<Token> out;
         while (true) {
+            const size_t begin = pos_;
             Token t = next();
             if (t.type == TokenType::Eof) break;
+            t.begin = static_cast<uint32_t>(begin);
+            t.end = static_cast<uint32_t>(pos_);
             out.push_back(std::move(t));
         }
         return out;
@@ -682,9 +685,89 @@ private:
 
 // ── Rules ─────────────────────────────────────────────────────────────────────
 
+// What @supports asks, answered for this engine. Unknown properties do no harm inside a
+// rule, so what's refused is what a page would rather have a fallback for: values we can't
+// compute, and other browsers' properties.
+bool declarationSupported(const std::string& name, const std::vector<Token>& value) {
+    if (name.starts_with("-moz-") || name.starts_with("-ms-") || name.starts_with("-o-")) return false;
+    static const char* const kNoProperty[] = {"container-type", "container", "container-name", "anchor-name", "position-anchor", "backdrop-filter", "mask", "mask-image", "clip-path", "filter", "transform", "transition", "animation"};
+    for (const char* p : kNoProperty)
+        if (name == p) return false;
+    for (const Token& t : value) {
+        const std::string text = lower(t.text);
+        if (t.type == TokenType::Function) {
+            for (const char* f : {"oklab", "oklch", "lab", "lch", "color-mix", "color", "hwb", "conic-gradient", "linear-gradient", "radial-gradient", "anchor", "image-set"})
+                if (text == f) return false;
+        } else if (t.type == TokenType::Ident && (text == "subgrid" || text == "masonry" || text == "sticky")) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool supportsTokens(const std::vector<Token>& q, size_t begin, size_t end, int depth) {
+    if (depth > 32) return false;
+    size_t i = begin;
+    const auto skip_ws = [&] {
+        while (i < end && q[i].type == TokenType::Whitespace) ++i;
+    };
+    bool result = true, have = false, use_or = false, negate = false;
+    while (true) {
+        skip_ws();
+        if (i >= end) break;
+        const Token& t = q[i];
+        if (t.type == TokenType::Ident) {
+            const std::string word = lower(t.text);
+            if (word == "not") negate = true;
+            else if (word == "or") use_or = true;
+            else if (word == "and") use_or = false;
+            else return false;
+            ++i;
+            continue;
+        }
+        if (t.type != TokenType::LeftParen && t.type != TokenType::Function) return false;
+        // To the matching close.
+        size_t close = i + 1;
+        for (int nesting = 1; close < end; ++close) {
+            const TokenType ty = q[close].type;
+            if (ty == TokenType::LeftParen || ty == TokenType::Function) ++nesting;
+            else if (ty == TokenType::RightParen && --nesting == 0) break;
+        }
+        bool part = false;
+        if (t.type == TokenType::Function) {
+            part = lower(t.text) == "selector";
+        } else {
+            size_t colon = i + 1;
+            int nesting = 0;
+            for (; colon < close; ++colon) {
+                const TokenType ty = q[colon].type;
+                if (ty == TokenType::LeftParen || ty == TokenType::Function) ++nesting;
+                else if (ty == TokenType::RightParen) --nesting;
+                else if (ty == TokenType::Colon && nesting == 0) break;
+            }
+            if (colon < close) {
+                std::string name;
+                for (size_t k = i + 1; k < colon; ++k)
+                    if (q[k].type == TokenType::Ident) name = lower(q[k].text);
+                part = declarationSupported(name, std::vector<Token>(q.begin() + static_cast<std::ptrdiff_t>(colon) + 1, q.begin() + static_cast<std::ptrdiff_t>(close)));
+            } else {
+                part = supportsTokens(q, i + 1, close, depth + 1);
+            }
+        }
+        if (negate) part = !part;
+        negate = false;
+        result = !have ? part : use_or ? (result || part) : (result && part);
+        have = true;
+        i = std::min(close + 1, end);
+    }
+    return have && result;
+}
+
+bool supportsMatches(const std::vector<Token>& query) { return supportsTokens(query, 0, query.size(), 0); }
+
 class SheetParser {
 public:
-    explicit SheetParser(const std::vector<Token>& tokens) : tokens_(tokens) {}
+    SheetParser(const std::vector<Token>& tokens, std::string_view source) : tokens_(tokens), source_(source) {}
 
     void parseRange(size_t begin, size_t end, std::vector<std::vector<Token>>& media, Stylesheet& out, int depth) {
         Stream s(tokens_, begin, end);
@@ -720,7 +803,7 @@ private:
     }
 
     void atRule(Stream& s, std::vector<std::vector<Token>>& media, Stylesheet& out, int depth) {
-        const std::string name = s.take().text;
+        const std::string name = lower(s.take().text);
         const size_t prelude = s.pos();
         size_t begin = 0, end = 0;
         const bool has_block = findBlock(s, begin, end);
@@ -746,18 +829,23 @@ private:
             parseRange(begin, end, media, out, depth + 1);
             media.pop_back();
         } else if (name == "supports") {
-            // We can't honestly answer most queries yet. A "not" is usually a
-            // fallback for browsers lacking something; the rest we try to obey.
-            const auto prelude_toks = preludeTokens();
-            const bool negated = std::any_of(prelude_toks.begin(), prelude_toks.end(), [](const Token& t) {
-                return t.type == TokenType::Ident && lower(t.text) == "not";
-            });
-            if (!negated) parseRange(begin, end, media, out, depth + 1);
+            if (supportsMatches(preludeTokens())) parseRange(begin, end, media, out, depth + 1);
         } else if (name == "layer" || name == "container" || name == "scope") {
             // Rules inside still apply, without the layer's or container's conditions.
             if (name == "layer") parseRange(begin, end, media, out, depth + 1);
         }
-        // @font-face, @keyframes, @page, @counter-style...: nothing uses them yet.
+        else if (name == "font-face") {
+            FontFaceRule face;
+            parseDeclarationsInto(tokens_, begin, end, face.declarations);
+            for (const Declaration& d : face.declarations) {
+                if (d.name != "unicode-range" || d.value.empty()) continue;
+                const size_t from = d.value.front().begin, to = d.value.back().end;
+                if (from <= to && to <= source_.size()) face.unicode_range = std::string(source_.substr(from, to - from));
+            }
+            face.media = media;
+            out.font_faces.push_back(std::move(face));
+        }
+        // @keyframes, @page, @counter-style...: nothing uses them yet.
     }
 
     void qualifiedRule(Stream& s, std::vector<std::vector<Token>>& media, Stylesheet& out) {
@@ -778,6 +866,7 @@ private:
     }
 
     const std::vector<Token>& tokens_;
+    std::string_view source_;
 };
 
 }  // namespace
@@ -799,7 +888,7 @@ Stylesheet parseStylesheet(std::string_view css) {
     const std::vector<Token> tokens = tokenize(css);
     Stylesheet out;
     std::vector<std::vector<Token>> media;
-    SheetParser(tokens).parseRange(0, tokens.size(), media, out, 0);
+    SheetParser(tokens, css).parseRange(0, tokens.size(), media, out, 0);
     return out;
 }
 
@@ -846,7 +935,161 @@ bool featureMatches(const std::string& name, const Token* value, const MediaCont
 
 }  // namespace
 
-bool mediaMatches(const std::vector<Token>& query, const MediaContext& context) {
+namespace {
+
+// A length in a media query, which may be calc(): relative to no element, so an em is 16px.
+class MediaLength {
+public:
+    MediaLength(const std::vector<Token>& t, size_t begin, size_t end) : t_(t), i_(begin), end_(end) {}
+
+    bool read(float& out) {
+        if (!sum(out, 0)) return false;
+        ws();
+        return i_ >= end_;
+    }
+
+private:
+    void ws() {
+        while (i_ < end_ && t_[i_].type == TokenType::Whitespace) ++i_;
+    }
+    bool delim(const char* d) {
+        ws();
+        if (i_ < end_ && t_[i_].type == TokenType::Delim && t_[i_].text == d) {
+            ++i_;
+            return true;
+        }
+        return false;
+    }
+    bool sum(float& out, int depth) {
+        if (depth > 32 || !product(out, depth)) return false;
+        while (true) {
+            float next = 0;
+            if (delim("+")) {
+                if (!product(next, depth)) return false;
+                out += next;
+            } else if (delim("-")) {
+                if (!product(next, depth)) return false;
+                out -= next;
+            } else {
+                return true;
+            }
+        }
+    }
+    bool product(float& out, int depth) {
+        if (!atom(out, depth)) return false;
+        while (true) {
+            float next = 0;
+            if (delim("*")) {
+                if (!atom(next, depth)) return false;
+                out *= next;
+            } else if (delim("/")) {
+                if (!atom(next, depth) || next == 0) return false;
+                out /= next;
+            } else {
+                return true;
+            }
+        }
+    }
+    bool atom(float& out, int depth) {
+        ws();
+        if (i_ >= end_) return false;
+        const Token& t = t_[i_];
+        if (t.type == TokenType::Number) {
+            out = static_cast<float>(t.number);
+            ++i_;
+            return true;
+        }
+        if (t.type == TokenType::Dimension) {
+            // lengthPx() takes negative for "unknown", so give it the size and put the sign back.
+            Token size = t;
+            size.number = std::abs(t.number);
+            const float px = lengthPx(size);
+            if (px < 0) return false;
+            out = t.number < 0 ? -px : px;
+            ++i_;
+            return true;
+        }
+        if (t.type == TokenType::LeftParen || (t.type == TokenType::Function && lower(t.text) == "calc")) {
+            ++i_;
+            if (!sum(out, depth + 1)) return false;
+            ws();
+            if (i_ >= end_ || t_[i_].type != TokenType::RightParen) return false;
+            ++i_;
+            return true;
+        }
+        return false;
+    }
+
+    const std::vector<Token>& t_;
+    size_t i_, end_;
+};
+
+// (width >= 40em), (400px < height <= 50rem). Only sizes can be compared like this.
+bool rangeMatches(const std::vector<Token>& q, size_t begin, size_t end, const MediaContext& c, bool& ok) {
+    struct Comparison {
+        size_t at = 0, len = 0;
+        char op = 0;
+        bool equal = false;
+    };
+    std::vector<Comparison> ops;
+    int nesting = 0;
+    for (size_t i = begin; i < end; ++i) {
+        const Token& t = q[i];
+        if (t.type == TokenType::LeftParen || t.type == TokenType::Function) ++nesting;
+        else if (t.type == TokenType::RightParen) --nesting;
+        else if (nesting == 0 && t.type == TokenType::Delim && (t.text == "<" || t.text == ">" || t.text == "=")) {
+            Comparison op{i, 1, t.text[0], t.text == "="};
+            if (t.text != "=" && i + 1 < end && q[i + 1].type == TokenType::Delim && q[i + 1].text == "=") {
+                op.equal = true;
+                op.len = 2;
+                ++i;
+            }
+            ops.push_back(op);
+        }
+    }
+    if (ops.empty()) return false;
+    ok = false;
+    if (ops.size() > 2) return true;
+    // One side at a time: a size, or the feature's current value.
+    const auto side = [&](size_t from, size_t to, float& value, bool& is_feature) {
+        while (from < to && q[from].type == TokenType::Whitespace) ++from;
+        while (to > from && q[to - 1].type == TokenType::Whitespace) --to;
+        if (to == from + 1 && q[from].type == TokenType::Ident) {
+            const std::string name = lower(q[from].text);
+            if (name == "width" || name == "device-width") value = c.width;
+            else if (name == "height" || name == "device-height") value = c.height;
+            else return false;
+            is_feature = true;
+            return true;
+        }
+        return MediaLength(q, from, to).read(value);
+    };
+    const auto compare = [](float a, const Comparison& op, float b) {
+        if (op.op == '=') return a == b;
+        if (op.op == '<') return op.equal ? a <= b : a < b;
+        return op.equal ? a >= b : a > b;
+    };
+    float values[3] = {0, 0, 0};
+    bool feature[3] = {false, false, false};
+    if (!side(begin, ops[0].at, values[0], feature[0])) return true;
+    const size_t after = ops[0].at + ops[0].len;
+    if (!side(after, ops.size() == 2 ? ops[1].at : end, values[1], feature[1])) return true;
+    if (ops.size() == 2 && !side(ops[1].at + ops[1].len, end, values[2], feature[2])) return true;
+    if (feature[0] + feature[1] + feature[2] != 1) return true;
+    ok = compare(values[0], ops[0], values[1]) && (ops.size() < 2 || compare(values[1], ops[1], values[2]));
+    return true;
+}
+
+bool mediaMatchesAt(const std::vector<Token>& query, const MediaContext& context, int depth);
+
+}  // namespace
+
+bool mediaMatches(const std::vector<Token>& query, const MediaContext& context) { return mediaMatchesAt(query, context, 0); }
+
+namespace {
+
+bool mediaMatchesAt(const std::vector<Token>& query, const MediaContext& context, int depth) {
+    if (depth > 32) return false;
     // A comma-separated list: any one that matches will do.
     bool any = false;
     bool saw_part = false;
@@ -871,6 +1114,7 @@ bool mediaMatches(const std::vector<Token>& query, const MediaContext& context) 
             s.take();
             saw_part = true;
             if (word == "not") negate = true;
+            else if (word == "or") finish();
             else if (word == "only" || word == "and") {}
             else if (word == "screen" || word == "all") {}
             else ok = false;   // print, speech, and the unknown
@@ -878,13 +1122,37 @@ bool mediaMatches(const std::vector<Token>& query, const MediaContext& context) 
             const size_t open = s.pos();
             s.skipComponent();
             saw_part = true;
+            size_t first = open + 1;
+            const size_t inner_end = s.pos() > open + 1 ? s.pos() - 1 : open + 1;
+            while (first < inner_end && query[first].type == TokenType::Whitespace) ++first;
+            // Brackets around more conditions.
+            if (first < inner_end && (query[first].type == TokenType::LeftParen ||
+                                      (query[first].type == TokenType::Ident && lower(query[first].text) == "not"))) {
+                if (!mediaMatchesAt(std::vector<Token>(query.begin() + static_cast<std::ptrdiff_t>(first), query.begin() + static_cast<std::ptrdiff_t>(inner_end)), context, depth + 1)) ok = false;
+                continue;
+            }
+            bool in_range = true;
+            if (rangeMatches(query, first, inner_end, context, in_range)) {
+                if (!in_range) ok = false;
+                continue;
+            }
             std::string name;
             const Token* value = nullptr;
+            Token computed;
             for (size_t i = open + 1; i + 1 < s.pos(); ++i) {
                 const Token& inner = query[i];
                 if (inner.type == TokenType::Whitespace || inner.type == TokenType::Colon) continue;
                 if (name.empty() && inner.type == TokenType::Ident) name = lower(inner.text);
-                else if (!value) value = &inner;
+                else if (!value) {
+                    value = &inner;
+                    // (min-width: calc(...))
+                    float px = 0;
+                    if (inner.type == TokenType::Function && MediaLength(query, i, inner_end).read(px)) {
+                        computed.type = TokenType::Number;
+                        computed.number = px;
+                        value = &computed;
+                    }
+                }
             }
             if (!featureMatches(name, value, context)) ok = false;
         } else {
@@ -896,5 +1164,7 @@ bool mediaMatches(const std::vector<Token>& query, const MediaContext& context) 
     finish();
     return any || query.empty();
 }
+
+}  // namespace
 
 }  // namespace fbx::xweb::css

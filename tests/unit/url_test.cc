@@ -41,3 +41,25 @@ TEST(Url, RelativeBases) {
     EXPECT_EQ(resolveUrl("http://a/b", "http://c"), "http://c/");
     EXPECT_EQ(resolveUrl("http://a/b", "  c\n"), "http://a/c");
 }
+
+TEST(DataUrl, Decodes) {
+    std::string body, type;
+    ASSERT_TRUE(decodeDataUrl("data:font/woff2;base64,aGVsbG8=", body, type));
+    EXPECT_EQ(body, "hello");
+    EXPECT_EQ(type, "font/woff2");
+    ASSERT_TRUE(decodeDataUrl("DATA:text/plain,a%20b", body, type));
+    EXPECT_EQ(body, "a b");
+    ASSERT_TRUE(decodeDataUrl("data:,x", body, type));
+    EXPECT_EQ(type, "text/plain");
+    ASSERT_TRUE(decodeDataUrl("data:;base64,aGk%3D", body, type));
+    EXPECT_EQ(body, "hi");
+    EXPECT_FALSE(decodeDataUrl("data:nocomma", body, type));
+    EXPECT_FALSE(decodeDataUrl("data:;base64,!!!", body, type));
+    EXPECT_FALSE(decodeDataUrl("http://a/b", body, type));
+    EXPECT_FALSE(decodeDataUrl("", body, type));
+}
+
+TEST(DataUrl, ComesThroughResolvingAsIs) {
+    const std::string data = "data:font/woff;base64,AA+/AA==";
+    EXPECT_EQ(resolveUrl("http://a/b.css", data), data);
+}

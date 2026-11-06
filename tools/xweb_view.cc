@@ -58,6 +58,7 @@ constexpr uint64_t kMaxImagePixels = 40'000'000;     // one image
 constexpr uint64_t kMaxPagePixels = 120'000'000;     // all of a page's, about 480 MB
 constexpr size_t kMaxLocalFile = 32u << 20;
 constexpr auto kRelayoutEvery = std::chrono::milliseconds(200);
+constexpr size_t kFontWorkers = 4;
 
 std::string lowerCase(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(), [](char c) { return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) : c; });
@@ -135,6 +136,14 @@ Resource loadLocal(const web::Url& url) {
 }
 
 Resource load(const std::string& address) {
+    {
+        Resource inline_data;
+        if (web::decodeDataUrl(address, inline_data.body, inline_data.content_type)) {
+            inline_data.ok = true;
+            inline_data.final_url = address;
+            return inline_data;
+        }
+    }
     const web::Url url = web::parseUrl(address);
     if (url.scheme == "file") return loadLocal(url);
     Resource r;
@@ -178,6 +187,7 @@ struct Page {
     std::map<std::string, std::string> sheets;   // by absolute URL
     std::map<std::string, std::shared_ptr<LoadedImage>> images;   // by absolute URL, UI thread only
     uint64_t pixels = 0;
+    bool fonts_known = false;   // its @font-face rules are in force, and what they need asked for
 };
 
 std::string findBase(const web::Document& doc, const std::string& url) {
@@ -291,6 +301,9 @@ private:
 class RenderWebPage : public RenderNode {
 public:
     RenderWebPage() { setKeepColors(true); }   // a page's colours are the page's, in every theme
+
+    // Told once a page, at its first layout, what fonts its text calls for.
+    void onFontsWanted(std::function<void(const std::shared_ptr<Page>&, std::vector<web::WebFontFace>)> f) { on_fonts_ = std::move(f); }
 
     void show(std::shared_ptr<Page> page) {
         page_ = std::move(page);
@@ -418,6 +431,15 @@ private:
                 return it == page.sheets.end() ? std::string{} : it->second;
             },
             [this](const web::ComputedStyle& s) { return web::chWidth(measurer_, s); });
+        if (!page.fonts_known) {
+            page_->fonts_known = true;
+            std::vector<web::WebFontFace> faces = styles.fontFaces();
+            // Those in a <style> are still relative to the page.
+            for (web::WebFontFace& f : faces)
+                for (std::string& src : f.sources) src = web::resolveUrl(page.base, src);
+            web::setPageWebFonts(std::move(faces));
+            if (on_fonts_) on_fonts_(page_, web::wantedWebFonts(*page.doc, styles));
+        }
         layout_ = web::layoutPage(*page.doc, styles, measurer_, &images_, width, height);
         // The engine puts a run's baseline 0.8em below where it's told: answer in those
         // terms, for the baseline the font's own ascent put it on.
@@ -443,7 +465,17 @@ private:
         dl.addCommand(fbx::shared::CommandType::DrawRect, {reinterpret_cast<const uint8_t*>(&r), sizeof(r)});
     }
 
-    static void text(fbx::xrender::DisplayList& dl, const web::PaintOp& op, float x, float y) {
+    // One line's text, in the fonts it takes: usually there's only one.
+    void text(fbx::xrender::DisplayList& dl, const web::PaintOp& op, float x, float y) {
+        const std::vector<web::FontRun> runs = web::fontRuns(op.text, op.font);
+        for (const web::FontRun& run : runs) {
+            const std::string_view piece = std::string_view(op.text).substr(run.begin, run.end - run.begin);
+            textRun(dl, op, piece, run.family, x, y);
+            if (runs.size() > 1) x += measurer_.width(piece, op.font);
+        }
+    }
+
+    static void textRun(fbx::xrender::DisplayList& dl, const web::PaintOp& op, std::string_view piece, const std::string& family, float x, float y) {
         fbx::shared::TextData td{};
         td.x_ = x;
         td.y_ = y;
@@ -452,16 +484,15 @@ private:
         td.g_ = static_cast<float>(op.color.g) / 255;
         td.b_ = static_cast<float>(op.color.b) / 255;
         td.a_ = static_cast<float>(op.color.a) / 255;
-        td.string_length_ = static_cast<uint32_t>(op.text.size());
+        td.string_length_ = static_cast<uint32_t>(piece.size());
         td.font_weight_ = static_cast<uint16_t>(std::clamp((op.font.weight + 50) / 100 * 100, 100, 900));
         td.font_style_ = static_cast<uint8_t>(op.font.italic ? fbx::xrender::FontStyle::Italic : fbx::xrender::FontStyle::Normal);
-        const std::string family = web::fontFamilyFor(op.font.family);
         const size_t n = std::min(family.size(), sizeof(td.font_family_) - 1);
         std::memcpy(td.font_family_, family.data(), n);
         td.font_family_[n] = '\0';
-        std::vector<uint8_t> payload(sizeof(td) + op.text.size());
+        std::vector<uint8_t> payload(sizeof(td) + piece.size());
         std::memcpy(payload.data(), &td, sizeof(td));
-        std::memcpy(payload.data() + sizeof(td), op.text.data(), op.text.size());
+        std::memcpy(payload.data() + sizeof(td), piece.data(), piece.size());
         dl.addCommand(fbx::shared::CommandType::DrawText, payload);
     }
 
@@ -485,6 +516,7 @@ private:
     }
 
     std::shared_ptr<Page> page_;
+    std::function<void(const std::shared_ptr<Page>&, std::vector<web::WebFontFace>)> on_fonts_;
     PageImages images_;
     web::XrenderTextMeasurer measurer_;
     web::PageLayout layout_;
@@ -497,7 +529,9 @@ private:
 
 class Browser {
 public:
-    explicit Browser(std::shared_ptr<RenderWebPage> node) : node_(std::move(node)) {}
+    explicit Browser(std::shared_ptr<RenderWebPage> node) : node_(std::move(node)) {
+        node_->onFontsWanted([this](const std::shared_ptr<Page>& page, std::vector<web::WebFontFace> faces) { loadFonts(page, std::move(faces)); });
+    }
 
     void setAddressField(std::shared_ptr<TextInputWidget> field) { address_ = std::move(field); }
 
@@ -675,6 +709,46 @@ private:
                         page->images[url] = image;
                         relayout_wanted_ = true;
                     });
+                }
+            }).detach();
+        }
+    }
+
+    // In the background, text showing in another font until they come. A face has its
+    // sources tried in order, until one really is a font.
+    void loadFonts(const std::shared_ptr<Page>& page, std::vector<web::WebFontFace> faces) {
+        const uint64_t mine = generation_.load();
+        struct Work {
+            std::mutex mutex;
+            std::deque<std::vector<std::string>> queue;
+        };
+        auto work = std::make_shared<Work>();
+        for (web::WebFontFace& f : faces) {
+            const bool have = std::any_of(f.sources.begin(), f.sources.end(), [](const std::string& s) { return web::haveWebFontData(s); });
+            if (!have) work->queue.push_back(std::move(f.sources));
+        }
+        if (work->queue.empty()) return;
+        for (size_t i = 0; i < kFontWorkers; ++i) {
+            std::thread([this, page, work, mine] {
+                while (generation_.load() == mine) {
+                    std::vector<std::string> sources;
+                    {
+                        std::lock_guard<std::mutex> lock(work->mutex);
+                        if (work->queue.empty()) return;
+                        sources = std::move(work->queue.front());
+                        work->queue.pop_front();
+                    }
+                    for (const std::string& url : sources) {
+                        Resource got = load(url);
+                        if (!got.ok || got.http_status >= 400) continue;
+                        auto bytes = std::make_shared<const std::string>(std::move(got.body));
+                        if (!web::webFontUsable(bytes)) continue;
+                        XApplication::post([this, url, bytes, mine] {
+                            if (!web::addWebFontData(url, bytes)) return;
+                            if (generation_.load() == mine) relayout_wanted_ = true;
+                        });
+                        break;
+                    }
                 }
             }).detach();
         }

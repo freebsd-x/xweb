@@ -23,6 +23,12 @@ public:
 };
 
 const char* const kSeeds[] = {
+    "<style>@font-face{font-family:a;src:url(a) format('woff2'),local(b);unicode-range:U+0-7F,U+4??;font-weight:100 900}"
+    "#g{display:grid;grid-template:'a a b' 40px 'c . b' minmax(10px,1fr) [x y] / repeat(auto-fill,minmax(10%,1fr)) fit-content(50px) [z] 2fr;grid-auto-rows:min-content 5px;gap:3px 1em;"
+    "grid-auto-flow:column dense;justify-content:space-around;align-content:end;place-items:center end}"
+    "#g>*{grid-area:a;grid-row:span 3/-1;grid-column:x 2/span y;order:-1;justify-self:end;width:max-content}"
+    "#h{display:inline-grid;grid:auto-flow dense 1fr/repeat(3,1fr);width:fit-content}</style>"
+    "<div id=g><p>a</p><b>b</b>text<img src=x><div id=h><i>c</i><table><td>d</table></div><span style='display:flex;position:absolute'>e</span></div>",
     "<!doctype html><html><head><style>a{color:red}#b>c:nth-child(2n+1){margin:1em auto;width:calc(100% - 1px)}@media (min-width:1px){d{--x:1;e:var(--x)}}</style></head>"
     "<body><p>one<b>two<i>three</b>four</i><table><tr><td>x<select><option>y</select></table><ul><li>a<li>b</ul><svg><g/><foreignObject><div>z</div></foreignObject></svg>"
     "<math><mi>q</mi><annotation-xml encoding=text/html><p>r</annotation-xml></math><template><td>s</template><img src=x alt=y><input value=v><pre>\n t\n</pre>&amp;&#x41;&notin;",
@@ -75,6 +81,27 @@ TEST(Fuzz, MutatedPages) {
         for (int g = 0; g < generations; ++g) page = mutate(std::move(page), rng);
         throughEverything(page, static_cast<float>(rng() % 1200));
     }
+}
+
+TEST(Fuzz, HostileGrids) {
+    const auto run = [](const std::string& html) {
+        const auto doc = parseHtml(html);
+        const StyledDocument styles(*doc, {800, 600});
+        FixedText text;
+        (void)layoutPage(*doc, styles, text, nullptr, 800, 600);
+    };
+    std::string items;
+    for (int i = 0; i < 4000; ++i) items += "<div>x</div>";
+    // Huge placements, huge spans, and lots of both.
+    run("<style>#g{display:grid}#g>div{grid-column:1000000/-1000000;grid-row:span 100000}</style><div id=g>" + items + "</div>");
+    run("<style>#g{display:grid;grid-template-columns:repeat(auto-fill,1px) repeat(100000,1fr)}#g>div{grid-column:span 1000;grid-row:span 1000}</style><div id=g>" + items + "</div>");
+    run("<style>#g{display:grid;grid-auto-flow:row dense;grid-template-columns:repeat(1000,1fr)}#g>:nth-child(2n){grid-column:span 999}</style><div id=g>" + items + "</div>");
+    run("<style>#g{display:grid;grid-template-columns:repeat(auto-fill,0px);grid-template-rows:repeat(auto-fit,minmax(0,0))}</style><div id=g>x</div>");
+    // Nesting, which shouldn't double the work per level.
+    std::string nest = "x";
+    for (int i = 0; i < 300; ++i) nest = "<div>" + nest + "</div>";
+    run("<style>div{display:grid;grid-template-rows:100px;grid-template-columns:1fr auto}</style>" + nest);
+    run("<style>div{display:grid}</style>" + nest);
 }
 
 TEST(Fuzz, RandomBytes) {

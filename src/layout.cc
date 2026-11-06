@@ -38,7 +38,9 @@ struct Box {
     float margin_top_outer = 0, margin_bottom_outer = 0;   // after collapsing with children
     bool collapses_through = false;
     bool collapsed_border = false; // a table with border-collapse: edges are shared
-    bool flex_item = false;
+    bool flex_item = false;        // or a grid item
+    float measured_width = -1, measured_height = 0;   // a grid item's natural height at that width
+    float laid_width = -1, laid_height = -2;          // what it was last laid out at; -1 height is auto
     bool anonymous_table_part = false;
     bool quirky_no_top_margin = false, quirky_no_bottom_margin = false;
     float static_y = 0;            // where an absolutely positioned box would have gone
@@ -68,6 +70,7 @@ struct Box {
     [[nodiscard]] Display display() const noexcept { return style ? style->display : Display::Block; }
     [[nodiscard]] bool isTable() const noexcept { return display() == Display::Table || display() == Display::InlineTable; }
     [[nodiscard]] bool isFlex() const noexcept { return display() == Display::Flex || display() == Display::InlineFlex; }
+    [[nodiscard]] bool isGrid() const noexcept { return display() == Display::Grid || display() == Display::InlineGrid; }
     [[nodiscard]] float frameWidth() const noexcept { return padding[Left] + padding[Right] + border[Left] + border[Right]; }
     [[nodiscard]] float frameHeight() const noexcept { return padding[Top] + padding[Bottom] + border[Top] + border[Bottom]; }
     [[nodiscard]] float outerWidth() const noexcept { return width + frameWidth(); }
@@ -344,7 +347,8 @@ private:
             case Display::Inline: return BoxKind::Inline;
             case Display::InlineBlock:
             case Display::InlineTable:
-            case Display::InlineFlex: return BoxKind::InlineBlock;
+            case Display::InlineFlex:
+            case Display::InlineGrid: return BoxKind::InlineBlock;
             default: return BoxKind::Block;
         }
     }
@@ -364,8 +368,42 @@ private:
         return box;
     }
 
+    // An element's content as boxes in `box`, which is its own unless it has none.
+    void addChildren(const Node* el, const ComputedStyle& style, Box& box, int depth, int& counter) {
+        if (const ComputedStyle* before = styles_.beforeOf(el)) box.kids.push_back(pseudoBox(*before));
+        for (const Node* c : el->children) {
+            if (c->type == NodeType::Text) {
+                if (c->data.empty()) continue;
+                auto t = std::make_unique<Box>();
+                t->kind = BoxKind::Text;
+                t->node = c;
+                t->style = &style;
+                t->text = c->data;
+                box.kids.push_back(std::move(t));
+            } else if (c->isElement()) {
+                const ComputedStyle* cs = styles_.styleOf(c);
+                if (!cs) continue;
+                if (cs->display == Display::Contents && !isReplaced(c) && !c->isHtml("br") && !c->isHtml("input")) {
+                    if (depth < kMaxBoxDepth) addChildren(c, *cs, box, depth + 1, counter);
+                    continue;
+                }
+                auto kid = build(c, *cs, depth + 1);
+                if (!kid) continue;
+                if (cs->display == Display::ListItem) {
+                    if (const std::string* v = c->attr("value"))
+                        counter = static_cast<int>(std::strtol(v->c_str(), nullptr, 10));
+                    kid->list_number = counter++;
+                }
+                box.kids.push_back(std::move(kid));
+            }
+        }
+        if (const ComputedStyle* after = styles_.afterOf(el)) box.kids.push_back(pseudoBox(*after));
+    }
+
     std::unique_ptr<Box> build(const Node* el, const ComputedStyle& style, int depth) {
         if (style.display == Display::None || style.display == Display::TableColumn || depth > kMaxBoxDepth) return nullptr;
+        // Contents that reaches here is on something that has to have a box, and there it's nothing.
+        if (style.display == Display::Contents && (isReplaced(el) || el->isHtml("br") || el->isHtml("input"))) return nullptr;
         auto box = std::make_unique<Box>();
         box->node = el;
         box->style = &style;
@@ -401,30 +439,7 @@ private:
         if (const std::string* start = el->attr("start"))
             counter = static_cast<int>(std::strtol(start->c_str(), nullptr, 10));
 
-        if (const ComputedStyle* before = styles_.beforeOf(el)) box->kids.push_back(pseudoBox(*before));
-        for (const Node* c : el->children) {
-            if (c->type == NodeType::Text) {
-                if (c->data.empty()) continue;
-                auto t = std::make_unique<Box>();
-                t->kind = BoxKind::Text;
-                t->node = c;
-                t->style = &style;
-                t->text = c->data;
-                box->kids.push_back(std::move(t));
-            } else if (c->isElement()) {
-                const ComputedStyle* cs = styles_.styleOf(c);
-                if (!cs) continue;
-                auto kid = build(c, *cs, depth + 1);
-                if (!kid) continue;
-                if (cs->display == Display::ListItem) {
-                    if (const std::string* v = c->attr("value"))
-                        counter = static_cast<int>(std::strtol(v->c_str(), nullptr, 10));
-                    kid->list_number = counter++;
-                }
-                box->kids.push_back(std::move(kid));
-            }
-        }
-        if (const ComputedStyle* after = styles_.afterOf(el)) box->kids.push_back(pseudoBox(*after));
+        addChildren(el, style, *box, depth, counter);
 
         finishBox(*box);
 
@@ -506,7 +521,7 @@ private:
         if (std::any_of(box.kids.begin(), box.kids.end(), [](const auto& k) { return isTablePart(*k); }))
             wrapKids(box, Display::Table, [](const Box& k) { return !isTablePart(k) && !isBlankText(k); }, true);
 
-        if (d == Display::Flex || d == Display::InlineFlex) {
+        if (d == Display::Flex || d == Display::InlineFlex || d == Display::Grid || d == Display::InlineGrid) {
             // Each child is an item, and an item is a block; loose text gets one made.
             wrapKids(box, Display::Block, [](const Box& k) { return k.kind != BoxKind::Text && k.kind != BoxKind::LineBreak; }, true);
             for (auto& k : box.kids) {
@@ -599,7 +614,7 @@ private:
         const Display d = b.display();
         return &b == root_ || b.kind == BoxKind::InlineBlock || b.outOfFlow() || b.floating() || b.flex_item ||
                b.style->overflow_clip || d == Display::FlowRoot || d == Display::TableCell || d == Display::TableCaption ||
-               d == Display::Flex || d == Display::InlineFlex;
+               d == Display::Flex || d == Display::InlineFlex || d == Display::Grid || d == Display::InlineGrid;
     }
 
     // `flow` is the containing block's content box; `est_top` where this box's border
@@ -616,8 +631,8 @@ private:
             content = s.width.resolve(cb_width);
             if (s.border_box) content -= frame;
             content = std::max(0.0f, content);
-        } else if (b.isTable()) {
-            content = std::min(preferredWidth(b), std::max(0.0f, cb_width - frame - b.margin[Left] - b.margin[Right]));
+        } else if (b.isTable() || s.width_keyword != ComputedStyle::WidthKeyword::None) {
+            content = shrinkToFit(b, std::max(0.0f, cb_width - frame - b.margin[Left] - b.margin[Right]));
         } else {
             content = std::max(0.0f, cb_width - frame - b.margin[Left] - b.margin[Right]);
         }
@@ -627,7 +642,7 @@ private:
         // Auto margins share what's left.
         const float free_space = cb_width - b.width - frame;
         const bool ml_auto = s.margin[Left].is_auto, mr_auto = s.margin[Right].is_auto;
-        if (!width_auto || !s.max_width.is_auto || b.isTable()) {
+        if (!width_auto || !s.max_width.is_auto || b.isTable() || s.width_keyword != ComputedStyle::WidthKeyword::None) {
             if (ml_auto && mr_auto) {
                 b.margin[Left] = b.margin[Right] = std::max(0.0f, free_space / 2);
             } else if (ml_auto) {
@@ -666,6 +681,12 @@ private:
         }
         if (b.isFlex()) {
             layoutFlex(b, own_height);
+            b.margin_top_outer = b.margin[Top];
+            b.margin_bottom_outer = b.margin[Bottom];
+            return;
+        }
+        if (b.isGrid()) {
+            layoutGrid(b, own_height);
             b.margin_top_outer = b.margin[Top];
             b.margin_bottom_outer = b.margin[Bottom];
             return;
@@ -816,7 +837,7 @@ private:
         } else if (!s.offset[Left].is_auto && !s.offset[Right].is_auto) {
             width = base - s.offset[Left].resolve(base) - s.offset[Right].resolve(base) - frame - k.margin[Left] - k.margin[Right];
         } else {
-            width = std::min(preferredWidth(k), base - frame);
+            width = shrinkToFit(k, base - frame);
         }
         k.width = clampWidth(k, std::max(0.0f, width), base);
         std::optional<float> own;
@@ -839,7 +860,7 @@ private:
             width = s.width.resolve(cb_width);
             if (s.border_box) width -= frame;
         } else {
-            width = std::min(preferredWidth(k), std::max(0.0f, cb_width - frame - k.margin[Left] - k.margin[Right]));
+            width = shrinkToFit(k, std::max(0.0f, cb_width - frame - k.margin[Left] - k.margin[Right]));
         }
         k.width = clampWidth(k, std::max(0.0f, width), cb_width);
         std::optional<float> own;
@@ -897,6 +918,15 @@ private:
         return b.pref_width;
     }
 
+    // How wide something sized by its content is, with this much room.
+    float shrinkToFit(Box& b, float room) {
+        switch (b.style->width_keyword) {
+            case ComputedStyle::WidthKeyword::MaxContent: return preferredWidth(b);
+            case ComputedStyle::WidthKeyword::MinContent: return minContentWidth(b);
+            default: return std::min(preferredWidth(b), room);
+        }
+    }
+
     // The narrowest it can go: its longest word.
     float minContentWidth(Box& b) {
         if (b.min_content >= 0) return b.min_content;
@@ -932,6 +962,7 @@ private:
             }
             return total;
         }
+        if (b.isGrid()) return gridIntrinsicWidth(b, max_content);
         const bool inline_content = std::none_of(b.kids.begin(), b.kids.end(), [](const auto& k) { return k->inFlowBlock(); });
         float result = 0;
         if (inline_content) {
@@ -976,7 +1007,7 @@ private:
             if (s.border_box) width -= frame;
         } else {
             // Shrink to fit (10.3.9)
-            width = std::min(preferredWidth(b), std::max(0.0f, cb_width - frame - b.margin[Left] - b.margin[Right]));
+            width = shrinkToFit(b, std::max(0.0f, cb_width - frame - b.margin[Left] - b.margin[Right]));
         }
         b.width = clampWidth(b, std::max(0.0f, width), cb_width);
         std::optional<float> own;
@@ -1011,6 +1042,45 @@ private:
                     natural_w = text_.width(b.alt, f);
                     natural_h = lineHeightOf(s);
                 }
+            }
+        } else if (n->ns == Namespace::Svg && n->name == "svg") {
+            const auto size_attr = [n](const char* name) -> std::optional<float> {
+                const std::string* v = n->attr(name);
+                if (!v) return std::nullopt;
+                char* end = nullptr;
+                const float got = std::strtof(v->c_str(), &end);
+                if (end == v->c_str() || got < 0 || got > kMaxCoord || (*end != '\0' && std::string_view(end) != "px")) return std::nullopt;
+                return got;
+            };
+            const std::optional<float> attr_w = size_attr("width"), attr_h = size_attr("height");
+            float ratio = 0;   // width over height, if there's a viewBox to say
+            if (const std::string* box = n->attr("viewBox")) {
+                std::string text = *box;
+                std::replace(text.begin(), text.end(), ',', ' ');
+                float vb[4] = {0, 0, 0, 0};
+                const char* p = text.c_str();
+                bool ok = true;
+                for (float& value : vb) {
+                    char* end = nullptr;
+                    value = std::strtof(p, &end);
+                    ok = ok && end != p;
+                    p = end;
+                }
+                if (ok && vb[2] > 0 && vb[3] > 0) ratio = vb[2] / vb[3];
+            }
+            if (attr_w && attr_h) {
+                natural_w = *attr_w;
+                natural_h = *attr_h;
+            } else if (attr_w) {
+                natural_w = *attr_w;
+                natural_h = ratio > 0 ? *attr_w / ratio : 150;
+            } else if (attr_h) {
+                natural_h = *attr_h;
+                natural_w = ratio > 0 ? *attr_h * ratio : 300;
+            } else if (ratio > 0 && cb_width < kUnbounded / 2) {
+                // No size of its own, only a shape: as wide as there's room for.
+                natural_w = std::max(0.0f, cb_width - b.frameWidth() - b.margin[Left] - b.margin[Right]);
+                natural_h = natural_w / ratio;
             }
         } else if (n->isHtml("input")) {
             const std::string* ty = n->attr("type");
@@ -1676,8 +1746,758 @@ private:
         }
         const FlexAlign align = ks.align_self == FlexAlign::Auto ? s.align_items : ks.align_self;
         const float room = std::max(0.0f, c.width - it.frame_cross);
-        if (align == FlexAlign::Stretch && !ks.margin[Left].is_auto && !ks.margin[Right].is_auto) return clampWidth(k, room, c.width);
-        return clampWidth(k, std::min(preferredWidth(k), room), c.width);
+        if (align == FlexAlign::Stretch && !ks.margin[Left].is_auto && !ks.margin[Right].is_auto && ks.width_keyword == ComputedStyle::WidthKeyword::None) return clampWidth(k, room, c.width);
+        return clampWidth(k, shrinkToFit(k, room), c.width);
+    }
+
+    // ── Grid ──────────────────────────────────────────────────────────────────
+
+    static constexpr int kMaxGridLine = 10000;         // lines past this are this one
+    static constexpr int kMaxGridSpan = 1000;
+    static constexpr int kMaxAutoRepeat = 1000;
+    static constexpr uint64_t kPlacementBudget = 50000000;   // cells looked at per grid
+    static constexpr float kNoLimit = std::numeric_limits<float>::infinity();
+
+    struct GridAxis {
+        std::vector<GridTrack> tracks;   // explicit
+        std::vector<std::vector<std::string>> names;   // of each line
+        std::vector<bool> repeated;      // this explicit track came from auto-fit
+        const std::vector<GridTrack>* implicit = nullptr;
+        size_t area_lines = 0;
+    };
+
+    struct GridPlacedItem {
+        Box* box = nullptr;
+        int col0 = 0, col1 = 0, row0 = 0, row1 = 0;
+        bool col_set = false, row_set = false;
+        float row_contribution = 0;
+    };
+
+    struct SizedTrack {
+        GridTrack def;
+        float base = 0, growth = 0;
+        bool collapsed = false;
+        float offset = 0;
+    };
+
+    struct GridPlan {
+        std::vector<SizedTrack> cols, rows;
+        std::vector<GridPlacedItem> items;
+    };
+
+    enum class TrackRoom { Definite, MaxContent, MinContent };
+
+    // How wide a track would be for working out how many repeats fit.
+    static float repeatSize(const GridTrack& t, float room) {
+        const float at_max = t.max.kind == GridSize::Fixed ? t.max.length.resolve(room) : 0;
+        const float at_min = t.min.kind == GridSize::Fixed ? t.min.length.resolve(room) : 0;
+        if (t.max.kind == GridSize::Fixed && t.min.kind == GridSize::Fixed) return std::max(at_min, at_max);
+        return t.max.kind == GridSize::Fixed ? at_max : at_min;
+    }
+
+    static GridAxis expandAxis(const GridTrackList* list, const std::vector<GridTrack>* implicit, std::optional<float> room, float gap, int area_tracks) {
+        GridAxis axis;
+        axis.implicit = implicit;
+        if (list) {
+            int repeats = 0;
+            if (!list->repeat.empty()) {
+                repeats = 1;
+                if (room) {
+                    float fixed = 0, unit = 0;
+                    for (const GridTrack& t : list->tracks) fixed += repeatSize(t, *room) + gap;
+                    for (const GridTrack& t : list->repeat) unit += repeatSize(t, *room) + gap;
+                    if (unit > 0) repeats = std::clamp(static_cast<int>(std::floor((*room + gap - fixed) / unit)), 1, kMaxAutoRepeat);
+                }
+            }
+            for (size_t i = 0; i <= list->tracks.size(); ++i) {
+                std::vector<std::string> line = i < list->names.size() ? list->names[i] : std::vector<std::string>{};
+                if (!list->repeat.empty() && i == list->repeat_at) {
+                    for (int r = 0; r < repeats; ++r) {
+                        for (size_t t = 0; t < list->repeat.size(); ++t) {
+                            line.insert(line.end(), list->repeat_names[t].begin(), list->repeat_names[t].end());
+                            axis.names.push_back(std::move(line));
+                            line.clear();
+                            axis.tracks.push_back(list->repeat[t]);
+                            axis.repeated.push_back(list->auto_fit);
+                        }
+                        line.insert(line.end(), list->repeat_names.back().begin(), list->repeat_names.back().end());
+                    }
+                    line.insert(line.end(), list->names_after_repeat.begin(), list->names_after_repeat.end());
+                }
+                if (i < list->tracks.size()) {
+                    axis.names.push_back(std::move(line));
+                    axis.tracks.push_back(list->tracks[i]);
+                    axis.repeated.push_back(false);
+                } else {
+                    axis.names.push_back(std::move(line));
+                }
+            }
+        }
+        if (axis.names.empty()) axis.names.emplace_back();
+        // Named areas can make the explicit grid bigger than the template did.
+        while (static_cast<int>(axis.tracks.size()) < area_tracks) {
+            axis.tracks.push_back(implicit && !implicit->empty() ? (*implicit)[(axis.tracks.size() - (list ? list->tracks.size() : 0)) % implicit->size()] : GridTrack{});
+            axis.repeated.push_back(false);
+            axis.names.emplace_back();
+        }
+        return axis;
+    }
+
+    // Where a line is, counted from the explicit grid's first line as 0.
+    static std::optional<int> resolveLine(const GridLine& l, const GridAxis& axis, const GridAreas* areas, bool rows, bool start) {
+        const int count = static_cast<int>(axis.names.size());
+        if (l.span) return std::nullopt;
+        if (l.name.empty()) {
+            if (l.line == 0) return std::nullopt;
+            const int at = l.line > 0 ? l.line - 1 : count + l.line;
+            return std::clamp(at, -kMaxGridLine, kMaxGridLine);
+        }
+        if (l.line == 0 && areas) {
+            const auto it = areas->areas.find(l.name);
+            if (it != areas->areas.end()) {
+                const GridAreaRect& r = it->second;
+                return rows ? (start ? r.row_start : r.row_end) : (start ? r.column_start : r.column_end);
+            }
+        }
+        if (areas) {
+            // A name-start or name-end line exists for each named area.
+            const bool is_start = l.name.ends_with("-start"), is_end = l.name.ends_with("-end");
+            if (is_start || is_end) {
+                const auto it = areas->areas.find(l.name.substr(0, l.name.size() - (is_start ? 6 : 4)));
+                if (it != areas->areas.end()) {
+                    const GridAreaRect& r = it->second;
+                    return rows ? (is_start ? r.row_start : r.row_end) : (is_start ? r.column_start : r.column_end);
+                }
+            }
+        }
+        // The nth line by that name, in either direction.
+        const auto named = [&](const std::string& name) -> std::optional<int> {
+            const int want = l.line == 0 ? 1 : std::abs(l.line);
+            int seen = 0;
+            for (int n = 0; n < count; ++n) {
+                const int at = l.line < 0 ? count - 1 - n : n;
+                if (std::find(axis.names[at].begin(), axis.names[at].end(), name) != axis.names[at].end() && ++seen == want) return at;
+            }
+            return std::nullopt;
+        };
+        if (auto found = named(l.name)) return found;
+        return named(l.name + (start ? "-start" : "-end"));
+    }
+
+    // Both ends of an item on one axis: its lines, or just how many tracks it spans.
+    static void placementOf(const GridLine& a, const GridLine& b, const GridAxis& axis, const GridAreas* areas, bool rows, int& from, int& to, bool& set) {
+        const std::optional<int> start = resolveLine(a, axis, areas, rows, true);
+        const std::optional<int> end = resolveLine(b, axis, areas, rows, false);
+        const int span_a = std::min(a.span, kMaxGridSpan), span_b = std::min(b.span, kMaxGridSpan);
+        set = true;
+        if (start && end) {
+            from = std::min(*start, *end);
+            to = std::max(*start, *end);
+            if (from == to) to = from + 1;
+        } else if (start) {
+            from = *start;
+            to = from + std::max(1, span_b);
+        } else if (end) {
+            to = *end;
+            from = to - std::max(1, span_a);
+        } else {
+            set = false;
+            from = 0;
+            to = std::max(1, span_a ? span_a : span_b);
+        }
+    }
+
+    // The placement algorithm (8.5). `major` is the axis auto-placement moves along last:
+    // rows, unless grid-auto-flow says column.
+    static void autoPlace(std::vector<GridPlacedItem>& items, bool flow_column, bool dense, int minor_count) {
+        const auto major0 = [&](GridPlacedItem& it) -> int& { return flow_column ? it.col0 : it.row0; };
+        const auto major1 = [&](GridPlacedItem& it) -> int& { return flow_column ? it.col1 : it.row1; };
+        const auto minor0 = [&](GridPlacedItem& it) -> int& { return flow_column ? it.row0 : it.col0; };
+        const auto minor1 = [&](GridPlacedItem& it) -> int& { return flow_column ? it.row1 : it.col1; };
+        const auto major_set = [&](const GridPlacedItem& it) { return flow_column ? it.col_set : it.row_set; };
+        const auto minor_set = [&](const GridPlacedItem& it) { return flow_column ? it.row_set : it.col_set; };
+
+        std::vector<std::vector<uint8_t>> taken;
+        uint64_t budget = kPlacementBudget;
+        const auto is_free = [&](int ma0, int ma1, int mi0, int mi1) {
+            for (int ma = ma0; ma < ma1 && ma < static_cast<int>(taken.size()); ++ma) {
+                const auto& row = taken[static_cast<size_t>(ma)];
+                for (int mi = mi0; mi < mi1 && mi < static_cast<int>(row.size()); ++mi) {
+                    if (budget == 0) return true;   // past the limit things may overlap
+                    --budget;
+                    if (row[static_cast<size_t>(mi)]) return false;
+                }
+            }
+            return true;
+        };
+        const auto occupy = [&](int ma0, int ma1, int mi0, int mi1) {
+            const uint64_t cells = static_cast<uint64_t>(ma1 - ma0) * static_cast<uint64_t>(mi1 - mi0);
+            if (cells > budget) { budget = 0; return; }
+            budget -= cells;
+            if (static_cast<int>(taken.size()) < ma1) taken.resize(static_cast<size_t>(ma1));
+            for (int ma = ma0; ma < ma1; ++ma) {
+                auto& row = taken[static_cast<size_t>(ma)];
+                if (static_cast<int>(row.size()) < mi1) row.resize(static_cast<size_t>(mi1), 0);
+                for (int mi = mi0; mi < mi1; ++mi) row[static_cast<size_t>(mi)] = 1;
+            }
+        };
+
+        for (GridPlacedItem& it : items)
+            if (it.col_set && it.row_set) occupy(major0(it), major1(it), minor0(it), minor1(it));
+
+        // Fixed on the major axis: they go first, in their own row.
+        std::unordered_map<int, int> row_cursor;
+        for (GridPlacedItem& it : items) {
+            if (!major_set(it) || minor_set(it)) continue;
+            const int span = minor1(it) - minor0(it);
+            int mi = dense ? 0 : row_cursor[major0(it)];
+            while (!is_free(major0(it), major1(it), mi, mi + span) && mi < kMaxGridLine) ++mi;
+            minor0(it) = mi;
+            minor1(it) = mi + span;
+            occupy(major0(it), major1(it), mi, mi + span);
+            if (!dense) row_cursor[major0(it)] = mi + span;
+        }
+
+        // The rest, with a cursor.
+        int cursor_ma = 0, cursor_mi = 0;
+        for (GridPlacedItem& it : items) {
+            if (major_set(it)) continue;
+            const int ma_span = major1(it) - major0(it);
+            if (minor_set(it)) {
+                if (dense) {
+                    cursor_ma = 0;
+                } else if (minor0(it) < cursor_mi) {
+                    ++cursor_ma;
+                }
+                cursor_mi = minor0(it);
+                while (!is_free(cursor_ma, cursor_ma + ma_span, minor0(it), minor1(it)) && cursor_ma < kMaxGridLine) ++cursor_ma;
+            } else {
+                const int mi_span = minor1(it) - minor0(it);
+                if (dense) { cursor_ma = 0; cursor_mi = 0; }
+                while (cursor_ma < kMaxGridLine) {
+                    if (cursor_mi + mi_span > std::max(minor_count, mi_span)) {
+                        cursor_mi = 0;
+                        ++cursor_ma;
+                        continue;
+                    }
+                    if (is_free(cursor_ma, cursor_ma + ma_span, cursor_mi, cursor_mi + mi_span)) break;
+                    ++cursor_mi;
+                }
+                minor0(it) = cursor_mi;
+                minor1(it) = cursor_mi + mi_span;
+            }
+            major0(it) = cursor_ma;
+            major1(it) = cursor_ma + ma_span;
+            occupy(major0(it), major1(it), minor0(it), minor1(it));
+            if (minor_set(it)) continue;
+            cursor_mi = minor1(it);
+        }
+    }
+
+    static std::vector<SizedTrack> gridTracks(const GridAxis& axis, int first, int last) {
+        // `first` is negative if lines before the explicit grid are in use.
+        std::vector<SizedTrack> out;
+        out.reserve(static_cast<size_t>(last - first));
+        const int count = static_cast<int>(axis.tracks.size());
+        const auto implicit_at = [&](int n) {
+            if (!axis.implicit || axis.implicit->empty()) return GridTrack{};
+            const int size = static_cast<int>(axis.implicit->size());
+            return (*axis.implicit)[static_cast<size_t>(((n % size) + size) % size)];
+        };
+        for (int i = first; i < last; ++i) {
+            SizedTrack t;
+            if (i >= 0 && i < count) {
+                t.def = axis.tracks[static_cast<size_t>(i)];
+            } else {
+                t.def = implicit_at(i < 0 ? i : i - count);
+            }
+            out.push_back(std::move(t));
+        }
+        return out;
+    }
+
+    GridPlan gridPlan(Box& c, std::optional<float> width, std::optional<float> height) {
+        const ComputedStyle& s = *c.style;
+        const GridAreas* areas = s.grid_areas.get();
+        const GridAxis cols = expandAxis(s.grid_columns.get(), s.grid_auto_columns.get(), width, s.column_gap, areas ? areas->columns : 0);
+        const GridAxis rows = expandAxis(s.grid_rows.get(), s.grid_auto_rows.get(), height, s.row_gap, areas ? areas->rows : 0);
+
+        GridPlan plan;
+        for (auto& kp : c.kids) {
+            if (kp->outOfFlow()) continue;
+            GridPlacedItem it;
+            it.box = kp.get();
+            plan.items.push_back(it);
+        }
+        std::stable_sort(plan.items.begin(), plan.items.end(), [](const GridPlacedItem& a, const GridPlacedItem& b) { return a.box->style->order < b.box->style->order; });
+
+        int col_min = 0, row_min = 0;
+        for (GridPlacedItem& it : plan.items) {
+            const ComputedStyle& ks = *it.box->style;
+            placementOf(ks.grid_column_start, ks.grid_column_end, cols, areas, false, it.col0, it.col1, it.col_set);
+            placementOf(ks.grid_row_start, ks.grid_row_end, rows, areas, true, it.row0, it.row1, it.row_set);
+            if (it.col_set) col_min = std::min(col_min, it.col0);
+            if (it.row_set) row_min = std::min(row_min, it.row0);
+        }
+        // Lines before the explicit grid: move everything so that it starts at 0.
+        int col_tracks = static_cast<int>(cols.tracks.size()) - col_min, row_tracks = static_cast<int>(rows.tracks.size()) - row_min;
+        for (GridPlacedItem& it : plan.items) {
+            if (it.col_set) { it.col0 -= col_min; it.col1 -= col_min; }
+            if (it.row_set) { it.row0 -= row_min; it.row1 -= row_min; }
+            const int col_extent = it.col_set ? it.col1 : it.col1 - it.col0;
+            const int row_extent = it.row_set ? it.row1 : it.row1 - it.row0;
+            if (s.grid_flow_column) row_tracks = std::max(row_tracks, row_extent);
+            else col_tracks = std::max(col_tracks, col_extent);
+        }
+        autoPlace(plan.items, s.grid_flow_column, s.grid_dense, s.grid_flow_column ? row_tracks : col_tracks);
+        int col_last = col_tracks, row_last = row_tracks;
+        for (const GridPlacedItem& it : plan.items) {
+            col_last = std::max(col_last, it.col1);
+            row_last = std::max(row_last, it.row1);
+        }
+        col_last = std::min(col_last, kMaxGridLine);
+        row_last = std::min(row_last, kMaxGridLine);
+        for (GridPlacedItem& it : plan.items) {
+            it.col1 = std::min(it.col1, col_last);
+            it.col0 = std::min(it.col0, it.col1 - 1);
+            it.row1 = std::min(it.row1, row_last);
+            it.row0 = std::min(it.row0, it.row1 - 1);
+        }
+        plan.cols = gridTracks(cols, col_min, col_min + col_last);
+        plan.rows = gridTracks(rows, row_min, row_min + row_last);
+
+        // auto-fit: repeats with nothing in them aren't there.
+        const auto collapse_empty = [&](std::vector<SizedTrack>& tracks, const GridAxis& axis, int shift, auto span_of) {
+            for (size_t r = 0; r < axis.repeated.size(); ++r) {
+                if (!axis.repeated[r]) continue;
+                const int at = static_cast<int>(r) - shift;
+                const bool used = std::any_of(plan.items.begin(), plan.items.end(), [&](const GridPlacedItem& it) {
+                    const auto [a, b] = span_of(it);
+                    return a <= at && at < b;
+                });
+                if (!used && at >= 0 && at < static_cast<int>(tracks.size())) tracks[static_cast<size_t>(at)].collapsed = true;
+            }
+        };
+        collapse_empty(plan.cols, cols, col_min, [](const GridPlacedItem& it) { return std::pair(it.col0, it.col1); });
+        collapse_empty(plan.rows, rows, row_min, [](const GridPlacedItem& it) { return std::pair(it.row0, it.row1); });
+        return plan;
+    }
+
+    static float sumGaps(const std::vector<SizedTrack>& tracks, float gap, int from, int to) {
+        int n = 0;
+        for (int i = from; i < to; ++i) n += tracks[static_cast<size_t>(i)].collapsed ? 0 : 1;
+        return n > 1 ? gap * static_cast<float>(n - 1) : 0;
+    }
+
+    // What an item asks of the tracks it spans, in the axis being sized.
+    struct TrackContribution {
+        int from = 0, to = 0;
+        float automatic = 0;   // its minimum: where a track's own minimum is `auto`
+        float min = 0, max = 0;
+    };
+
+    // The track sizing algorithm (11), one axis at a time.
+    static void sizeTracks(std::vector<SizedTrack>& t, std::optional<float> avail, float gap, TrackRoom room, std::vector<TrackContribution> items, bool stretch_auto) {
+        for (SizedTrack& k : t) {
+            if (k.collapsed) continue;
+            GridTrack& d = k.def;
+            // Percentages of something not yet known count as auto.
+            if (!avail) {
+                if (d.min.kind == GridSize::Fixed && d.min.length.hasPercent()) d.min = GridSize{};
+                if (d.max.kind == GridSize::Fixed && d.max.length.hasPercent()) d.max = GridSize{};
+                if (d.fit_content && d.fit_limit.hasPercent()) d.fit_content = false;
+            }
+            const float base_of = avail.value_or(0);
+            k.base = d.min.kind == GridSize::Fixed ? d.min.length.resolve(base_of) : 0;
+            k.growth = d.max.kind == GridSize::Fixed ? std::max(k.base, d.max.length.resolve(base_of)) : kNoLimit;
+        }
+
+        // Smallest spans first, as the bigger ones then only ask for what's still missing.
+        std::stable_sort(items.begin(), items.end(), [](const TrackContribution& a, const TrackContribution& b) { return a.to - a.from < b.to - b.from; });
+        for (const TrackContribution& it : items) {
+            bool any_fr = false;
+            float fixed_max = 0;
+            bool all_fixed_max = true;
+            for (int i = it.from; i < it.to; ++i) {
+                const SizedTrack& k = t[static_cast<size_t>(i)];
+                if (k.collapsed) continue;
+                any_fr = any_fr || k.def.max.kind == GridSize::Fr;
+                if (k.def.max.kind == GridSize::Fixed) fixed_max += k.growth;
+                else all_fixed_max = false;
+            }
+            const float gaps = sumGaps(t, gap, it.from, it.to);
+            float automatic = it.automatic;
+            if (all_fixed_max) automatic = std::min(automatic, fixed_max + gaps);
+
+            // Base sizes.
+            float have = gaps;
+            float want = 0;
+            std::vector<SizedTrack*> targets;
+            for (int i = it.from; i < it.to; ++i) {
+                SizedTrack& k = t[static_cast<size_t>(i)];
+                if (k.collapsed) continue;
+                have += k.base;
+                if (k.def.min.kind == GridSize::Fixed) continue;
+                if (any_fr && k.def.max.kind != GridSize::Fr) continue;
+                targets.push_back(&k);
+                const float c = k.def.min.kind == GridSize::Auto ? automatic : k.def.min.kind == GridSize::MinContent ? it.min : it.max;
+                want = std::max(want, c);
+            }
+            if (!targets.empty() && want > have) {
+                float extra = want - have;
+                // Up to their growth limits first.
+                for (int round = 0; round < 8 && extra > 0.001f; ++round) {
+                    std::vector<SizedTrack*> open;
+                    for (SizedTrack* k : targets)
+                        if (k->base < k->growth) open.push_back(k);
+                    if (open.empty()) break;
+                    const float share = extra / static_cast<float>(open.size());
+                    for (SizedTrack* k : open) {
+                        const float take = std::min(share, k->growth - k->base);
+                        k->base += take;
+                        extra -= take;
+                    }
+                }
+                if (extra > 0.001f) {
+                    const float share = extra / static_cast<float>(targets.size());
+                    for (SizedTrack* k : targets) k->base += share;
+                }
+            }
+
+            // Growth limits.
+            if (any_fr) continue;
+            float grown = gaps;
+            std::vector<SizedTrack*> growing;
+            float want_growth = 0;
+            for (int i = it.from; i < it.to; ++i) {
+                SizedTrack& k = t[static_cast<size_t>(i)];
+                if (k.collapsed) continue;
+                grown += std::isinf(k.growth) ? k.base : k.growth;
+                if (k.def.max.kind == GridSize::Fixed) continue;
+                growing.push_back(&k);
+                float c = k.def.max.kind == GridSize::MinContent ? it.min : it.max;
+                if (k.def.fit_content) c = std::min(c, k.def.fit_limit.resolve(avail.value_or(0)));
+                want_growth = std::max(want_growth, c);
+            }
+            if (growing.empty()) continue;
+            const float extra = std::max(0.0f, want_growth - grown);
+            const float share = extra / static_cast<float>(growing.size());
+            for (SizedTrack* k : growing) k->growth = (std::isinf(k->growth) ? k->base : k->growth) + share;
+        }
+        for (SizedTrack& k : t) {
+            if (k.collapsed) continue;
+            if (std::isinf(k.growth)) k.growth = k.base;
+            k.growth = std::max(k.growth, k.base);
+        }
+
+        const auto track_sum = [&] {
+            float total = sumGaps(t, gap, 0, static_cast<int>(t.size()));
+            for (const SizedTrack& k : t)
+                if (!k.collapsed) total += k.base;
+            return total;
+        };
+
+        // Maximize: the free space up to each growth limit.
+        if (room == TrackRoom::MaxContent) {
+            for (SizedTrack& k : t)
+                if (!k.collapsed) k.base = k.growth;
+        } else if (avail) {
+            float free_space = *avail - track_sum();
+            for (int round = 0; round < 32 && free_space > 0.001f; ++round) {
+                int open = 0;
+                for (const SizedTrack& k : t)
+                    if (!k.collapsed && k.base + 0.0001f < k.growth) ++open;
+                if (open == 0) break;
+                const float share = free_space / static_cast<float>(open);
+                for (SizedTrack& k : t) {
+                    if (k.collapsed || k.base + 0.0001f >= k.growth) continue;
+                    const float take = std::min(share, k.growth - k.base);
+                    k.base += take;
+                    free_space -= take;
+                }
+            }
+        }
+
+        // Flexible tracks.
+        bool has_fr = false;
+        for (const SizedTrack& k : t) has_fr = has_fr || (!k.collapsed && k.def.max.kind == GridSize::Fr);
+        if (has_fr && room != TrackRoom::MinContent) {
+            float fr_size = 0;
+            if (avail) {
+                // Tracks whose base is already more than their share stop being flexible.
+                std::vector<bool> inflexible(t.size(), false);
+                for (size_t round = 0; round <= t.size(); ++round) {
+                    float left = *avail - sumGaps(t, gap, 0, static_cast<int>(t.size()));
+                    float factors = 0;
+                    for (size_t i = 0; i < t.size(); ++i) {
+                        if (t[i].collapsed) continue;
+                        if (t[i].def.max.kind == GridSize::Fr && !inflexible[i]) factors += t[i].def.max.fr;
+                        else left -= t[i].base;
+                    }
+                    fr_size = std::max(0.0f, left) / std::max(factors, 1.0f);
+                    bool changed = false;
+                    for (size_t i = 0; i < t.size(); ++i) {
+                        if (t[i].collapsed || t[i].def.max.kind != GridSize::Fr || inflexible[i]) continue;
+                        if (t[i].base > fr_size * t[i].def.max.fr) {
+                            inflexible[i] = true;
+                            changed = true;
+                        }
+                    }
+                    if (!changed) break;
+                }
+            } else {
+                for (const SizedTrack& k : t) {
+                    if (k.collapsed || k.def.max.kind != GridSize::Fr) continue;
+                    fr_size = std::max(fr_size, k.base / std::max(k.def.max.fr, 1.0f));
+                }
+                for (const TrackContribution& it : items) {
+                    float factors = 0, others = sumGaps(t, gap, it.from, it.to);
+                    for (int i = it.from; i < it.to; ++i) {
+                        const SizedTrack& k = t[static_cast<size_t>(i)];
+                        if (k.collapsed) continue;
+                        if (k.def.max.kind == GridSize::Fr) factors += k.def.max.fr;
+                        else others += k.base;
+                    }
+                    if (factors > 0) fr_size = std::max(fr_size, (it.max - others) / std::max(factors, 1.0f));
+                }
+            }
+            for (SizedTrack& k : t) {
+                if (k.collapsed || k.def.max.kind != GridSize::Fr) continue;
+                k.base = std::max(k.base, fr_size * k.def.max.fr);
+            }
+        }
+
+        // What's left goes to the auto tracks, unless the page aligns them some other way.
+        if (avail && stretch_auto) {
+            const float free_space = *avail - track_sum();
+            int autos = 0;
+            for (const SizedTrack& k : t) autos += !k.collapsed && k.def.max.kind == GridSize::Auto && !k.def.fit_content ? 1 : 0;
+            if (free_space > 0 && autos > 0) {
+                const float share = free_space / static_cast<float>(autos);
+                for (SizedTrack& k : t)
+                    if (!k.collapsed && k.def.max.kind == GridSize::Auto && !k.def.fit_content) k.base += share;
+            }
+        }
+        for (SizedTrack& k : t) k.base = clampCoord(k.base);
+    }
+
+    std::vector<TrackContribution> columnContributions(GridPlan& plan) {
+        std::vector<TrackContribution> out;
+        out.reserve(plan.items.size());
+        for (const GridPlacedItem& it : plan.items) {
+            Box& k = *it.box;
+            const ComputedStyle& ks = *k.style;
+            TrackContribution c;
+            c.from = it.col0;
+            c.to = it.col1;
+            // Asked for both whether or not they matter: finding them out disturbs the box,
+            // so it has to happen before its real layout. See gridItemLayout().
+            const float min = outerIntrinsic(k, false);
+            const float max = outerIntrinsic(k, true);
+            c.min = min;
+            c.max = std::max(min, max);
+            const float explicit_min = ks.min_width.hasPercent() ? 0 : ks.min_width.px;
+            if (explicit_min > 0) {
+                const float outer = explicit_min + (ks.border_box ? 0 : k.frameWidth()) + k.margin[Left] + k.margin[Right];
+                c.automatic = outer;
+                c.min = std::max(c.min, outer);
+                c.max = std::max(c.max, outer);
+            } else {
+                c.automatic = ks.overflow_clip ? k.frameWidth() + k.margin[Left] + k.margin[Right] : c.min;
+            }
+            out.push_back(c);
+        }
+        return out;
+    }
+
+    float gridIntrinsicWidth(Box& b, bool max_content) {
+        GridPlan plan = gridPlan(b, std::nullopt, std::nullopt);
+        sizeTracks(plan.cols, std::nullopt, b.style->column_gap, max_content ? TrackRoom::MaxContent : TrackRoom::MinContent, columnContributions(plan), false);
+        float total = sumGaps(plan.cols, b.style->column_gap, 0, static_cast<int>(plan.cols.size()));
+        for (const SizedTrack& t : plan.cols)
+            if (!t.collapsed) total += t.base;
+        return total;
+    }
+
+    // Lays an item out unless the last time was already at this size: nested grids would
+    // otherwise double the work at every level.
+    void gridItemLayout(Box& k, float width, std::optional<float> height) {
+        const float wanted = height.value_or(-1.0f);
+        if (k.laid_width == width && k.laid_height == wanted) return;
+        layoutItem(k, width, height);
+        k.laid_width = width;
+        k.laid_height = wanted;
+    }
+
+    // Its natural height at a width; only worked out once for each width.
+    float gridItemNaturalHeight(Box& k, float width) {
+        if (k.measured_width == width) return k.measured_height;
+        gridItemLayout(k, width, std::nullopt);
+        k.measured_width = width;
+        k.measured_height = k.height;
+        return k.height;
+    }
+
+    float gridItemWidth(Box& k, float area, FlexAlign justify) {
+        const ComputedStyle& ks = *k.style;
+        const float room = std::max(0.0f, area - k.frameWidth() - k.margin[Left] - k.margin[Right]);
+        if (!ks.width.is_auto) {
+            float w = ks.width.resolve(area);
+            if (ks.border_box) w -= k.frameWidth();
+            return clampWidth(k, std::max(0.0f, w), area);
+        }
+        const bool stretch = (justify == FlexAlign::Auto || justify == FlexAlign::Stretch) && !ks.margin[Left].is_auto && !ks.margin[Right].is_auto;
+        const bool keyword = ks.width_keyword != ComputedStyle::WidthKeyword::None;
+        return clampWidth(k, stretch && !keyword ? room : shrinkToFit(k, room), area);
+    }
+
+    static void alignTracks(std::vector<SizedTrack>& t, float gap, std::optional<float> avail, FlexAlign align) {
+        float total = sumGaps(t, gap, 0, static_cast<int>(t.size()));
+        int live = 0;
+        for (const SizedTrack& k : t) {
+            if (k.collapsed) continue;
+            total += k.base;
+            ++live;
+        }
+        const float free_space = avail ? *avail - total : 0;
+        float pos = 0, between = gap;
+        if (live > 0) {
+            const auto n = static_cast<float>(live);
+            if (free_space > 0) {
+                switch (align) {
+                    case FlexAlign::End: pos = free_space; break;
+                    case FlexAlign::Center: pos = free_space / 2; break;
+                    case FlexAlign::SpaceBetween:
+                        if (live > 1) between += free_space / (n - 1);
+                        break;
+                    case FlexAlign::SpaceAround:
+                        pos = free_space / n / 2;
+                        between += free_space / n;
+                        break;
+                    case FlexAlign::SpaceEvenly:
+                        pos = free_space / (n + 1);
+                        between += free_space / (n + 1);
+                        break;
+                    default: break;
+                }
+            } else if (free_space < 0) {
+                if (align == FlexAlign::End) pos = free_space;
+                else if (align == FlexAlign::Center) pos = free_space / 2;
+            }
+        }
+        for (SizedTrack& k : t) {
+            k.offset = pos;
+            if (k.collapsed) continue;
+            pos += k.base + between;
+        }
+    }
+
+    static float areaSize(const std::vector<SizedTrack>& t, float gap, int from, int to) {
+        float total = sumGaps(t, gap, from, to);
+        for (int i = from; i < to; ++i)
+            if (!t[static_cast<size_t>(i)].collapsed) total += t[static_cast<size_t>(i)].base;
+        return total;
+    }
+
+    void layoutGrid(Box& c, std::optional<float> own_height) {
+        const ComputedStyle& s = *c.style;
+        for (auto& kp : c.kids) {
+            if (!kp->outOfFlow()) continue;
+            kp->static_y = 0;
+            layoutOutOfFlow(*kp, c.width);
+        }
+
+        // Repeats that fit a height can go by a definite one or by a max-height.
+        std::optional<float> repeat_height = own_height;
+        if (!repeat_height && !s.max_height.is_auto && !s.max_height.hasPercent()) repeat_height = s.max_height.px - (s.border_box ? c.frameHeight() : 0);
+        GridPlan plan = gridPlan(c, c.width, repeat_height);
+        const FlexAlign justify_content = s.justify_content;
+        const FlexAlign align_content = s.align_content;
+
+        // Columns come first, as a row's height depends on how wide things in it are.
+        sizeTracks(plan.cols, c.width, s.column_gap, TrackRoom::Definite, columnContributions(plan),
+                   justify_content == FlexAlign::Auto || justify_content == FlexAlign::Stretch);
+
+        std::vector<TrackContribution> row_asks;
+        row_asks.reserve(plan.items.size());
+        for (GridPlacedItem& it : plan.items) {
+            Box& k = *it.box;
+            const ComputedStyle& ks = *k.style;
+            const float area_w = areaSize(plan.cols, s.column_gap, it.col0, it.col1);
+            resolveSpacing(k, area_w);
+            const FlexAlign justify = ks.justify_self == FlexAlign::Auto ? s.justify_items : ks.justify_self;
+            const float w = gridItemWidth(k, area_w, justify);
+            float natural;
+            if (const auto fixed = !ks.height.hasPercent() ? specifiedHeight(k, std::nullopt) : std::nullopt) natural = *fixed;
+            else natural = gridItemNaturalHeight(k, w);
+            const float outer = natural + k.frameHeight() + k.margin[Top] + k.margin[Bottom];
+            TrackContribution ask;
+            ask.from = it.row0;
+            ask.to = it.row1;
+            ask.min = ask.max = outer;
+            ask.automatic = ks.overflow_clip ? k.frameHeight() + k.margin[Top] + k.margin[Bottom] : outer;
+            row_asks.push_back(ask);
+        }
+
+        const bool stretch_rows = align_content == FlexAlign::Auto || align_content == FlexAlign::Stretch;
+        const std::vector<SizedTrack> rows_before = plan.rows;
+        sizeTracks(plan.rows, own_height, s.row_gap, own_height ? TrackRoom::Definite : TrackRoom::MaxContent, row_asks, stretch_rows);
+        const auto rows_total = [&] { return areaSize(plan.rows, s.row_gap, 0, static_cast<int>(plan.rows.size())); };
+        const float box_extra = s.border_box ? c.frameHeight() : 0;
+        const float min_h = s.min_height.hasPercent() ? 0 : std::max(0.0f, s.min_height.px - box_extra);
+        const float max_h = s.max_height.is_auto || s.max_height.hasPercent() ? kNoLimit : std::max(0.0f, s.max_height.px - box_extra);
+        std::optional<float> rows_room = own_height;
+        if (!own_height) {
+            // Under a minimum, or over a maximum, it's as if that had been the height.
+            const float natural = rows_total();
+            if (natural < min_h) rows_room = min_h;
+            else if (natural > max_h) rows_room = max_h;
+            if (rows_room) {
+                plan.rows = rows_before;
+                sizeTracks(plan.rows, rows_room, s.row_gap, TrackRoom::Definite, row_asks, stretch_rows);
+            }
+        }
+
+        alignTracks(plan.cols, s.column_gap, c.width, justify_content);
+        alignTracks(plan.rows, s.row_gap, rows_room, align_content);
+
+        for (GridPlacedItem& it : plan.items) {
+            Box& k = *it.box;
+            const ComputedStyle& ks = *k.style;
+            const float area_w = areaSize(plan.cols, s.column_gap, it.col0, it.col1);
+            const float area_h = areaSize(plan.rows, s.row_gap, it.row0, it.row1);
+            const float area_x = plan.cols[static_cast<size_t>(it.col0)].offset;
+            const float area_y = plan.rows[static_cast<size_t>(it.row0)].offset;
+            const FlexAlign justify = ks.justify_self == FlexAlign::Auto ? s.justify_items : ks.justify_self;
+            const FlexAlign align = ks.align_self == FlexAlign::Auto ? s.align_items : ks.align_self;
+            const float w = gridItemWidth(k, area_w, justify);
+            const bool stretch_h = ks.height.is_auto && (align == FlexAlign::Auto || align == FlexAlign::Stretch) && !ks.margin[Top].is_auto && !ks.margin[Bottom].is_auto;
+            std::optional<float> h = specifiedHeight(k, area_h);
+            if (stretch_h) h = std::max(0.0f, area_h - k.frameHeight() - k.margin[Top] - k.margin[Bottom]);
+            if (h) {
+                if (!ks.max_height.is_auto) *h = std::min(*h, std::max(0.0f, ks.max_height.resolve(area_h) - (ks.border_box ? k.frameHeight() : 0)));
+                *h = std::max(*h, std::max(0.0f, ks.min_height.resolve(area_h) - (ks.border_box ? k.frameHeight() : 0)));
+            }
+            gridItemLayout(k, w, h);
+
+            const auto offset_in = [](float free_space, FlexAlign a, bool auto_a, bool auto_b) {
+                if (auto_a && auto_b) return std::max(0.0f, free_space) / 2;
+                if (auto_a) return std::max(0.0f, free_space);
+                if (auto_b) return 0.0f;
+                if (a == FlexAlign::End) return free_space;
+                if (a == FlexAlign::Center) return free_space / 2;
+                return 0.0f;
+            };
+            const float free_w = area_w - k.outerWidth() - k.margin[Left] - k.margin[Right];
+            const float free_h = area_h - k.outerHeight() - k.margin[Top] - k.margin[Bottom];
+            k.x = area_x + k.margin[Left] + offset_in(free_w, justify, ks.margin[Left].is_auto, ks.margin[Right].is_auto);
+            k.y = area_y + k.margin[Top] + offset_in(free_h, align, ks.margin[Top].is_auto, ks.margin[Bottom].is_auto);
+        }
+
+        float h = own_height.value_or(rows_room.value_or(rows_total()));
+        if (!own_height) h = std::min(h, max_h);
+        h = std::max(h, min_h);
+        c.height = clampCoord(h);
     }
 
     // ── Inline layout ─────────────────────────────────────────────────────────
@@ -1908,7 +2728,7 @@ private:
             while (inner->last_baseline < 0) {
                 // A flex container or a table goes by its first line, a block by its last.
                 const Box* next = nullptr;
-                const bool from_start = inner->isFlex() || inner->isTable() || inner->display() == Display::TableRowGroup ||
+                const bool from_start = inner->isFlex() || inner->isGrid() || inner->isTable() || inner->display() == Display::TableRowGroup ||
                                         inner->display() == Display::TableRow;
                 for (const auto& k : inner->kids) {
                     if (!k->inFlowBlock() || k->collapses_through) continue;

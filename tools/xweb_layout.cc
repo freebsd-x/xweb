@@ -10,6 +10,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -20,6 +21,7 @@
 #include "xweb/layout.h"
 #include "xweb/style.h"
 #include "xweb/text_measurer.h"
+#include "xweb/url.h"
 
 namespace {
 
@@ -57,13 +59,30 @@ int main(int argc, char** argv) {
     const std::filesystem::path page_path(argv[1]);
     const std::filesystem::path base = page_path.has_parent_path() ? page_path.parent_path() : std::filesystem::path(".");
     XrenderTextMeasurer text;
-    const StyledDocument styles(
-        *doc, {w, h},
-        [&](const std::string& href) -> std::string {
-            std::ifstream sheet(base / href.substr(0, href.find_first_of("?#")), std::ios::binary);
-            return {std::istreambuf_iterator<char>(sheet), std::istreambuf_iterator<char>()};
-        },
-        [&](const ComputedStyle& s) { return chWidth(text, s); });
+    const auto sheet_text = [&](const std::string& href) -> std::string {
+        std::ifstream sheet(base / href.substr(0, href.find_first_of("?#")), std::ios::binary);
+        return {std::istreambuf_iterator<char>(sheet), std::istreambuf_iterator<char>()};
+    };
+    const auto ch = [&](const ComputedStyle& s) { return chWidth(text, s); };
+    {
+        // Fonts have arrived before layout here: there's nothing to wait for.
+        const StyledDocument first(*doc, {w, h}, sheet_text, ch);
+        setPageWebFonts(first.fontFaces());
+        for (const WebFontFace& face : wantedWebFonts(*doc, first)) {
+            for (const std::string& src : face.sources) {
+                std::string body, type;
+                if (!decodeDataUrl(src, body, type)) {
+                    std::ifstream file(base / src.substr(0, src.find_first_of("?#")), std::ios::binary);
+                    body.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+                }
+                auto bytes = std::make_shared<const std::string>(std::move(body));
+                if (!webFontUsable(bytes)) continue;
+                (void)addWebFontData(src, bytes);
+                break;
+            }
+        }
+    }
+    const StyledDocument styles(*doc, {w, h}, sheet_text, ch);
     FileImages images(base);
     const PageLayout page = layoutPage(*doc, styles, text, &images, w, h);
     // In document order, whatever order they were painted in.

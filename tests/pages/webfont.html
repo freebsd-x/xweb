@@ -1,0 +1,45 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>
+@font-face { font-family: "Plain Woff"; src: url(fonts/serif.woff) format("woff"); }
+@font-face { font-family: Two; src: url(missing.woff2) format("woff2"), url(fonts/mono-bold.woff) format("woff"); }
+@font-face { font-family: "Unsupported"; src: url(nope.eot) format("embedded-opentype"), url("fonts/sans.ttf"); }
+@font-face { font-family: Styled; src: url(fonts/serif.woff); font-weight: 400; }
+@font-face { font-family: Styled; src: url(fonts/sans.ttf); font-weight: 700; }
+@font-face { font-family: Styled; src: url(fonts/serif-italic.woff); font-style: italic; }
+@font-face { font-family: Split; src: url(fonts/serif.woff); unicode-range: U+0-7F; }
+@font-face { font-family: Split; src: url(fonts/mono-bold.woff); unicode-range: U+30-39, U+25??; }
+@font-face { font-family: OnlyB; src: url(fonts/mono-bold.woff); unicode-range: U+4F; }
+@font-face { font-family: Broken; src: url(webfont.html); }
+@media (max-width: 10px) { @font-face { font-family: NotNow; src: url(fonts/sans.ttf); } }
+body { margin: 8px; font: 16px/normal sans-serif; }
+div { width: max-content; margin: 2px 0; }
+.a { font-family: "Plain Woff", monospace; }
+.b { font-family: Two; font-size: 20px; }
+.c { font-family: Unsupported; }
+.d { font-family: Styled; }
+.e { font-family: Styled; font-weight: bold; }
+.f { font-family: Styled; font-style: italic; }
+/* Set because a line mixing fonts is taller under "normal" in Chromium; see README. */
+.g { font-family: Split; line-height: 22px; }
+.h { font-family: OnlyB, "Plain Woff"; line-height: 22px; }
+.i { font-family: Broken, Two; }
+.j { font-family: NotNow, Two; }
+.k { font-family: Nothing, "Plain Woff"; font-size: 30px; }
+.l { font-family: "plain woff"; }
+.m { display: inline-block; width: 12ch; font-family: Two; border: 1px solid; }
+</style>
+<div class="a">The quick brown fox jumps over the lazy dog</div>
+<div class="b">The quick brown fox jumps over the lazy dog</div>
+<div class="c">The quick brown fox jumps over the lazy dog</div>
+<div class="d">The quick brown fox jumps over the lazy dog</div>
+<div class="e">The quick brown fox jumps over the lazy dog</div>
+<div class="f">The quick brown fox jumps over the lazy dog</div>
+<div class="g">Letters and 0123456789 digits</div>
+<div class="h">OOO letters aside OOO</div>
+<div class="i">The quick brown fox</div>
+<div class="j">The quick brown fox</div>
+<div class="k">Tall line in a web font</div>
+<div class="l">Names ignore case</div>
+<p class="m">ch</p>
+<div id="proof" style="font-family: Two; font-size: 100px; line-height: 1">MMMMMMMMMM</div>

@@ -342,3 +342,75 @@ TEST(Links, ABlockLinkIsClickableAllOver) {
     EXPECT_FLOAT_EQ(r.page.links[0].h, 20);
     EXPECT_EQ(r.page.links[1].href, "/y");
 }
+
+// Grid. Boxes against Chromium are in tests/pages/grid.html; these pin the rules down.
+
+TEST(Grid, FixedFrAndGaps) {
+    const auto r = layout("<!doctype html><style>body{margin:0}#g{display:grid;grid-template-columns:100px 1fr 3fr;gap:10px 20px;grid-auto-rows:30px}</style>"
+                          "<div id=g><i id=a style=display:block>a</i><i id=b style=display:block>b</i><i id=c style=display:block>c</i><i id=d style=display:block>d</i></div>", 660);
+    EXPECT_FLOAT_EQ(r.box("a").w, 100);
+    EXPECT_FLOAT_EQ(r.box("b").x, 120);
+    EXPECT_FLOAT_EQ(r.box("b").w, 130);
+    EXPECT_FLOAT_EQ(r.box("c").x, 270);
+    EXPECT_FLOAT_EQ(r.box("c").w, 390);
+    EXPECT_FLOAT_EQ(r.box("d").y, 40);
+    EXPECT_FLOAT_EQ(r.box("g").h, 70);
+}
+
+TEST(Grid, NamedAreasPlaceItems) {
+    const auto r = layout("<!doctype html><style>body{margin:0}#g{display:grid;grid-template:'h h' 10px 'n m' 20px / 50px 1fr}"
+                          "#m{grid-area:m}#h{grid-area:h}#n{grid-area:n}</style><div id=g><div id=m></div><div id=n></div><div id=h></div></div>", 300);
+    EXPECT_FLOAT_EQ(r.box("h").w, 300);
+    EXPECT_FLOAT_EQ(r.box("n").y, 10);
+    EXPECT_FLOAT_EQ(r.box("n").w, 50);
+    EXPECT_FLOAT_EQ(r.box("m").x, 50);
+    EXPECT_FLOAT_EQ(r.box("m").h, 20);
+}
+
+TEST(Grid, AutoFillAndAutoFit) {
+    const std::string kids = "<div id=a></div><div id=b></div>";
+    auto r = layout("<!doctype html><style>body{margin:0}#g{display:grid;grid-template-columns:repeat(auto-fill,minmax(100px,1fr))}</style><div id=g>" + kids + "</div>", 450);
+    EXPECT_FLOAT_EQ(r.box("a").w, 112.5f);   // four tracks
+    r = layout("<!doctype html><style>body{margin:0}#g{display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr))}</style><div id=g>" + kids + "</div>", 450);
+    EXPECT_FLOAT_EQ(r.box("a").w, 225);      // the empty ones collapse
+}
+
+TEST(Grid, ItemsAreAlignedInTheirAreas) {
+    const auto r = layout("<!doctype html><style>body{margin:0}#g{display:grid;grid-template-columns:100px;grid-template-rows:100px}"
+                          "#a{width:20px;height:10px;justify-self:end;align-self:center}</style><div id=g><div id=a></div></div>", 300);
+    EXPECT_FLOAT_EQ(r.box("a").x, 80);
+    EXPECT_FLOAT_EQ(r.box("a").y, 45);
+}
+
+TEST(Grid, AnInvalidTemplateIsIgnored) {
+    // "b" isn't a rectangle, so the whole declaration goes, as if it weren't there.
+    const auto r = layout("<!doctype html><style>body{margin:0}#g{display:grid;grid-template-areas:'a b' 'b b'}</style><div id=g><div id=a style=height:5px></div><div id=c style=height:5px></div></div>", 300);
+    EXPECT_FLOAT_EQ(r.box("c").y, 5);
+    EXPECT_FLOAT_EQ(r.box("c").w, 300);
+}
+
+TEST(Width, ContentKeywords) {
+    const auto r = layout("<!doctype html><style>body{margin:0;font-size:10px}div{margin:auto}</style>"
+                          "<div id=a style=width:max-content>aaaa bbbb</div><div id=b style=width:min-content>aaaa bbbb</div><div id=c style=width:fit-content>aaaa bbbb</div>", 300);
+    EXPECT_FLOAT_EQ(r.box("a").w, 45);
+    EXPECT_FLOAT_EQ(r.box("b").w, 20);
+    EXPECT_FLOAT_EQ(r.box("c").w, 45);
+    EXPECT_FLOAT_EQ(r.box("c").x, 127.5f);   // centred, as it has a width of its own
+}
+
+TEST(Contents, ChildrenTakeItsPlace) {
+    const auto r = layout("<!doctype html><style>body{margin:0}#g{display:grid;grid-template-columns:100px 100px}</style>"
+                          "<div id=g><section style='display:contents;border:9px solid'><div id=a></div><div style=display:contents><div id=b></div></div></section></div>", 400);
+    EXPECT_FLOAT_EQ(r.box("a").x, 0);
+    EXPECT_FLOAT_EQ(r.box("a").w, 100);
+    EXPECT_FLOAT_EQ(r.box("b").x, 100);
+}
+
+TEST(Contents, HasNoBoxButPassesOnItsStyle) {
+    const auto r = layout("<!doctype html><body style=margin:0><div id=a style='display:contents;font-size:20px'><p id=b style=margin:0>x</p></div>", 400);
+    for (const auto& b : r.page.boxes) {
+        const std::string* id = b.node->attr("id");
+        EXPECT_FALSE(id && *id == "a");
+    }
+    EXPECT_FLOAT_EQ(r.box("b").w, 400);
+}

@@ -23,6 +23,7 @@ struct Token {
     double number = 0;     // Number, Percentage, Dimension
     bool is_integer = false;
     bool is_id = false;    // Hash that would make a valid #id
+    uint32_t begin = 0, end = 0;   // where it is in the source
 };
 
 [[nodiscard]] std::vector<Token> tokenize(std::string_view css);
@@ -83,8 +84,15 @@ struct Rule {
     std::vector<std::vector<Token>> media;
 };
 
+struct FontFaceRule {
+    std::vector<Declaration> declarations;
+    std::string unicode_range;   // as written: it doesn't survive being tokenized
+    std::vector<std::vector<Token>> media;
+};
+
 struct Stylesheet {
     std::vector<Rule> rules;
+    std::vector<FontFaceRule> font_faces;
     std::vector<std::string> imports;   // @import URLs, in order
 };
 
