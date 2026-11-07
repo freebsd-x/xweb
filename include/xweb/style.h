@@ -93,6 +93,15 @@ struct GridLine {
     [[nodiscard]] bool isAuto() const noexcept { return line == 0 && span == 0 && name.empty(); }
 };
 
+enum class BorderStyle : uint8_t { None, Hidden, Solid, Dashed, Dotted, Double, Groove, Ridge, Inset, Outset };
+
+// One box-shadow.
+struct BoxShadow {
+    float x = 0, y = 0, blur = 0, spread = 0;
+    Color color{0, 0, 0, 255};
+    bool inset = false;
+};
+
 // A CSS gradient as specified: what it comes to depends on the box it fills.
 struct GradientStop {
     Color color;
@@ -219,7 +228,9 @@ struct ComputedStyle {
     Float float_side = Float::None;
     Clear clear = Clear::None;
     bool overflow_clip = false;        // overflow other than visible; we don't draw scrollbars
-    float border_radius = 0;
+    Length radius[4][2];   // corners top-left, top-right, bottom-right, bottom-left; horizontal and vertical
+    BorderStyle border_style[4] = {BorderStyle::None, BorderStyle::None, BorderStyle::None, BorderStyle::None};
+    std::shared_ptr<const std::vector<BoxShadow>> box_shadow;   // first on top
     VerticalAlign vertical_align = VerticalAlign::Baseline;
     bool table_fixed = false;
     // Flexbox

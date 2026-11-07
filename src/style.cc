@@ -1401,6 +1401,19 @@ bool isBorderStyle(std::string_view s) {
     return std::find(std::begin(v), std::end(v), s) != std::end(v);
 }
 
+BorderStyle borderStyleOf(std::string_view s) {
+    if (s == "hidden") return BorderStyle::Hidden;
+    if (s == "solid") return BorderStyle::Solid;
+    if (s == "dashed") return BorderStyle::Dashed;
+    if (s == "dotted") return BorderStyle::Dotted;
+    if (s == "double") return BorderStyle::Double;
+    if (s == "groove") return BorderStyle::Groove;
+    if (s == "ridge") return BorderStyle::Ridge;
+    if (s == "inset") return BorderStyle::Inset;
+    if (s == "outset") return BorderStyle::Outset;
+    return BorderStyle::None;
+}
+
 }  // namespace
 
 bool parseColor(const Tokens& value, const Color& current, Color& out) {
@@ -1907,6 +1920,7 @@ private:
         const LengthContext c = lengthContext(s);
         float width = 3;
         bool none = true;
+        BorderStyle style = BorderStyle::None;
         Color color = s.color;
         for (size_t start : valueStarts(v)) {
             const Token& t = v[start];
@@ -1919,6 +1933,7 @@ private:
             if (t.type == TokenType::Ident && isBorderStyle(lower(t.text))) {
                 const std::string n = lower(t.text);
                 none = n == "none" || n == "hidden";
+                style = borderStyleOf(n);
                 continue;
             }
             size_t i = start;
@@ -1928,6 +1943,7 @@ private:
         for (int side : sides) {
             s.border_width[side] = width;
             border_none_[side] = none;
+            s.border_style[side] = style;
             s.border_color[side] = color;
         }
     }
@@ -2513,9 +2529,15 @@ private:
         else if (p == "clip-path") to.clip_path = from.clip_path;
         else if (p == "opacity") to.opacity = from.opacity;
         else if (p == "box-sizing") to.border_box = from.border_box;
+        else if (p == "box-shadow") to.box_shadow = from.box_shadow;
         else if (p == "z-index") to.z_index = from.z_index;
+        else if (p.ends_with("radius")) {
+            for (int i = 0; i < 4; ++i)
+                for (int j = 0; j < 2; ++j) to.radius[i][j] = from.radius[i][j];
+        }
         else if (p.starts_with("border")) {
             std::copy(std::begin(from.border_width), std::end(from.border_width), std::begin(to.border_width));
+            std::copy(std::begin(from.border_style), std::end(from.border_style), std::begin(to.border_style));
             std::copy(std::begin(from.border_color), std::end(from.border_color), std::begin(to.border_color));
         }
         else if (p == "top") to.offset[Top] = from.offset[Top];
@@ -2540,12 +2562,14 @@ private:
         }
         const Tokens& v = *vp;
         const std::string kw = keyword(v);
-        if (p.starts_with("border") && (kw == "inherit" || kw == "initial" || kw == "unset" || kw == "revert")) {
+        if (p.starts_with("border") && !p.ends_with("radius") && p != "border-spacing" && p != "border-collapse" &&
+            (kw == "inherit" || kw == "initial" || kw == "unset" || kw == "revert")) {
             const bool from_parent = kw == "inherit";
             for (int side = 0; side < 4; ++side) {
                 s.border_width[side] = from_parent ? parent.border_width[side] : 3.0f;
                 s.border_color[side] = from_parent ? parent.border_color[side] : s.color;
                 border_none_[side] = from_parent ? parent.border_width[side] == 0 : true;
+                s.border_style[side] = from_parent ? parent.border_style[side] : BorderStyle::None;
             }
             return;
         }
@@ -2596,9 +2620,75 @@ private:
             return;
         }
         if (p == "border-radius") {
-            Length l;
-            size_t k = i;
-            if (lengthAt(v, k, c, l, false)) s.border_radius = std::max(0.0f, l.px);
+            // Up to four horizontal radii, then maybe "/" and up to four vertical ones.
+            std::vector<Length> lists[2];
+            int which = 0;
+            for (size_t start : valueStarts(v)) {
+                if (v[start].type == TokenType::Delim && v[start].text == "/") {
+                    if (which == 1) return;
+                    which = 1;
+                    continue;
+                }
+                size_t k = start;
+                Length l;
+                if (!lengthAt(v, k, c, l, false) || l.px < 0 || l.percent < 0 || lists[which].size() == 4) return;
+                lists[which].push_back(l);
+            }
+            if (lists[0].empty() || (which == 1 && lists[1].empty())) return;
+            if (which == 0) lists[1] = lists[0];
+            for (int axis = 0; axis < 2; ++axis) {
+                const std::vector<Length>& l = lists[axis];
+                const Length tl = l[0], tr = l.size() > 1 ? l[1] : l[0], br = l.size() > 2 ? l[2] : l[0], bl = l.size() > 3 ? l[3] : tr;
+                s.radius[0][axis] = tl;
+                s.radius[1][axis] = tr;
+                s.radius[2][axis] = br;
+                s.radius[3][axis] = bl;
+            }
+            return;
+        }
+        if (p == "border-top-left-radius" || p == "border-top-right-radius" || p == "border-bottom-right-radius" || p == "border-bottom-left-radius") {
+            const int corner = p == "border-top-left-radius" ? 0 : p == "border-top-right-radius" ? 1 : p == "border-bottom-right-radius" ? 2 : 3;
+            std::vector<Length> got;
+            for (size_t start : valueStarts(v)) {
+                size_t k = start;
+                Length l;
+                if (!lengthAt(v, k, c, l, false) || l.px < 0 || l.percent < 0 || got.size() == 2) return;
+                got.push_back(l);
+            }
+            if (got.empty()) return;
+            s.radius[corner][0] = got[0];
+            s.radius[corner][1] = got.size() > 1 ? got[1] : got[0];
+            return;
+        }
+        if (p == "box-shadow" || p == "-webkit-box-shadow") {
+            if (kw == "none") { s.box_shadow = nullptr; return; }
+            auto shadows = std::make_shared<std::vector<BoxShadow>>();
+            for (const Tokens& part : commaParts(v)) {
+                BoxShadow sh;
+                sh.color = s.color;
+                std::vector<float> lengths;
+                for (size_t start : valueStarts(part)) {
+                    size_t k = start;
+                    if (part[k].type == TokenType::Ident && lower(part[k].text) == "inset") { sh.inset = true; continue; }
+                    Length l;
+                    if (lengthAt(part, k, c, l, false)) {
+                        if (lengths.size() == 4) return;
+                        lengths.push_back(l.px);
+                        continue;
+                    }
+                    k = start;
+                    Color col;
+                    if (!colorFromTokens(part, k, s.color, col)) return;
+                    sh.color = col;
+                }
+                if (lengths.size() < 2) return;
+                sh.x = lengths[0];
+                sh.y = lengths[1];
+                sh.blur = lengths.size() > 2 ? std::max(0.0f, lengths[2]) : 0;
+                sh.spread = lengths.size() > 3 ? lengths[3] : 0;
+                if (shadows->size() < 16) shadows->push_back(sh);
+            }
+            s.box_shadow = shadows->empty() ? nullptr : std::move(shadows);
             return;
         }
         if (p == "vertical-align") {
@@ -2853,17 +2943,20 @@ private:
                 const std::string n = lower(v[starts[idx]].text);
                 return n == "none" || n == "hidden";
             };
-            const auto setSide = [&](int side, bool none) { border_none_[side] = none; };
-            if (p == "border-top-style") setSide(Top, noneAt(0));
-            else if (p == "border-right-style") setSide(Right, noneAt(0));
-            else if (p == "border-bottom-style") setSide(Bottom, noneAt(0));
-            else if (p == "border-left-style") setSide(Left, noneAt(0));
+            const auto setSide = [&](int side, size_t idx) {
+                border_none_[side] = noneAt(idx);
+                s.border_style[side] = idx < starts.size() ? borderStyleOf(lower(v[starts[idx]].text)) : BorderStyle::None;
+            };
+            if (p == "border-top-style") setSide(Top, 0);
+            else if (p == "border-right-style") setSide(Right, 0);
+            else if (p == "border-bottom-style") setSide(Bottom, 0);
+            else if (p == "border-left-style") setSide(Left, 0);
             else {
                 const size_t n = starts.size();
-                setSide(Top, noneAt(0));
-                setSide(Right, noneAt(n > 1 ? 1 : 0));
-                setSide(Bottom, noneAt(n > 2 ? 2 : 0));
-                setSide(Left, noneAt(n > 3 ? 3 : (n > 1 ? 1 : 0)));
+                setSide(Top, 0);
+                setSide(Right, n > 1 ? 1 : 0);
+                setSide(Bottom, n > 2 ? 2 : 0);
+                setSide(Left, n > 3 ? 3 : (n > 1 ? 1 : 0));
             }
             return;
         }

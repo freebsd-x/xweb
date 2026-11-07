@@ -3221,26 +3221,82 @@ private:
         }
     }
 
+    void addBoxPaint(float x, float y, float w, float h, std::shared_ptr<const BoxPaint> box) {
+        if (!(w > 0) || !(h > 0) || w > kMaxCoord || h > kMaxCoord) return;
+        PaintOp op;
+        op.kind = PaintKind::Box;
+        op.x = x;
+        op.y = y;
+        op.w = w;
+        op.h = h;
+        op.box = std::move(box);
+        out_->ops.push_back(std::move(op));
+    }
+
+    void paintShadows(const BoxPaint& base, float x, float y, float opacity, bool inset, const std::vector<BoxShadow>& shadows) {
+        // The first is on top: painted last.
+        for (size_t i = shadows.size(); i-- > 0;) {
+            const BoxShadow& sh = shadows[i];
+            if (sh.inset != inset || !sh.color.visible()) continue;
+            auto p = std::make_shared<BoxPaint>(base);
+            p->part = inset ? BoxPaint::Part::InsetShadow : BoxPaint::Part::OuterShadow;
+            p->shadow = sh;
+            p->shadow.color = faded(sh.color, opacity);
+            if (inset) {
+                p->ox = p->oy = 0;
+                addBoxPaint(x, y, base.w, base.h, std::move(p));
+                continue;
+            }
+            // Room for the blur, the spread and the offset around the box.
+            const float m = std::max(0.0f, sh.spread) + sh.blur * 1.5f + 1;
+            const float left = std::max(0.0f, m - sh.x), top = std::max(0.0f, m - sh.y);
+            const float right = std::max(0.0f, m + sh.x), bottom = std::max(0.0f, m + sh.y);
+            p->ox = left;
+            p->oy = top;
+            addBoxPaint(x - left, y - top, base.w + left + right, base.h + top + bottom, std::move(p));
+        }
+    }
+
     void paintFrame(const Box& b, float x, float y, float opacity) {
         const ComputedStyle& s = *b.style;
         const float w = b.outerWidth(), h = b.outerHeight();
         if (s.hidden) return;
-        const float r = std::min({s.border_radius, w / 2, h / 2});
-        const bool same_border = b.border[Top] > 0 && b.border[Top] == b.border[Right] && b.border[Top] == b.border[Bottom] &&
-                                 b.border[Top] == b.border[Left] && s.border_color[Top] == s.border_color[Right] &&
-                                 s.border_color[Top] == s.border_color[Bottom] && s.border_color[Top] == s.border_color[Left];
+        // Corners, as lengths of this box, fitted so neighbours don't overlap.
+        BoxPaint base;
+        base.w = w;
+        base.h = h;
+        bool rounded = false;
+        for (int i = 0; i < 4; ++i) {
+            base.radii[i][0] = std::max(0.0f, s.radius[i][0].resolve(w));
+            base.radii[i][1] = std::max(0.0f, s.radius[i][1].resolve(h));
+            if (base.radii[i][0] <= 0 || base.radii[i][1] <= 0) base.radii[i][0] = base.radii[i][1] = 0;
+            rounded = rounded || base.radii[i][0] > 0;
+        }
+        fitRadii(base.radii, w, h);
+        // One circular radius all round is what a plain rectangle can do.
+        const float r0 = base.radii[0][0];
+        bool uniform = true;
+        for (int i = 0; i < 4; ++i) uniform = uniform && base.radii[i][0] == r0 && base.radii[i][1] == r0;
+        for (int i = 0; i < 4; ++i) {
+            base.border[i] = b.border[i];
+            base.colors[i] = faded(s.border_color[i], opacity);
+            base.styles[i] = s.border_style[i];
+        }
+
         const bool own_background = &b != skip_background_;
+        if (own_background && s.box_shadow) paintShadows(base, x, y, opacity, false, *s.box_shadow);
         // A mask shows the background colour only where the mask's images are.
         const Color bg = !own_background || s.masked ? Color{0, 0, 0, 0} : faded(s.background, opacity);
-        if (r > 0 && same_border && bg.visible()) {
-            // A rounded border is the border colour's shape with the fill's inside it.
-            const float bw = b.border[Top];
-            addRect(x, y, w, h, faded(s.border_color[Top], opacity), r);
-            addRect(x + bw, y + bw, w - 2 * bw, h - 2 * bw, bg, std::max(0.0f, r - bw));
-            if (own_background && s.background_layers) paintLayers(b, x, y, *s.background_layers, opacity, nullptr, Rect{0, 0, 0, 0}, false);
-            return;
+        if (bg.visible()) {
+            if (uniform) {
+                addRect(x, y, w, h, bg, r0);
+            } else {
+                auto p = std::make_shared<BoxPaint>(base);
+                p->part = BoxPaint::Part::Background;
+                p->background = bg;
+                addBoxPaint(x, y, w, h, std::move(p));
+            }
         }
-        addRect(x, y, w, h, bg, r);
         if (own_background) {
             if (s.masked) {
                 const Color tint = faded(s.background, opacity);
@@ -3248,9 +3304,29 @@ private:
             } else if (s.background_layers) {
                 paintLayers(b, x, y, *s.background_layers, opacity, nullptr, Rect{0, 0, 0, 0}, false);
             }
+            if (s.box_shadow) paintShadows(base, x, y, opacity, true, *s.box_shadow);
+        }
+
+        const float t = b.border[Top], rt = b.border[Right], bt = b.border[Bottom], l = b.border[Left];
+        if (t <= 0 && rt <= 0 && bt <= 0 && l <= 0) return;
+        // Square, solid and the same colour where sides meet: rectangles. Anything else is
+        // drawn: rounded, patterned, shaded, or two colours meeting on a diagonal.
+        bool plain = !rounded || b.collapsed_border;
+        for (int i = 0; i < 4 && plain; ++i) {
+            const BorderStyle st = s.border_style[i];
+            if (b.border[i] > 0 && st != BorderStyle::Solid && st != BorderStyle::None && st != BorderStyle::Hidden && !b.collapsed_border) plain = false;
+            const int next = (i + 1) % 4;
+            if (b.border[i] > 0 && b.border[next] > 0 && std::max(b.border[i], b.border[next]) >= 2 && !(s.border_color[i] == s.border_color[next]) &&
+                !b.collapsed_border)
+                plain = false;
+        }
+        if (!plain) {
+            auto p = std::make_shared<BoxPaint>(base);
+            p->part = BoxPaint::Part::Border;
+            addBoxPaint(x, y, w, h, std::move(p));
+            return;
         }
         // A collapsed border is centred on the edge the two cells share.
-        const float t = b.border[Top], rt = b.border[Right], bt = b.border[Bottom], l = b.border[Left];
         const float grow = b.collapsed_border ? 1 : 0;
         if (t > 0) addRect(x - grow * l, y - grow * t, w + grow * (l + rt), t * (1 + grow), faded(s.border_color[Top], opacity));
         if (bt > 0) addRect(x - grow * l, y + h - bt, w + grow * (l + rt), bt * (1 + grow), faded(s.border_color[Bottom], opacity));

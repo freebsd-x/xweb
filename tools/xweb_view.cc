@@ -406,6 +406,7 @@ public:
                 case web::PaintKind::Image: image(dl, op, op.x + at.x_, y); break;
                 case web::PaintKind::Gradient: gradient(dl, op, op.x + at.x_, y); break;
                 case web::PaintKind::Svg: inlineSvg(dl, op, op.x + at.x_, y); break;
+                case web::PaintKind::Box: boxPaint(dl, op, op.x + at.x_, y); break;
                 default: break;
             }
         }
@@ -616,6 +617,34 @@ private:
         const web::Gradient& g = *op.gradient;
         const float w = op.w, h = op.h;
         if (const CachedRaster* r = cached(key, [&, pw = pw, ph = ph] { return web::renderGradient(g, w, h, pw, ph); })) drawRaster(dl, *r, x, y, op.w, op.h);
+    }
+
+    static std::string boxKey(const web::BoxPaint& b) {
+        std::string k = std::to_string(static_cast<int>(b.part));
+        const auto f = [&](float v) { k += "," + std::to_string(v); };
+        f(b.w); f(b.h); f(b.ox); f(b.oy);
+        for (const auto& r : b.radii) { f(r[0]); f(r[1]); }
+        for (int i = 0; i < 4; ++i) {
+            f(b.border[i]);
+            k += ":" + colorKey(b.colors[i]) + ":" + std::to_string(static_cast<int>(b.styles[i]));
+        }
+        k += "|" + colorKey(b.background);
+        f(b.shadow.x); f(b.shadow.y); f(b.shadow.blur); f(b.shadow.spread);
+        k += colorKey(b.shadow.color);
+        return k;
+    }
+
+    void boxPaint(fbx::xrender::DisplayList& dl, const web::PaintOp& op, float x, float y) {
+        if (!op.box || op.w <= 0 || op.h <= 0) return;
+        // On whole pixels, its fraction moved inside it, so nothing is resampled.
+        const float x0 = std::floor(x), y0 = std::floor(y);
+        web::BoxPaint box = *op.box;
+        box.ox += x - x0;
+        box.oy += y - y0;
+        const float w = std::ceil(op.w + x - x0), h = std::ceil(op.h + y - y0);
+        const auto [pw, ph] = rasterSize(w, h);
+        const std::string key = "b:" + boxKey(box) + ":" + std::to_string(pw) + "x" + std::to_string(ph);
+        if (const CachedRaster* r = cached(key, [&, pw = pw, ph = ph] { return web::renderBoxPaint(box, w, h, pw, ph); })) drawRaster(dl, *r, x0, y0, w, h);
     }
 
     void inlineSvg(fbx::xrender::DisplayList& dl, const web::PaintOp& op, float x, float y) {

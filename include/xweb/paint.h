@@ -87,6 +87,8 @@ public:
     void composite(const Canvas& layer, float opacity, const Canvas* mask = nullptr);
     // Coverage of these polygons, as a canvas whose alpha is it: for clip paths.
     static Canvas coverage(uint32_t width, uint32_t height, const Contours& contours, bool even_odd);
+    // A mask from coverage values, one per pixel.
+    static Canvas fromAlpha(uint32_t width, uint32_t height, const std::vector<float>& alpha);
 
     void setClip(float x, float y, float w, float h);
     void resetClip();
@@ -116,6 +118,29 @@ struct StrokeStyle {
 [[nodiscard]] std::vector<std::pair<std::vector<Point>, bool>> parsePathData(const std::string& d, float scale);
 // A transform attribute's value.
 [[nodiscard]] Matrix parseTransform(const std::string& text);
+
+// What layout can't hand over as plain rectangles: a background with uneven corners,
+// borders that are rounded, patterned, shaded or split diagonally, and shadows.
+struct BoxPaint {
+    enum class Part : uint8_t { Background, Border, OuterShadow, InsetShadow } part = Part::Background;
+    float w = 0, h = 0;      // the border box
+    float ox = 0, oy = 0;    // where its top left is in the area drawn
+    float radii[4][2] = {};  // corners clockwise from top left, x and y, already fitted to the box
+    float border[4] = {};    // top, right, bottom, left
+    Color colors[4];
+    BorderStyle styles[4] = {};
+    Color background;
+    BoxShadow shadow;
+};
+// Drawn into an area this big (CSS pixels) at this many pixels.
+[[nodiscard]] Raster renderBoxPaint(const BoxPaint& box, float area_w, float area_h, uint32_t px_w, uint32_t px_h);
+// A rounded rectangle with each corner its own: radii as in BoxPaint.
+[[nodiscard]] Contours roundedRect(float x, float y, float w, float h, const float radii[4][2]);
+// Corner radii scaled down together until adjacent ones fit along each side.
+void fitRadii(float radii[4][2], float w, float h);
+// Chromium's shading for inset, outset, groove and ridge.
+[[nodiscard]] Color darker(Color c);
+[[nodiscard]] Color lighter(Color c);
 
 // A CSS gradient filling a box this size, at this many pixels.
 [[nodiscard]] Raster renderGradient(const Gradient& gradient, float box_w, float box_h, uint32_t px_w, uint32_t px_h);

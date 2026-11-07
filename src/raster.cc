@@ -5,6 +5,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstring>
+#include <functional>
 
 #include "xweb/paint.h"
 
@@ -267,6 +268,12 @@ void Canvas::fill(const Contours& contours, bool even_odd, const Paint& paint) {
     scan(contours, even_odd, clip_x0_, clip_y0_, clip_x1_, clip_y1_, [&](int y, const float* cover, int x0, int x1) {
         blendSpan(static_cast<uint32_t>(y), static_cast<uint32_t>(x0), static_cast<uint32_t>(x1), cover, paint);
     });
+}
+
+Canvas Canvas::fromAlpha(uint32_t width, uint32_t height, const std::vector<float>& alpha) {
+    Canvas out(width, height);
+    for (size_t i = 0; i < alpha.size() && i * 4 + 3 < out.px_.size(); ++i) out.px_[i * 4 + 3] = alpha[i];
+    return out;
 }
 
 Canvas Canvas::coverage(uint32_t width, uint32_t height, const Contours& contours, bool even_odd) {
@@ -899,6 +906,437 @@ Raster renderGradient(const Gradient& g, float box_w, float box_h, uint32_t px_w
             o[3] = c.a;
         }
     return out;
+}
+
+}  // namespace fbx::xweb
+
+// ── Boxes: uneven corners, fancy borders, shadows ────────────────────────────
+
+namespace fbx::xweb {
+
+Contours roundedRect(float x, float y, float w, float h, const float radii[4][2]) {
+    if (w <= 0 || h <= 0) return {};
+    std::vector<Point> c;
+    const auto corner = [&](int i, float cx, float cy, float a0) {
+        const float rx = radii[i][0], ry = radii[i][1];
+        if (rx <= 0 || ry <= 0) {
+            c.push_back({cx + (i == 1 || i == 2 ? 0 : 0), cy});
+            return false;
+        }
+        arcPoints(c, cx, cy, rx, ry, a0, a0 + kPi / 2, 1);
+        return true;
+    };
+    // Each corner's arc centre, or the corner itself when it's square.
+    if (!corner(0, x + radii[0][0], y + radii[0][1], kPi)) c.back() = {x, y};
+    if (!corner(1, x + w - radii[1][0], y + radii[1][1], 3 * kPi / 2)) c.back() = {x + w, y};
+    if (!corner(2, x + w - radii[2][0], y + h - radii[2][1], 0)) c.back() = {x + w, y + h};
+    if (!corner(3, x + radii[3][0], y + h - radii[3][1], kPi / 2)) c.back() = {x, y + h};
+    return {c};
+}
+
+void fitRadii(float radii[4][2], float w, float h) {
+    float f = 1;
+    const auto check = [&](float side, float a, float b) {
+        if (a + b > side && a + b > 0) f = std::min(f, side / (a + b));
+    };
+    check(w, radii[0][0], radii[1][0]);
+    check(h, radii[1][1], radii[2][1]);
+    check(w, radii[2][0], radii[3][0]);
+    check(h, radii[3][1], radii[0][1]);
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 2; ++j) radii[i][j] = std::max(0.0f, radii[i][j] * f);
+}
+
+namespace {
+
+bool isBlack(Color c) { return c.r == 0 && c.g == 0 && c.b == 0; }
+
+// As Blink's Color::Dark and Color::Light.
+Color shade(Color c, bool dark) {
+    if (isBlack(c)) return {0x54, 0x54, 0x54, c.a};
+    const float r = c.r / 255.0f, g = c.g / 255.0f, b = c.b / 255.0f;
+    const float v = std::max({r, g, b});
+    float m;
+    if (dark) m = v == 0 ? 0 : std::max(0.0f, (v - 0.33f) / v);
+    else m = v == 0 ? 0 : std::min(1.0f, v + 0.33f) / v;
+    const float k = 255.99998f;
+    return {static_cast<uint8_t>(std::clamp(r * m * k, 0.0f, 255.0f)), static_cast<uint8_t>(std::clamp(g * m * k, 0.0f, 255.0f)),
+            static_cast<uint8_t>(std::clamp(b * m * k, 0.0f, 255.0f)), c.a};
+}
+
+int distanceSquared(Color a, Color b) {
+    const int dr = a.r - b.r, dg = a.g - b.g, db = a.b - b.b;
+    return dr * dr + dg * dg + db * db;
+}
+
+// Blink's CalculateBorderStyleColor: the top and left of an inset darken, and so on.
+Color styleColor(BorderStyle style, int side, Color c) {
+    const bool top_left = side == 0 || side == 3;
+    const bool darken = top_left == (style == BorderStyle::Inset || style == BorderStyle::Groove);
+    if (darken) {
+        if (distanceSquared(c, {0, 0, 0, 255}) > distanceSquared({0x20, 0x20, 0x20, 255}, {0, 0, 0, 255})) return shade(c, true);
+    } else if (distanceSquared(c, {255, 255, 255, 255}) > distanceSquared({0xEB, 0xEB, 0xEB, 255}, {255, 255, 255, 255})) {
+        return shade(c, false);
+    }
+    return c;
+}
+
+// Three box blurs, which come close to a Gaussian of this deviation, over alpha.
+// `outside`: what lies beyond the edges, which an inset shadow needs to be solid.
+void blurAlpha(std::vector<float>& a, int w, int h, float sigma, float outside = 0) {
+    if (sigma < 0.3f || w <= 0 || h <= 0) return;
+    int sizes[3];
+    const float ideal = std::sqrt(12 * sigma * sigma / 3 + 1);
+    int wl = static_cast<int>(std::floor(ideal));
+    if (wl % 2 == 0) --wl;
+    const int wu = wl + 2;
+    const float mi = (12 * sigma * sigma - 3.0f * wl * wl - 4.0f * 3 * wl - 3 * 3) / (-4.0f * wl - 4);
+    const int m = static_cast<int>(std::lround(mi));
+    for (int i = 0; i < 3; ++i) sizes[i] = i < m ? wl : wu;
+    std::vector<float> tmp(a.size());
+    const auto pass = [&](std::vector<float>& src, std::vector<float>& dst, int radius, bool horizontal) {
+        const int n = horizontal ? w : h, lines = horizontal ? h : w;
+        const float inv = 1.0f / static_cast<float>(2 * radius + 1);
+        for (int l = 0; l < lines; ++l) {
+            const auto at = [&](int i) -> float& { return horizontal ? src[static_cast<size_t>(l) * w + i] : src[static_cast<size_t>(i) * w + l]; };
+            const auto out = [&](int i) -> float& { return horizontal ? dst[static_cast<size_t>(l) * w + i] : dst[static_cast<size_t>(i) * w + l]; };
+            float acc = 0;
+            for (int i = -radius; i <= radius; ++i) acc += (i >= 0 && i < n) ? at(i) : outside;
+            for (int i = 0; i < n; ++i) {
+                out(i) = acc * inv;
+                const int add = i + radius + 1, sub = i - radius;
+                acc += (add < n ? at(add) : outside) - (sub >= 0 ? at(sub) : outside);
+            }
+        }
+    };
+    for (int i = 0; i < 3; ++i) {
+        const int r = (sizes[i] - 1) / 2;
+        if (r <= 0) continue;
+        pass(a, tmp, r, true);
+        pass(tmp, a, r, false);
+    }
+}
+
+std::vector<float> coverageOf(int w, int h, const Contours& contours, bool even_odd) {
+    std::vector<float> out(static_cast<size_t>(w) * h, 0.0f);
+    scan(contours, even_odd, 0, 0, w, h, [&](int y, const float* cover, int x0, int x1) {
+        for (int x = x0; x < x1; ++x) out[static_cast<size_t>(y) * w + x] = std::min(1.0f, std::fabs(cover[x]));
+    });
+    return out;
+}
+
+Contours scaled(Contours c, float kx, float ky, float dx, float dy) {
+    for (auto& poly : c)
+        for (Point& p : poly) p = {(p.x + dx) * kx, (p.y + dy) * ky};
+    return c;
+}
+
+// The rounded rectangle inside this one by these insets: its radii shrink by them.
+Contours insetShape(float x, float y, float w, float h, const float radii[4][2], float top, float right, float bottom, float left) {
+    float r[4][2] = {{radii[0][0] - left, radii[0][1] - top},
+                     {radii[1][0] - right, radii[1][1] - top},
+                     {radii[2][0] - right, radii[2][1] - bottom},
+                     {radii[3][0] - left, radii[3][1] - bottom}};
+    for (auto& c : r) {
+        c[0] = std::max(0.0f, c[0]);
+        c[1] = std::max(0.0f, c[1]);
+    }
+    return roundedRect(x + left, y + top, w - left - right, h - top - bottom, r);
+}
+
+// Points along a polyline, by distance.
+struct Walk {
+    std::vector<Point> pts;
+    std::vector<float> at;   // distance to each point
+    explicit Walk(std::vector<Point> p) : pts(std::move(p)) {
+        float d = 0;
+        for (size_t i = 0; i < pts.size(); ++i) {
+            if (i) d += std::hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
+            at.push_back(d);
+        }
+    }
+    [[nodiscard]] float length() const { return at.empty() ? 0 : at.back(); }
+    [[nodiscard]] Point point(float d) const {
+        if (pts.empty()) return {};
+        if (d <= 0) return pts.front();
+        for (size_t i = 1; i < pts.size(); ++i)
+            if (at[i] >= d) {
+                const float seg = at[i] - at[i - 1];
+                const float t = seg > 0 ? (d - at[i - 1]) / seg : 0;
+                return {pts[i - 1].x + (pts[i].x - pts[i - 1].x) * t, pts[i - 1].y + (pts[i].y - pts[i - 1].y) * t};
+            }
+        return pts.back();
+    }
+    [[nodiscard]] std::vector<Point> piece(float d0, float d1) const {
+        std::vector<Point> out{point(d0)};
+        for (size_t i = 0; i < pts.size(); ++i)
+            if (at[i] > d0 && at[i] < d1) out.push_back(pts[i]);
+        out.push_back(point(d1));
+        return out;
+    }
+};
+
+// A polygon cut to the side of a line where `keep(p) >= 0`, the line given by `keep` linear.
+std::vector<Point> clipHalf(const std::vector<Point>& in, const std::function<float(Point)>& keep) {
+    std::vector<Point> out;
+    for (size_t i = 0; i < in.size(); ++i) {
+        const Point a = in[i], b = in[(i + 1) % in.size()];
+        const float ka = keep(a), kb = keep(b);
+        if (ka >= 0) out.push_back(a);
+        if ((ka >= 0) != (kb >= 0)) {
+            const float t = ka / (ka - kb);
+            out.push_back({a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t});
+        }
+    }
+    return out;
+}
+
+Contours sideRegionUncut(int side, float w, float h, const float b[4]);
+
+// One side's share of the ring: from its outer corners in toward the middle, split from
+// the neighbours along the line through each outer corner and its inner one, and from the
+// opposite side where their widths say they meet.
+Contours sideRegion(int side, float w, float h, const float b[4]) {
+    Contours c = sideRegionUncut(side, w, h, b);
+    if (c.empty()) return c;
+    const float split_y = b[0] + b[2] > 0 ? h * b[0] / (b[0] + b[2]) : h / 2;
+    const float split_x = b[3] + b[1] > 0 ? w * b[3] / (b[3] + b[1]) : w / 2;
+    std::function<float(Point)> keep;
+    switch (side) {
+        case 0: keep = [=](Point p) { return split_y - p.y; }; break;
+        case 1: keep = [=](Point p) { return p.x - split_x; }; break;
+        case 2: keep = [=](Point p) { return p.y - split_y; }; break;
+        default: keep = [=](Point p) { return split_x - p.x; }; break;
+    }
+    c[0] = clipHalf(c[0], keep);
+    return c;
+}
+
+Contours sideRegionUncut(int side, float w, float h, const float b[4]) {
+    const float big = 4 * (w + h) + 100;
+    const auto toward = [&](Point outer, float dx, float dy) {
+        const float n = std::hypot(dx, dy);
+        if (n <= 0) return outer;
+        return Point{outer.x + dx / n * big, outer.y + dy / n * big};
+    };
+    Point a, c, a_far, c_far;
+    switch (side) {
+        case 0: a = {0, 0}; c = {w, 0}; a_far = toward(a, b[3], b[0]); c_far = toward(c, -b[1], b[0]); break;
+        case 1: a = {w, 0}; c = {w, h}; a_far = toward(a, -b[1], b[0]); c_far = toward(c, -b[1], -b[2]); break;
+        case 2: a = {w, h}; c = {0, h}; a_far = toward(a, -b[1], -b[2]); c_far = toward(c, b[3], -b[2]); break;
+        default: a = {0, h}; c = {0, 0}; a_far = toward(a, b[3], -b[2]); c_far = toward(c, b[3], b[0]); break;
+    }
+    // Don't let the two cut lines cross into a bow tie: stop where they meet.
+    const float d1x = a_far.x - a.x, d1y = a_far.y - a.y, d2x = c_far.x - c.x, d2y = c_far.y - c.y;
+    const float den = d1x * d2y - d1y * d2x;
+    if (std::fabs(den) > 1e-6f) {
+        const float t = ((c.x - a.x) * d2y - (c.y - a.y) * d2x) / den;
+        const float u = ((c.x - a.x) * d1y - (c.y - a.y) * d1x) / den;
+        if (t > 0 && t < 1 && u > 0 && u < 1) {
+            const Point m{a.x + d1x * t, a.y + d1y * t};
+            return {{a, c, m}};
+        }
+    }
+    return {{a, c, c_far, a_far}};
+}
+
+// The middle of a side's border, from the middle of one corner to the middle of the next.
+std::vector<Point> sideCentreLine(int side, float w, float h, const float r[4][2], const float b[4]) {
+    // The ring's middle: a rounded rectangle halfway in.
+    float mid[4][2];
+    const float hb[4] = {b[0] / 2, b[1] / 2, b[2] / 2, b[3] / 2};
+    const float ins[4][2] = {{hb[3], hb[0]}, {hb[1], hb[0]}, {hb[1], hb[2]}, {hb[3], hb[2]}};
+    for (int i = 0; i < 4; ++i) {
+        mid[i][0] = std::max(0.0f, r[i][0] - ins[i][0]);
+        mid[i][1] = std::max(0.0f, r[i][1] - ins[i][1]);
+    }
+    const float x0 = hb[3], y0 = hb[0], x1 = w - hb[1], y1 = h - hb[2];
+    std::vector<Point> out;
+    const auto arc = [&](int i, float cx, float cy, float a0, float a1) {
+        if (mid[i][0] <= 0 || mid[i][1] <= 0) {
+            // A square corner: the side's line runs on to the box's edge, as Chromium's does.
+            const bool horizontal = side == 0 || side == 2;
+            const float x = i == 0 || i == 3 ? (horizontal ? 0 : x0) : (horizontal ? w : x1);
+            const float y = i < 2 ? (horizontal ? y0 : 0) : (horizontal ? y1 : h);
+            out.push_back({x, y});
+            return;
+        }
+        arcPoints(out, cx, cy, mid[i][0], mid[i][1], a0, a1, 1);
+    };
+    switch (side) {
+        case 0:
+            arc(0, x0 + mid[0][0], y0 + mid[0][1], 5 * kPi / 4, 3 * kPi / 2);
+            arc(1, x1 - mid[1][0], y0 + mid[1][1], 3 * kPi / 2, 7 * kPi / 4);
+            break;
+        case 1:
+            arc(1, x1 - mid[1][0], y0 + mid[1][1], 7 * kPi / 4, 2 * kPi);
+            arc(2, x1 - mid[2][0], y1 - mid[2][1], 0, kPi / 4);
+            break;
+        case 2:
+            arc(2, x1 - mid[2][0], y1 - mid[2][1], kPi / 4, kPi / 2);
+            arc(3, x0 + mid[3][0], y1 - mid[3][1], kPi / 2, 3 * kPi / 4);
+            break;
+        default:
+            arc(3, x0 + mid[3][0], y1 - mid[3][1], 3 * kPi / 4, kPi);
+            arc(0, x0 + mid[0][0], y0 + mid[0][1], kPi, 5 * kPi / 4);
+            break;
+    }
+    return out;
+}
+
+}  // namespace
+
+Color darker(Color c) { return shade(c, true); }
+Color lighter(Color c) { return shade(c, false); }
+
+Raster renderBoxPaint(const BoxPaint& box, float area_w, float area_h, uint32_t px_w, uint32_t px_h) {
+    if (px_w == 0 || px_h == 0 || area_w <= 0 || area_h <= 0 || px_w > kMaxRasterSide || px_h > kMaxRasterSide ||
+        static_cast<uint64_t>(px_w) * px_h > kMaxRasterPixels)
+        return {};
+    const float kx = static_cast<float>(px_w) / area_w, ky = static_cast<float>(px_h) / area_h;
+    const int W = static_cast<int>(px_w), H = static_cast<int>(px_h);
+    Canvas canvas(px_w, px_h);
+    const Contours outer = scaled(roundedRect(0, 0, box.w, box.h, box.radii), kx, ky, box.ox, box.oy);
+    const float* b = box.border;
+
+    switch (box.part) {
+        case BoxPaint::Part::Background: {
+            Paint p;
+            p.color = box.background;
+            canvas.fill(outer, false, p);
+            break;
+        }
+        case BoxPaint::Part::Border: {
+            const Contours inner = scaled(insetShape(0, 0, box.w, box.h, box.radii, b[0], b[1], b[2], b[3]), kx, ky, box.ox, box.oy);
+            Contours both = outer;
+            both.insert(both.end(), inner.begin(), inner.end());
+            const std::vector<float> ringcov = coverageOf(W, H, both, true);
+            for (int side = 0; side < 4; ++side) {
+                const BorderStyle st = box.styles[side];
+                if (b[side] <= 0 || st == BorderStyle::None || st == BorderStyle::Hidden || !box.colors[side].visible()) continue;
+                const std::vector<float> region = coverageOf(W, H, scaled(sideRegion(side, box.w, box.h, b), kx, ky, box.ox, box.oy), false);
+                // What this side paints, before its region cuts it out.
+                std::vector<std::pair<Contours, Color>> shapes;
+                const Color c = box.colors[side];
+                const auto ring = [&](float from, float to) {
+                    // The band between `from` and `to` of the way in, as an even-odd pair.
+                    Contours a = scaled(insetShape(0, 0, box.w, box.h, box.radii, b[0] * from, b[1] * from, b[2] * from, b[3] * from), kx, ky, box.ox, box.oy);
+                    const Contours z = scaled(insetShape(0, 0, box.w, box.h, box.radii, b[0] * to, b[1] * to, b[2] * to, b[3] * to), kx, ky, box.ox, box.oy);
+                    a.insert(a.end(), z.begin(), z.end());
+                    return a;
+                };
+                bool even_odd = true;
+                if (st == BorderStyle::Solid) {
+                    shapes.push_back({ring(0, 1), c});
+                } else if (st == BorderStyle::Inset || st == BorderStyle::Outset) {
+                    shapes.push_back({ring(0, 1), styleColor(st, side, c)});
+                } else if (st == BorderStyle::Groove || st == BorderStyle::Ridge) {
+                    const BorderStyle out_half = st == BorderStyle::Groove ? BorderStyle::Inset : BorderStyle::Outset;
+                    const BorderStyle in_half = st == BorderStyle::Groove ? BorderStyle::Outset : BorderStyle::Inset;
+                    shapes.push_back({ring(0, 0.5f), styleColor(out_half, side, c)});
+                    shapes.push_back({ring(0.5f, 1), styleColor(in_half, side, c)});
+                } else if (st == BorderStyle::Double) {
+                    if (b[side] < 3) shapes.push_back({ring(0, 1), c});
+                    else {
+                        shapes.push_back({ring(0, 1.0f / 3), c});
+                        shapes.push_back({ring(2.0f / 3, 1), c});
+                    }
+                } else {
+                    // Dashes or dots along the middle of the border.
+                    even_odd = false;
+                    const Walk walk(sideCentreLine(side, box.w, box.h, box.radii, b));
+                    const float width = b[side], len = walk.length();
+                    Contours marks;
+                    // Blink's lengths: a dash twice the width (three times when thin), a gap
+                    // once (twice); a dot the width with a gap the same. The gap then
+                    // stretches or shrinks so whole dashes start and end the side.
+                    const bool dots = st == BorderStyle::Dotted;
+                    const float dash = dots ? width : width * (width >= 3 ? 2 : 3);
+                    const float gap = dots ? width : width * (width >= 3 ? 1 : 2);
+                    const float fewer = std::floor((len + gap) / (dash + gap));
+                    const float more = fewer + 1;
+                    const float gap_fewer = fewer > 1 ? (len - fewer * dash) / (fewer - 1) : 0;
+                    const float gap_more = (len - more * dash) / (more - 1);
+                    const bool use_more = gap_more > 0 && std::fabs(gap_more - gap) < std::fabs(gap_fewer - gap);
+                    const int n = static_cast<int>(std::clamp(use_more ? more : fewer, 1.0f, 10000.0f));
+                    const float real_gap = use_more ? gap_more : gap_fewer;
+                    const StrokeStyle stroke{width, 0, 0, 4};
+                    for (int i = 0; i < n; ++i) {
+                        const float d0 = n == 1 ? std::max(0.0f, (len - dash) / 2) : i * (dash + real_gap);
+                        if (dots && width >= 3) {
+                            const Point p = walk.point(d0 + dash / 2);
+                            for (auto& e : ellipse(p.x, p.y, width / 2, width / 2, kx)) marks.push_back(std::move(e));
+                            continue;
+                        }
+                        const float d1 = std::min(len, d0 + dash);
+                        for (auto& poly : strokeOutline(walk.piece(d0, d1), false, stroke, kx)) marks.push_back(std::move(poly));
+                    }
+                    shapes.push_back({scaled(marks, kx, ky, box.ox, box.oy), c});
+                }
+                // The side's region, within the ring: dashes mustn't stray outside the border.
+                std::vector<float> cut = region;
+                for (size_t i = 0; i < cut.size(); ++i) cut[i] *= ringcov[i];
+                const Canvas mask = Canvas::fromAlpha(px_w, px_h, cut);
+                for (const auto& [shape, color] : shapes) {
+                    Canvas layer(px_w, px_h);
+                    Paint p;
+                    p.color = color;
+                    layer.fill(shape, even_odd, p);
+                    canvas.composite(layer, 1, &mask);
+                }
+            }
+            break;
+        }
+        case BoxPaint::Part::OuterShadow:
+        case BoxPaint::Part::InsetShadow: {
+            const BoxShadow& sh = box.shadow;
+            const float sigma = sh.blur / 2;
+            std::vector<float> alpha;
+            if (box.part == BoxPaint::Part::OuterShadow) {
+                // The box grown by the spread and moved by the offset, blurred, and not under the box.
+                const float s = sh.spread;
+                float r[4][2];
+                for (int i = 0; i < 4; ++i)
+                    for (int j = 0; j < 2; ++j) r[i][j] = box.radii[i][j] > 0 ? std::max(0.0f, box.radii[i][j] + s) : 0;
+                const Contours shape = scaled(roundedRect(-s, -s, box.w + 2 * s, box.h + 2 * s, r), kx, ky, box.ox + sh.x, box.oy + sh.y);
+                alpha = coverageOf(W, H, shape, false);
+                blurAlpha(alpha, W, H, sigma * kx);
+                const std::vector<float> under = coverageOf(W, H, outer, false);
+                for (size_t i = 0; i < alpha.size(); ++i) alpha[i] *= 1 - under[i];
+            } else {
+                // Inside the padding box: everywhere but the padding box shrunk by the spread and moved.
+                const Contours padding = scaled(insetShape(0, 0, box.w, box.h, box.radii, b[0], b[1], b[2], b[3]), kx, ky, box.ox, box.oy);
+                const float s = sh.spread;
+                const float pw = box.w - b[1] - b[3], ph = box.h - b[0] - b[2];
+                float r[4][2] = {{box.radii[0][0] - b[3] - s, box.radii[0][1] - b[0] - s}, {box.radii[1][0] - b[1] - s, box.radii[1][1] - b[0] - s},
+                                 {box.radii[2][0] - b[1] - s, box.radii[2][1] - b[2] - s}, {box.radii[3][0] - b[3] - s, box.radii[3][1] - b[2] - s}};
+                for (auto& c : r) {
+                    c[0] = std::max(0.0f, c[0]);
+                    c[1] = std::max(0.0f, c[1]);
+                }
+                const std::vector<float> hole = pw - 2 * s > 0 && ph - 2 * s > 0
+                    ? coverageOf(W, H, scaled(roundedRect(b[3] + s, b[0] + s, pw - 2 * s, ph - 2 * s, r), kx, ky, box.ox + sh.x, box.oy + sh.y), false)
+                    : std::vector<float>(static_cast<size_t>(W) * H, 0.0f);
+                alpha.resize(hole.size());
+                for (size_t i = 0; i < hole.size(); ++i) alpha[i] = 1 - hole[i];
+                blurAlpha(alpha, W, H, sigma * kx, 1);
+                const std::vector<float> inside = coverageOf(W, H, padding, false);
+                for (size_t i = 0; i < alpha.size(); ++i) alpha[i] *= inside[i];
+            }
+            Raster out;
+            out.width = px_w;
+            out.height = px_h;
+            out.rgba.resize(static_cast<size_t>(W) * H * 4);
+            for (size_t i = 0; i < alpha.size(); ++i) {
+                out.rgba[i * 4] = sh.color.r;
+                out.rgba[i * 4 + 1] = sh.color.g;
+                out.rgba[i * 4 + 2] = sh.color.b;
+                out.rgba[i * 4 + 3] = toByte(std::clamp(alpha[i], 0.0f, 1.0f) * sh.color.a / 255.0f);
+            }
+            return out;
+        }
+    }
+    return canvas.toRaster();
 }
 
 }  // namespace fbx::xweb

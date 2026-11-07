@@ -87,7 +87,7 @@ int main(int argc, char** argv) {
 
     // XWEB_PAINT_OPS=1 lists what's painted besides text, for finding what drew what.
     if (std::getenv("XWEB_PAINT_OPS")) {
-        static const char* kNames[] = {"rect", "text", "image", "clip", "unclip", "gradient", "svg"};
+        static const char* kNames[] = {"rect", "text", "image", "clip", "unclip", "gradient", "svg", "box"};
         for (const PaintOp& op : page.ops)
             if (op.kind != PaintKind::Text)
                 std::fprintf(stderr, "%s %.1f %.1f %.1f %.1f %s%s\n", kNames[static_cast<int>(op.kind)], op.x, op.y, op.w, op.h, op.text.substr(0, 60).c_str(), op.tint ? " (tint)" : "");
@@ -128,6 +128,20 @@ int main(int argc, char** argv) {
                 const auto ph = static_cast<uint32_t>(std::clamp(std::ceil(op.h), 1.0f, 2048.0f));
                 const Raster r = renderGradient(*op.gradient, op.w, op.h, pw, ph);
                 canvas.drawRaster(r, op.x, op.y, op.w, op.h, op.color.a / 255.0f);
+                break;
+            }
+            case PaintKind::Box: {
+                if (!op.box) break;
+                // Unsnapped: it holds its own edges, at fractions too.
+                // Drawn on whole pixels, its fraction moved inside it, so nothing is resampled.
+                const float x0 = std::floor(raw.x), y0 = std::floor(raw.y);
+                BoxPaint box = *op.box;
+                box.ox += raw.x - x0;
+                box.oy += raw.y - y0;
+                const auto pw = static_cast<uint32_t>(std::clamp(std::ceil(raw.w + raw.x - x0), 1.0f, 4096.0f));
+                const auto ph = static_cast<uint32_t>(std::clamp(std::ceil(raw.h + raw.y - y0), 1.0f, 4096.0f));
+                const Raster r = renderBoxPaint(box, static_cast<float>(pw), static_cast<float>(ph), pw, ph);
+                canvas.drawRaster(r, x0, y0, static_cast<float>(pw), static_cast<float>(ph));
                 break;
             }
             case PaintKind::Svg: {

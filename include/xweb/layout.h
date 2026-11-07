@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "xweb/dom.h"
+#include "xweb/paint.h"
 #include "xweb/style.h"
 
 namespace fbx::xweb {
@@ -46,6 +47,7 @@ enum class PaintKind {
     Rect, Text, Image, ClipBegin, ClipEnd,
     Gradient,   // `gradient` filling the rectangle
     Svg,        // the inline <svg> `node`, drawn into the rectangle; currentColor is `color`
+    Box,        // `box` (uneven corners, fancy borders, a shadow) drawn into the rectangle
 };
 
 struct PaintOp {
@@ -58,6 +60,7 @@ struct PaintOp {
     bool tint = false;     // Image: only its alpha, in `color` (a mask over a background colour)
     std::shared_ptr<const Gradient> gradient;
     const Node* node = nullptr;
+    std::shared_ptr<const BoxPaint> box;
 };
 
 struct LinkArea {

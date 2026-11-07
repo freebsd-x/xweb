@@ -426,3 +426,94 @@ TEST(Fuzz, HostileSvgAndBackgrounds) {
     for (int i = 0; i < 5000; ++i) stops += "red " + std::to_string(i) + "px,";
     run("<style>div{background:" + stops + "blue)}</style><div></div>");
 }
+
+TEST(BoxPaint, DashedSideHasGaps) {
+    BoxPaint b;
+    b.part = BoxPaint::Part::Border;
+    b.w = 100;
+    b.h = 20;
+    b.border[2] = 3;
+    b.colors[2] = {0, 0, 0, 255};
+    b.styles[2] = BorderStyle::Dashed;
+    const Raster r = renderBoxPaint(b, 100, 20, 100, 20);
+    int on = 0, off = 0;
+    for (uint32_t x = 0; x < 100; ++x) (at(r, x, 18).a > 128 ? on : off)++;
+    EXPECT_GT(on, 40);
+    EXPECT_GT(off, 20);
+    EXPECT_EQ(at(r, 50, 5).a, 0);
+}
+
+TEST(Style, BorderStylesPerSide) {
+    const auto doc = parseHtml("<style>#a{border-top:5px solid #333;border-bottom:3px dashed #333}"
+                               "#b{border:2px dotted red;border-left-style:double;border-radius:10px 20px / 5px}</style><div id=a></div><div id=b></div>");
+    const StyledDocument styles(*doc, {800, 600});
+    const ComputedStyle* a = styleById(*doc, styles, "a");
+    ASSERT_TRUE(a);
+    EXPECT_EQ(a->border_style[Top], BorderStyle::Solid);
+    EXPECT_EQ(a->border_style[Bottom], BorderStyle::Dashed);
+    EXPECT_FLOAT_EQ(a->border_width[Left], 0);
+    const ComputedStyle* b = styleById(*doc, styles, "b");
+    EXPECT_EQ(b->border_style[Left], BorderStyle::Double);
+    EXPECT_EQ(b->border_style[Top], BorderStyle::Dotted);
+    EXPECT_FLOAT_EQ(b->radius[1][0].px, 20);
+    EXPECT_FLOAT_EQ(b->radius[3][0].px, 20);
+    EXPECT_FLOAT_EQ(b->radius[2][1].px, 5);
+}
+
+TEST(BoxPaint, ShadowsAndCorners) {
+    // An inset shadow darkens the edges, not the middle.
+    BoxPaint b;
+    b.part = BoxPaint::Part::InsetShadow;
+    b.w = 60;
+    b.h = 60;
+    b.shadow.blur = 10;
+    b.shadow.color = {0, 0, 0, 255};
+    const Raster r = renderBoxPaint(b, 60, 60, 60, 60);
+    EXPECT_GT(at(r, 1, 30).a, 60);
+    EXPECT_LT(at(r, 30, 30).a, 5);
+    // An outer one spreads beyond the box, but not under it.
+    BoxPaint o;
+    o.part = BoxPaint::Part::OuterShadow;
+    o.w = o.h = 20;
+    o.ox = o.oy = 10;
+    o.shadow.spread = 5;
+    o.shadow.color = {255, 0, 0, 255};
+    const Raster s = renderBoxPaint(o, 40, 40, 40, 40);
+    EXPECT_EQ(at(s, 7, 20).a, 255);
+    EXPECT_EQ(at(s, 20, 20).a, 0);
+    EXPECT_EQ(at(s, 2, 20).a, 0);
+    // Uneven corners: the rounded one is cut, the square one isn't.
+    BoxPaint c;
+    c.part = BoxPaint::Part::Background;
+    c.w = c.h = 40;
+    c.radii[0][0] = c.radii[0][1] = 20;
+    c.background = {0, 0, 255, 255};
+    const Raster t = renderBoxPaint(c, 40, 40, 40, 40);
+    EXPECT_EQ(at(t, 1, 1).a, 0);
+    EXPECT_EQ(at(t, 38, 1).a, 255);
+    float radii[4][2] = {{100, 100}, {100, 100}, {0, 0}, {0, 0}};
+    fitRadii(radii, 50, 300);
+    EXPECT_FLOAT_EQ(radii[0][0], 25);
+}
+
+TEST(Fuzz, HostileBoxes) {
+    const auto run = [](const std::string& html) {
+        const auto doc = parseHtml(html);
+        const StyledDocument styles(*doc, {800, 600});
+        FixedText text;
+        const PageLayout page = layoutPage(*doc, styles, text, nullptr, 800, 600);
+        for (const PaintOp& op : page.ops)
+            if (op.kind == PaintKind::Box && op.box) {
+                const float w = std::min(op.w, 300.0f), h = std::min(op.h, 300.0f);
+                (void)renderBoxPaint(*op.box, w, h, static_cast<uint32_t>(std::max(1.0f, w)), static_cast<uint32_t>(std::max(1.0f, h)));
+            }
+    };
+    run("<div style='width:50px;height:50px;box-shadow:0 0 1e9px 1e9px red, inset 1e9px 0 0 -1e9px blue'></div>");
+    run("<div style='width:50px;height:50px;border-radius:1e9px 0 / 0 1e9px;border:1e9px dashed red'></div>");
+    run("<div style='width:100000px;height:1px;border:1px dotted red;border-radius:50%'></div>");
+    run("<div style='width:0;height:0;border:5px double red;border-radius:3px;box-shadow:inset 0 0 5px red'></div>");
+    std::string many = "box-shadow:";
+    for (int i = 0; i < 100; ++i) many += "1px 1px 30px red,";
+    run("<div style='width:20px;height:20px;" + many + "0 0 red'></div>");
+    run("<div style='width:20px;height:20px;border-style:groove ridge inset outset;border-width:1e-9px 7px 3px nanpx;border-radius:-5px'></div>");
+}

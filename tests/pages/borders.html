@@ -1,0 +1,64 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Border styles, corners and shadows</title>
+<style>
+  body { margin: 8px; font: 14px sans-serif; background: #fff; }
+  .row { display: flex; flex-wrap: wrap; gap: 16px; margin-bottom: 18px; }
+  .b { width: 100px; height: 60px; background: #f3f6fa; }
+
+  /* Styles */
+  .s1 { border: 4px dashed #0969da; }
+  .s2 { border: 4px dotted #cf222e; }
+  .s3 { border: 1px dashed #333; }
+  .s4 { border: 2px dotted #1a7f37; }
+  .s5 { border: 6px double #8250df; }
+  .s6 { border: 8px groove #999; }
+  .s7 { border: 8px ridge #c90; }
+  .s8 { border: 6px inset #ccc; }
+  .s9 { border: 6px outset #36c; }
+  .s10 { border-width: 6px; border-style: solid; border-color: #d00 #0a0 #00d #fa0; }
+  .s11 { border-top: 5px solid #333; border-bottom: 3px dashed #333; }
+
+  /* Corners */
+  .c1 { border-radius: 30px 0 30px 0; background: #0969da; }
+  .c2 { border-radius: 50%; background: #2da44e; }
+  .c3 { border-radius: 40px / 15px; background: #bf3989; }
+  .c4 { border-top-left-radius: 50px 20px; border-bottom-right-radius: 10px; background: #fb8500; }
+  .c5 { border: 4px solid #333; border-radius: 16px; background: #ffd33d; }
+  .c6 { border: 3px dashed #0969da; border-radius: 20px; }
+  .c7 { border: 10px solid; border-color: #d00 #0a0 #00d #fa0; border-radius: 24px; }
+  .c8 { border-radius: 999px; background: #6639ba; height: 30px; }
+
+  /* Shadows */
+  .h1 { box-shadow: 0 2px 6px rgba(0,0,0,0.3); }
+  .h2 { box-shadow: 8px 8px 0 #0969da; }
+  .h3 { box-shadow: 0 0 0 4px #ffd33d; border-radius: 12px; }
+  .h4 { box-shadow: inset 0 0 12px rgba(0,0,0,0.5); }
+  .h5 { box-shadow: 0 10px 20px -5px rgba(207,34,46,0.6), 0 0 0 1px #ddd; border-radius: 8px; }
+  .h6 { box-shadow: inset 6px 6px 0 #2da44e; border: 2px solid #333; }
+  .h7 { box-shadow: 0 4px 12px rgba(0,0,0,0.25); border-radius: 50%; }
+
+  hr { width: 300px; margin: 10px 0; }
+</style>
+</head>
+<body>
+<div class="row">
+  <div class="b s1"></div><div class="b s2"></div><div class="b s3"></div><div class="b s4"></div>
+  <div class="b s5"></div><div class="b s6"></div><div class="b s7"></div>
+</div>
+<div class="row">
+  <div class="b s8"></div><div class="b s9"></div><div class="b s10"></div><div class="b s11"></div>
+</div>
+<div class="row">
+  <div class="b c1"></div><div class="b c2"></div><div class="b c3"></div><div class="b c4"></div>
+  <div class="b c5"></div><div class="b c6"></div><div class="b c7"></div><div class="b c8"></div>
+</div>
+<div class="row">
+  <div class="b h1"></div><div class="b h2"></div><div class="b h3"></div><div class="b h4"></div>
+  <div class="b h5"></div><div class="b h6"></div><div class="b h7"></div>
+</div>
+<hr>
+</body>
+</html>
