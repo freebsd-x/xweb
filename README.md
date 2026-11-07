@@ -13,10 +13,11 @@ repo sync
 
 ## Where it stands
 
-The Browser app still runs Chromium. `out/xwebview [address or file]` is a small browser
-on this engine: it follows links and redirects, has history and an address bar, and
-fetches pages, stylesheets and images through the compositor's broker from inside its
-sandbox. Many simple sites work; anything needing scripts doesn't yet.
+The Browser app runs on this engine (`out/xwebview [address or file]` is the same viewer
+on its own): it follows links and redirects, has history and an address bar, and fetches
+pages, stylesheets, images and fonts through the compositor's broker from inside its
+sandbox. Many sites read well; anything needing scripts doesn't work yet, and the
+Browser's "Open in Chromium" hands such a page to Chromium.
 
 | Works | Not yet |
 |---|---|

@@ -1,7 +1,8 @@
-// xwebview [address] — a small browser on our own engine: parsing, style, layout and
+// xwebview [--open] [address] — a browser on our own engine: parsing, style, layout and
 // painting are all ours. Pages come over the network through the compositor's broker
-// and xfetch, since this process runs sandboxed and can't open a socket. The Browser app
-// keeps using Chromium until this can replace it: no scripts, no forms, no cookies.
+// and xfetch, since this process runs sandboxed and can't open a socket. It's also the
+// Browser app (apps/Browser.xapp), which builds this file in: there "Open in Chromium"
+// hands the page to Chromium for what we can't do yet (scripts, forms, cookies).
 
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -52,6 +53,7 @@ namespace {
 constexpr float kOffscreenMargin = 256;     // painted past the window, for smooth scrolling
 constexpr float kMaxWindowHeight = 8192;
 constexpr float kToolbarHeight = 44;
+constexpr float kChromiumButtonWidth = 136;
 constexpr size_t kMaxSheets = 48;           // stylesheets one page can make us fetch
 constexpr size_t kMaxImages = 256;
 constexpr size_t kImageWorkers = 4;
@@ -756,6 +758,9 @@ public:
         navigate(url, Mode::New);
     }
 
+    // Where we are, as the address bar would say it.
+    [[nodiscard]] std::string currentUrl() const { return index_ < history_.size() ? history_[index_].url : std::string{}; }
+
     void back() { travel(-1); }
     void forward() { travel(1); }
     void reload() {
@@ -1039,10 +1044,37 @@ std::string startingAddress(const std::string& arg) {
     return arg;
 }
 
+XBusClient* g_xbus = nullptr;   // the UI thread's connection, once it's up
+
+// Asks the shell to open the page in the Browser's other engine. The Browser starts
+// Chromium for a "chromium:" target; the shell only launches, it doesn't trust us more.
+void openInChromium(const std::string& url) {
+    const web::Url u = web::parseUrl(url);
+    if (!g_xbus || (u.scheme != "http" && u.scheme != "https" && u.scheme != "file")) return;
+    // A local file goes as its path, which is what the launcher takes for files.
+    const std::string target = "chromium:" + (u.scheme == "file" ? percentDecoded(u.path) : url);
+    fbx::shared::ShellLaunchRequest req{};
+    if (target.size() >= sizeof(req.file_path_)) {
+        XApplication::setTitle("This address is too long to hand to Chromium");
+        return;
+    }
+    std::strncpy(req.app_id_, "com.freebsdx.browser", sizeof(req.app_id_) - 1);
+    std::memcpy(req.file_path_, target.data(), target.size());
+    g_xbus->Call("com.freebsdx.Shell", static_cast<uint32_t>(fbx::shared::ShellOpcode::LaunchWithFile),
+                 {reinterpret_cast<const uint8_t*>(&req), sizeof(req)}, {});
+}
+
 }  // namespace
 
-int main(int argc, char** argv) {
-    const std::string start = argc > 1 ? startingAddress(argv[1]) : std::string{};
+// The viewer, for xwebview's own main and for the Browser app's.
+int webViewMain(int argc, char** argv) {
+    std::string arg;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string_view(argv[i]) == "--open") continue;
+        arg = argv[i];
+        break;
+    }
+    const std::string start = arg.empty() ? std::string{} : startingAddress(arg);
 
     auto node = std::make_shared<RenderWebPage>();
     static Browser browser(node);
@@ -1068,6 +1100,7 @@ int main(int argc, char** argv) {
     button("Forward", 72, [] { browser.forward(); });
     button("Reload", 64, [] { browser.reload(); });
     toolbar->addChild(std::make_shared<FlexibleWidget>(address));
+    button("Open in Chromium", kChromiumButtonWidth, [] { openInChromium(browser.currentUrl()); });
 
     auto page = std::make_shared<WebPageWidget>(node, &browser);
     auto scroll = std::make_shared<ScrollViewWidget>(page);
@@ -1096,11 +1129,12 @@ int main(int argc, char** argv) {
         return false;
     });
 
-    const int status = XApplication::Run(root, "/tmp/freebsdx.sock", false, false, [start, address_field = address](XBusClient&) {
+    const int status = XApplication::Run(root, "/tmp/freebsdx.sock", false, false, [start, address_field = address](XBusClient& xbus) {
+        g_xbus = &xbus;
         // The field takes the rest of the row, which only now has a known width.
         int window_w = 0, window_h = 0;
         XApplication::windowSize(window_w, window_h);
-        if (window_w > 0) address_field->setFixedSize(static_cast<float>(window_w) - 56 - 72 - 64 - 6 * 5, 30);
+        if (window_w > 0) address_field->setFixedSize(static_cast<float>(window_w) - 56 - 72 - 64 - kChromiumButtonWidth - 6 * 6, 30);
         // The last chance to open font files: the sandbox closes right after this.
         using fbx::xrender::FontManager;
         using fbx::xrender::FontStyle;
@@ -1114,3 +1148,7 @@ int main(int argc, char** argv) {
     // Loads may still be running on other threads, using what would be destroyed here.
     std::_Exit(status);
 }
+
+#ifndef XWEB_VIEW_NO_MAIN
+int main(int argc, char** argv) { return webViewMain(argc, argv); }
+#endif
