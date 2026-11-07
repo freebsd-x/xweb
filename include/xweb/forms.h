@@ -55,6 +55,8 @@ public:
     void setValue(const Node* control, std::string value);
     // A checkbox flips; a radio button turns on and its group's others off.
     void activate(const Node* control);
+    // A script's `checked = x`: a radio turned on still turns its group off.
+    void setChecked(const Node* control, bool on);
     void select(const Node* select, int index);
     // Everything in the form back to what the page said.
     void reset(const Node* form);

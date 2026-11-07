@@ -951,7 +951,9 @@ Runtime::Result Runtime::evaluate(std::string_view source, std::string_view name
         (void)name;
         return result;
     }
-    steps_ = 0;
+    // Nested (a script run from an event a script dispatched): the outer one's state stays.
+    const size_t saved_envs = env_stack.size(), saved_calls = call_depth, saved_eval = eval_depth;
+    if (saved_envs == 0 && saved_calls == 0) steps_ = 0;
     programs_.push_back(prog);
     try {
         Interpreter interp(*this, prog);
@@ -966,9 +968,9 @@ Runtime::Result Runtime::evaluate(std::string_view source, std::string_view name
     } catch (const Terminated& t) {
         result.error = "Stopped: " + t.why;
     }
-    env_stack.clear();
-    call_depth = 0;
-    eval_depth = 0;
+    env_stack.resize(saved_envs);
+    call_depth = saved_calls;
+    eval_depth = saved_eval;
     return result;
 }
 

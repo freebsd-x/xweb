@@ -155,6 +155,10 @@ public:
     Object* target = nullptr;   // an iterator's subject
     uint8_t iter_kind = 0;
 
+    // The embedder's: what a DOM wrapper stands for, and which kind of thing it is.
+    void* host = nullptr;
+    uint8_t host_kind = 0;
+
 private:
     std::vector<std::pair<PropertyKey, Property>> props_;
     std::unordered_map<PropertyKey, size_t, PropertyKeyHash> index_;
@@ -192,6 +196,8 @@ public:
     void setConsole(std::function<void(std::string_view level, const std::string& text)> sink) { console_ = std::move(sink); }
     // How much work one evaluate() may do before it's stopped.
     void setStepBudget(uint64_t steps) { step_budget_ = steps; }
+    // A new task (an event, a timer) starts with the whole budget again.
+    void resetSteps() { steps_ = 0; }
 
     [[nodiscard]] Object* global() const noexcept { return global_; }
 

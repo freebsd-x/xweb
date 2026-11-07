@@ -16,6 +16,8 @@ libxweb = static_library('xweb',
   'src/raster.cc',
   'src/svg.cc',
   'src/forms.cc',
+  'src/query.cc',
+  'src/script.cc',
   'src/js/lexer.cc',
   'src/js/parser.cc',
   'src/js/runtime.cc',
@@ -60,7 +62,7 @@ test('xweb html5lib',
   suite : 'unit',
 )
 
-foreach unit : [['css', 'css_parser_test.cc'], ['style', 'style_test.cc'], ['layout', 'layout_test.cc'], ['fuzz', 'fuzz_test.cc'], ['html', 'html_parser_test.cc'], ['url', 'url_test.cc'], ['encoding', 'encoding_test.cc'], ['paint', 'paint_test.cc'], ['forms', 'forms_test.cc'], ['js', 'js_test.cc']]
+foreach unit : [['css', 'css_parser_test.cc'], ['style', 'style_test.cc'], ['layout', 'layout_test.cc'], ['fuzz', 'fuzz_test.cc'], ['html', 'html_parser_test.cc'], ['url', 'url_test.cc'], ['encoding', 'encoding_test.cc'], ['paint', 'paint_test.cc'], ['forms', 'forms_test.cc'], ['js', 'js_test.cc'], ['script', 'script_test.cc']]
   test('xweb ' + unit[0],
     executable('xweb_' + unit[0] + '_test', 'tests/unit' / unit[1], dependencies : [xweb_dep, gtest_dep]),
     suite : 'unit',

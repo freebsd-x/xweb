@@ -3406,6 +3406,11 @@ private:
                     return;
                 }
             }
+            // Not loaded: maybe one a script just added. Ask for it.
+            if (const std::string* src = n->attr("src"); src && images_ && !images_->imageSize(*src) && !images_->imageRatio(*src) &&
+                out_->images_wanted.size() < 512 &&
+                std::find(out_->images_wanted.begin(), out_->images_wanted.end(), *src) == out_->images_wanted.end())
+                out_->images_wanted.push_back(*src);
             if (!b.alt.empty()) addText(cx, cy, b.alt, s, opacity);
             return;
         }

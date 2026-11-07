@@ -269,6 +269,16 @@ void FormState::activate(const Node* control) {
     s.checked = true;
 }
 
+void FormState::setChecked(const Node* control, bool on) {
+    if (on && controlKind(control) == ControlKind::Radio) {
+        if (!checked(control)) activate(control);
+        return;
+    }
+    State& st = states_[control];
+    st.has_checked = true;
+    st.checked = on;
+}
+
 void FormState::select(const Node* select, int index) {
     const int count = static_cast<int>(optionsOf(select).size());
     states_[select].selected = index >= 0 && index < count ? index : -1;

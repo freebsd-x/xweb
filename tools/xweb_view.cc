@@ -43,6 +43,7 @@
 #include "xweb/html_parser.h"
 #include "xweb/layout.h"
 #include "xweb/paint.h"
+#include "xweb/script.h"
 #include "xweb/style.h"
 #include "xweb/text_measurer.h"
 #include "xweb/url.h"
@@ -206,6 +207,16 @@ Resource loadPost(const web::FormSubmission& sub) {
     return r;
 }
 
+// A code point as UTF-8.
+std::string utf8Of(char32_t cp) {
+    std::string out;
+    if (cp < 0x80) out += static_cast<char>(cp);
+    else if (cp < 0x800) { out += static_cast<char>(0xC0 | (cp >> 6)); out += static_cast<char>(0x80 | (cp & 0x3F)); }
+    else if (cp < 0x10000) { out += static_cast<char>(0xE0 | (cp >> 12)); out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F)); out += static_cast<char>(0x80 | (cp & 0x3F)); }
+    else { out += static_cast<char>(0xF0 | (cp >> 18)); out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F)); out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F)); out += static_cast<char>(0x80 | (cp & 0x3F)); }
+    return out;
+}
+
 // ── A loaded page ─────────────────────────────────────────────────────────────
 
 struct LoadedImage {
@@ -225,6 +236,8 @@ struct Page {
     uint64_t pixels = 0;
     bool fonts_known = false;   // its @font-face rules are in force, and what they need asked for
     web::FormState forms;       // what its controls hold; UI thread only
+    std::map<std::string, std::string> scripts;   // external scripts' text, by absolute URL
+    std::unique_ptr<web::PageScript> script;      // its scripts' world; UI thread only. Last: it refers to doc
 };
 
 std::string findBase(const web::Document& doc, const std::string& url) {
@@ -266,6 +279,31 @@ void loadSheets(Page& page, const std::atomic<uint64_t>& generation, uint64_t mi
         std::string css = got.ok ? web::decodeToUtf8(got.body, got.content_type) : std::string{};
         for (const std::string& ref : web::css::parseStylesheet(css).imports) queue.push_back(web::resolveUrl(url, ref));
         page.sheets[url] = std::move(css);
+    }
+}
+
+// The page's external scripts, fetched with its stylesheets, so they run in order.
+void loadScripts(Page& page, const std::atomic<uint64_t>& generation, uint64_t mine) {
+    constexpr size_t kMaxScripts = 100;
+    constexpr size_t kMaxScriptBytes = 8 << 20;
+    std::vector<const web::Node*> todo{page.doc->root()};
+    std::vector<std::string> urls;
+    while (!todo.empty() && urls.size() < kMaxScripts) {
+        const web::Node* n = todo.back();
+        todo.pop_back();
+        if (n->isHtml("script"))
+            if (const std::string* src = n->attr("src")) {
+                const std::string* type = n->attr("type");
+                const std::string t = type ? lowerCase(*type) : "";
+                if (t.empty() || t.find("javascript") != std::string::npos || t == "text/ecmascript") urls.push_back(web::resolveUrl(page.base, *src));
+            }
+        todo.insert(todo.end(), n->children.rbegin(), n->children.rend());
+    }
+    for (const std::string& url : urls) {
+        if (generation.load() != mine) return;
+        if (page.scripts.count(url)) continue;
+        Resource got = load(url, web::sameSite(page.url, url));
+        if (got.ok && got.http_status < 400 && got.body.size() <= kMaxScriptBytes) page.scripts[url] = web::decodeToUtf8(got.body, got.content_type);
     }
 }
 
@@ -472,6 +510,68 @@ public:
             return nullptr;
         }
         return nullptr;
+    }
+
+    // The element a click at this point is on: the innermost box, or the link inside it.
+    [[nodiscard]] web::Node* nodeAt(float page_x, float page_y) const {
+        const web::Node* hit = nullptr;
+        for (auto it = layout_.boxes.rbegin(); it != layout_.boxes.rend(); ++it)
+            if (page_x >= it->x && page_x < it->x + it->w && page_y >= it->y && page_y < it->y + it->h) {
+                hit = it->node;
+                break;
+            }
+        if (const std::string* href = linkAt(page_x, page_y); href && hit) {
+            std::vector<const web::Node*> todo{hit};
+            while (!todo.empty()) {
+                const web::Node* n = todo.back();
+                todo.pop_back();
+                if (n->isHtml("a"))
+                    if (const std::string* h = n->attr("href"); h && *h == *href) return const_cast<web::Node*>(n);
+                todo.insert(todo.end(), n->children.rbegin(), n->children.rend());
+            }
+        }
+        return const_cast<web::Node*>(hit);
+    }
+
+    // A few computed values, for getComputedStyle.
+    [[nodiscard]] std::unordered_map<std::string, std::string> computedStyleOf(const web::Node* n) const {
+        std::unordered_map<std::string, std::string> out;
+        const web::ComputedStyle* s = styles_ ? styles_->styleOf(n) : nullptr;
+        if (!s) {
+            out["display"] = "none";
+            return out;
+        }
+        static const char* kDisplay[] = {"none", "inline", "block", "inline-block", "list-item", "flow-root", "table", "inline-table",
+                                         "table-caption", "table-row-group", "table-row", "table-cell", "table-column", "flex",
+                                         "inline-flex", "grid", "inline-grid", "contents"};
+        const auto idx = static_cast<size_t>(s->display);
+        out["display"] = idx < std::size(kDisplay) ? kDisplay[idx] : "block";
+        out["visibility"] = s->hidden ? "hidden" : "visible";
+        static const char* kPosition[] = {"static", "relative", "absolute", "fixed"};
+        out["position"] = kPosition[static_cast<size_t>(s->position)];
+        const auto rgb = [](web::Color c) {
+            if (c.a == 255) return "rgb(" + std::to_string(c.r) + ", " + std::to_string(c.g) + ", " + std::to_string(c.b) + ")";
+            char a[16];
+            std::snprintf(a, sizeof a, "%g", c.a / 255.0);
+            return "rgba(" + std::to_string(c.r) + ", " + std::to_string(c.g) + ", " + std::to_string(c.b) + ", " + a + ")";
+        };
+        out["color"] = rgb(s->color);
+        out["background-color"] = rgb(s->background);
+        const auto px = [](float v) {
+            char b[32];
+            std::snprintf(b, sizeof b, "%gpx", v);
+            return std::string(b);
+        };
+        out["font-size"] = px(s->font_size);
+        out["font-weight"] = std::to_string(s->font_weight);
+        out["font-family"] = s->font_family;
+        out["opacity"] = std::to_string(s->opacity).substr(0, 4);
+        out["z-index"] = std::to_string(s->z_index);
+        if (const web::ElementBox* b = boxOf(n)) {
+            out["width"] = px(b->w);
+            out["height"] = px(b->h);
+        }
+        return out;
     }
 
     [[nodiscard]] const web::ElementBox* boxOf(const web::Node* n) const {
@@ -948,6 +1048,11 @@ public:
 
     // Once a frame: images arrive in bursts, and laying a page out for each would crawl.
     void onFrame() {
+        // The page's event loop: timers and animation frames.
+        if (Page* page = node_->page(); page && page->script) {
+            if (page->script->busy()) page->script->tick();
+            if (page->script->takeDirty()) node_->invalidate();
+        }
         if (!relayout_wanted_) return;
         const auto now = std::chrono::steady_clock::now();
         if (now - last_relayout_ < kRelayoutEvery) return;
@@ -1020,9 +1125,10 @@ private:
             Resource got = post ? loadPost(*post) : load(url, true);
             if (generation_.load() != mine) return;
             page->url = got.ok ? got.final_url : url;
-            page->doc = web::parseHtml(htmlFor(got, url));
+            page->doc = web::parseHtml(htmlFor(got, url), web::ParseOptions{.scripting = true});
             page->base = findBase(*page->doc, page->url);
             loadSheets(*page, generation_, mine);
+            loadScripts(*page, generation_, mine);
             if (generation_.load() != mine) return;
             std::vector<std::string> images = imageSources(*page);
             XApplication::post([this, page, mine, restore, images = std::move(images)]() mutable {
@@ -1051,6 +1157,7 @@ private:
 
     void install(const std::shared_ptr<Page>& page, float scroll) {
         node_->show(page);
+        startScripts(page);
         // Redirected? This is where we are now.
         if (index_ < history_.size()) history_[index_].url = page->url;
         showAddress(page->url);
@@ -1061,6 +1168,75 @@ private:
             // The title comes out of layout, which has just run.
             XApplication::setTitle(node_->title().empty() ? "Web" : node_->title());
         });
+    }
+
+    // The page's scripts run once it's shown, in its own world; what they ask of the
+    // browser goes through these.
+    void startScripts(const std::shared_ptr<Page>& page) {
+        web::PageScript::Host host;
+        host.url = page->url;
+        host.base = page->base;
+        int w = 0, h = 0;
+        XApplication::windowSize(w, h);
+        host.viewport_w = w > 0 ? static_cast<float>(w) : 1000;
+        host.viewport_h = h > 0 ? static_cast<float>(h) - kToolbarHeight : 800;
+        host.forms = &page->forms;
+        host.console = [](std::string_view level, const std::string& text) { std::cerr << "[page " << level << "] " << text << "\n"; };
+        host.navigate = [this](const std::string& url) { XApplication::post([this, url] { navigate(url, Mode::New); }); };
+        host.rect = [this](const web::Node* n) -> std::optional<web::ElementRect> {
+            if (const web::ElementBox* b = node_->boxOf(n)) return web::ElementRect{b->x, b->y, b->w, b->h};
+            return std::nullopt;
+        };
+        host.computed_style = [this](const web::Node* n) { return node_->computedStyleOf(n); };
+        Page* raw = page.get();
+        host.activate = [this](const web::Node* n) { activateNode(n); };
+        host.submit = [this, raw](const web::Node* form) {
+            if (auto sub = web::submitForm(form, nullptr, raw->forms, raw->base)) XApplication::post([this, sub = std::move(*sub)] { submit(sub); });
+        };
+        host.focus = [this, raw](const web::Node* n) {
+            if (!web::isTypedInto(web::controlKind(n))) return;
+            raw->forms.focused = n;
+            raw->forms.caret = raw->forms.value(n).size();
+            node_->invalidate();
+        };
+        host.scroll_to = [this](float, float y) { node_->scrollTo(y); };
+        host.scroll_y = [this] { return node_->scrollY(); };
+        page->script = std::make_unique<web::PageScript>(*page->doc, std::move(host));
+        page->script->run([raw](const std::string& url) -> std::optional<std::string> {
+            const auto it = raw->scripts.find(url);
+            if (it == raw->scripts.end()) return std::nullopt;
+            return it->second;
+        });
+        if (page->script->takeDirty()) node_->invalidate();
+    }
+
+    // A click's default action, for element.click() and the like: follow a link, tick a
+    // box, send a form.
+    void activateNode(const web::Node* n) {
+        Page* page = node_->page();
+        if (!page) return;
+        for (const web::Node* a = n; a; a = a->parent)
+            if (a->isHtml("a"))
+                if (const std::string* href = a->attr("href")) {
+                    const std::string h = *href;
+                    XApplication::post([this, h] { follow(h); });
+                    return;
+                }
+        switch (web::controlKind(n)) {
+            case web::ControlKind::Checkbox:
+            case web::ControlKind::Radio:
+                page->forms.activate(n);
+                node_->invalidate();
+                break;
+            case web::ControlKind::Submit:
+            case web::ControlKind::Image:
+                if (const web::Node* form = web::formOwner(n)) {
+                    if (page->script && !page->script->submit(const_cast<web::Node*>(form), const_cast<web::Node*>(n))) return;
+                    if (auto sub = web::submitForm(form, n, page->forms, page->base)) XApplication::post([this, sub = std::move(*sub)] { submit(sub); });
+                }
+                break;
+            default: break;
+        }
     }
 
     void loadImages(const std::shared_ptr<Page>& page, std::vector<std::string> sources, uint64_t mine) {
@@ -1180,13 +1356,27 @@ public:
             if (const web::Node* select = node_->openPopup(); select && page) {
                 if (!down) return true;
                 const int row = node_->popupRowAt(x, y);
-                if (row >= 0 && !web::optionsOf(select)[static_cast<size_t>(row)]->attr("disabled")) page->forms.select(select, row);
+                if (row >= 0 && !web::optionsOf(select)[static_cast<size_t>(row)]->attr("disabled")) {
+                    page->forms.select(select, row);
+                    if (page->script) page->script->change(const_cast<web::Node*>(select));
+                }
                 node_->closeSelect();
                 changed();
                 return true;
             }
             const web::Node* control = page ? node_->controlAt(x, y) : nullptr;
             const web::ControlKind kind = web::controlKind(control);
+            if (!down && page && page->script) {
+                // Scripts hear the click first, and may cancel what it would do.
+                web::Node* target = node_->nodeAt(x, y);
+                const bool go_on = page->script->click(target, x, y);
+                if (page->script->takeDirty()) changed();
+                if (!go_on) {
+                    pressed_control_ = nullptr;
+                    pressed_.clear();
+                    return true;
+                }
+            }
             if (down) {
                 pressed_control_ = control;
                 if (web::isTypedInto(kind)) {
@@ -1216,6 +1406,40 @@ public:
             return true;
         }
         const web::Node* field = page->forms.focused;
+        if (page->script && event.type_ == InputEventType::KeyPress) {
+            // keydown and keyup, to the field being typed into or the page.
+            const bool down = event.value_b_ != 0;
+            std::string key;
+            switch (event.value_a_) {
+                case 28: case 96: key = "Enter"; break;
+                case 14: key = "Backspace"; break;
+                case 15: key = "Tab"; break;
+                case 1: key = "Escape"; break;
+                case 111: key = "Delete"; break;
+                case 103: key = "ArrowUp"; break;
+                case 108: key = "ArrowDown"; break;
+                case 105: key = "ArrowLeft"; break;
+                case 106: key = "ArrowRight"; break;
+                case 102: key = "Home"; break;
+                case 107: key = "End"; break;
+                case 104: key = "PageUp"; break;
+                case 109: key = "PageDown"; break;
+                case 57: key = " "; break;
+                default:
+                    if (event.char_value_ > 0 && event.char_value_ < 0x80) key = std::string(1, static_cast<char>(event.char_value_));
+                    else if (event.char_value_ >= 0x80) key = utf8Of(static_cast<char32_t>(event.char_value_));
+                    else key = "Unidentified";
+            }
+            int code = event.char_value_ >= 'a' && event.char_value_ <= 'z' ? event.char_value_ - 32 : event.char_value_;
+            if (key == "Enter") code = 13;
+            else if (key == "Escape") code = 27;
+            else if (key == "Backspace") code = 8;
+            else if (key == "Tab") code = 9;
+            else if (key.starts_with("Arrow")) code = key == "ArrowLeft" ? 37 : key == "ArrowUp" ? 38 : key == "ArrowRight" ? 39 : 40;
+            const bool go_on = page->script->key(const_cast<web::Node*>(field), down, key, code, event.modifiers_);
+            if (page->script->takeDirty()) changed();
+            if (!go_on && field) return true;
+        }
         if (!field) return false;
         if (event.type_ == InputEventType::ImeCommit) {
             const uint32_t len = std::min(event.modifiers_, 8u);
@@ -1348,8 +1572,10 @@ private:
         } else {
             selecting_all_ = false;
         }
+        const bool really = page->forms.value(field) != e.text;
         page->forms.setValue(field, e.text);
         page->forms.caret = std::min(e.cursor, page->forms.value(field).size());
+        if (really && page->script) page->script->input(const_cast<web::Node*>(field));
         changed();
     }
 
@@ -1361,6 +1587,10 @@ private:
             case web::ControlKind::Checkbox:
             case web::ControlKind::Radio:
                 page->forms.activate(control);
+                if (page->script) {
+                    page->script->input(const_cast<web::Node*>(control));
+                    page->script->change(const_cast<web::Node*>(control));
+                }
                 changed();
                 break;
             case web::ControlKind::Select:
@@ -1396,6 +1626,10 @@ private:
     void submit(const web::Node* form, const web::Node* submitter) {
         Page* page = node_->page();
         if (!page || !form) return;
+        if (page->script && !page->script->submit(const_cast<web::Node*>(form), const_cast<web::Node*>(submitter))) {
+            if (page->script->takeDirty()) changed();
+            return;
+        }
         auto sub = web::submitForm(form, submitter, page->forms, page->base);
         if (!sub) return;
         Browser* browser = browser_;
