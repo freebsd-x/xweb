@@ -1,7 +1,7 @@
 // xwebview [address] — a small browser on our own engine: parsing, style, layout and
 // painting are all ours. Pages come over the network through the compositor's broker
 // and xfetch, since this process runs sandboxed and can't open a socket. The Browser app
-// keeps using Chromium until this can replace it: no scripts, no forms, no web fonts.
+// keeps using Chromium until this can replace it: no scripts, no forms, no cookies.
 
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -38,6 +38,7 @@
 #include "xweb/encoding.h"
 #include "xweb/html_parser.h"
 #include "xweb/layout.h"
+#include "xweb/paint.h"
 #include "xweb/style.h"
 #include "xweb/text_measurer.h"
 #include "xweb/url.h"
@@ -56,6 +57,7 @@ constexpr size_t kMaxImages = 256;
 constexpr size_t kImageWorkers = 4;
 constexpr uint64_t kMaxImagePixels = 40'000'000;     // one image
 constexpr uint64_t kMaxPagePixels = 120'000'000;     // all of a page's, about 480 MB
+constexpr uint64_t kMaxRasterCachePixels = 32'000'000;   // SVG, gradients and masks we've drawn, about 128 MB
 constexpr size_t kMaxLocalFile = 32u << 20;
 constexpr auto kRelayoutEvery = std::chrono::milliseconds(200);
 constexpr size_t kFontWorkers = 4;
@@ -178,6 +180,7 @@ struct LoadedImage {
     std::vector<uint8_t> pixels;
     uint32_t width = 0, height = 0;
     uint32_t id = 0;
+    std::shared_ptr<const web::SvgImage> svg;   // drawn at whatever size it's shown, instead
 };
 
 struct Page {
@@ -186,6 +189,7 @@ struct Page {
     std::string base;      // what its relative links are relative to
     std::map<std::string, std::string> sheets;   // by absolute URL
     std::map<std::string, std::shared_ptr<LoadedImage>> images;   // by absolute URL, UI thread only
+    std::set<std::string> requested;   // images asked for, loaded or not; UI thread only
     uint64_t pixels = 0;
     bool fonts_known = false;   // its @font-face rules are in force, and what they need asked for
 };
@@ -249,7 +253,15 @@ std::vector<std::string> imageSources(const Page& page) {
     return out;
 }
 
-std::optional<LoadedImage> decodeImage(const std::string& url, const std::string& bytes) {
+std::optional<LoadedImage> decodeImage(const std::string& url, const std::string& bytes, const std::string& type) {
+    if (web::SvgImage::sniff(bytes, type, url)) {
+        // Parsed here, drawn later at the size it turns out to be shown.
+        auto svg = web::SvgImage::parse(bytes);
+        if (!svg) return std::nullopt;
+        LoadedImage image;
+        image.svg = std::move(svg);
+        return image;
+    }
     // The decoder takes a descriptor; anonymous shared memory works inside the sandbox.
     const int fd = shm_open(SHM_ANON, O_RDWR | O_CLOEXEC, 0600);
     if (fd < 0) return std::nullopt;
@@ -285,7 +297,23 @@ public:
     std::optional<std::pair<float, float>> imageSize(const std::string& src) override {
         const LoadedImage* image = find(src);
         if (!image) return std::nullopt;
+        if (image->svg) {
+            const web::SvgSize& s = image->svg->size();
+            if (s.width && s.height) return std::make_pair(*s.width, *s.height);
+            if (s.width && s.ratio > 0) return std::make_pair(*s.width, *s.width / s.ratio);
+            if (s.height && s.ratio > 0) return std::make_pair(*s.height * s.ratio, *s.height);
+            if (s.ratio > 0) return std::nullopt;   // a shape only: see imageRatio
+            return std::make_pair(300.0f, 150.0f);
+        }
         return std::make_pair(static_cast<float>(image->width), static_cast<float>(image->height));
+    }
+
+    std::optional<float> imageRatio(const std::string& src) override {
+        const LoadedImage* image = find(src);
+        if (!image || !image->svg) return std::nullopt;
+        const web::SvgSize& s = image->svg->size();
+        if (s.width || s.height || s.ratio <= 0) return std::nullopt;
+        return s.ratio;
     }
 
     const LoadedImage* find(const std::string& src) const {
@@ -304,10 +332,13 @@ public:
 
     // Told once a page, at its first layout, what fonts its text calls for.
     void onFontsWanted(std::function<void(const std::shared_ptr<Page>&, std::vector<web::WebFontFace>)> f) { on_fonts_ = std::move(f); }
+    // Told after a layout what images its styles call for that haven't been asked for.
+    void onImagesWanted(std::function<void(const std::shared_ptr<Page>&, std::vector<std::string>)> f) { on_images_ = std::move(f); }
 
     void show(std::shared_ptr<Page> page) {
         page_ = std::move(page);
         images_.setPage(page_.get());
+        rasters_.clear();
         dirty_ = true;
     }
     void invalidate() { dirty_ = true; }
@@ -331,6 +362,7 @@ public:
     }
 
     void paintSelf(fbx::xrender::DisplayList& dl, Offset at) noexcept override {
+        ++paint_frame_;
         fill(dl, at.x_, at.y_, size_.width_, size_.height_, layout_.canvas);
         // Clips nest, but the engine only has "set" and "reset": each is set to what it
         // and its parents leave, and a pop goes back to the one before. The bottom of the
@@ -372,6 +404,8 @@ public:
                 case web::PaintKind::Rect: fill(dl, op.x + at.x_, y, op.w, op.h, op.color, op.radius); break;
                 case web::PaintKind::Text: text(dl, op, op.x + at.x_, text_y_[i] + at.y_); break;
                 case web::PaintKind::Image: image(dl, op, op.x + at.x_, y); break;
+                case web::PaintKind::Gradient: gradient(dl, op, op.x + at.x_, y); break;
+                case web::PaintKind::Svg: inlineSvg(dl, op, op.x + at.x_, y); break;
                 default: break;
             }
         }
@@ -424,13 +458,14 @@ private:
             return;
         }
         const Page& page = *page_;
-        const web::StyledDocument styles(
-            *page.doc, {width, height},
+        styles_ = std::make_unique<web::StyledDocument>(
+            *page.doc, web::css::MediaContext{width, height},
             [&page](const std::string& href) {
                 const auto it = page.sheets.find(web::resolveUrl(page.base, href));
                 return it == page.sheets.end() ? std::string{} : it->second;
             },
             [this](const web::ComputedStyle& s) { return web::chWidth(measurer_, s); });
+        const web::StyledDocument& styles = *styles_;
         if (!page.fonts_known) {
             page_->fonts_known = true;
             std::vector<web::WebFontFace> faces = styles.fontFaces();
@@ -441,6 +476,12 @@ private:
             if (on_fonts_) on_fonts_(page_, web::wantedWebFonts(*page.doc, styles));
         }
         layout_ = web::layoutPage(*page.doc, styles, measurer_, &images_, width, height);
+        std::vector<std::string> wanted;
+        for (const std::string& src : layout_.images_wanted) {
+            std::string url = web::resolveUrl(page.base, src);
+            if (!page_->requested.count(url)) wanted.push_back(std::move(url));
+        }
+        if (!wanted.empty() && on_images_) on_images_(page_, std::move(wanted));
         // The engine puts a run's baseline 0.8em below where it's told: answer in those
         // terms, for the baseline the font's own ascent put it on.
         text_y_.assign(layout_.ops.size(), 0);
@@ -496,9 +537,131 @@ private:
         dl.addCommand(fbx::shared::CommandType::DrawText, payload);
     }
 
+    // Rasters we've drawn on the CPU (SVG, gradients, tinted masks), by what they show.
+    struct CachedRaster {
+        web::Raster raster;
+        uint32_t id = 0;
+        uint64_t used = 0;
+        uint64_t frame = 0;   // the last paint that put its pixels in a display list
+    };
+
+    // How many pixels to draw something shown this big: all of them, within limits.
+    static std::pair<uint32_t, uint32_t> rasterSize(float w, float h) {
+        double pw = std::max(1.0, std::round(static_cast<double>(w))), ph = std::max(1.0, std::round(static_cast<double>(h)));
+        const double side = static_cast<double>(web::kMaxRasterSide);
+        const double fit = std::min({1.0, side / pw, side / ph, std::sqrt(static_cast<double>(web::kMaxRasterPixels) / (pw * ph))});
+        return {static_cast<uint32_t>(std::max(1.0, std::floor(pw * fit))), static_cast<uint32_t>(std::max(1.0, std::floor(ph * fit)))};
+    }
+
+    const CachedRaster* cached(const std::string& key, const std::function<web::Raster()>& draw) {
+        ++use_clock_;
+        if (auto it = rasters_.find(key); it != rasters_.end()) {
+            it->second.used = use_clock_;
+            it->second.frame = paint_frame_;
+            return it->second.raster.empty() ? nullptr : &it->second;
+        }
+        CachedRaster c;
+        c.raster = draw();
+        c.id = nextImageId();
+        c.used = use_clock_;
+        c.frame = paint_frame_;
+        raster_pixels_ += static_cast<uint64_t>(c.raster.width) * c.raster.height;
+        const CachedRaster& kept = rasters_[key] = std::move(c);
+        // Past the budget, the longest unused go; never one this paint has already handed
+        // to the display list, whose pixels the compositor has yet to read.
+        while (raster_pixels_ > kMaxRasterCachePixels && rasters_.size() > 1) {
+            auto oldest = rasters_.end();
+            for (auto it = rasters_.begin(); it != rasters_.end(); ++it)
+                if (it->second.frame != paint_frame_ && (oldest == rasters_.end() || it->second.used < oldest->second.used)) oldest = it;
+            if (oldest == rasters_.end()) break;
+            raster_pixels_ -= static_cast<uint64_t>(oldest->second.raster.width) * oldest->second.raster.height;
+            rasters_.erase(oldest);
+        }
+        return kept.raster.empty() ? nullptr : &kept;
+    }
+
+    static void drawRaster(fbx::xrender::DisplayList& dl, const CachedRaster& r, float x, float y, float w, float h) {
+        fbx::shared::ImageData d{};
+        d.x_ = x;
+        d.y_ = y;
+        d.width_ = w;
+        d.height_ = h;
+        d.texture_id_ = r.id;
+        d.pixel_ptr_ = r.raster.rgba.data();
+        d.pixel_width_ = r.raster.width;
+        d.pixel_height_ = r.raster.height;
+        dl.addCommand(fbx::shared::CommandType::DrawImage, {reinterpret_cast<const uint8_t*>(&d), sizeof(d)});
+    }
+
+    static std::string colorKey(web::Color c) {
+        return std::to_string((static_cast<uint32_t>(c.r) << 24) | (static_cast<uint32_t>(c.g) << 16) | (static_cast<uint32_t>(c.b) << 8) | c.a);
+    }
+
+    static std::string gradientKey(const web::Gradient& g) {
+        std::string k = std::to_string(static_cast<int>(g.kind)) + (g.repeating ? "r" : "") + "|" + std::to_string(g.angle) + "|" +
+                        std::to_string(g.to_x) + "," + std::to_string(g.to_y) + "|" + std::to_string(g.center_x.px) + "," +
+                        std::to_string(g.center_x.percent) + "," + std::to_string(g.center_y.px) + "," + std::to_string(g.center_y.percent) +
+                        "|" + (g.circle ? "c" : "e") + std::to_string(static_cast<int>(g.extent)) + (g.explicit_size ? "s" : "") +
+                        std::to_string(g.radius_x.px) + "," + std::to_string(g.radius_x.percent) + "," + std::to_string(g.radius_y.px) + "," +
+                        std::to_string(g.radius_y.percent) + "|" + std::to_string(g.from);
+        for (const web::GradientStop& st : g.stops)
+            k += "|" + colorKey(st.color) + (st.has_position ? "@" + std::to_string(st.position.px) + "," + std::to_string(st.position.percent) : "");
+        return k;
+    }
+
+    void gradient(fbx::xrender::DisplayList& dl, const web::PaintOp& op, float x, float y) {
+        if (!op.gradient || op.w <= 0 || op.h <= 0) return;
+        const auto [pw, ph] = rasterSize(op.w, op.h);
+        const std::string key = "g:" + gradientKey(*op.gradient) + ":" + std::to_string(op.w) + "x" + std::to_string(op.h);
+        const web::Gradient& g = *op.gradient;
+        const float w = op.w, h = op.h;
+        if (const CachedRaster* r = cached(key, [&, pw = pw, ph = ph] { return web::renderGradient(g, w, h, pw, ph); })) drawRaster(dl, *r, x, y, op.w, op.h);
+    }
+
+    void inlineSvg(fbx::xrender::DisplayList& dl, const web::PaintOp& op, float x, float y) {
+        if (!op.node || !styles_ || op.w <= 0 || op.h <= 0) return;
+        const auto [pw, ph] = rasterSize(op.w, op.h);
+        char ptr[32];
+        std::snprintf(ptr, sizeof ptr, "%p", static_cast<const void*>(op.node));
+        const std::string key = std::string("s:") + ptr + ":" + std::to_string(pw) + "x" + std::to_string(ph) + ":" + colorKey(op.color);
+        const web::Node* node = op.node;
+        const web::StyledDocument* styles = styles_.get();
+        const web::Color color = op.color;
+        if (const CachedRaster* r = cached(key, [&, pw = pw, ph = ph] { return web::renderSvg(*node, pw, ph, styles, color); })) drawRaster(dl, *r, x, y, op.w, op.h);
+    }
+
     void image(fbx::xrender::DisplayList& dl, const web::PaintOp& op, float x, float y) {
         const LoadedImage* loaded = images_.find(op.text);
         if (!loaded) return;
+        if (loaded->svg || op.tint) {
+            // Drawn for this size (an SVG), or only its alpha in a colour (a mask).
+            const auto [pw, ph] = loaded->svg ? rasterSize(op.w, op.h) : std::pair<uint32_t, uint32_t>{loaded->width, loaded->height};
+            char ptr[32];
+            std::snprintf(ptr, sizeof ptr, "%p", static_cast<const void*>(loaded));
+            const std::string key = std::string("i:") + ptr + ":" + std::to_string(pw) + "x" + std::to_string(ph) + (op.tint ? ":" + colorKey(op.color) : "");
+            const bool tint = op.tint;
+            const web::Color color = op.color;
+            const CachedRaster* r = cached(key, [&, pw = pw, ph = ph] {
+                web::Raster out;
+                if (loaded->svg) {
+                    out = loaded->svg->render(pw, ph);
+                } else {
+                    out.width = loaded->width;
+                    out.height = loaded->height;
+                    out.rgba = loaded->pixels;
+                }
+                if (tint)
+                    for (size_t i = 0; i + 3 < out.rgba.size(); i += 4) {
+                        out.rgba[i] = color.r;
+                        out.rgba[i + 1] = color.g;
+                        out.rgba[i + 2] = color.b;
+                        out.rgba[i + 3] = static_cast<uint8_t>(out.rgba[i + 3] * color.a / 255);
+                    }
+                return out;
+            });
+            if (r) drawRaster(dl, *r, x, y, op.w, op.h);
+            return;
+        }
         fbx::shared::ImageData d{};
         d.x_ = x;
         d.y_ = y;
@@ -517,6 +680,10 @@ private:
 
     std::shared_ptr<Page> page_;
     std::function<void(const std::shared_ptr<Page>&, std::vector<web::WebFontFace>)> on_fonts_;
+    std::function<void(const std::shared_ptr<Page>&, std::vector<std::string>)> on_images_;
+    std::unique_ptr<web::StyledDocument> styles_;   // the last layout's, which inline SVG is drawn with
+    std::map<std::string, CachedRaster> rasters_;
+    uint64_t raster_pixels_ = 0, use_clock_ = 0, paint_frame_ = 0;
     PageImages images_;
     web::XrenderTextMeasurer measurer_;
     web::PageLayout layout_;
@@ -531,6 +698,10 @@ class Browser {
 public:
     explicit Browser(std::shared_ptr<RenderWebPage> node) : node_(std::move(node)) {
         node_->onFontsWanted([this](const std::shared_ptr<Page>& page, std::vector<web::WebFontFace> faces) { loadFonts(page, std::move(faces)); });
+        node_->onImagesWanted([this](const std::shared_ptr<Page>& page, std::vector<std::string> urls) {
+            // Not from inside layout: next turn of the loop.
+            XApplication::post([this, page, urls = std::move(urls)]() mutable { loadImages(page, std::move(urls), generation_.load()); });
+        });
     }
 
     void setAddressField(std::shared_ptr<TextInputWidget> field) { address_ = std::move(field); }
@@ -679,6 +850,9 @@ private:
     }
 
     void loadImages(const std::shared_ptr<Page>& page, std::vector<std::string> sources, uint64_t mine) {
+        std::erase_if(sources, [&](const std::string& url) {
+            return page->requested.size() >= kMaxImages || !page->requested.insert(url).second;
+        });
         if (sources.empty()) return;
         struct Work {
             std::mutex mutex;
@@ -698,7 +872,7 @@ private:
                     }
                     Resource got = load(url);
                     if (!got.ok || got.http_status >= 400) continue;
-                    auto decoded = decodeImage(url, got.body);
+                    auto decoded = decodeImage(url, got.body, got.content_type);
                     if (!decoded) continue;
                     auto image = std::make_shared<LoadedImage>(std::move(*decoded));
                     XApplication::post([this, page, url, image, mine] {

@@ -18,3 +18,4 @@ build/
 # macOS
 .DS_Store
 tests/pages/fonts/
+.xweb-pixels-*

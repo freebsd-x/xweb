@@ -13,6 +13,8 @@ libxweb = static_library('xweb',
   'src/css_parser.cc',
   'src/style.cc',
   'src/layout.cc',
+  'src/raster.cc',
+  'src/svg.cc',
   include_directories : xweb_inc,
 )
 
@@ -35,6 +37,13 @@ xweb_layout = executable('xweb_layout', 'tools/xweb_layout.cc',
   include_directories : include_directories('../../include', '../xrender/include'),
 )
 
+# The first screenful painted on the CPU, without text; scripts/xweb-pixels.py checks
+# it against Chromium's.
+xweb_paint = executable('xweb_paint', 'tools/xweb_paint.cc',
+  dependencies : [xweb_text_dep, freetype_dep, harfbuzz_dep, fontconfig_dep, libpng_dep, vulkan_dep],
+  include_directories : include_directories('../../include', '../xrender/include'),
+)
+
 # The html5lib conformance suite, run against the parser (tests/html5lib, known gaps
 # listed in tests/html5lib_known_failures.txt).
 test('xweb html5lib',
@@ -43,7 +52,7 @@ test('xweb html5lib',
   suite : 'unit',
 )
 
-foreach unit : [['css', 'css_parser_test.cc'], ['style', 'style_test.cc'], ['layout', 'layout_test.cc'], ['fuzz', 'fuzz_test.cc'], ['html', 'html_parser_test.cc'], ['url', 'url_test.cc'], ['encoding', 'encoding_test.cc']]
+foreach unit : [['css', 'css_parser_test.cc'], ['style', 'style_test.cc'], ['layout', 'layout_test.cc'], ['fuzz', 'fuzz_test.cc'], ['html', 'html_parser_test.cc'], ['url', 'url_test.cc'], ['encoding', 'encoding_test.cc'], ['paint', 'paint_test.cc']]
   test('xweb ' + unit[0],
     executable('xweb_' + unit[0] + '_test', 'tests/unit' / unit[1], dependencies : [xweb_dep, gtest_dep]),
     suite : 'unit',

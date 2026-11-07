@@ -302,7 +302,8 @@ TEST(Color, LightDarkTakesTheLight) {
     EXPECT_FALSE(parseColor(css::tokenize("light-dark(light-dark(red,blue),blue)"), Color{}, c));
 }
 
-TEST(Mask, AMaskedColourIsntPaintedAsABlock) {
+// The colour stays: layout draws it through the mask's image (Layout.MaskTintsTheBackgroundColour).
+TEST(Mask, AMaskedColourIsKeptForTheMask) {
     const auto doc = parseHtml("<!doctype html><div id=a style='background:red;mask-image:url(x.svg)'></div><div id=b style='background:red;mask:none'></div><div id=c style='background:red'></div>");
     const StyledDocument styles(*doc, {800, 600});
     const auto find = [&](const char* id) {
@@ -315,7 +316,9 @@ TEST(Mask, AMaskedColourIsntPaintedAsABlock) {
         }
         return static_cast<const Node*>(nullptr);
     };
-    EXPECT_FALSE(styles.styleOf(find("a"))->background.visible());
+    EXPECT_TRUE(styles.styleOf(find("a"))->masked);
+    EXPECT_TRUE(styles.styleOf(find("a"))->background.visible());
+    EXPECT_FALSE(styles.styleOf(find("b"))->masked);
     EXPECT_TRUE(styles.styleOf(find("b"))->background.visible());
     EXPECT_TRUE(styles.styleOf(find("c"))->background.visible());
 }

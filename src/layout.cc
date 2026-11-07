@@ -24,6 +24,7 @@ enum class BoxKind { Block, Inline, InlineBlock, Text, Replaced, LineBreak };
 struct Box {
     BoxKind kind = BoxKind::Block;
     const Node* node = nullptr;
+    std::pair<float, float> laid_out_for{-1, -1};   // absolutely positioned: the containing block it was sized for
     const ComputedStyle* style = nullptr;
     std::vector<std::unique_ptr<Box>> kids;
     std::string text;              // Text
@@ -253,13 +254,21 @@ public:
         const Node* body = doc.body();
         const ComputedStyle* body_style = body ? styles_.styleOf(body) : nullptr;
         const Box* skip_bg = nullptr;
-        if (root_style->background.visible()) {
+        const auto hasBackground = [](const ComputedStyle& st) { return st.background.visible() || (st.background_layers && !st.masked); };
+        if (hasBackground(*root_style)) {
             page.canvas = root_style->background;
             skip_bg = root.get();
-        } else if (body_style && body_style->background.visible()) {
+        } else if (body_style && hasBackground(*body_style)) {
             page.canvas = body_style->background;
             for (const auto& k : root->kids)
                 if (k->node == body) skip_bg = k.get();
+        }
+        if (!page.canvas.visible()) page.canvas = {255, 255, 255, 255};
+        else if (page.canvas.a != 255) {
+            // Over the white a browser starts from.
+            const float a = page.canvas.a / 255.0f;
+            const auto over = [a](uint8_t c) { return static_cast<uint8_t>(std::lround(c * a + 255 * (1 - a))); };
+            page.canvas = {over(page.canvas.r), over(page.canvas.g), over(page.canvas.b), 255};
         }
         skip_background_ = skip_bg;
         out_ = &page;
@@ -270,6 +279,18 @@ public:
         paintContents(*root, root->x, root_y, viewport, 1.0f);
         flushPositioned();
         page.height = std::max({vh_, max_bottom_, root_y + root->outerHeight() + root->margin_bottom_outer});
+        // The canvas's images, under everything: placed for their element, drawn everywhere.
+        if (skip_bg && skip_bg->style->background_layers) {
+            std::vector<PaintOp> painted = std::move(page.ops);
+            page.ops.clear();
+            float bx = root->x, by = root_y;
+            if (skip_bg != root.get()) {
+                bx += root->border[Left] + root->padding[Left] + skip_bg->x;
+                by += root->border[Top] + root->padding[Top] + skip_bg->y;
+            }
+            paintLayers(*skip_bg, bx, by, *skip_bg->style->background_layers, 1.0f, nullptr, Rect{0, 0, std::max(vw_, page.width), page.height}, true);
+            page.ops.insert(page.ops.end(), std::make_move_iterator(painted.begin()), std::make_move_iterator(painted.end()));
+        }
         return page;
     }
 
@@ -825,9 +846,12 @@ private:
         b.margin_bottom_outer = mb;
     }
 
-    void layoutOutOfFlow(Box& k, float cb_width) {
+    // Laid out first against its parent's width; once painting knows the real containing
+    // block, again if what it measures by turns out different (layoutForContainingBlock).
+    void layoutOutOfFlow(Box& k, float cb_width, std::optional<float> cb_height = std::nullopt) {
         const ComputedStyle& s = *k.style;
         const float base = s.position == Position::Fixed ? vw_ : cb_width;
+        const float base_h = s.position == Position::Fixed ? vh_ : cb_height.value_or(vh_);
         resolveSpacing(k, base);
         const float frame = k.frameWidth();
         float width;
@@ -846,9 +870,29 @@ private:
             if (s.border_box) h -= k.frameHeight();
             own = std::max(0.0f, h);
         } else if (!s.height.is_auto) {
-            own = std::max(0.0f, s.height.resolve(vh_));
+            float h = s.height.resolve(base_h);
+            if (s.border_box) h -= k.frameHeight();
+            own = std::max(0.0f, h);
+        } else if (cb_height && !s.offset[Top].is_auto && !s.offset[Bottom].is_auto) {
+            // Both edges given: as tall as they leave.
+            own = std::max(0.0f, base_h - s.offset[Top].resolve(base_h) - s.offset[Bottom].resolve(base_h) - k.frameHeight() - k.margin[Top] - k.margin[Bottom]);
         }
+        k.laid_out_for = {base, cb_height.value_or(-1)};
         layoutContents(k, own, Flow{});
+    }
+
+    // Whether an absolutely positioned box's size depends on its containing block in a way
+    // its first layout couldn't know, and if so, lays it out again.
+    void layoutForContainingBlock(const Box& kc, const Rect& cb) {
+        Box& k = const_cast<Box&>(kc);   // laid out, not yet painted: nothing has its old size
+        const ComputedStyle& s = *k.style;
+        if (s.position != Position::Absolute) return;
+        const bool by_height = s.height.hasPercent() || (s.height.is_auto && !s.offset[Top].is_auto && !s.offset[Bottom].is_auto);
+        const bool by_width = s.width.hasPercent() || (!s.offset[Left].is_auto && !s.offset[Right].is_auto) ||
+                              s.offset[Left].hasPercent() || s.margin[Left].hasPercent() || s.padding[Left].hasPercent();
+        const bool width_changed = std::abs(k.laid_out_for.first - cb.w) > 0.01f;
+        const bool height_changed = std::abs(k.laid_out_for.second - cb.h) > 0.01f;
+        if ((by_height && height_changed) || (by_width && width_changed)) layoutOutOfFlow(k, cb.w, cb.h);
     }
 
     void layoutFloat(Box& k, float cb_width) {
@@ -1032,6 +1076,11 @@ private:
                 if (const auto size = images_->imageSize(*src)) {
                     natural_w = size->first;
                     natural_h = size->second;
+                    have_natural = true;
+                } else if (const auto ratio = images_->imageRatio(*src); ratio && *ratio > 0 && cb_width < kUnbounded / 2) {
+                    // A shape but no size: as wide as there's room for, as an inline <svg> is.
+                    natural_w = std::max(0.0f, cb_width - b.frameWidth() - b.margin[Left] - b.margin[Right]);
+                    natural_h = natural_w / *ratio;
                     have_natural = true;
                 }
             }
@@ -1684,6 +1733,12 @@ private:
                         if (std::abs(k.height - inner_cross) > 0.01f) layoutItem(k, it->main, inner_cross);
                     } else if (std::abs(k.width - inner_cross) > 0.01f) {
                         layoutItem(k, inner_cross, it->main);
+                    }
+                    // A picture item stretches too, without keeping its shape.
+                    if (row && k.kids.size() == 1 && k.kids[0]->kind == BoxKind::Replaced && k.kids[0]->node == k.node &&
+                        !k.fragments.empty() && k.fragments[0].atomic == k.kids[0].get()) {
+                        k.kids[0]->height = inner_cross;
+                        k.fragments[0].h = inner_cross;
                     }
                     it->cross_outer = line_cross[li];
                 }
@@ -3035,6 +3090,137 @@ private:
         out_->ops.push_back(std::move(op));
     }
 
+    // Background (or mask) layers, bottom first. `tint`: draw the images' alpha in that colour.
+    // `canvas`: paint over this area instead of the box's own (the root's background).
+    void paintLayers(const Box& b, float x, float y, const BackgroundLayers& layers, float opacity, const Color* tint, Rect canvas,
+                     bool use_canvas) {
+        const float w = b.outerWidth(), h = b.outerHeight();
+        const auto area = [&](BackgroundBox which) {
+            Rect r{x, y, w, h};
+            if (which == BackgroundBox::Border) return r;
+            r.x += b.border[Left];
+            r.y += b.border[Top];
+            r.w -= b.border[Left] + b.border[Right];
+            r.h -= b.border[Top] + b.border[Bottom];
+            if (which == BackgroundBox::Content) {
+                r.x += b.padding[Left];
+                r.y += b.padding[Top];
+                r.w -= b.padding[Left] + b.padding[Right];
+                r.h -= b.padding[Top] + b.padding[Bottom];
+            }
+            r.w = std::max(0.0f, r.w);
+            r.h = std::max(0.0f, r.h);
+            return r;
+        };
+        constexpr size_t kMaxTiles = 10'000;
+        for (size_t i = layers.images.size(); i-- > 0;) {
+            const BackgroundImage& image = layers.images[i];
+            if (image.none()) continue;
+            if (tint && !image.gradient && image.url.empty()) continue;
+            const auto pick = [&](const auto& list) { return list[i % list.size()]; };
+            if (layers.sizes.empty() || layers.positions.empty() || layers.repeats.empty() || layers.origins.empty() || layers.clips.empty()) return;
+            const Rect origin = area(pick(layers.origins));
+            const Rect clip = use_canvas ? canvas : area(pick(layers.clips));
+            if (clip.w <= 0 || clip.h <= 0) continue;
+            // What the image brings: a size, a shape, or (a gradient) neither.
+            std::optional<float> iw, ih;
+            float ratio = 0;
+            if (!image.url.empty()) {
+                if (!images_) continue;
+                if (const auto size = images_->imageSize(image.url)) {
+                    iw = size->first;
+                    ih = size->second;
+                    if (*ih > 0) ratio = *iw / *ih;
+                } else if (const auto rr = images_->imageRatio(image.url)) {
+                    ratio = *rr;
+                } else {
+                    if (std::find(out_->images_wanted.begin(), out_->images_wanted.end(), image.url) == out_->images_wanted.end() &&
+                        out_->images_wanted.size() < 512)
+                        out_->images_wanted.push_back(image.url);
+                    continue;
+                }
+            } else if (tint) {
+                continue;   // a gradient mask: drawn as if there were none
+            }
+            const BackgroundSize size = pick(layers.sizes);
+            float tw = 0, th = 0;
+            if (size.kind != BackgroundSize::Kind::Explicit) {
+                if (ratio > 0) {
+                    const float k = size.kind == BackgroundSize::Kind::Contain ? std::min(origin.w / ratio, origin.h) : std::max(origin.w / ratio, origin.h);
+                    th = k;
+                    tw = k * ratio;
+                } else {
+                    tw = origin.w;
+                    th = origin.h;
+                }
+            } else {
+                const bool aw = size.width.is_auto, ah = size.height.is_auto;
+                if (!aw) tw = size.width.resolve(origin.w);
+                if (!ah) th = size.height.resolve(origin.h);
+                if (aw && ah) {
+                    if (iw && ih) { tw = *iw; th = *ih; }
+                    else if (ratio > 0) {
+                        const float k = std::min(origin.w / ratio, origin.h);
+                        tw = k * ratio;
+                        th = k;
+                    } else { tw = origin.w; th = origin.h; }
+                } else if (aw) {
+                    tw = ratio > 0 ? th * ratio : iw ? *iw : origin.w;
+                } else if (ah) {
+                    th = ratio > 0 ? tw / ratio : ih ? *ih : origin.h;
+                }
+            }
+            if (!(tw > 0.01f) || !(th > 0.01f) || tw > kMaxCoord || th > kMaxCoord) continue;
+            const auto [pos_x, pos_y] = pick(layers.positions);
+            const float px = origin.x + pos_x.px + pos_x.percent * (origin.w - tw) / 100.0f;
+            const float py = origin.y + pos_y.px + pos_y.percent * (origin.h - th) / 100.0f;
+            const auto [rx, ry] = pick(layers.repeats);
+            float x0 = px, y0 = py;
+            if (rx) x0 = px - std::ceil((px - clip.x) / tw) * tw;
+            if (ry) y0 = py - std::ceil((py - clip.y) / th) * th;
+            const float x_end = rx ? clip.x + clip.w : px + tw * 0.5f;
+            const float y_end = ry ? clip.y + clip.h : py + th * 0.5f;
+            const double tiles = (rx ? std::ceil((x_end - x0) / tw) : 1.0) * (ry ? std::ceil((y_end - y0) / th) : 1.0);
+            if (!(tiles <= static_cast<double>(kMaxTiles))) continue;
+            PaintOp begin;
+            begin.kind = PaintKind::ClipBegin;
+            begin.x = clip.x;
+            begin.y = clip.y;
+            begin.w = clip.w;
+            begin.h = clip.h;
+            out_->ops.push_back(begin);
+            for (float ty = y0; ty < y_end; ty += th) {
+                for (float tx = x0; tx < x_end; tx += tw) {
+                    if (tx + tw <= clip.x || ty + th <= clip.y || tx >= clip.x + clip.w || ty >= clip.y + clip.h) {
+                        if (!rx) break;
+                        continue;
+                    }
+                    PaintOp op;
+                    op.x = tx;
+                    op.y = ty;
+                    op.w = tw;
+                    op.h = th;
+                    if (image.gradient) {
+                        op.kind = PaintKind::Gradient;
+                        op.gradient = image.gradient;
+                        op.color = faded(Color{255, 255, 255, 255}, opacity);
+                    } else {
+                        op.kind = PaintKind::Image;
+                        op.text = image.url;
+                        op.tint = tint != nullptr;
+                        op.color = tint ? *tint : faded(Color{255, 255, 255, 255}, opacity);
+                    }
+                    out_->ops.push_back(std::move(op));
+                    if (!rx) break;
+                }
+                if (!ry) break;
+            }
+            PaintOp end;
+            end.kind = PaintKind::ClipEnd;
+            out_->ops.push_back(end);
+        }
+    }
+
     void paintFrame(const Box& b, float x, float y, float opacity) {
         const ComputedStyle& s = *b.style;
         const float w = b.outerWidth(), h = b.outerHeight();
@@ -3043,22 +3229,35 @@ private:
         const bool same_border = b.border[Top] > 0 && b.border[Top] == b.border[Right] && b.border[Top] == b.border[Bottom] &&
                                  b.border[Top] == b.border[Left] && s.border_color[Top] == s.border_color[Right] &&
                                  s.border_color[Top] == s.border_color[Bottom] && s.border_color[Top] == s.border_color[Left];
-        const Color bg = &b == skip_background_ ? Color{0, 0, 0, 0} : faded(s.background, opacity);
+        const bool own_background = &b != skip_background_;
+        // A mask shows the background colour only where the mask's images are.
+        const Color bg = !own_background || s.masked ? Color{0, 0, 0, 0} : faded(s.background, opacity);
         if (r > 0 && same_border && bg.visible()) {
             // A rounded border is the border colour's shape with the fill's inside it.
             const float bw = b.border[Top];
             addRect(x, y, w, h, faded(s.border_color[Top], opacity), r);
             addRect(x + bw, y + bw, w - 2 * bw, h - 2 * bw, bg, std::max(0.0f, r - bw));
+            if (own_background && s.background_layers) paintLayers(b, x, y, *s.background_layers, opacity, nullptr, Rect{0, 0, 0, 0}, false);
             return;
         }
         addRect(x, y, w, h, bg, r);
+        if (own_background) {
+            if (s.masked) {
+                const Color tint = faded(s.background, opacity);
+                if (tint.visible()) paintLayers(b, x, y, *s.mask_layers, opacity, &tint, Rect{0, 0, 0, 0}, false);
+            } else if (s.background_layers) {
+                paintLayers(b, x, y, *s.background_layers, opacity, nullptr, Rect{0, 0, 0, 0}, false);
+            }
+        }
         // A collapsed border is centred on the edge the two cells share.
         const float t = b.border[Top], rt = b.border[Right], bt = b.border[Bottom], l = b.border[Left];
         const float grow = b.collapsed_border ? 1 : 0;
         if (t > 0) addRect(x - grow * l, y - grow * t, w + grow * (l + rt), t * (1 + grow), faded(s.border_color[Top], opacity));
         if (bt > 0) addRect(x - grow * l, y + h - bt, w + grow * (l + rt), bt * (1 + grow), faded(s.border_color[Bottom], opacity));
-        if (l > 0) addRect(x - grow * l, y - grow * t, l * (1 + grow), h + grow * (t + bt), faded(s.border_color[Left], opacity));
-        if (rt > 0) addRect(x + w - rt, y - grow * t, rt * (1 + grow), h + grow * (t + bt), faded(s.border_color[Right], opacity));
+        // Sides don't overlap at the corners, or a translucent colour would show twice there.
+        const float side_top = grow > 0 ? y - t : y + t, side_h = grow > 0 ? h + t + bt : h - t - bt;
+        if (l > 0 && side_h > 0) addRect(x - grow * l, side_top, l * (1 + grow), side_h, faded(s.border_color[Left], opacity));
+        if (rt > 0 && side_h > 0) addRect(x + w - rt, side_top, rt * (1 + grow), side_h, faded(s.border_color[Right], opacity));
     }
 
     void addText(float x, float y, const std::string& text, const ComputedStyle& s, float opacity) {
@@ -3083,7 +3282,7 @@ private:
         const Node* n = b.node;
         if (n->isHtml("img")) {
             if (const std::string* src = n->attr("src")) {
-                if (images_ && images_->imageSize(*src)) {
+                if (images_ && (images_->imageSize(*src) || images_->imageRatio(*src))) {
                     PaintOp op;
                     op.kind = PaintKind::Image;
                     op.x = cx;
@@ -3097,6 +3296,19 @@ private:
                 }
             }
             if (!b.alt.empty()) addText(cx, cy, b.alt, s, opacity);
+            return;
+        }
+        if (n->ns == Namespace::Svg && n->name == "svg") {
+            if (b.width <= 0 || b.height <= 0) return;
+            PaintOp op;
+            op.kind = PaintKind::Svg;
+            op.x = cx;
+            op.y = cy;
+            op.w = b.width;
+            op.h = b.height;
+            op.node = n;
+            op.color = faded(s.color, opacity);
+            out_->ops.push_back(std::move(op));
             return;
         }
         const std::string shown = controlText(n);
@@ -3180,6 +3392,8 @@ private:
                             ? Rect{x + b.border[Left], y + b.border[Top], b.width + b.padding[Left] + b.padding[Right],
                                    b.height + b.padding[Top] + b.padding[Bottom]}
                             : cb_in;
+        const size_t outer_cb_clip_depth = cb_clip_depth_;
+        if (s.position != Position::Static) cb_clip_depth_ = clip_stack_.size();
         if (s.overflow_clip) {
             PaintOp op;
             op.kind = PaintKind::ClipBegin;
@@ -3187,6 +3401,7 @@ private:
             op.y = y + b.border[Top];
             op.w = b.width + b.padding[Left] + b.padding[Right];
             op.h = b.height + b.padding[Top] + b.padding[Bottom];
+            clip_stack_.push_back({op.x, op.y, op.w, op.h});
             out_->ops.push_back(std::move(op));
         }
         // Floats paint above their context's in-flow blocks: later siblings' backgrounds
@@ -3200,7 +3415,7 @@ private:
         for (const auto& kp : b.kids) {
             const Box& k = *kp;
             if (k.outOfFlow()) {
-                positioned_.push_back({&k, cx, cy + k.static_y, cb, opacity, order_++});
+                positioned_.push_back({&k, cx, cy + k.static_y, cb, opacity, order_++, clipsFor(k)});
                 continue;
             }
             if (k.floating()) {
@@ -3227,13 +3442,15 @@ private:
             PaintOp op;
             op.kind = PaintKind::ClipEnd;
             out_->ops.push_back(std::move(op));
+            if (!clip_stack_.empty()) clip_stack_.pop_back();
         }
+        cb_clip_depth_ = outer_cb_clip_depth;
     }
 
     // Absolute and floated boxes inside inline elements still need painting.
     void collectOutOfFlowIn(const Box& b, float cx, float cy, const Rect& cb, float opacity) {
         for (const auto& kp : b.kids) {
-            if (kp->outOfFlow()) positioned_.push_back({kp.get(), cx, cy + kp->static_y, cb, opacity, order_++});
+            if (kp->outOfFlow()) positioned_.push_back({kp.get(), cx, cy + kp->static_y, cb, opacity, order_++, clipsFor(*kp)});
             else if (kp->floating()) pending_floats_.push_back({kp.get(), cx, cy, cb, opacity});
             else if (kp->kind == BoxKind::Inline) collectOutOfFlowIn(*kp, cx, cy, cb, opacity);
         }
@@ -3265,13 +3482,35 @@ private:
                 const Box& k = *p.box;
                 const ComputedStyle& s = *k.style;
                 const Rect cb = s.position == Position::Fixed ? Rect{0, 0, vw_, vh_} : p.cb;
+                layoutForContainingBlock(k, cb);
                 float x = p.static_x + k.margin[Left], y = p.static_y + k.margin[Top];
                 if (!s.offset[Left].is_auto) x = cb.x + s.offset[Left].resolve(cb.w) + k.margin[Left];
                 else if (!s.offset[Right].is_auto) x = cb.x + cb.w - s.offset[Right].resolve(cb.w) - k.outerWidth() - k.margin[Right];
                 if (!s.offset[Top].is_auto) y = cb.y + s.offset[Top].resolve(cb.h) + k.margin[Top];
                 else if (!s.offset[Bottom].is_auto) y = cb.y + cb.h - s.offset[Bottom].resolve(cb.h) - k.outerHeight() - k.margin[Bottom];
                 record(k, x, y);
+                // Inside the clips it was inside, as far as its containing block.
+                for (const Rect& c : p.clips) {
+                    PaintOp op;
+                    op.kind = PaintKind::ClipBegin;
+                    op.x = c.x;
+                    op.y = c.y;
+                    op.w = c.w;
+                    op.h = c.h;
+                    out_->ops.push_back(std::move(op));
+                }
+                const std::vector<Rect> saved = std::move(clip_stack_);
+                clip_stack_ = p.clips;
+                const size_t saved_depth = cb_clip_depth_;
+                cb_clip_depth_ = clip_stack_.size();
                 paintContents(k, x, y, cb, p.opacity);
+                clip_stack_ = saved;
+                cb_clip_depth_ = saved_depth;
+                for (size_t i = 0; i < p.clips.size(); ++i) {
+                    PaintOp op;
+                    op.kind = PaintKind::ClipEnd;
+                    out_->ops.push_back(std::move(op));
+                }
             }
         }
     }
@@ -3282,6 +3521,7 @@ private:
         Rect cb;
         float opacity;
         size_t order;
+        std::vector<Rect> clips;   // overflow clips between it and its containing block
     };
 
     struct PendingFloat {
@@ -3301,6 +3541,15 @@ private:
     const Box* root_ = nullptr;
     float max_bottom_ = 0;
     std::vector<Positioned> positioned_;
+    std::vector<Rect> clip_stack_;   // overflow clips around what's being painted
+    size_t cb_clip_depth_ = 0;       // how many of them are outside the containing block
+
+    // An absolutely positioned box is clipped by overflow inside its containing block, not
+    // outside it; a fixed one by none.
+    std::vector<Rect> clipsFor(const Box& k) const {
+        if (k.style->position == Position::Fixed) return {};
+        return {clip_stack_.begin() + static_cast<std::ptrdiff_t>(std::min(cb_clip_depth_, clip_stack_.size())), clip_stack_.end()};
+    }
     std::vector<PendingFloat> pending_floats_;
     size_t order_ = 0;
     int relayouts_ = 0;

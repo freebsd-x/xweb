@@ -22,21 +22,9 @@
 #include "xweb/style.h"
 #include "xweb/text_measurer.h"
 #include "xweb/url.h"
+#include "file_images.h"
 
 namespace {
-
-class FileImages : public fbx::xweb::ImageSizes {
-public:
-    explicit FileImages(std::filesystem::path base) : base_(std::move(base)) {}
-    std::optional<std::pair<float, float>> imageSize(const std::string& src) override {
-        auto decoded = fbx::xrender::ImageDecoder::decode((base_ / src).string(), 512, 512);
-        if (!decoded) return std::nullopt;
-        return std::make_pair(static_cast<float>(decoded->width_), static_cast<float>(decoded->height_));
-    }
-
-private:
-    std::filesystem::path base_;
-};
 
 }  // namespace
 
@@ -83,7 +71,7 @@ int main(int argc, char** argv) {
         }
     }
     const StyledDocument styles(*doc, {w, h}, sheet_text, ch);
-    FileImages images(base);
+    fbx::xweb::tools::FileImages images(base);
     const PageLayout page = layoutPage(*doc, styles, text, &images, w, h);
     // In document order, whatever order they were painted in.
     std::unordered_map<const Node*, const ElementBox*> by_node;

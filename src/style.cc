@@ -661,6 +661,593 @@ std::string keyword(const Tokens& v) {
     return i == v.size() ? w : std::string{};
 }
 
+// ── Backgrounds, masks and gradients ──────────────────────────────────────────
+
+constexpr size_t kMaxBackgroundLayers = 32;
+constexpr size_t kMaxGradientStops = 256;
+
+// A value's top-level comma-separated parts.
+std::vector<Tokens> commaParts(const Tokens& v, size_t begin = 0, size_t end = SIZE_MAX) {
+    std::vector<Tokens> parts(1);
+    int depth = 0;
+    end = std::min(end, v.size());
+    for (size_t i = begin; i < end; ++i) {
+        const TokenType ty = v[i].type;
+        if (ty == TokenType::Function || ty == TokenType::LeftParen) ++depth;
+        else if (ty == TokenType::RightParen && depth > 0) --depth;
+        if (depth == 0 && ty == TokenType::Comma) {
+            parts.emplace_back();
+            continue;
+        }
+        parts.back().push_back(v[i]);
+    }
+    return parts;
+}
+
+// Where the function opened at v[i] closes.
+size_t closingParen(const Tokens& v, size_t i) {
+    int depth = 0;
+    for (; i < v.size(); ++i) {
+        if (v[i].type == TokenType::Function || v[i].type == TokenType::LeftParen) ++depth;
+        else if (v[i].type == TokenType::RightParen && --depth == 0) return i;
+    }
+    return v.size();
+}
+
+bool angleOf(const Token& t, float& deg) {
+    if (t.type == TokenType::Number && t.number == 0) {
+        deg = 0;
+        return true;
+    }
+    if (t.type != TokenType::Dimension) return false;
+    const std::string u = lower(t.text);
+    const auto n = static_cast<float>(t.number);
+    if (u == "deg") deg = n;
+    else if (u == "rad") deg = n * 180.0f / 3.14159265f;
+    else if (u == "grad") deg = n * 0.9f;
+    else if (u == "turn") deg = n * 360.0f;
+    else return false;
+    return std::isfinite(deg);
+}
+
+// A url() at v[i], which moves past it.
+bool urlAt(const Tokens& v, size_t& i, std::string& out) {
+    if (i >= v.size()) return false;
+    if (v[i].type == TokenType::Url) {
+        out = v[i].text;
+        ++i;
+        return true;
+    }
+    if (v[i].type == TokenType::Function && lower(v[i].text) == "url") {
+        size_t k = i + 1;
+        skipWs(v, k);
+        if (k >= v.size() || v[k].type != TokenType::String) return false;
+        out = v[k].text;
+        i = closingParen(v, i) + 1;
+        return true;
+    }
+    return false;
+}
+
+// left/center/right/top/bottom as a share along their axis; which axis, in `vertical`.
+bool positionKeyword(const std::string& k, float& percent, int& axis) {
+    if (k == "left") { percent = 0; axis = 0; }
+    else if (k == "right") { percent = 100; axis = 0; }
+    else if (k == "top") { percent = 0; axis = 1; }
+    else if (k == "bottom") { percent = 100; axis = 1; }
+    else if (k == "center") { percent = 50; axis = -1; }
+    else return false;
+    return true;
+}
+
+// A <position> (background-position, "at" in gradients) from the items in `v`, all of
+// which it must use.
+bool positionFrom(const Tokens& v, const LengthContext& c, Length& x, Length& y) {
+    struct Item { bool is_kw; std::string kw; Length len; };
+    std::vector<Item> items;
+    for (size_t start : valueStarts(v)) {
+        size_t k = start;
+        if (v[k].type == TokenType::Ident) {
+            items.push_back({true, lower(v[k].text), {}});
+            continue;
+        }
+        Length l;
+        if (!lengthAt(v, k, c, l, false)) return false;
+        items.push_back({false, {}, l});
+    }
+    if (items.empty() || items.size() > 4) return false;
+    const auto pct = [](float p) { Length l; l.percent = p; return l; };
+    if (items.size() <= 2) {
+        Length out[2] = {pct(50), pct(50)};
+        int axes[2] = {-1, -1};
+        for (size_t n = 0; n < items.size(); ++n) {
+            if (items[n].is_kw) {
+                float p = 0;
+                if (!positionKeyword(items[n].kw, p, axes[n])) return false;
+                out[n] = pct(p);
+            } else {
+                out[n] = items[n].len;
+                axes[n] = -2;   // a length: its place says which axis
+            }
+        }
+        if (items.size() == 1) {
+            if (axes[0] == 1) { x = pct(50); y = out[0]; } else { x = out[0]; y = pct(50); }
+            return true;
+        }
+        const bool swap = axes[0] == 1 || axes[1] == 0;
+        if (swap && (axes[0] == -2 || axes[1] == -2)) return false;   // "top 10px" isn't two values
+        if (axes[0] == axes[1] && axes[0] >= 0) return false;
+        x = swap ? out[1] : out[0];
+        y = swap ? out[0] : out[1];
+        return true;
+    }
+    // Three or four: keywords, each maybe with an offset from that edge.
+    bool have_x = false, have_y = false;
+    Length rx = pct(50), ry = pct(50);
+    for (size_t n = 0; n < items.size(); ++n) {
+        if (!items[n].is_kw) return false;
+        float p = 0;
+        int axis = 0;
+        if (!positionKeyword(items[n].kw, p, axis)) return false;
+        Length l = pct(p);
+        if (n + 1 < items.size() && !items[n + 1].is_kw) {
+            if (axis == -1) return false;   // center takes no offset
+            const Length off = items[++n].len;
+            if (p == 100) { l.px -= off.px; l.percent -= off.percent; }
+            else { l.px += off.px; l.percent += off.percent; }
+        }
+        if (axis == -1) axis = have_x ? 1 : 0;
+        if (axis == 0) { if (have_x) return false; have_x = true; rx = l; }
+        else { if (have_y) return false; have_y = true; ry = l; }
+    }
+    x = rx;
+    y = ry;
+    return true;
+}
+
+// A gradient function at v[i] (its Function token); moves past it.
+std::shared_ptr<const Gradient> gradientAt(const Tokens& v, size_t& i, const LengthContext& c, const Color& current) {
+    std::string name = lower(v[i].text);
+    const bool legacy = name.starts_with("-webkit-") || name.starts_with("-moz-") || name.starts_with("-o-");
+    if (legacy) name = name.substr(name.find('-', 1) + 1);
+    auto g = std::make_shared<Gradient>();
+    if (name.starts_with("repeating-")) {
+        g->repeating = true;
+        name = name.substr(10);
+    }
+    if (name == "linear-gradient") g->kind = Gradient::Kind::Linear;
+    else if (name == "radial-gradient") g->kind = Gradient::Kind::Radial;
+    else if (name == "conic-gradient") g->kind = Gradient::Kind::Conic;
+    else return nullptr;
+    const size_t close = closingParen(v, i);
+    std::vector<Tokens> parts = commaParts(v, i + 1, close);
+    i = close + 1;
+    if (parts.empty()) return nullptr;
+
+    // The first part says how, unless it's already a stop.
+    size_t first_stop = 0;
+    {
+        const Tokens& head = parts[0];
+        const std::vector<size_t> starts = valueStarts(head);
+        size_t k0 = starts.empty() ? 0 : starts[0];
+        Color probe;
+        const bool is_stop = !starts.empty() && colorFromTokens(head, k0, current, probe);
+        if (!is_stop && !starts.empty()) {
+            first_stop = 1;
+            if (g->kind == Gradient::Kind::Linear) {
+                float deg = 0;
+                if (starts.size() == 1 && angleOf(head[starts[0]], deg)) {
+                    // The old prefixed syntax counted from "to right", anticlockwise.
+                    g->angle = legacy ? 90 - deg : deg;
+                } else {
+                    size_t n = 0;
+                    if (!legacy) {
+                        if (head[starts[0]].type != TokenType::Ident || lower(head[starts[0]].text) != "to") return nullptr;
+                        n = 1;
+                    }
+                    if (n >= starts.size()) return nullptr;
+                    for (; n < starts.size(); ++n) {
+                        if (head[starts[n]].type != TokenType::Ident) return nullptr;
+                        const std::string k = lower(head[starts[n]].text);
+                        // The prefixed form names where it starts, not where it goes.
+                        const int sign = legacy ? -1 : 1;
+                        if (k == "left") g->to_x = -sign;
+                        else if (k == "right") g->to_x = sign;
+                        else if (k == "top") g->to_y = -sign;
+                        else if (k == "bottom") g->to_y = sign;
+                        else if (!(legacy && k == "center")) return nullptr;
+                    }
+                    if (g->to_x == 0 && g->to_y == 0) g->to_y = 1;
+                    if (g->to_x == 0) g->angle = g->to_y < 0 ? 0 : 180;
+                    else if (g->to_y == 0) g->angle = g->to_x < 0 ? 270 : 90;
+                }
+            } else {
+                // Before "at": shape, extent or size (radial), "from <angle>" (conic).
+                size_t n = 0;
+                std::vector<Length> sizes;
+                for (; n < starts.size(); ++n) {
+                    const Token& t = head[starts[n]];
+                    if (t.type == TokenType::Ident) {
+                        const std::string k = lower(t.text);
+                        if (k == "at") break;
+                        if (g->kind == Gradient::Kind::Conic) {
+                            if (k != "from" || n + 1 >= starts.size()) return nullptr;
+                            float deg = 0;
+                            if (!angleOf(head[starts[++n]], deg)) return nullptr;
+                            g->from = deg;
+                            continue;
+                        }
+                        if (k == "circle") g->circle = true;
+                        else if (k == "ellipse") g->circle = false;
+                        else if (k == "closest-side" || k == "contain") g->extent = Gradient::Extent::ClosestSide;
+                        else if (k == "closest-corner") g->extent = Gradient::Extent::ClosestCorner;
+                        else if (k == "farthest-side") g->extent = Gradient::Extent::FarthestSide;
+                        else if (k == "farthest-corner" || k == "cover") g->extent = Gradient::Extent::FarthestCorner;
+                        else return nullptr;
+                        continue;
+                    }
+                    if (g->kind == Gradient::Kind::Conic) return nullptr;
+                    size_t k = starts[n];
+                    Length l;
+                    if (!lengthAt(head, k, c, l, false)) return nullptr;
+                    sizes.push_back(l);
+                }
+                if (sizes.size() == 1) {
+                    g->circle = true;
+                    g->explicit_size = true;
+                    g->radius_x = g->radius_y = sizes[0];
+                } else if (sizes.size() == 2) {
+                    g->explicit_size = true;
+                    g->radius_x = sizes[0];
+                    g->radius_y = sizes[1];
+                } else if (sizes.size() > 2) {
+                    return nullptr;
+                }
+                if (n < starts.size()) {
+                    Tokens where(head.begin() + static_cast<std::ptrdiff_t>(starts[n] + 1), head.end());
+                    if (!positionFrom(where, c, g->center_x, g->center_y)) return nullptr;
+                }
+            }
+        }
+    }
+    for (size_t p = first_stop; p < parts.size() && g->stops.size() < kMaxGradientStops; ++p) {
+        const Tokens& part = parts[p];
+        const std::vector<size_t> starts = valueStarts(part);
+        if (starts.empty()) return nullptr;
+        size_t k = starts[0];
+        GradientStop stop;
+        if (!colorFromTokens(part, k, current, stop.color)) {
+            // A lone position is a hint for where halfway falls: drawn as if it weren't there.
+            Length l;
+            k = starts[0];
+            if (starts.size() == 1 && (lengthAt(part, k, c, l, false) || angleOf(part[starts[0]], l.px))) continue;
+            return nullptr;
+        }
+        std::vector<Length> at;
+        for (size_t n = 1; n < starts.size(); ++n) {
+            size_t q = starts[n];
+            Length l;
+            float deg = 0;
+            if (g->kind == Gradient::Kind::Conic && angleOf(part[q], deg)) l.percent = deg / 3.6f;
+            else if (!lengthAt(part, q, c, l, false)) return nullptr;
+            at.push_back(l);
+        }
+        if (at.size() > 2) return nullptr;
+        if (at.empty()) {
+            g->stops.push_back(stop);
+        } else {
+            for (const Length& l : at) {
+                stop.has_position = true;
+                stop.position = l;
+                g->stops.push_back(stop);
+            }
+        }
+    }
+    if (g->stops.empty()) return nullptr;
+    if (g->stops.size() == 1) g->stops.push_back(g->stops[0]);
+    return g;
+}
+
+// One layer's image at v[i]; moves past it.
+bool backgroundImageAt(const Tokens& v, size_t& i, const LengthContext& c, const Color& current, BackgroundImage& out) {
+    if (i >= v.size()) return false;
+    if (v[i].type == TokenType::Ident && lower(v[i].text) == "none") {
+        out = {};
+        ++i;
+        return true;
+    }
+    std::string url;
+    if (urlAt(v, i, url)) {
+        out = {};
+        out.url = url;
+        return true;
+    }
+    if (v[i].type == TokenType::Function && lower(v[i].text).find("gradient") != std::string::npos) {
+        size_t k = i;
+        auto g = gradientAt(v, k, c, current);
+        i = k;
+        out = {};
+        out.gradient = std::move(g);
+        return true;   // one we can't read is none
+    }
+    return false;
+}
+
+bool repeatKeyword(const std::string& k, bool& x, bool& y, bool second, bool& two_value) {
+    two_value = false;
+    if (k == "repeat-x") { x = true; y = false; return true; }
+    if (k == "repeat-y") { x = false; y = true; return true; }
+    const bool repeat = k == "repeat" || k == "space" || k == "round";
+    if (!repeat && k != "no-repeat") return false;
+    if (second) y = repeat;
+    else x = y = repeat;
+    two_value = true;
+    return true;
+}
+
+bool boxKeyword(const std::string& k, BackgroundBox& out) {
+    if (k == "border-box" || k == "text") out = BackgroundBox::Border;
+    else if (k == "padding-box") out = BackgroundBox::Padding;
+    else if (k == "content-box") out = BackgroundBox::Content;
+    else return false;
+    return true;
+}
+
+bool sizeFrom(const Tokens& v, const LengthContext& c, BackgroundSize& out) {
+    const std::vector<size_t> starts = valueStarts(v);
+    if (starts.empty() || starts.size() > 2) return false;
+    if (starts.size() == 1 && v[starts[0]].type == TokenType::Ident) {
+        const std::string k = lower(v[starts[0]].text);
+        if (k == "cover") { out = {BackgroundSize::Kind::Cover}; return true; }
+        if (k == "contain") { out = {BackgroundSize::Kind::Contain}; return true; }
+    }
+    BackgroundSize s;
+    Length got[2] = {Length::autoLength(), Length::autoLength()};
+    for (size_t n = 0; n < starts.size(); ++n) {
+        size_t k = starts[n];
+        if (!lengthAt(v, k, c, got[n], true)) return false;
+        if (!got[n].is_auto && (got[n].px < 0 || got[n].percent < 0)) return false;
+    }
+    s.width = got[0];
+    s.height = got[1];
+    out = s;
+    return true;
+}
+
+// The background (or mask) shorthand. Its colour, background's only, goes in `color`.
+bool layersFromShorthand(const Tokens& v, const LengthContext& c, const Color& current, bool mask, BackgroundLayers& out, Color* color) {
+    out = BackgroundLayers{};
+    out.sizes.clear();
+    out.positions.clear();
+    out.repeats.clear();
+    out.origins.clear();
+    out.clips.clear();
+    std::vector<Tokens> parts = commaParts(v);
+    if (parts.size() > kMaxBackgroundLayers) parts.resize(kMaxBackgroundLayers);
+    for (size_t p = 0; p < parts.size(); ++p) {
+        const Tokens& part = parts[p];
+        BackgroundImage image;
+        BackgroundSize size;
+        Length px, py;
+        bool rx = true, ry = true;
+        BackgroundBox origin = mask ? BackgroundBox::Border : BackgroundBox::Padding, clip = BackgroundBox::Border;
+        int boxes = 0, repeats = 0;
+        Tokens position, size_tokens;
+        bool in_size = false;
+        const std::vector<size_t> starts = valueStarts(part);
+        for (size_t n = 0; n < starts.size(); ++n) {
+            size_t k = starts[n];
+            const Token& t = part[k];
+            if (t.type == TokenType::Delim && t.text == "/") {
+                in_size = true;
+                continue;
+            }
+            if (backgroundImageAt(part, k, c, current, image)) continue;
+            if (t.type == TokenType::Ident) {
+                const std::string kw = lower(t.text);
+                bool two = false;
+                if (repeatKeyword(kw, rx, ry, repeats == 1, two)) { ++repeats; continue; }
+                BackgroundBox b;
+                if (boxKeyword(kw, b)) {
+                    if (boxes++ == 0) origin = clip = b;
+                    else clip = b;
+                    continue;
+                }
+                if (kw == "scroll" || kw == "fixed" || kw == "local") continue;
+                if (mask && (kw == "alpha" || kw == "luminance" || kw == "match-source" || kw == "add" || kw == "subtract" ||
+                             kw == "intersect" || kw == "exclude" || kw == "no-clip")) continue;
+            }
+            const bool positional = t.type == TokenType::Dimension || t.type == TokenType::Percentage || t.type == TokenType::Number ||
+                                    (t.type == TokenType::Function && (t.text == "calc" || t.text == "min" || t.text == "max" || t.text == "clamp")) ||
+                                    (t.type == TokenType::Ident && (lower(t.text) == "auto" || lower(t.text) == "cover" || lower(t.text) == "contain"));
+            float probe_pct = 0;
+            int probe_axis = 0;
+            const bool position_kw = t.type == TokenType::Ident && positionKeyword(lower(t.text), probe_pct, probe_axis);
+            if (positional || position_kw) {
+                const size_t end = n + 1 < starts.size() ? starts[n + 1] : part.size();
+                Tokens& into = in_size ? size_tokens : position;
+                into.insert(into.end(), part.begin() + static_cast<std::ptrdiff_t>(k), part.begin() + static_cast<std::ptrdiff_t>(end));
+                into.push_back(Token{TokenType::Whitespace});
+                continue;
+            }
+            Color col;
+            size_t q = k;
+            if (color && p + 1 == parts.size() && colorFromTokens(part, q, current, col)) {
+                *color = col;
+                continue;
+            }
+            return false;
+        }
+        if (!position.empty() && !positionFrom(position, c, px, py)) return false;
+        if (!size_tokens.empty() && !sizeFrom(size_tokens, c, size)) return false;
+        out.images.push_back(image);
+        out.sizes.push_back(size);
+        out.positions.emplace_back(px, py);
+        out.repeats.emplace_back(rx, ry);
+        out.origins.push_back(origin);
+        out.clips.push_back(clip);
+    }
+    return true;
+}
+
+// One background-* (or mask-*) longhand into `layers`.
+bool setLayerLonghand(const std::string& prop, const Tokens& v, const LengthContext& c, const Color& current, BackgroundLayers& layers) {
+    std::vector<Tokens> parts = commaParts(v);
+    if (parts.size() > kMaxBackgroundLayers) parts.resize(kMaxBackgroundLayers);
+    if (prop == "image") {
+        std::vector<BackgroundImage> images;
+        for (const Tokens& part : parts) {
+            size_t k = 0;
+            skipWs(part, k);
+            BackgroundImage image;
+            if (!backgroundImageAt(part, k, c, current, image)) return false;
+            images.push_back(image);
+        }
+        layers.images = std::move(images);
+        return true;
+    }
+    if (prop == "size") {
+        std::vector<BackgroundSize> sizes;
+        for (const Tokens& part : parts) {
+            BackgroundSize s;
+            if (!sizeFrom(part, c, s)) return false;
+            sizes.push_back(s);
+        }
+        layers.sizes = std::move(sizes);
+        return true;
+    }
+    if (prop == "position" || prop == "position-x" || prop == "position-y") {
+        std::vector<std::pair<Length, Length>> positions;
+        for (size_t n = 0; n < parts.size(); ++n) {
+            Length x, y;
+            if (prop == "position") {
+                if (!positionFrom(parts[n], c, x, y)) return false;
+            } else {
+                Length a, b;
+                if (!positionFrom(parts[n], c, a, b)) return false;
+                const auto old = n < layers.positions.size() ? layers.positions[n] : layers.positions.empty() ? std::pair<Length, Length>{} : layers.positions[n % layers.positions.size()];
+                // One value: positionFrom put a vertical keyword in b.
+                const Length one = prop == "position-x" ? a : (b.percent == 50 && b.px == 0 && !(a.percent == 50 && a.px == 0) ? a : b);
+                x = prop == "position-x" ? one : old.first;
+                y = prop == "position-y" ? one : old.second;
+            }
+            positions.emplace_back(x, y);
+        }
+        layers.positions = std::move(positions);
+        return true;
+    }
+    if (prop == "repeat") {
+        std::vector<std::pair<bool, bool>> repeats;
+        for (const Tokens& part : parts) {
+            bool x = true, y = true;
+            int n = 0;
+            for (size_t start : valueStarts(part)) {
+                bool two = false;
+                if (part[start].type != TokenType::Ident || !repeatKeyword(lower(part[start].text), x, y, n == 1, two)) return false;
+                ++n;
+            }
+            if (n == 0) return false;
+            repeats.emplace_back(x, y);
+        }
+        layers.repeats = std::move(repeats);
+        return true;
+    }
+    if (prop == "origin" || prop == "clip") {
+        std::vector<BackgroundBox> boxes;
+        for (const Tokens& part : parts) {
+            const std::vector<size_t> starts = valueStarts(part);
+            BackgroundBox b;
+            if (starts.size() != 1 || part[starts[0]].type != TokenType::Ident) return false;
+            const std::string k = lower(part[starts[0]].text);
+            if (!boxKeyword(k, b)) {
+                if (k == "no-clip") b = BackgroundBox::Border;
+                else return false;
+            }
+            boxes.push_back(b);
+        }
+        (prop == "origin" ? layers.origins : layers.clips) = std::move(boxes);
+        return true;
+    }
+    return prop == "attachment" || prop == "mode" || prop == "composite" || prop == "type" || prop == "blend-mode";
+}
+
+// ── SVG paint ─────────────────────────────────────────────────────────────────
+
+bool svgPaintFrom(const Tokens& v, const Color& current, SvgPaint& out) {
+    const std::vector<size_t> starts = valueStarts(v);
+    if (starts.empty()) return false;
+    size_t k = starts[0];
+    SvgPaint p;
+    std::string url;
+    if (urlAt(v, k, url)) {
+        p.kind = SvgPaint::Kind::Url;
+        const size_t hash = url.find('#');
+        p.url = hash == std::string::npos ? std::string{} : url.substr(hash);
+        skipWs(v, k);
+        if (k < v.size()) {
+            if (v[k].type == TokenType::Ident && lower(v[k].text) == "none") p.fallback = SvgPaint::Kind::None;
+            else if (v[k].type == TokenType::Ident && lower(v[k].text) == "currentcolor") p.fallback = SvgPaint::Kind::CurrentColor;
+            else if (colorFromTokens(v, k, current, p.fallback_color)) p.fallback = SvgPaint::Kind::Color;
+        }
+        out = p;
+        return true;
+    }
+    if (v[k].type == TokenType::Ident) {
+        const std::string kw = lower(v[k].text);
+        if (kw == "none") { out = {}; return true; }
+        if (kw == "currentcolor") { out = {SvgPaint::Kind::CurrentColor}; return true; }
+        if (kw == "context-fill" || kw == "context-stroke") { out = {}; return true; }
+    }
+    Color c;
+    if (!parseColor(v, current, c)) return false;
+    p.kind = SvgPaint::Kind::Color;
+    p.color = c;
+    out = p;
+    return true;
+}
+
+// An SVG number or length: unitless numbers are pixels there.
+bool svgLengthFrom(const Tokens& v, const LengthContext& c, float& out) {
+    size_t k = 0;
+    skipWs(v, k);
+    if (k >= v.size()) return false;
+    if (v[k].type == TokenType::Number) {
+        out = static_cast<float>(v[k].number);
+        return std::isfinite(out);
+    }
+    Length l;
+    if (!lengthAt(v, k, c, l, false)) return false;
+    out = l.px + l.percent * 0.01f * 100;   // a percentage of an unknown viewport: of a 100px one
+    return std::isfinite(out);
+}
+
+bool svgNumberFrom(const Tokens& v, float& out) {
+    size_t k = 0;
+    skipWs(v, k);
+    if (k >= v.size()) return false;
+    if (v[k].type == TokenType::Number) out = static_cast<float>(v[k].number);
+    else if (v[k].type == TokenType::Percentage) out = static_cast<float>(v[k].number) / 100.0f;
+    else return false;
+    return std::isfinite(out);
+}
+
+// url() tokens in a sheet's declarations, made absolute against where the sheet came from.
+void absolutizeUrls(std::vector<Declaration>& decls, const std::string& base) {
+    for (Declaration& d : decls) {
+        Tokens& v = d.value;
+        for (size_t i = 0; i < v.size(); ++i) {
+            if (v[i].type == TokenType::Url) {
+                if (!v[i].text.starts_with('#') && !v[i].text.starts_with("data:")) v[i].text = resolveUrl(base, v[i].text);
+            } else if (v[i].type == TokenType::Function && lower(v[i].text) == "url") {
+                size_t k = i + 1;
+                skipWs(v, k);
+                if (k < v.size() && v[k].type == TokenType::String && !v[k].text.starts_with('#') && !v[k].text.starts_with("data:"))
+                    v[k].text = resolveUrl(base, v[k].text);
+            }
+        }
+    }
+}
+
 // ── @font-face ────────────────────────────────────────────────────────────────
 
 constexpr size_t kMaxFontFaces = 512;
@@ -884,6 +1471,8 @@ private:
             if (!std::all_of(rule.media.begin(), rule.media.end(), [&](const Tokens& q) { return css::mediaMatches(q, out_.media_); })) continue;
             if (auto face = webFontFrom(rule, url)) out_.font_faces_.push_back(std::move(*face));
         }
+        if (!url.empty())
+            for (css::Rule& rule : sheet.rules) absolutizeUrls(rule.declarations, url);
         sheets_.push_back(std::make_unique<css::Stylesheet>(std::move(sheet)));
         const css::Stylesheet& kept = *sheets_.back();
         for (const css::Rule& rule : kept.rules) {
@@ -925,7 +1514,7 @@ private:
         while (!todo.empty()) {
             const Node* n = todo.back();
             todo.pop_back();
-            if (n->isHtml("style")) {
+            if (n->isHtml("style") || (n->ns == Namespace::Svg && n->name == "style")) {
                 const std::string* media = n->attr("media");
                 if (!media || css::mediaMatches(css::tokenize(*media), out_.media_))
                     addSheet(css::parseStylesheet(n->textContent()), Origin::Author, 0);
@@ -1118,6 +1707,32 @@ private:
     // ── Presentational hints ──────────────────────────────────────────────────
 
     static void hints(const Node* el, std::string& css_text) {
+        if (el->ns == Namespace::Svg) {
+            // Presentation attributes: author rules of no specificity.
+            static constexpr const char* kPresentation[] = {
+                "fill", "stroke", "stroke-width", "fill-opacity", "stroke-opacity", "fill-rule", "stroke-linecap",
+                "stroke-linejoin", "stroke-miterlimit", "stroke-dasharray", "stroke-dashoffset", "stop-color",
+                "stop-opacity", "opacity", "color", "display", "visibility", "clip-path"};
+            for (const char* name : kPresentation) {
+                const std::string* v = el->attr(name);
+                if (!v || v->find_first_of(";{}") != std::string::npos) continue;
+                css_text += std::string(name) + ":" + *v + ";";
+            }
+            // An <svg>'s width and height are presentation attributes too.
+            if (el->name == "svg") {
+                for (const char* name : {"width", "height"}) {
+                    const std::string* v = el->attr(name);
+                    if (!v || v->empty() || v->size() > 32) continue;
+                    char* end = nullptr;
+                    const double n = std::strtod(v->c_str(), &end);
+                    if (end == v->c_str() || n < 0) continue;
+                    const std::string unit(end);
+                    if (unit.empty()) css_text += std::string(name) + ":" + *v + "px;";
+                    else if (unit == "px" || unit == "%" || unit == "em" || unit == "rem" || unit == "pt") css_text += std::string(name) + ":" + *v + ";";
+                }
+            }
+            return;
+        }
         if (el->ns != Namespace::Html) return;
         const auto dimension = [&](std::string_view attr_name, std::string_view prop) {
             const std::string* v = el->attr(attr_name);
@@ -1839,6 +2454,17 @@ private:
         else if (p == "visibility") to.hidden = from.hidden;
         else if (p == "border-spacing") to.border_spacing = from.border_spacing;
         else if (p == "border-collapse") to.border_collapse = from.border_collapse;
+        else if (p == "fill") to.fill = from.fill;
+        else if (p == "stroke") to.stroke = from.stroke;
+        else if (p == "stroke-width") to.stroke_width = from.stroke_width;
+        else if (p == "stroke-miterlimit") to.stroke_miterlimit = from.stroke_miterlimit;
+        else if (p == "stroke-dashoffset") to.stroke_dashoffset = from.stroke_dashoffset;
+        else if (p == "stroke-dasharray") to.stroke_dasharray = from.stroke_dasharray;
+        else if (p == "fill-opacity") to.fill_opacity = from.fill_opacity;
+        else if (p == "stroke-opacity") to.stroke_opacity = from.stroke_opacity;
+        else if (p == "fill-rule") to.fill_evenodd = from.fill_evenodd;
+        else if (p == "stroke-linecap") to.stroke_linecap = from.stroke_linecap;
+        else if (p == "stroke-linejoin") to.stroke_linejoin = from.stroke_linejoin;
         else return false;
         return true;
     }
@@ -1878,7 +2504,13 @@ private:
         else if (p == "min-height") to.min_height = from.min_height;
         else if (p == "max-width") to.max_width = from.max_width;
         else if (p == "max-height") to.max_height = from.max_height;
-        else if (p == "background-color" || p == "background") to.background = from.background;
+        else if (p == "background-color") to.background = from.background;
+        else if (p == "background") { to.background = from.background; to.background_layers = from.background_layers; }
+        else if (p.starts_with("background-")) to.background_layers = from.background_layers;
+        else if (p == "mask" || p == "-webkit-mask" || p.starts_with("mask-") || p.starts_with("-webkit-mask-")) { to.mask_layers = from.mask_layers; to.masked = from.masked; }
+        else if (p == "stop-color") to.stop_color = from.stop_color;
+        else if (p == "stop-opacity") to.stop_opacity = from.stop_opacity;
+        else if (p == "clip-path") to.clip_path = from.clip_path;
         else if (p == "opacity") to.opacity = from.opacity;
         else if (p == "box-sizing") to.border_box = from.border_box;
         else if (p == "z-index") to.z_index = from.z_index;
@@ -1987,8 +2619,63 @@ private:
             return;
         }
         if (p == "content") { setContent(s, v); return; }
-        if (p == "mask" || p == "mask-image" || p == "-webkit-mask" || p == "-webkit-mask-image") {
-            s.masked = kw != "none";
+        if (p == "mask" || p == "-webkit-mask" || p.starts_with("mask-") || p.starts_with("-webkit-mask-")) {
+            const std::string longhand = p == "mask" || p == "-webkit-mask" ? std::string{} : p.substr(p.find("mask-") + 5);
+            if (longhand.empty()) {
+                BackgroundLayers layers;
+                if (layersFromShorthand(v, c, s.color, true, layers, nullptr)) s.mask_layers = std::make_shared<BackgroundLayers>(std::move(layers));
+                return;
+            }
+            BackgroundLayers layers = s.mask_layers ? *s.mask_layers : BackgroundLayers{};
+            if (!s.mask_layers) layers.origins = {BackgroundBox::Border};
+            if (setLayerLonghand(longhand, v, c, s.color, layers)) s.mask_layers = std::make_shared<BackgroundLayers>(std::move(layers));
+            return;
+        }
+        if (p == "fill" || p == "stroke") {
+            SvgPaint paint;
+            if (!svgPaintFrom(v, s.color, paint)) return;
+            (p == "fill" ? s.fill : s.stroke) = paint;
+            s.svg_set |= p == "fill" ? kSetFill : kSetStroke;
+            return;
+        }
+        if (p == "stroke-width") { float w = 0; if (svgLengthFrom(v, c, w) && w >= 0) { s.stroke_width = w; s.svg_set |= kSetStrokeWidth; } return; }
+        if (p == "stroke-miterlimit") { float m = 0; if (svgNumberFrom(v, m) && m >= 1) { s.stroke_miterlimit = m; s.svg_set |= kSetMiter; } return; }
+        if (p == "stroke-dashoffset") { float d = 0; if (svgLengthFrom(v, c, d)) { s.stroke_dashoffset = d; s.svg_set |= kSetDashOffset; } return; }
+        if (p == "fill-opacity" || p == "stroke-opacity" || p == "stop-opacity") {
+            float o = 0;
+            if (!svgNumberFrom(v, o)) return;
+            o = std::clamp(o, 0.0f, 1.0f);
+            if (p == "fill-opacity") { s.fill_opacity = o; s.svg_set |= kSetFillOpacity; }
+            else if (p == "stroke-opacity") { s.stroke_opacity = o; s.svg_set |= kSetStrokeOpacity; }
+            else s.stop_opacity = o;
+            return;
+        }
+        if (p == "fill-rule") { s.fill_evenodd = kw == "evenodd"; s.svg_set |= kSetFillRule; return; }
+        if (p == "stroke-linecap") { s.stroke_linecap = kw == "round" ? 1 : kw == "square" ? 2 : 0; s.svg_set |= kSetLinecap; return; }
+        if (p == "stroke-linejoin") { s.stroke_linejoin = kw == "round" ? 1 : kw == "bevel" ? 2 : 0; s.svg_set |= kSetLinejoin; return; }
+        if (p == "stroke-dasharray") {
+            s.svg_set |= kSetDash;
+            if (kw == "none") { s.stroke_dasharray = nullptr; return; }
+            auto dashes = std::make_shared<std::vector<float>>();
+            for (size_t start : valueStarts(v)) {
+                if (v[start].type == TokenType::Comma) continue;
+                Tokens one{v[start]};
+                float d = 0;
+                if (!svgLengthFrom(one, c, d) || d < 0) return;
+                if (dashes->size() < 64) dashes->push_back(d);
+            }
+            if (dashes->size() % 2) dashes->insert(dashes->end(), dashes->begin(), dashes->end());
+            float total = 0;
+            for (float d : *dashes) total += d;
+            s.stroke_dasharray = total > 0 ? std::move(dashes) : nullptr;
+            return;
+        }
+        if (p == "stop-color") { oneColor(s.stop_color); return; }
+        if (p == "clip-path") {
+            size_t k = i;
+            std::string url;
+            s.clip_path.clear();
+            if (urlAt(v, k, url) && url.find('#') != std::string::npos) s.clip_path = url.substr(url.find('#'));
             return;
         }
         if (p.starts_with("grid") || p.starts_with("justify-") || p.starts_with("place-")) {
@@ -2048,7 +2735,7 @@ private:
                 s.z_index = static_cast<int>(std::clamp(v[i].number, -1e6, 1e6));
             return;
         }
-        if (p == "visibility") { s.hidden = kw == "hidden" || kw == "collapse"; return; }
+        if (p == "visibility") { s.hidden = kw == "hidden" || kw == "collapse"; s.svg_set |= kSetVisibility; return; }
         if (p == "opacity") {
             if (i < v.size() && v[i].type == TokenType::Number) s.opacity = std::clamp(static_cast<float>(v[i].number), 0.0f, 1.0f);
             else if (i < v.size() && v[i].type == TokenType::Percentage) s.opacity = std::clamp(static_cast<float>(v[i].number) / 100.0f, 0.0f, 1.0f);
@@ -2057,13 +2744,16 @@ private:
         if (p == "box-sizing") { s.border_box = kw == "border-box"; return; }
         if (p == "background-color") { oneColor(s.background); return; }
         if (p == "background") {
-            // Colours only, for now: images and gradients need more than a rectangle.
-            s.background = {0, 0, 0, 0};
-            for (size_t start : valueStarts(v)) {
-                size_t k = start;
-                Color parsed;
-                if (colorFromTokens(v, k, s.color, parsed)) s.background = parsed;
-            }
+            BackgroundLayers layers;
+            Color color{0, 0, 0, 0};
+            if (!layersFromShorthand(v, c, s.color, false, layers, &color)) return;
+            s.background = color;
+            s.background_layers = layers.empty() ? nullptr : std::make_shared<BackgroundLayers>(std::move(layers));
+            return;
+        }
+        if (p.starts_with("background-")) {
+            BackgroundLayers layers = s.background_layers ? *s.background_layers : BackgroundLayers{};
+            if (setLayerLonghand(p.substr(11), v, c, s.color, layers)) s.background_layers = std::make_shared<BackgroundLayers>(std::move(layers));
             return;
         }
         if (p == "margin") { setBoxSides(s.margin, v, c, true); return; }
@@ -2274,6 +2964,17 @@ private:
         s.custom = parent.custom;
         s.border_spacing = parent.border_spacing;
         s.border_collapse = parent.border_collapse;
+        s.fill = parent.fill;
+        s.stroke = parent.stroke;
+        s.stroke_width = parent.stroke_width;
+        s.stroke_miterlimit = parent.stroke_miterlimit;
+        s.stroke_dashoffset = parent.stroke_dashoffset;
+        s.fill_opacity = parent.fill_opacity;
+        s.stroke_opacity = parent.stroke_opacity;
+        s.fill_evenodd = parent.fill_evenodd;
+        s.stroke_linecap = parent.stroke_linecap;
+        s.stroke_linejoin = parent.stroke_linejoin;
+        s.stroke_dasharray = parent.stroke_dasharray;
     }
 
     void resolveInto(const Node* el, const ComputedStyle& parent, ComputedStyle& s) {
@@ -2425,6 +3126,7 @@ private:
                 skipWs(*v, i);
                 setFontFamily(s, *v, i);
             } else if (p == "color") {
+                s.svg_set |= kSetColor;
                 Tokens sub;
                 size_t budget = kMaxVarTokens;
                 const Tokens* v = &m.decl->value;
@@ -2456,9 +3158,9 @@ private:
 
         for (int side = 0; side < 4; ++side)
             if (border_none_[side]) s.border_width[side] = 0;
-        // Its colour only exists to show through the mask, usually as an icon. A block of it
-        // isn't that icon, and nothing where an icon goes reads better.
-        if (s.masked) s.background = Color{0, 0, 0, 0};
+        // Its colour only shows through the mask: layout draws it that way, or not at all.
+        s.masked = s.mask_layers && std::any_of(s.mask_layers->images.begin(), s.mask_layers->images.end(),
+                                                [](const BackgroundImage& i) { return !i.url.empty(); });
 
         // Absolute, fixed and floated boxes are blocks, whatever they said.
         const bool out_of_flow = s.position == Position::Absolute || s.position == Position::Fixed;
@@ -2505,7 +3207,8 @@ private:
         ComputedStyle& s = out_.storage_.back();
         resolveInto(el, parent, s);
         out_.styles_[el] = &s;
-        if (s.display == Display::None) return;   // nothing below gets a box
+        // Nothing below gets a box; but an SVG's hidden parts can still be drawn by <use>.
+        if (s.display == Display::None && el->ns != Namespace::Svg) return;
         resolvePseudo(el, s, before_, out_.before_);
         resolvePseudo(el, s, after_, out_.after_);
         for (const Node* c : el->children)

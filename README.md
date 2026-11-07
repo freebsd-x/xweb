@@ -21,12 +21,13 @@ sandbox. Many simple sites work; anything needing scripts doesn't yet.
 | Works | Not yet |
 |---|---|
 | HTML5 parsing, including error recovery, templates, SVG/MathML trees | `<selectedcontent>` mirroring |
-| CSS parsing, selectors (not `:has()`), cascade, `@media` with range syntax and `calc()`, `@supports`, `@import`, `var()`, `calc()`, `::before`/`::after`, `display: contents`, `light-dark()` | animations, transforms, `@container`, masks (a masked box shows nothing) |
+| CSS parsing, selectors (not `:has()`), cascade, `@media` with range syntax and `calc()`, `@supports`, `@import`, `var()`, `calc()`, `::before`/`::after`, `display: contents`, `light-dark()` | animations, transforms, `@container`, masks over anything but a background colour, gradient masks |
 | Block and inline layout, margin collapsing, inline-block, lists, `width: max-content` and friends | form controls' widths are approximate, especially with an inherited font |
 | **Floats, tables (auto and fixed), flexbox, grid** (areas, named lines, `repeat`, `minmax`, `fr`, auto-placement), positioning | subgrid, masonry, baseline alignment and absolute positioning within grid areas; sticky, z-index stacking contexts, collapsed-border conflict resolution |
 | **Web fonts**: `@font-face`, WOFF, WOFF2, TTF, OTF, variable weights, `unicode-range`, fonts in `data:` URLs, swapped in as they arrive | synthetic bold and italic, cross-origin checks on fonts, `font-display`, other variation axes, lines mixing fonts growing to fit all of them under `line-height: normal` |
-| Backgrounds (colours), borders, rounded corners, overflow clipping, text, images beside the page, the size of an inline `<svg>` | drawing `<svg>`, background images, gradients, shadows, per-corner radii, dashed borders |
-| Network (http, https, `data:`), links, redirects, history, fragments, UTF-8, UTF-16, Latin-1 | **JavaScript, forms, cookies**, other encodings (Shift_JIS, EUC-KR...), SVG images, HTTP cache |
+| **Backgrounds**: colours, images (`url()`, layers, size, position, repeat, origin, clip), linear, radial and conic gradients (repeating too); masked icons; borders, rounded corners, overflow clipping (positioned children too), text, images | shadows, per-corner radii, dashed and dotted borders, `background-attachment: fixed`, `space`/`round` repeats, rounded clipping of backgrounds |
+| **SVG**, inline and as images: paths, shapes, groups, `<use>`/`<symbol>`, transforms, `viewBox`, gradients, clip paths, strokes with joins, caps and dashes, group opacity, CSS styling | SVG text, `<image>`, masks, patterns, markers, filters |
+| Network (http, https, `data:`), links, redirects, history, fragments, UTF-8, UTF-16, Latin-1 | **JavaScript, forms, cookies**, other encodings (Shift_JIS, EUC-KR...), HTTP cache |
 | Refuses to reach this machine or the local network | so a LAN device's page can't be opened either |
 
 ## Layers
@@ -45,14 +46,18 @@ placement and fonts all have limits, font files reach only FreeType inside the s
 
 - `xweb html5lib`: the html5lib tree-construction suite (`tests/html5lib`, MIT). Gaps are
   listed in `tests/html5lib_known_failures.txt`; a listed test that starts passing fails.
-- `xweb css`, `style`, `layout`, `html`: unit tests.
+- `xweb css`, `style`, `layout`, `html`, `paint`: unit tests (`paint` is the rasterizer,
+  gradients and SVG).
 - `xweb fuzz`: mutated and pathological input through the whole pipeline. Worth running
   in an ASan build after changing the engine.
 - `scripts/xweb-compare.py sdk/xweb/tests/pages/*.html`: every element's box against
   headless Chromium. Needs Chromium, so it isn't in the unit suite.
-- `headless-e2e.py webview webnav webfont`: a page in a real window checked pixel by
-  pixel, browsing a local test site, including that nobody else may browse, and a page's
-  own fonts arriving through the sandbox.
+- `scripts/xweb-pixels.py sdk/xweb/tests/pages/*.html`: the first screenful painted on the
+  CPU by `xweb_paint`, against Chromium's screenshot, pixel by pixel with text hidden on both
+  sides. `XWEB_PAINT_OPS=1 out/sdk/xweb/xweb_paint page.html w h out.png` lists what's painted.
+- `headless-e2e.py webview webnav webfont webpaint`: a page in a real window checked pixel
+  by pixel, browsing a local test site, including that nobody else may browse, a page's own
+  fonts arriving through the sandbox, and gradients, SVG, CSS images and masks.
 - `tests/make_webfonts.py`: makes the WOFF fonts `tests/pages/webfont.html` uses from
   installed ones, as the fonts aren't ours to keep here. `xweb-compare.py` runs it. WOFF2 has
   no repeatable test: it's FreeType's to decode, and was checked by hand against Chromium

@@ -38,9 +38,15 @@ public:
     virtual ~ImageSizes() = default;
     // The image's natural size, if it could be loaded.
     [[nodiscard]] virtual std::optional<std::pair<float, float>> imageSize(const std::string& src) = 0;
+    // For a loaded image with a shape but no size (an SVG with only a viewBox): width over height.
+    [[nodiscard]] virtual std::optional<float> imageRatio(const std::string& src) { (void)src; return std::nullopt; }
 };
 
-enum class PaintKind { Rect, Text, Image, ClipBegin, ClipEnd };
+enum class PaintKind {
+    Rect, Text, Image, ClipBegin, ClipEnd,
+    Gradient,   // `gradient` filling the rectangle
+    Svg,        // the inline <svg> `node`, drawn into the rectangle; currentColor is `color`
+};
 
 struct PaintOp {
     PaintKind kind = PaintKind::Rect;
@@ -49,6 +55,9 @@ struct PaintOp {
     float radius = 0;      // Rect: rounded corners
     std::string text;      // Text: the run. Image: its source.
     FontSpec font;
+    bool tint = false;     // Image: only its alpha, in `color` (a mask over a background colour)
+    std::shared_ptr<const Gradient> gradient;
+    const Node* node = nullptr;
 };
 
 struct LinkArea {
@@ -69,6 +78,7 @@ struct PageLayout {
     std::vector<LinkArea> links;
     std::vector<ElementBox> boxes;
     std::string title;
+    std::vector<std::string> images_wanted;   // CSS images it would have drawn, not loaded yet
 };
 
 // A StyledDocument::ChMeasure that asks `text`.

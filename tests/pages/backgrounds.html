@@ -1,0 +1,88 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Backgrounds, gradients, SVG and masks</title>
+<style>
+  body { margin: 8px; font: 14px sans-serif; background: #f6f8fa; }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 10px; }
+  .t { width: 110px; height: 70px; border: 2px solid #333; }
+
+  /* Linear */
+  .l1 { background: linear-gradient(#e66465, #9198e5); }
+  .l2 { background: linear-gradient(90deg, red, yellow 30%, green 70%, blue); }
+  .l3 { background: linear-gradient(to top right, #000, #fff); }
+  .l4 { background: linear-gradient(135deg, rgba(255,0,0,0.8), transparent 60%), #36c; }
+  .l5 { background: repeating-linear-gradient(45deg, #222 0 10px, #fc0 10px 20px); }
+  .l6 { background: -webkit-linear-gradient(left, #0a0, #00a); }
+  .l7 { background: linear-gradient(to bottom, red 50%, blue 50%); }
+
+  /* Radial and conic */
+  .r1 { background: radial-gradient(#fff, #069); }
+  .r2 { background: radial-gradient(circle, yellow, red 40px, black); }
+  .r3 { background: radial-gradient(closest-side at 30% 40%, #fff, #c00); }
+  .r4 { background: radial-gradient(circle farthest-side at left top, #0f0, #030); }
+  .r5 { background: repeating-radial-gradient(circle at center, #fff 0 6px, #08f 6px 12px); }
+  .c1 { background: conic-gradient(red, yellow, lime, aqua, blue, magenta, red); }
+  .c2 { background: conic-gradient(from 90deg at 40% 60%, #333 0 25%, #eee 0 50%, #333 0 75%, #eee 0); }
+
+  /* Images */
+  .i1 { background: url(images/checker.png); }
+  .i2 { background: #ddd url(images/checker.png) no-repeat center; }
+  .i3 { background: url(images/checker.png) repeat-x 0 50%; background-color: #cfe; }
+  .i4 { background-image: url(images/stripe.png); background-repeat: repeat-x; }
+  .i5 { background: url(images/checker.png) right 6px bottom 4px / 24px 24px no-repeat, #fee; }
+  .i6 { background: url(images/star.svg) no-repeat center / contain #fff; }
+  .i7 { background: url(images/star.svg) 0 0 / 20px auto, linear-gradient(#fff, #ccc); }
+  .i8 { background: url(images/logo.svg) no-repeat center / cover; }
+  .i9 { background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10'%3E%3Ccircle cx='5' cy='5' r='3' fill='%23c06'/%3E%3C/svg%3E"); }
+  .i11 { background: url(images/no-viewbox.svg) 0 0 / 40px 30px; }
+  .i10 { padding: 8px; border-width: 8px; border-style: solid; border-color: rgba(0,0,0,0.3);
+         background: linear-gradient(#9cf, #36c) content-box, #fc9; }
+
+  /* Masks */
+  .m { width: 24px; height: 24px; background-color: #0969da; border: none;
+       -webkit-mask: url(images/icon-mask.svg) no-repeat center / contain; mask: url(images/icon-mask.svg) no-repeat center / contain; }
+  .m2 { width: 48px; height: 48px; background-color: #8250df; border: none;
+        mask-image: url(images/icon-mask.svg); mask-size: 100% 100%; -webkit-mask-image: url(images/icon-mask.svg); -webkit-mask-size: 100% 100%; }
+
+  /* Inline SVG */
+  svg.icon { width: 48px; height: 48px; color: #cf222e; }
+  .blue svg { fill: #0969da; }
+</style>
+</head>
+<body>
+<div class="row">
+  <div class="t l1"></div><div class="t l2"></div><div class="t l3"></div><div class="t l4"></div>
+  <div class="t l5"></div><div class="t l6"></div><div class="t l7"></div>
+</div>
+<div class="row">
+  <div class="t r1"></div><div class="t r2"></div><div class="t r3"></div><div class="t r4"></div>
+  <div class="t r5"></div><div class="t c1"></div><div class="t c2"></div>
+</div>
+<div class="row">
+  <div class="t i1"></div><div class="t i2"></div><div class="t i3"></div><div class="t i4"></div>
+  <div class="t i5"></div><div class="t i6"></div><div class="t i7"></div>
+</div>
+<div class="row">
+  <div class="t i8"></div><div class="t i9"></div><div class="t i10"></div><div class="t i11"></div>
+  <div class="m"></div><div class="m2"></div>
+</div>
+<div class="row">
+  <svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" fill="currentColor"/><path d="M7 12l3 3 7-7" fill="none" stroke="#fff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+  <svg width="60" height="48" viewBox="0 0 30 24">
+    <defs><radialGradient id="rg" cx="40%" cy="40%" r="60%"><stop offset="0" stop-color="#fff"/><stop offset="1" stop-color="#2da44e"/></radialGradient></defs>
+    <ellipse cx="15" cy="12" rx="14" ry="10" fill="url(#rg)" stroke="#116329" stroke-width="1"/>
+  </svg>
+  <svg width="48" height="48" style="display:none"><symbol id="sq" viewBox="0 0 10 10"><rect x="1" y="1" width="8" height="8" rx="2"/></symbol></svg>
+  <span class="blue"><svg width="48" height="48"><use href="#sq"/></svg></span>
+  <svg width="48" height="48" viewBox="0 0 48 48"><g transform="rotate(30 24 24)" opacity="0.6"><rect x="8" y="8" width="32" height="32" fill="#bf3989"/><rect x="16" y="16" width="16" height="16" fill="#fff"/></g></svg>
+  <svg width="80" height="48" viewBox="0 0 80 48"><path d="M4 40 Q 20 4 40 24 T 76 8" fill="none" stroke="#953800" stroke-width="3" stroke-dasharray="8 4"/><path d="M10 10 A 8 8 0 1 1 10 11" fill="#ffd33d" fill-rule="evenodd"/></svg>
+  <svg width="48" height="48" viewBox="0 0 48 48"><defs><clipPath id="cp"><circle cx="24" cy="24" r="18"/></clipPath></defs><g clip-path="url(#cp)"><rect width="24" height="48" fill="#1f883d"/><rect x="24" width="24" height="48" fill="#fb8500"/></g></svg>
+  <img src="images/star.svg" alt="">
+  <img src="images/logo.svg" width="120" alt="">
+  <img src="images/checker.png" width="32" height="32" alt="">
+  <img src="images/no-viewbox.svg" style="width:40px;height:30px" alt="">
+</div>
+</body>
+</html>

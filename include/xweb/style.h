@@ -93,6 +93,76 @@ struct GridLine {
     [[nodiscard]] bool isAuto() const noexcept { return line == 0 && span == 0 && name.empty(); }
 };
 
+// A CSS gradient as specified: what it comes to depends on the box it fills.
+struct GradientStop {
+    Color color;
+    bool has_position = false;
+    Length position;   // along the gradient line; percentages of its length
+};
+
+struct Gradient {
+    enum class Kind { Linear, Radial, Conic } kind = Kind::Linear;
+    bool repeating = false;
+    // Linear: an angle (0 is up, clockwise), or toward a side or corner.
+    float angle = 180;
+    int to_x = 0, to_y = 0;   // -1, 0, 1: "to left top" is (-1, -1); both 0 means the angle
+    // Radial and conic: the centre, and radial's size.
+    Length center_x = Length{false, 0, 50}, center_y = Length{false, 0, 50};
+    bool circle = false;
+    enum class Extent { ClosestSide, ClosestCorner, FarthestSide, FarthestCorner } extent = Extent::FarthestCorner;
+    bool explicit_size = false;
+    Length radius_x, radius_y;
+    float from = 0;   // conic: where it starts, degrees
+    std::vector<GradientStop> stops;
+};
+
+// One layer's image: a url(), a gradient, or nothing (none).
+struct BackgroundImage {
+    std::string url;   // absolute if the sheet's address was
+    std::shared_ptr<const Gradient> gradient;
+    [[nodiscard]] bool none() const noexcept { return url.empty() && !gradient; }
+};
+
+enum class BackgroundBox { Border, Padding, Content };
+
+struct BackgroundSize {
+    enum class Kind { Explicit, Cover, Contain } kind = Kind::Explicit;
+    Length width = Length::autoLength(), height = Length::autoLength();
+};
+
+// The background-* (or mask-*) longhands, each a list; layer i takes entry i of each,
+// the shorter lists repeating. The first layer is on top.
+struct BackgroundLayers {
+    std::vector<BackgroundImage> images;
+    std::vector<BackgroundSize> sizes{BackgroundSize{}};
+    std::vector<std::pair<Length, Length>> positions{{Length{}, Length{}}};
+    std::vector<std::pair<bool, bool>> repeats{{true, true}};   // x, y
+    std::vector<BackgroundBox> origins{BackgroundBox::Padding};
+    std::vector<BackgroundBox> clips{BackgroundBox::Border};
+    [[nodiscard]] bool empty() const noexcept {
+        for (const BackgroundImage& i : images)
+            if (!i.none()) return false;
+        return true;
+    }
+};
+
+// SVG's paint: fill and stroke.
+struct SvgPaint {
+    enum class Kind { None, Color, CurrentColor, Url } kind = Kind::None;
+    Color color;
+    std::string url;          // a fragment, "#id"
+    Kind fallback = Kind::None;   // url(#x) red: if #x isn't a paint server
+    Color fallback_color;
+};
+
+// Which SVG properties an element sets itself, rather than inheriting: in a <use>'s copy
+// of a symbol, what's inherited comes from the <use>, not the symbol's own parents.
+enum SvgSetBits : uint32_t {
+    kSetFill = 1, kSetStroke = 2, kSetStrokeWidth = 4, kSetFillOpacity = 8, kSetStrokeOpacity = 16,
+    kSetFillRule = 32, kSetLinecap = 64, kSetLinejoin = 128, kSetDash = 256, kSetColor = 512, kSetMiter = 1024,
+    kSetDashOffset = 2048, kSetVisibility = 4096,
+};
+
 struct ComputedStyle {
     Display display = Display::Inline;
     Position position = Position::Static;
@@ -117,10 +187,26 @@ struct ComputedStyle {
     std::shared_ptr<const std::map<std::string, std::vector<css::Token>>> custom;
     float border_spacing = 0;
     bool border_collapse = false;
+    // SVG, inherited
+    SvgPaint fill{SvgPaint::Kind::Color, Color{0, 0, 0, 255}};
+    SvgPaint stroke;
+    float stroke_width = 1, stroke_miterlimit = 4, stroke_dashoffset = 0;
+    float fill_opacity = 1, stroke_opacity = 1;
+    bool fill_evenodd = false;
+    uint8_t stroke_linecap = 0;    // butt, round, square
+    uint8_t stroke_linejoin = 0;   // miter, round, bevel
+    std::shared_ptr<const std::vector<float>> stroke_dasharray;
 
     // Not inherited, though underlines reach descendants' text
     Color background{0, 0, 0, 0};
+    std::shared_ptr<const BackgroundLayers> background_layers;   // null: no images
+    std::shared_ptr<const BackgroundLayers> mask_layers;
     bool masked = false;   // shaped by a mask we can't draw
+    // SVG, not inherited
+    uint32_t svg_set = 0;   // SvgSetBits
+    Color stop_color{0, 0, 0, 255};
+    float stop_opacity = 1;
+    std::string clip_path;   // "#id"
     Length margin[4], padding[4], offset[4] = {Length::autoLength(), Length::autoLength(), Length::autoLength(), Length::autoLength()};
     float border_width[4] = {0, 0, 0, 0};
     Color border_color[4];
