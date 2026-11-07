@@ -216,3 +216,96 @@ TEST(Js, Fuzz) {
     for (int i = 0; i < 10000; ++i) chain += "+0";
     EXPECT_EQ(run(chain), "0");
 }
+
+TEST(Js, RegExpMatching) {
+    EXPECT_EQ(run("'2024-11-08'.match(/(\\d+)-(\\d+)-(\\d+)/).slice(1).join()"), "2024,11,08");
+    EXPECT_EQ(run("/(?<y>\\d{4})-(?<m>\\d\\d)/.exec('on 2020-05').groups.m"), "05");
+    EXPECT_EQ(run("[.../(a)|(b)/.exec('b')].map(String).join()"), "b,undefined,b");
+    // Captures inside a repeat are cleared each time round; an empty round ends the loop.
+    EXPECT_EQ(run("/(z)((a+)?(b+)?(c))*/.exec('zaacbbbcac').map(String).join()"), "zaacbbbcac,z,ac,a,undefined,c");
+    EXPECT_EQ(run("/(a*)*b/.test('aaac')"), "false");
+    EXPECT_EQ(run("[/<(.*?)>/.exec('<a><b>')[1], /<(.*)>/.exec('<a><b>')[1], /x{2,3}?/.exec('xxxx')[0]].join()"), "a,a><b,xx");
+    EXPECT_EQ(run("[/(?<=\\$)\\d+/.exec('cost $42')[0], /(?<!\\$)\\b\\d+/.exec('$42 or 17')[0], /\\d+(?!%)/.exec('50%')[0]].join()"), "42,17,5");
+    EXPECT_EQ(run("/(?=(a+))a*b\\1/.exec('baaabac')[0]"), "aba");
+    EXPECT_EQ(run("/^(\\w+)\\s\\1$/.test('hello hello')"), "true");
+    EXPECT_EQ(run("[/^abc$/m.test('x\\nabc'), /a.c/s.test('a\\nc'), /a.c/.test('a\\nc'), /σ/i.test('Σ'), /é/i.test('É')].join()"),
+              "true,true,false,true,true");
+    EXPECT_EQ(run("[/^.$/u.test('😀'), /^.$/.test('😀'), /\\u{1F600}/u.test('😀'), /\\p{L}+/u.exec('12 héllo')[0]].join()"),
+              "true,false,true,héllo");
+    // The web's leniency outside unicode mode.
+    EXPECT_EQ(run("[/a{/.test('a{'), /]/.test(']'), /\\101/.test('A'), /\\8/.test('8'), /[\\w-.]+/.exec('a.b-c d')[0], /\\k/.test('k')].join()"),
+              "true,true,true,true,a.b-c,true");
+    EXPECT_EQ(run("const g = /o/g; [g.test('foo'), g.lastIndex, g.test('foo'), g.lastIndex, g.test('foo'), g.lastIndex].join()"),
+              "true,2,true,3,false,0");
+    EXPECT_EQ(run("const y = /o/y; [y.test('foo'), (y.lastIndex = 1, y.test('foo'))].join()"), "false,true");
+}
+
+TEST(Js, RegExpStrings) {
+    EXPECT_EQ(run("'a1b2c3'.replace(/\\d/g, d => d * 2)"), "a2b4c6");
+    EXPECT_EQ(run("'John Smith'.replace(/(\\w+)\\s(\\w+)/, '$2, $1')"), "Smith, John");
+    EXPECT_EQ(run("'2020-05'.replace(/(?<y>\\d{4})-(?<m>\\d\\d)/, '$<m>/$<y>')"), "05/2020");
+    EXPECT_EQ(run("'abc'.replace(/b/, \"[$`|$&|$']\")"), "a[a|b|c]c");
+    EXPECT_EQ(run("[...'a1b22c333'.matchAll(/\\d+/g)].map(m => m[0] + '@' + m.index).join()"), "1@1,22@3,333@6");
+    EXPECT_EQ(run("JSON.stringify(['a, b,c'.split(/\\s*,\\s*/), 'abc'.split(/(b)/), ''.split(/x/), 'test'.split(/(?:)/, 2)])"),
+              R"([["a","b","c"],["a","b","c"],[""],["t","e"]])");
+    EXPECT_EQ(run("['aXbX'.match(/x/gi).join(), 'abc'.search(/c/), 'abc'.match(/z/), 'aaa'.replaceAll(/a/g, 'b')].join('|')"), "X,X|2||bbb");
+    EXPECT_EQ(run("/(\\d+)/.exec('ab 42'); RegExp.$1"), "42");
+    EXPECT_EQ(run("[String(/a\\/b/g), new RegExp('a/b').source, String(new RegExp('')), new RegExp(/ab/g, 'i').flags].join()"),
+              "/a\\/b/g,a\\/b,/(?:)/,i");
+    EXPECT_EQ(run("Object.prototype.toString.call(/x/)"), "[object RegExp]");
+    EXPECT_EQ(run("class R extends RegExp {} const r = new R('x', 'g'); [r instanceof R, r.test('x'), r.flags].join()"), "true,true,g");
+    // A page's own matcher object, through the Symbol methods.
+    EXPECT_EQ(run("'abc'.replace({ [Symbol.replace](s, w) { return s + w; } }, '!')"), "abc!");
+}
+
+TEST(Js, RegExpErrorsAndLimits) {
+    EXPECT_EQ(run("/(/"), "throws: SyntaxError: invalid regular expression: unterminated group (line 1)");
+    EXPECT_EQ(run("new RegExp('a', 'gg')"), "throws: SyntaxError: Invalid regular expression flags 'gg'");
+    EXPECT_EQ(run("try { new RegExp('[b-a]') } catch (e) { e.name }"), "SyntaxError");
+    EXPECT_EQ(run("try { /\\p{L}/u.test('x') && new RegExp('\\\\p{', 'u') } catch (e) { e.name }"), "SyntaxError");
+    EXPECT_EQ(run("try { 'x'.matchAll(/x/) } catch (e) { e.name }"), "TypeError");
+    // Catastrophic backtracking stops at the step budget, not never.
+    EXPECT_NE(run("/(a+)+b/.test('a'.repeat(40))").find("ran too long"), std::string::npos);
+    // A long text is fine: simple repeats don't stack a frame per character.
+    EXPECT_EQ(run("const s = 'x'.repeat(1 << 20) + 'y'; [/x*y/.exec(s)[0].length, /(?:x|z)*?y/.test(s), s.split(/x/).length].join()"),
+              "1048577,true,1048577");
+    EXPECT_EQ(run("var a = ['x']; a.foo = 1; a.index = 2; [a.foo, a.index, a.length].join()"), "1,2,1");
+}
+
+TEST(Js, RegExpFuzz) {
+    // Mangled patterns compile or throw a SyntaxError, and every one runs to an answer.
+    const std::string corpus[] = {
+        "(?<y>\\d{4})-(?<m>\\d\\d)", "^(?:a|b)*?c$", "(?<=\\$)\\d+(?!%)", "[\\w-.]+@[^\\s]{2,}", "(a*)*b\\1\\k<n>(?<n>x)",
+        "\\p{Lu}\\P{N}[\\u{1F600}-\\u{1F64F}]", "a{2,3}?b+?c*?[^]$", "\\cJ\\x41\\u0042\\101\\0[\\b]",
+    };
+    const char* flags[] = {"", "g", "i", "u", "giu", "msy", "dv"};
+    std::mt19937 rng(61);
+    for (int round = 0; round < 3000; ++round) {
+        std::string p = corpus[rng() % std::size(corpus)];
+        const int edits = 1 + rng() % 5;
+        for (int e = 0; e < edits && !p.empty(); ++e) {
+            const size_t at = rng() % p.size();
+            switch (rng() % 4) {
+                case 0: p.erase(at, 1 + rng() % 3); break;
+                case 1: p.insert(at, 1, "()[]{}?*+|^$\\.-<>=!:,"[rng() % 21]); break;
+                case 2: p[at] = static_cast<char>(32 + rng() % 95); break;
+                default: p.insert(at, p.substr(rng() % p.size(), rng() % 6)); break;
+            }
+        }
+        std::string escaped;
+        for (char c : p) {
+            if (c == '\\' || c == '\'') escaped += '\\';
+            escaped += c;
+        }
+        const std::string r = run("try { const re = new RegExp('" + escaped + "', '" + flags[rng() % std::size(flags)] +
+                                  "'); [re.exec('aab$42 Hé 😀 2020-05 x@yy.zz'), 'aXb'.replace(re, '$1'), 'a,b'.split(re)].length } "
+                                  "catch (e) { e.name }");
+        EXPECT_TRUE(r == "3" || r == "SyntaxError" || r.find("ran too long") != std::string::npos) << p << " -> " << r;
+    }
+    // Pathological shapes.
+    EXPECT_EQ(run("try { new RegExp('('.repeat(100000)) } catch (e) { e.name }"), "SyntaxError");
+    EXPECT_EQ(run("new RegExp('(?:a{1000}){1000}').test('a'.repeat(1000000))"), "true");   // single-character repeats stay small
+    EXPECT_EQ(run("try { new RegExp('(?:(?:a|b){1000}){1000}') } catch (e) { e.message }"),
+              "Invalid regular expression: /(?:(?:a|b){1000}){1000}/: regular expression too large");
+    EXPECT_EQ(run("new RegExp('(?:'.repeat(400) + 'x' + ')'.repeat(400)).test('x')"), "true");
+}

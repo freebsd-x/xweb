@@ -756,6 +756,7 @@ void Runtime::installBuiltins() {
             case ObjectClass::Number: name = u"Number"; break;
             case ObjectClass::String: name = u"String"; break;
             case ObjectClass::Arguments: name = u"Arguments"; break;
+            case ObjectClass::RegExp: name = u"RegExp"; break;
             default: break;
         }
         return Value::string(std::u16string(u"[object ") + name + u"]");
@@ -881,7 +882,19 @@ void Runtime::installBuiltins() {
     put(symbol_ctor, u"toPrimitive", Value::symbol(sym_to_primitive), 0);
     put(symbol_ctor, u"toStringTag", Value::symbol(sym_to_string_tag), 0);
     put(symbol_ctor, u"hasInstance", Value::symbol(sym_has_instance), 0);
-    for (const char16_t* name : {u"asyncIterator", u"match", u"matchAll", u"replace", u"search", u"split", u"species", u"unscopables", u"isConcatSpreadable"})
+    sym_match = newSymbol(u"Symbol.match");
+    sym_match_all = newSymbol(u"Symbol.matchAll");
+    sym_replace = newSymbol(u"Symbol.replace");
+    sym_search = newSymbol(u"Symbol.search");
+    sym_split = newSymbol(u"Symbol.split");
+    put(symbol_ctor, u"match", Value::symbol(sym_match), 0);
+    put(symbol_ctor, u"matchAll", Value::symbol(sym_match_all), 0);
+    put(symbol_ctor, u"replace", Value::symbol(sym_replace), 0);
+    put(symbol_ctor, u"search", Value::symbol(sym_search), 0);
+    put(symbol_ctor, u"split", Value::symbol(sym_split), 0);
+    sym_species = newSymbol(u"Symbol.species");
+    put(symbol_ctor, u"species", Value::symbol(sym_species), 0);
+    for (const char16_t* name : {u"asyncIterator", u"unscopables", u"isConcatSpreadable"})
         put(symbol_ctor, name, Value::symbol(newSymbol(std::u16string(u"Symbol.") + name)), 0);
     method(symbol_ctor, u"for", 1, [](Runtime& rt, const Value&, Args a) {
         const std::u16string key = *rt.toString(arg(a, 0));
@@ -1251,13 +1264,21 @@ void Runtime::installBuiltins() {
     // ── Array ──
     array_prototype = allocate<Object>(object_prototype, ObjectClass::Array);
     Object* array_ctor = ctor(u"Array", 1, [](Runtime& rt, const Value&, Args a) {
+        Object* arr;
         if (a.size() == 1 && a[0].isNumber()) {
             const double n = a[0].asNumber();
             if (n < 0 || n != std::floor(n) || n > 4294967295.0) rt.throwError("RangeError", "invalid array length");
             if (n > 100'000'000) rt.throwError("RangeError", "array too long");
-            return Value::object(rt.newArray(std::vector<Value>(static_cast<size_t>(n), Value::empty())));
+            arr = rt.newArray(std::vector<Value>(static_cast<size_t>(n), Value::empty()));
+        } else {
+            arr = rt.newArray(std::vector<Value>(a.begin(), a.end()));
         }
-        return Value::object(rt.newArray(std::vector<Value>(a.begin(), a.end())));
+        // A subclass's instance: its prototype from new.target.
+        if (Object* nt = rt.construct_target) {
+            const Value p = rt.get(Value::object(nt), u"prototype");
+            if (p.isObject()) arr->prototype = p.asObject();
+        }
+        return Value::object(arr);
     }, array_prototype);
     method(array_ctor, u"isArray", 1, [](Runtime&, const Value&, Args a) { return Value::boolean(arg(a, 0).isObject() && arg(a, 0).asObject()->cls == ObjectClass::Array); });
     method(array_ctor, u"of", 0, [](Runtime& rt, const Value&, Args a) { return Value::object(rt.newArray(std::vector<Value>(a.begin(), a.end()))); });
@@ -1660,7 +1681,7 @@ void Runtime::installBuiltins() {
         return Value::number(at == std::u16string::npos ? -1 : static_cast<double>(at));
     });
     const auto noRegex = [](Runtime& rt, const Value& v) {
-        if (v.isObject() && rt.has(v.asObject(), u"__regex")) rt.throwError("TypeError", "a regular expression isn't allowed here");
+        if (rt.isRegExp(v)) rt.throwError("TypeError", "a regular expression isn't allowed here");
     };
     method(string_prototype, u"includes", 1, [thisString, noRegex](Runtime& rt, const Value& t, Args a) {
         noRegex(rt, arg(a, 0));
@@ -1668,12 +1689,14 @@ void Runtime::installBuiltins() {
         const double from = std::clamp(rt.toIntegerOrInfinity(arg(a, 1)), 0.0, static_cast<double>(s.size()));
         return Value::boolean(s.find(needle, static_cast<size_t>(from)) != std::u16string::npos);
     });
-    method(string_prototype, u"startsWith", 1, [thisString](Runtime& rt, const Value& t, Args a) {
+    method(string_prototype, u"startsWith", 1, [thisString, noRegex](Runtime& rt, const Value& t, Args a) {
+        noRegex(rt, arg(a, 0));
         const std::u16string s = thisString(rt, t), needle = *rt.toString(arg(a, 0));
         const size_t from = static_cast<size_t>(std::clamp(rt.toIntegerOrInfinity(arg(a, 1)), 0.0, static_cast<double>(s.size())));
         return Value::boolean(s.compare(from, needle.size(), needle) == 0 && from + needle.size() <= s.size());
     });
-    method(string_prototype, u"endsWith", 1, [thisString](Runtime& rt, const Value& t, Args a) {
+    method(string_prototype, u"endsWith", 1, [thisString, noRegex](Runtime& rt, const Value& t, Args a) {
+        noRegex(rt, arg(a, 0));
         const std::u16string s = thisString(rt, t), needle = *rt.toString(arg(a, 0));
         const size_t end = arg(a, 1).isUndefined() ? s.size() : static_cast<size_t>(std::clamp(rt.toIntegerOrInfinity(arg(a, 1)), 0.0, static_cast<double>(s.size())));
         return Value::boolean(needle.size() <= end && s.compare(end - needle.size(), needle.size(), needle) == 0);
@@ -1719,9 +1742,9 @@ void Runtime::installBuiltins() {
         const std::u16string s = thisString(rt, t);
         const uint32_t limit = arg(a, 1).isUndefined() ? 0xFFFFFFFFu : rt.toUint32(arg(a, 1));
         std::vector<Value> out;
+        const std::u16string sep = arg(a, 0).isUndefined() ? u"" : *rt.toString(arg(a, 0));
         if (limit == 0) return Value::object(rt.newArray());
         if (arg(a, 0).isUndefined()) return Value::object(rt.newArray({Value::string(s)}));
-        const std::u16string sep = *rt.toString(arg(a, 0));
         if (sep.empty()) {
             for (size_t i = 0; i < s.size() && out.size() < limit; ++i) out.push_back(Value::string(std::u16string(1, s[i])));
             return Value::object(rt.newArray(std::move(out)));
@@ -2042,6 +2065,7 @@ void Runtime::installBuiltins() {
                 if (v.isString()) line += utf8(v.asString());
                 else if (v.isSymbol()) line += "Symbol(" + utf8(v.asSymbol()->description) + ")";
                 else if (v.isObject() && v.asObject()->cls == ObjectClass::Error) line += describe(rt, v);
+                else if (v.isObject() && v.asObject()->cls == ObjectClass::RegExp) line += utf8(*rt.toString(v));
                 else if (v.isObject() && !rt.isCallable(v)) {
                     // As JSON where it can be; [object …] where it can't.
                     try {
@@ -2058,6 +2082,7 @@ void Runtime::installBuiltins() {
             return Value::undefined();
         });
     }
+    installRegExp();
     (void)rt;
 }
 

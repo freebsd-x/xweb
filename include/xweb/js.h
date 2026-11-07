@@ -2,8 +2,8 @@
 
 // Our JavaScript engine, written by hand like the rest of xweb: a lexer and parser for
 // the ES2020 language, and an interpreter that walks the tree it makes, with the
-// standard library's core. Not yet: generators, async functions, RegExp, Date, Promise
-// and the DOM, which the page's bindings will add.
+// standard library's core and regular expressions. Not yet: generators, async
+// functions, Date and Promise.
 
 #include <cstdint>
 #include <functional>
@@ -21,6 +21,7 @@ class Object;
 class Symbol;
 class Runtime;
 struct Env;
+namespace regex { struct Program; }
 
 using JSString = std::shared_ptr<const std::u16string>;
 
@@ -114,7 +115,7 @@ public:
 using NativeFunction = std::function<Value(Runtime&, const Value& this_value, std::span<const Value> args)>;
 
 enum class ObjectClass : uint8_t {
-    Ordinary, Array, Function, Error, Boolean, Number, String, Symbol, Arguments, Map, Set, Iterator,
+    Ordinary, Array, Function, Error, Boolean, Number, String, Symbol, Arguments, Map, Set, Iterator, RegExp,
 };
 
 struct FunctionData;   // a script function's code and closure (runtime.cc)
@@ -154,6 +155,8 @@ public:
     size_t cursor = 0;
     Object* target = nullptr;   // an iterator's subject
     uint8_t iter_kind = 0;
+    // A RegExp's compiled pattern; its source is `primitive`.
+    std::shared_ptr<const regex::Program> regexp;
 
     // The embedder's: what a DOM wrapper stands for, and which kind of thing it is.
     void* host = nullptr;
@@ -207,6 +210,10 @@ public:
     Object* newFunction(std::u16string name, int length, NativeFunction fn, bool constructor = false);
     Object* newError(const char* kind, const std::string& message);
     Symbol* newSymbol(std::u16string description, bool has_description = true);
+    // A RegExp, as /source/flags would make it; a bad pattern throws a SyntaxError.
+    Object* newRegExp(const std::u16string& source, const std::u16string& flags);
+    // IsRegExp: an object with a truthy Symbol.match, or else a RegExp.
+    bool isRegExp(const Value& v);
     void put(Object* o, const PropertyKey& key, Value v, uint8_t flags = kWritable | kConfigurable);
     void method(Object* o, const char16_t* name, int length, NativeFunction fn);
 
@@ -261,11 +268,21 @@ public:
     Object* array_iterator_prototype = nullptr;
     Object* map_prototype = nullptr;
     Object* set_prototype = nullptr;
+    Object* regexp_prototype = nullptr;
+    Object* regexp_string_iterator_prototype = nullptr;
+    Object* regexp_exec = nullptr;   // RegExp.prototype.exec, for the fast path
+    Object* regexp_constructor = nullptr;
     std::unordered_map<std::string, Object*> error_prototypes;
     Symbol* sym_iterator = nullptr;
     Symbol* sym_to_primitive = nullptr;
     Symbol* sym_to_string_tag = nullptr;
     Symbol* sym_has_instance = nullptr;
+    Symbol* sym_match = nullptr;
+    Symbol* sym_match_all = nullptr;
+    Symbol* sym_replace = nullptr;
+    Symbol* sym_search = nullptr;
+    Symbol* sym_split = nullptr;
+    Symbol* sym_species = nullptr;
     std::unordered_map<std::u16string, Symbol*> symbol_registry;
 
     // Heap.
@@ -283,12 +300,22 @@ public:
 
     // The interpreter's own (runtime.cc).
     void step();
+    // Many steps at once (the regex matcher, which counts its own).
+    void steps(uint64_t n) {
+        steps_ += n;
+        if (steps_ > step_budget_) throw Terminated{"the script ran too long"};
+    }
     std::vector<Env*> env_stack;
     size_t call_depth = 0;
     size_t eval_depth = 0;   // C++ recursion in the interpreter
     std::vector<Value> extra_roots;   // values bindings keep while a script runs
     Object* construct_target = nullptr;   // while a built-in constructor runs under new
     Object* array_values_ = nullptr;      // Array.prototype.values, for the fast path
+    // The last successful match, for the legacy RegExp.$1 and friends.
+    std::u16string regexp_last_input;
+    std::vector<int> regexp_last_caps;
+    // Compiled patterns by flags and source: a loop's literal compiles once.
+    std::unordered_map<std::u16string, std::shared_ptr<const regex::Program>> regexp_cache;
     void emitConsole(std::string_view level, const std::string& text) {
         if (console_) console_(level, text);
     }
@@ -298,6 +325,7 @@ public:
 
 private:
     void installBuiltins();
+    void installRegExp();
     std::vector<Cell*> cells_;
     size_t allocations_ = 0;
     std::vector<std::shared_ptr<struct Program>> programs_;   // every script's tree, kept for its functions

@@ -22,6 +22,8 @@ libxweb = static_library('xweb',
   'src/js/parser.cc',
   'src/js/runtime.cc',
   'src/js/builtins.cc',
+  'src/js/regexp.cc',
+  'src/js/regexp_builtins.cc',
   include_directories : xweb_inc,
 )
 

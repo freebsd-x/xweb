@@ -6,6 +6,7 @@
 #include <stdexcept>
 
 #include "ast.h"
+#include "regexp.h"
 #include "xweb/js.h"
 
 namespace fbx::xweb::js {
@@ -639,6 +640,23 @@ private:
             ctor = newFunction();
             ctor->body = p_.make(N::Block, n->line);
             ctor->strict = true;
+            if (n->a) {
+                // A derived class's default: constructor(...args) { super(...args); }
+                Node* rest = p_.make(N::Rest, n->line);
+                rest->a = p_.make(N::Identifier, n->line);
+                rest->a->str = u"args";
+                ctor->params.push_back(rest);
+                ctor->simple_params = false;
+                Node* call = p_.make(N::Call, n->line);
+                call->a = p_.make(N::Super, n->line);
+                Node* spread = p_.make(N::Spread, n->line);
+                spread->a = p_.make(N::Identifier, n->line);
+                spread->a->str = u"args";
+                call->kids.push_back(spread);
+                Node* stmt = p_.make(N::ExprStmt, n->line);
+                stmt->a = call;
+                ctor->body->kids.push_back(stmt);
+            }
         }
         ctor->name = n->str;
         ctor->is_class_constructor = true;
@@ -1306,6 +1324,11 @@ private:
             case Tok::Template:
                 return templateLiteral(false);
             case Tok::Regex: {
+                // A bad pattern is an early error: the script doesn't run at all.
+                const auto flags = regex::parseFlags(cur_.raw);
+                if (!flags) fail("invalid regular expression flags");
+                std::string why;
+                if (!regex::compile(cur_.value, *flags, why)) fail("invalid regular expression: " + why);
                 Node* n = p_.make(N::Regex, line);
                 n->str = cur_.value;
                 n->str2 = cur_.raw;

@@ -481,7 +481,10 @@ bool Runtime::set(Object* o, const PropertyKey& key, const Value& v, const Value
         return true;
     }
     if (!r->extensible) return false;
-    if (!key.isSymbol() && r->cls == ObjectClass::Array) return set(r, key, v, receiver);
+    // An index or length reached through the chain: the array's own fast path above.
+    // (Any other name is an ordinary property: going round again would never end.)
+    if (!key.isSymbol() && r->cls == ObjectClass::Array && r != o && (arrayIndex(key.name) >= 0 || key.name == u"length"))
+        return set(r, key, v, receiver);
     r->define(key, {v, nullptr, nullptr, kDefaultFlags});
     return true;
 }
@@ -884,10 +887,13 @@ void Runtime::collectGarbage() {
     for (Env* e : env_stack) markCell(e);
     for (const Value& v : extra_roots) markValue(v);
     for (Object* o : {object_prototype, function_prototype, array_prototype, string_prototype, number_prototype, boolean_prototype,
-                      symbol_prototype, error_prototype, iterator_prototype, array_iterator_prototype, map_prototype, set_prototype, array_values_})
+                      symbol_prototype, error_prototype, iterator_prototype, array_iterator_prototype, map_prototype, set_prototype, array_values_,
+                      regexp_prototype, regexp_string_iterator_prototype, regexp_exec, regexp_constructor})
         markCell(o);
     for (auto& [k, o] : error_prototypes) markCell(o);
-    for (Symbol* s : {sym_iterator, sym_to_primitive, sym_to_string_tag, sym_has_instance}) markCell(s);
+    for (Symbol* s : {sym_iterator, sym_to_primitive, sym_to_string_tag, sym_has_instance, sym_match, sym_match_all, sym_replace,
+                      sym_search, sym_split, sym_species})
+        markCell(s);
     for (auto& [k, s] : symbol_registry) markCell(s);
     while (!todo.empty()) {
         Cell* c = todo.back();
@@ -1623,7 +1629,7 @@ Value Interpreter::eval(Node* n, Env* env, bool strict) {
         case N::This: return thisValue(env);
         case N::Template: return evalTemplate(n, env, strict);
         case N::TaggedTemplate: return evalTagged(n, env, strict);
-        case N::Regex: rt_.throwError("SyntaxError", "regular expressions aren't supported yet");
+        case N::Regex: return Value::object(rt_.newRegExp(n->str, n->str2));
         case N::Array: return evalArray(n, env, strict);
         case N::Object: return evalObject(n, env, strict);
         case N::FunctionExpr: {
