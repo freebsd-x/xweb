@@ -3134,6 +3134,16 @@ private:
                 return m.origin != Origin::UserAgent && (m.decl->name == longhand || m.decl->name == "margin");
             });
         };
+        s.native_look = !std::any_of(matched.begin(), matched.end(), [](const MatchedDecl& m) {
+            if (m.origin == Origin::UserAgent) return false;
+            const std::string& n = m.decl->name;
+            if (n.starts_with("border") || n.starts_with("background")) return true;
+            if (n == "appearance" || n == "-webkit-appearance") {
+                const std::string k = keyword(m.decl->value);
+                return k == "none" || k == "textfield";
+            }
+            return false;
+        });
         s.ua_margin_top = !setByPage("margin-top");
         s.ua_margin_bottom = !setByPage("margin-bottom");
 

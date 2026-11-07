@@ -1,4 +1,5 @@
 #include "xweb/layout.h"
+#include "xweb/forms.h"
 
 #include <algorithm>
 #include <cmath>
@@ -218,8 +219,8 @@ std::string markerText(ListStyle style, int number) {
 
 class Layouter {
 public:
-    Layouter(const StyledDocument& styles, TextMeasurer& text, ImageSizes* images, float vw, float vh)
-        : styles_(styles), text_(text), images_(images), vw_(vw), vh_(vh) {}
+    Layouter(const StyledDocument& styles, TextMeasurer& text, ImageSizes* images, float vw, float vh, const FormState* forms)
+        : styles_(styles), text_(text), images_(images), forms_(forms), vw_(vw), vh_(vh) {}
 
     PageLayout run(const Document& doc) {
         PageLayout page;
@@ -341,6 +342,9 @@ private:
     std::string controlText(const Node* n) {
         if (n->isHtml("input")) {
             if (const std::string* v = n->attr("value"); v && !v->empty()) return *v;
+            const ControlKind k = controlKind(n);
+            if (k == ControlKind::Submit) return "Submit";
+            if (k == ControlKind::Reset) return "Reset";
             if (const std::string* v = n->attr("placeholder")) return *v;
             return {};
         }
@@ -1135,6 +1139,7 @@ private:
             const std::string* ty = n->attr("type");
             if (ty && (*ty == "checkbox" || *ty == "radio")) {
                 natural_w = natural_h = 13;
+                b.last_baseline = 13;   // its bottom edge sits on the baseline
             } else {
                 // A browser's size="20" default: 20 average characters.
                 float chars = 20;
@@ -1142,13 +1147,13 @@ private:
                     const float v = std::strtof(size->c_str(), nullptr);
                     if (v > 0 && v < 10000) chars = v;
                 }
-                natural_w = chars * s.font_size * 0.75f;
+                natural_w = chars * s.font_size * 0.7425f;   // Chromium's 20 characters of the default font here
                 natural_h = lineHeightOf(s);
                 const FontSpec font = fontOf(s);
                 b.last_baseline = text_.ascent(font) + (natural_h - text_.ascent(font) - text_.descent(font)) / 2;
                 const std::string shown = controlText(n);
                 if (ty && (*ty == "submit" || *ty == "button" || *ty == "reset"))
-                    natural_w = text_.width(shown.empty() ? "Submit" : shown, fontOf(s)) + 8;
+                    natural_w = text_.width(shown.empty() ? "Submit" : shown, fontOf(s));
             }
         } else if (n->isHtml("textarea")) {
             natural_w = 20 * s.font_size * 0.73f;
@@ -1163,7 +1168,9 @@ private:
             }
         } else if (n->isHtml("select")) {
             const FontSpec font = fontOf(s);
-            natural_w = text_.width(controlText(n), font) + 20;   // the arrow's room
+            float widest = 0;
+            for (const Node* o : optionsOf(n)) widest = std::max(widest, text_.width(optionLabel(o), font));
+            natural_w = widest + 20;   // the arrow's room
             natural_h = lineHeightOf(s) + 2;
             b.last_baseline = text_.ascent(font) + (natural_h - text_.ascent(font) - text_.descent(font)) / 2;
         } else if (n->isHtml("progress") || n->isHtml("meter")) {
@@ -3257,10 +3264,38 @@ private:
         }
     }
 
+    // Whether Chromium would draw this with its own theme instead of its CSS border.
+    static bool nativeControl(const Box& b) {
+        if (!b.node || !b.style->native_look) return false;
+        const ControlKind k = controlKind(b.node);
+        return k == ControlKind::Text || k == ControlKind::Password || k == ControlKind::TextArea || k == ControlKind::Select ||
+               k == ControlKind::Submit || k == ControlKind::Reset || k == ControlKind::Button;
+    }
+
     void paintFrame(const Box& b, float x, float y, float opacity) {
         const ComputedStyle& s = *b.style;
         const float w = b.outerWidth(), h = b.outerHeight();
         if (s.hidden) return;
+        if (nativeControl(b)) {
+            // Chromium's light theme: a 1px #767676 outline with corners of 2, darker when
+            // it has the keyboard; the fill is the control's own.
+            const bool focused = forms().focused == b.node;
+            addRect(x, y, w, h, faded(s.background, opacity), 2);
+            auto p = std::make_shared<BoxPaint>();
+            p->part = BoxPaint::Part::Border;
+            p->w = w;
+            p->h = h;
+            const float bw = focused ? 2 : 1;
+            for (int i = 0; i < 4; ++i) {
+                p->radii[i][0] = p->radii[i][1] = 2;
+                p->border[i] = bw;
+                p->colors[i] = faded(focused ? Color{0x10, 0x10, 0x10, 255} : Color{0x76, 0x76, 0x76, 255}, opacity);
+                p->styles[i] = BorderStyle::Solid;
+            }
+            fitRadii(p->radii, w, h);
+            addBoxPaint(x, y, w, h, std::move(p));
+            return;
+        }
         // Corners, as lengths of this box, fitted so neighbours don't overlap.
         BoxPaint base;
         base.w = w;
@@ -3387,11 +3422,131 @@ private:
             out_->ops.push_back(std::move(op));
             return;
         }
-        const std::string shown = controlText(n);
-        if (!shown.empty()) {
-            const std::string line = shown.substr(0, shown.find('\n'));
-            addText(cx, cy, line, s, opacity);
+        paintControl(b, x, y, cx, cy, opacity);
+    }
+
+    // A form control's insides: its text (or what it's waiting for), a caret if it's
+    // being typed into, a check, a dot or an arrow.
+    void paintControl(const Box& b, float x, float y, float cx, float cy, float opacity) {
+        const ComputedStyle& s = *b.style;
+        const Node* n = b.node;
+        const ControlKind kind = controlKind(n);
+        const FormState& st = forms();
+        if (kind == ControlKind::Checkbox || kind == ControlKind::Radio) {
+            auto p = std::make_shared<BoxPaint>();
+            p->part = kind == ControlKind::Checkbox ? BoxPaint::Part::Checkbox : BoxPaint::Part::Radio;
+            p->w = b.outerWidth();
+            p->h = b.outerHeight();
+            p->checked = st.checked(n);
+            addBoxPaint(x, y, p->w, p->h, std::move(p));
+            return;
         }
+        const FontSpec font = fontOf(s);
+        const float line_h = lineHeightOf(s);
+        const Rect content{cx, cy, b.width, b.height};
+        const auto clipped = [&](auto&& draw) {
+            PaintOp begin;
+            begin.kind = PaintKind::ClipBegin;
+            begin.x = content.x;
+            begin.y = content.y;
+            begin.w = content.w;
+            begin.h = content.h;
+            out_->ops.push_back(begin);
+            draw();
+            PaintOp end;
+            end.kind = PaintKind::ClipEnd;
+            out_->ops.push_back(end);
+        };
+        const auto text = [&](float tx, float ty, const std::string& t, Color c) {
+            PaintOp op;
+            op.kind = PaintKind::Text;
+            op.x = tx;
+            op.y = ty;
+            op.text = t;
+            op.font = font;
+            op.color = faded(c, opacity);
+            op.w = text_.width(t, font);
+            op.h = text_.ascent(font) + text_.descent(font);
+            out_->ops.push_back(std::move(op));
+        };
+        const bool focused = st.focused == n;
+        if (kind == ControlKind::Text || kind == ControlKind::Password) {
+            const std::string value = st.value(n);
+            std::string shown = value;
+            size_t caret = std::min(st.caret, value.size());
+            if (kind == ControlKind::Password) {
+                // A dot for each character, and the caret after as many.
+                std::string dots;
+                size_t dot_caret = 0;
+                for (size_t i = 0; i < value.size(); ++i)
+                    if ((static_cast<unsigned char>(value[i]) & 0xC0) != 0x80) {
+                        if (i < caret) dot_caret += 3;
+                        dots += "\u2022";
+                    }
+                shown = dots;
+                caret = dot_caret;
+            }
+            const float ty = cy + (b.height - line_h) / 2;
+            // Scrolled so the caret shows.
+            const float caret_x = text_.width(shown.substr(0, caret), font);
+            const float scroll = focused ? std::max(0.0f, caret_x - b.width + 1) : 0;
+            clipped([&] {
+                if (shown.empty()) {
+                    if (const std::string* ph = n->attr("placeholder"); ph && !ph->empty()) text(cx, ty, *ph, Color{0x75, 0x75, 0x75, 255});
+                } else {
+                    text(cx - scroll, ty, shown, s.color);
+                }
+                if (focused) addRect(cx + caret_x - scroll, ty, 1, line_h, faded(s.color, opacity));
+            });
+            return;
+        }
+        if (kind == ControlKind::TextArea) {
+            const std::string value = st.value(n);
+            const size_t caret = std::min(st.caret, value.size());
+            clipped([&] {
+                if (value.empty()) {
+                    if (const std::string* ph = n->attr("placeholder"); ph && !ph->empty()) text(cx, cy, *ph, Color{0x75, 0x75, 0x75, 255});
+                }
+                size_t start = 0;
+                float ly = cy;
+                for (int line = 0; start <= value.size() && line < 10000; ++line) {
+                    size_t end = value.find('\n', start);
+                    if (end == std::string::npos) end = value.size();
+                    const std::string part = value.substr(start, end - start);
+                    if (!part.empty()) text(cx, ly, part, s.color);
+                    if (focused && caret >= start && caret <= end) addRect(cx + text_.width(value.substr(start, caret - start), font), ly, 1, line_h, faded(s.color, opacity));
+                    start = end + 1;
+                    ly += line_h;
+                    if (end == value.size()) break;
+                }
+            });
+            return;
+        }
+        if (kind == ControlKind::Select) {
+            const std::vector<const Node*> options = optionsOf(n);
+            const int i = st.selected(n);
+            const std::string label = i >= 0 ? optionLabel(options[static_cast<size_t>(i)]) : std::string{};
+            const float arrow = std::min(20.0f, b.width);
+            clipped([&] {
+                if (!label.empty()) text(cx, cy + (b.height - line_h) / 2, label, s.color);
+            });
+            auto p = std::make_shared<BoxPaint>();
+            p->part = BoxPaint::Part::SelectArrow;
+            p->w = arrow;
+            p->h = b.height;
+            p->colors[0] = faded(s.color, opacity);
+            addBoxPaint(cx + b.width - arrow, cy, arrow, b.height, std::move(p));
+            return;
+        }
+        if (kind == ControlKind::Submit || kind == ControlKind::Reset || kind == ControlKind::Button) {
+            const std::string label = controlText(n);
+            if (label.empty()) return;
+            const float tw = text_.width(label, font);
+            clipped([&] { text(cx + std::max(0.0f, (b.width - tw) / 2), cy + (b.height - line_h) / 2, label, s.color); });
+            return;
+        }
+        const std::string shown = controlText(n);
+        if (!shown.empty()) addText(cx, cy, shown.substr(0, shown.find('\n')), s, opacity);
     }
 
     void paintFragments(const Box& b, float cx, float cy, const Rect& cb, float opacity) {
@@ -3610,6 +3765,9 @@ private:
     const StyledDocument& styles_;
     TextMeasurer& text_;
     ImageSizes* images_;
+    const FormState* forms_ = nullptr;
+    FormState no_forms_;   // what's shown when nobody keeps form state: what the page said
+    [[nodiscard]] const FormState& forms() const { return forms_ ? *forms_ : no_forms_; }
     float vw_, vh_;
     std::deque<ComputedStyle> anon_styles_;
     PageLayout* out_ = nullptr;
@@ -3637,8 +3795,8 @@ private:
 float chWidth(TextMeasurer& text, const ComputedStyle& style) { return text.width("0", fontOf(style)); }
 
 PageLayout layoutPage(const Document& doc, const StyledDocument& styles, TextMeasurer& text, ImageSizes* images,
-                      float viewport_width, float viewport_height) {
-    return Layouter(styles, text, images, viewport_width, viewport_height).run(doc);
+                      float viewport_width, float viewport_height, const FormState* forms) {
+    return Layouter(styles, text, images, viewport_width, viewport_height, forms).run(doc);
 }
 
 }  // namespace fbx::xweb

@@ -1200,6 +1200,53 @@ Raster renderBoxPaint(const BoxPaint& box, float area_w, float area_h, uint32_t 
     const float* b = box.border;
 
     switch (box.part) {
+        case BoxPaint::Part::Checkbox:
+        case BoxPaint::Part::Radio:
+        case BoxPaint::Part::SelectArrow: {
+            // Chromium's light theme: #767676 outlines, #0075ff when on.
+            const Color grey{0x76, 0x76, 0x76, 255}, blue{0x00, 0x75, 0xff, 255}, white{255, 255, 255, 255};
+            const float x0 = box.ox, y0 = box.oy, w = box.w, h = box.h;
+            const auto fillShape = [&](const Contours& c, Color col, bool even_odd = false) {
+                Paint p;
+                p.color = col;
+                canvas.fill(scaled(c, kx, ky, 0, 0), even_odd, p);
+            };
+            const auto strokeLine = [&](std::vector<Point> pts, float width, Color col) {
+                Contours all;
+                const StrokeStyle st{width, 1, 1, 4};
+                for (auto& poly : strokeOutline(pts, false, st, kx)) all.push_back(std::move(poly));
+                fillShape(all, col);
+            };
+            if (box.part == BoxPaint::Part::SelectArrow) {
+                strokeLine({{x0 + w * 0.3f, y0 + h * 0.4f}, {x0 + w * 0.5f, y0 + h * 0.6f}, {x0 + w * 0.7f, y0 + h * 0.4f}},
+                           std::max(1.0f, w * 0.12f), box.colors[0]);
+                break;
+            }
+            if (box.part == BoxPaint::Part::Checkbox) {
+                const float r[4][2] = {{2, 2}, {2, 2}, {2, 2}, {2, 2}};
+                if (box.checked) {
+                    fillShape(roundedRect(x0, y0, w, h, r), blue);
+                    strokeLine({{x0 + w * 0.24f, y0 + h * 0.52f}, {x0 + w * 0.42f, y0 + h * 0.70f}, {x0 + w * 0.77f, y0 + h * 0.31f}},
+                               std::max(1.5f, w * 0.15f), white);
+                } else {
+                    Contours ring = roundedRect(x0, y0, w, h, r);
+                    const float ri[4][2] = {{1, 1}, {1, 1}, {1, 1}, {1, 1}};
+                    Contours inner = roundedRect(x0 + 1, y0 + 1, w - 2, h - 2, ri);
+                    fillShape(inner, white);
+                    ring.insert(ring.end(), inner.begin(), inner.end());
+                    fillShape(ring, grey, true);
+                }
+                break;
+            }
+            const float cx = x0 + w / 2, cy = y0 + h / 2, rr = std::min(w, h) / 2;
+            Contours outer_c = ellipse(cx, cy, rr, rr, kx);
+            Contours inner_c = ellipse(cx, cy, rr - 1, rr - 1, kx);
+            fillShape(inner_c, white);
+            outer_c.insert(outer_c.end(), inner_c.begin(), inner_c.end());
+            fillShape(outer_c, box.checked ? blue : grey, true);
+            if (box.checked) fillShape(ellipse(cx, cy, rr * 0.55f, rr * 0.55f, kx), blue);
+            break;
+        }
         case BoxPaint::Part::Background: {
             Paint p;
             p.color = box.background;

@@ -225,6 +225,7 @@ struct ComputedStyle {
     Length max_width = Length::autoLength(), max_height = Length::autoLength();
     int z_index = 0;
     bool ua_margin_top = true, ua_margin_bottom = true;   // not set by the page
+    bool native_look = true;   // a form control the page hasn't given a border, background or appearance: drawn as Chromium's
     Float float_side = Float::None;
     Clear clear = Clear::None;
     bool overflow_clip = false;        // overflow other than visible; we don't draw scrollbars

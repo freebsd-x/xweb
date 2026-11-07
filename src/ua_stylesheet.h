@@ -61,6 +61,8 @@ input { border: 2px inset gray; padding: 1px 2px; background-color: white; }
 textarea { border: 1px solid gray; padding: 2px; background-color: white; vertical-align: text-bottom; }
 select { border: 1px solid gray; padding: 0; background-color: white; }
 input[type=checkbox], input[type=radio] { border: none; padding: 0; margin: 3px 3px 3px 4px; }
+input[type=radio] { margin: 3px 3px 0 5px; }
+input[type=submit], input[type=reset], input[type=button] { padding: 1px 6px; border: 2px outset gray; background-color: #efefef; color: black; }
 button { border: 2px outset gray; padding: 1px 6px; background-color: #efefef; color: black; }
 fieldset { margin-left: 2px; margin-right: 2px; padding: 0.35em 0.75em 0.625em; border: 2px groove gray; }
 input[type=hidden] { display: none; }

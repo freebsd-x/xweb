@@ -122,7 +122,11 @@ struct StrokeStyle {
 // What layout can't hand over as plain rectangles: a background with uneven corners,
 // borders that are rounded, patterned, shaded or split diagonally, and shadows.
 struct BoxPaint {
-    enum class Part : uint8_t { Background, Border, OuterShadow, InsetShadow } part = Part::Background;
+    enum class Part : uint8_t {
+        Background, Border, OuterShadow, InsetShadow,
+        Checkbox, Radio, SelectArrow,   // form controls, as Chromium draws them; `checked` says which way
+    } part = Part::Background;
+    bool checked = false;
     float w = 0, h = 0;      // the border box
     float ox = 0, oy = 0;    // where its top left is in the area drawn
     float radii[4][2] = {};  // corners clockwise from top left, x and y, already fitted to the box

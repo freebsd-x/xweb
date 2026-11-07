@@ -88,7 +88,9 @@ struct PageLayout {
 [[nodiscard]] float chWidth(TextMeasurer& text, const ComputedStyle& style);
 
 // `images` may be null: an image then takes its size from attributes and style only.
+// `forms`: what the page's controls hold now (null: what the page said).
 [[nodiscard]] PageLayout layoutPage(const Document& doc, const StyledDocument& styles, TextMeasurer& text,
-                                    ImageSizes* images, float viewport_width, float viewport_height);
+                                    ImageSizes* images, float viewport_width, float viewport_height,
+                                    const class FormState* forms = nullptr);
 
 }  // namespace fbx::xweb

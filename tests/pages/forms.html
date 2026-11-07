@@ -1,0 +1,24 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Forms</title>
+<style>
+  body { margin: 8px; font: 14px sans-serif; }
+  p { margin: 6px 0; }
+  .styled { border: 1px solid #0969da; border-radius: 6px; padding: 5px 8px; background: #f6f8fa; }
+</style>
+</head>
+<body>
+<form action="/search" method="get">
+  <p><input name="q" value="hello"> <input name="empty" placeholder="Search"> <input type="password" name="pw" value="secret"></p>
+  <p><input type="checkbox" name="a" checked> <input type="checkbox" name="b"> <input type="radio" name="r" value="1" checked> <input type="radio" name="r" value="2"></p>
+  <p><select name="s"><option>One</option><option selected>Second option</option><option>3</option></select>
+     <select name="t"><option>A</option><option>Much longer label</option></select></p>
+  <p><textarea name="ta" rows="3" cols="20">First line
+second</textarea></p>
+  <p><input type="submit" value="Go"> <input type="reset"> <input type="button" value="Plain"> <button type="submit">Button</button></p>
+  <p><input class="styled" name="x" value="styled field"> <input type="submit" class="styled" value="Styled"></p>
+</form>
+</body>
+</html>
