@@ -1,9 +1,11 @@
 #include "xweb/url.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 
 #include <algorithm>
+#include <cctype>
 #include <vector>
 
 namespace fbx::xweb {
@@ -208,6 +210,52 @@ bool decodeDataUrl(std::string_view url, std::string& body, std::string& content
         }
     }
     return true;
+}
+
+std::string registrableDomain(const std::string& host_in) {
+    std::string host;
+    for (char c : host_in) host += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    while (!host.empty() && host.back() == '.') host.pop_back();
+    // An address, or a name with no dot: itself.
+    if (host.empty() || host.front() == '[' || host.find('.') == std::string::npos ||
+        std::all_of(host.begin(), host.end(), [](char c) { return (c >= '0' && c <= '9') || c == '.'; }))
+        return host;
+    std::vector<std::string> labels;
+    size_t start = 0;
+    while (true) {
+        const size_t dot = host.find('.', start);
+        labels.push_back(host.substr(start, dot == std::string::npos ? std::string::npos : dot - start));
+        if (dot == std::string::npos) break;
+        start = dot + 1;
+    }
+    const size_t n = labels.size();
+    size_t keep = 2;
+    static const char* kSecondLevel[] = {"co", "com", "net", "org", "gov", "ac", "or", "go", "ne", "edu", "gob", "mil", "ltd", "plc", "sch", "nhs"};
+    if (n >= 3 && labels[n - 1].size() == 2 &&
+        std::any_of(std::begin(kSecondLevel), std::end(kSecondLevel), [&](const char* l) { return labels[n - 2] == l; }))
+        keep = 3;
+    // Hosts where each name is someone else's site.
+    static const char* kShared[] = {"github.io", "gitlab.io", "pages.dev", "netlify.app", "vercel.app", "herokuapp.com", "blogspot.com", "appspot.com", "web.app", "firebaseapp.com", "azurewebsites.net", "cloudfront.net"};
+    const std::string last_two = labels[n - 2] + "." + labels[n - 1];
+    if (n >= 3 && std::any_of(std::begin(kShared), std::end(kShared), [&](const char* l) { return last_two == l; })) keep = 3;
+    if (n <= keep) return host;
+    std::string out;
+    for (size_t k = n - keep; k < n; ++k) out += (out.empty() ? "" : ".") + labels[k];
+    return out;
+}
+
+bool sameSite(const std::string& a, const std::string& b) {
+    const Url ua = parseUrl(a), ub = parseUrl(b);
+    const auto web = [](const std::string& s) { return s == "http" || s == "https"; };
+    if (!web(ua.scheme) || !web(ub.scheme)) return false;
+    const auto host = [](const Url& u) {
+        std::string h = u.authority;
+        if (const size_t at = h.rfind('@'); at != std::string::npos) h = h.substr(at + 1);
+        if (!h.empty() && h.front() == '[') return h.substr(0, h.find(']') + 1);
+        return h.substr(0, h.find(':'));
+    };
+    const std::string ha = host(ua), hb = host(ub);
+    return !ha.empty() && registrableDomain(ha) == registrableDomain(hb);
 }
 
 }  // namespace fbx::xweb

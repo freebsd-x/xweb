@@ -63,3 +63,19 @@ TEST(DataUrl, ComesThroughResolvingAsIs) {
     const std::string data = "data:font/woff;base64,AA+/AA==";
     EXPECT_EQ(resolveUrl("http://a/b.css", data), data);
 }
+
+TEST(Url, SameSiteForCookies) {
+    EXPECT_TRUE(sameSite("https://www.example.com/a", "https://img.example.com/b.png"));
+    EXPECT_TRUE(sameSite("http://example.com/", "https://cdn.example.com/x"));
+    EXPECT_FALSE(sameSite("https://example.com/", "https://example.org/"));
+    EXPECT_TRUE(sameSite("https://www.naver.co.kr/", "https://news.naver.co.kr/"));
+    EXPECT_FALSE(sameSite("https://a.co.kr/", "https://b.co.kr/"));
+    EXPECT_FALSE(sameSite("https://alice.github.io/", "https://bob.github.io/"));
+    EXPECT_TRUE(sameSite("http://127.0.0.1:8000/", "http://127.0.0.1:9000/x"));
+    EXPECT_FALSE(sameSite("http://127.0.0.1/", "http://localhost/"));
+    EXPECT_FALSE(sameSite("file:///a.html", "file:///b.html"));
+    EXPECT_FALSE(sameSite("https://example.com/", "data:text/plain,x"));
+    EXPECT_EQ(registrableDomain("WWW.Example.COM."), "example.com");
+    EXPECT_EQ(registrableDomain("bbc.co.uk"), "bbc.co.uk");
+    EXPECT_EQ(registrableDomain("localhost"), "localhost");
+}

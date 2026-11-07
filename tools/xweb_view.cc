@@ -142,7 +142,8 @@ Resource loadLocal(const web::Url& url) {
     return r;
 }
 
-Resource load(const std::string& address) {
+// `cookies`: for a page or the page's own site's files (see kFetchCookies).
+Resource load(const std::string& address, bool cookies = false) {
     {
         Resource inline_data;
         if (web::decodeDataUrl(address, inline_data.body, inline_data.content_type)) {
@@ -160,7 +161,7 @@ Resource load(const std::string& address) {
         return r;
     }
     // A fragment isn't sent to the server.
-    auto got = fetchWebBlocking(url.withoutFragment());
+    auto got = fetchWebBlocking(url.withoutFragment(), cookies);
     r.http_status = got.http_status;
     switch (got.status) {
         case fbx::shared::FetchStatus::Ok:
@@ -261,7 +262,7 @@ void loadSheets(Page& page, const std::atomic<uint64_t>& generation, uint64_t mi
         queue.pop_front();
         if (page.sheets.count(url)) continue;
         ++fetched;
-        Resource got = load(url);
+        Resource got = load(url, web::sameSite(page.url, url));
         std::string css = got.ok ? web::decodeToUtf8(got.body, got.content_type) : std::string{};
         for (const std::string& ref : web::css::parseStylesheet(css).imports) queue.push_back(web::resolveUrl(url, ref));
         page.sheets[url] = std::move(css);
@@ -1016,7 +1017,7 @@ private:
         const float restore = mode == Mode::History ? history_[index_].scroll : (mode == Mode::Reload ? node_->scrollY() : 0);
         std::thread([this, url, mine, restore, post = std::move(post)] {
             auto page = std::make_shared<Page>();
-            Resource got = post ? loadPost(*post) : load(url);
+            Resource got = post ? loadPost(*post) : load(url, true);
             if (generation_.load() != mine) return;
             page->url = got.ok ? got.final_url : url;
             page->doc = web::parseHtml(htmlFor(got, url));
@@ -1083,7 +1084,7 @@ private:
                         url = std::move(work->queue.front());
                         work->queue.pop_front();
                     }
-                    Resource got = load(url);
+                    Resource got = load(url, web::sameSite(page->url, url));
                     if (!got.ok || got.http_status >= 400) continue;
                     auto decoded = decodeImage(url, got.body, got.content_type);
                     if (!decoded) continue;
@@ -1126,7 +1127,7 @@ private:
                         work->queue.pop_front();
                     }
                     for (const std::string& url : sources) {
-                        Resource got = load(url);
+                        Resource got = load(url, web::sameSite(page->url, url));
                         if (!got.ok || got.http_status >= 400) continue;
                         auto bytes = std::make_shared<const std::string>(std::move(got.body));
                         if (!web::webFontUsable(bytes)) continue;

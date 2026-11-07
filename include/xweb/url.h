@@ -32,4 +32,11 @@ struct Url {
 // What a data: URL holds. False if it isn't one, or is damaged.
 [[nodiscard]] bool decodeDataUrl(std::string_view url, std::string& body, std::string& content_type);
 
+// Whether two addresses are the same site, as cookies count it: the same scheme family
+// and registrable domain ("www.example.co.kr" and "img.example.co.kr" are). Without the
+// full public suffix list, a two-part country suffix (co.uk, co.kr, com.au...) is known
+// by its shape; xfetch's curl checks the real list before keeping any cookie.
+[[nodiscard]] bool sameSite(const std::string& a, const std::string& b);
+[[nodiscard]] std::string registrableDomain(const std::string& host);
+
 }  // namespace fbx::xweb
