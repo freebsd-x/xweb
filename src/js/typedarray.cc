@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstring>
 
+#include "bigint.h"
 #include "internal.h"
 
 namespace fbx::xweb::js {
@@ -16,11 +17,36 @@ using Args = std::span<const Value>;
 
 Value arg(Args a, size_t i) { return i < a.size() ? a[i] : Value::undefined(); }
 
-enum Kind : uint8_t { Int8, Uint8, Uint8C, Int16, Uint16, Int32, Uint32, Float32, Float64, kKinds };
+enum Kind : uint8_t { Int8, Uint8, Uint8C, Int16, Uint16, Int32, Uint32, Float32, Float64, BigInt64, BigUint64, kKinds };
 
 const char16_t* const kNames[kKinds] = {u"Int8Array", u"Uint8Array", u"Uint8ClampedArray", u"Int16Array", u"Uint16Array",
-                                        u"Int32Array", u"Uint32Array", u"Float32Array", u"Float64Array"};
-const size_t kSizes[kKinds] = {1, 1, 1, 2, 2, 4, 4, 4, 8};
+                                        u"Int32Array", u"Uint32Array", u"Float32Array", u"Float64Array", u"BigInt64Array", u"BigUint64Array"};
+const size_t kSizes[kKinds] = {1, 1, 1, 2, 2, 4, 4, 4, 8, 8, 8};
+
+bool isBigKind(uint8_t kind) { return kind == BigInt64 || kind == BigUint64; }
+
+Value bigValue(const bigint::Big& b) { return Value::bigint(std::make_shared<const std::u16string>(bigint::encode(b))); }
+
+// ToBigInt.
+Value toBigInt(Runtime& rt, const Value& v) {
+    const Value p = rt.toPrimitive(v, "number");
+    switch (p.type()) {
+        case Value::Type::BigInt: return p;
+        case Value::Type::Boolean: return bigValue(bigint::fromInt64(p.asBoolean() ? 1 : 0));
+        case Value::Type::String: {
+            const auto b = bigint::parse(p.asString());
+            if (!b) rt.throwError("SyntaxError", "can't convert '" + utf8(p.asString()) + "' to a BigInt");
+            return bigValue(*b);
+        }
+        default: rt.throwError("TypeError", "can't convert that to a BigInt");
+    }
+}
+
+// What an element of this kind holds, converted from anything (ToNumber or ToBigInt).
+Value toElement(Runtime& rt, uint8_t kind, const Value& v) {
+    if (isBigKind(kind)) return toBigInt(rt, v);
+    return Value::number(rt.toNumber(v));
+}
 
 constexpr size_t kMaxBytes = size_t{1} << 31;   // 2 GiB: more than a page should ask for
 
@@ -148,8 +174,24 @@ Object* newTypedOfLength(Runtime& rt, uint8_t kind, size_t length, Object* proto
 
 uint8_t* elementPtr(const Object* t, size_t i) { return bufferOf(t)->bytes.data() + t->view_offset + i * kSizes[t->view_kind]; }
 
-double getAt(const Object* t, size_t i) { return readNumber(elementPtr(t, i), t->view_kind); }
-void setAt(Object* t, size_t i, double d) { writeNumber(elementPtr(t, i), t->view_kind, d); }
+Value readValue(const uint8_t* p, uint8_t kind) {
+    if (kind == BigInt64) { int64_t v; std::memcpy(&v, p, 8); return bigValue(bigint::fromInt64(v)); }
+    if (kind == BigUint64) { uint64_t v; std::memcpy(&v, p, 8); return bigValue(bigint::fromUint64(v)); }
+    return Value::number(readNumber(p, kind));
+}
+
+// `v` already converted for the kind (toElement).
+void writeValue(uint8_t* p, uint8_t kind, const Value& v) {
+    if (isBigKind(kind)) {
+        const uint64_t bits = bigint::toUint64(bigint::decode(v.bigintDigits()));
+        std::memcpy(p, &bits, 8);
+        return;
+    }
+    writeNumber(p, kind, v.asNumber());
+}
+
+Value getV(const Object* t, size_t i) { return readValue(elementPtr(t, i), t->view_kind); }
+void setV(Object* t, size_t i, const Value& v) { writeValue(elementPtr(t, i), t->view_kind, v); }
 
 Value speciesConstructor(Runtime& rt, Object* o, Object* fallback) {
     const Value c = rt.get(Value::object(o), u"constructor");
@@ -181,8 +223,8 @@ Object* speciesCreate(Runtime& rt, Object* exemplar, std::vector<Value> args, si
 // Copies values into a fresh typed array (from a list, an array-like or another typed array).
 void fillFrom(Runtime& rt, Object* t, const std::vector<Value>& values) {
     for (size_t i = 0; i < values.size(); ++i) {
-        const double d = rt.toNumber(values[i]);
-        if (i < typedLength(t)) setAt(t, i, d);
+        const Value d = toElement(rt, t->view_kind, values[i]);
+        if (i < typedLength(t)) setV(t, i, d);
     }
 }
 
@@ -319,13 +361,13 @@ bool typedValidIndex(const Object* ta, double index) {
 
 Value typedGet(const Object* ta, double index) {
     if (!typedValidIndex(ta, index)) return Value::undefined();
-    return Value::number(getAt(ta, static_cast<size_t>(index)));
+    return getV(ta, static_cast<size_t>(index));
 }
 
 bool typedSet(Runtime& rt, Object* ta, double index, const Value& v) {
-    const double d = rt.toNumber(v);   // even for an index that isn't there
+    const Value d = toElement(rt, ta->view_kind, v);   // even for an index that isn't there
     if (!typedValidIndex(ta, index)) return false;
-    setAt(ta, static_cast<size_t>(index), d);
+    setV(ta, static_cast<size_t>(index), d);
     return true;
 }
 
@@ -528,12 +570,12 @@ void Runtime::installTypedArrays() {
     method(P, u"fill", 1, [](Runtime& rt, const Value& t, Args a) {
         Object* o = validTyped(rt, t, "fill");
         const size_t len = typedLength(o);
-        const double v = rt.toNumber(arg(a, 0));
+        const Value v = toElement(rt, o->view_kind, arg(a, 0));
         const size_t first = relative(rt, arg(a, 1), len, 0);
         const size_t last = relative(rt, arg(a, 2), len, len);
         validTyped(rt, t, "fill");
         const size_t now = typedLength(o);
-        for (size_t i = first; i < last && i < now; ++i) setAt(o, i, v);
+        for (size_t i = first; i < last && i < now; ++i) setV(o, i, v);
         return t;
     });
     method(P, u"set", 1, [](Runtime& rt, const Value& t, Args a) {
@@ -550,17 +592,17 @@ void Runtime::installTypedArrays() {
             if (detached(s)) rt.throwError("TypeError", "the source's buffer is detached");
             const size_t n = typedLength(s);
             if (off + static_cast<double>(n) > static_cast<double>(len)) rt.throwError("RangeError", "the source doesn't fit");
-            std::vector<double> vals(n);   // read first: they may share a buffer
-            for (size_t i = 0; i < n; ++i) vals[i] = getAt(s, i);
-            for (size_t i = 0; i < n; ++i) setAt(o, static_cast<size_t>(off) + i, vals[i]);
+            if (isBigKind(s->view_kind) != isBigKind(o->view_kind)) rt.throwError("TypeError", "BigInt and number typed arrays don't mix");
+            std::vector<Value> vals(n);   // read first: they may share a buffer
+            for (size_t i = 0; i < n; ++i) vals[i] = getV(s, i);
+            for (size_t i = 0; i < n; ++i) setV(o, static_cast<size_t>(off) + i, vals[i]);
             return Value::undefined();
         }
         Object* s = rt.toObject(src);
         const uint64_t n = rt.lengthOf(s);
         if (off + static_cast<double>(n) > static_cast<double>(len)) rt.throwError("RangeError", "the source doesn't fit");
         for (uint64_t i = 0; i < n; ++i) {
-            const double d = rt.toNumber(rt.get(s, PropertyKey(Runtime::numberToString(static_cast<double>(i))), Value::object(s)));
-            typedSet(rt, o, off + static_cast<double>(i), Value::number(d));
+            typedSet(rt, o, off + static_cast<double>(i), rt.get(s, PropertyKey(Runtime::numberToString(static_cast<double>(i))), Value::object(s)));
         }
         return Value::undefined();
     });
@@ -584,7 +626,7 @@ void Runtime::installTypedArrays() {
         if (n) {
             validTyped(rt, t, "slice");
             const size_t now = typedLength(o);
-            for (size_t i = 0; i < n && first + i < now; ++i) setAt(out, i, getAt(o, first + i));
+            for (size_t i = 0; i < n && first + i < now; ++i) setV(out, i, getV(o, first + i));
         }
         return Value::object(out);
     });
@@ -617,9 +659,9 @@ void Runtime::installTypedArrays() {
         Object* o = validTyped(rt, t, "reverse");
         const size_t len = typedLength(o);
         for (size_t i = 0; i < len / 2; ++i) {
-            const double x = getAt(o, i), y = getAt(o, len - 1 - i);
-            setAt(o, i, y);
-            setAt(o, len - 1 - i, x);
+            const Value x = getV(o, i), y = getV(o, len - 1 - i);
+            setV(o, i, y);
+            setV(o, len - 1 - i, x);
         }
         return t;
     });
@@ -642,13 +684,18 @@ void Runtime::installTypedArrays() {
     });
     const auto sortValues = [](Runtime& rt, Object* o, const Value& cmp) {
         const size_t len = typedLength(o);
-        std::vector<double> v(len);
-        for (size_t i = 0; i < len; ++i) v[i] = getAt(o, i);
+        std::vector<Value> v(len);
+        for (size_t i = 0; i < len; ++i) v[i] = getV(o, i);
         if (cmp.isUndefined()) {
-            std::stable_sort(v.begin(), v.end(), lessThan);
+            if (isBigKind(o->view_kind))
+                std::stable_sort(v.begin(), v.end(), [](const Value& x, const Value& y) {
+                    return bigint::compare(bigint::decode(x.bigintDigits()), bigint::decode(y.bigintDigits())) < 0;
+                });
+            else
+                std::stable_sort(v.begin(), v.end(), [](const Value& x, const Value& y) { return lessThan(x.asNumber(), y.asNumber()); });
         } else {
-            std::stable_sort(v.begin(), v.end(), [&](double x, double y) {
-                const Value args[2] = {Value::number(x), Value::number(y)};
+            std::stable_sort(v.begin(), v.end(), [&](const Value& x, const Value& y) {
+                const Value args[2] = {x, y};
                 const double r = rt.toNumber(rt.call(cmp, Value::undefined(), args));
                 return r < 0;
             });
@@ -658,24 +705,24 @@ void Runtime::installTypedArrays() {
     method(P, u"sort", 1, [sortValues](Runtime& rt, const Value& t, Args a) {
         if (!arg(a, 0).isUndefined() && !rt.isCallable(arg(a, 0))) rt.throwError("TypeError", "sort's comparator must be a function");
         Object* o = validTyped(rt, t, "sort");
-        const std::vector<double> v = sortValues(rt, o, arg(a, 0));
+        const std::vector<Value> v = sortValues(rt, o, arg(a, 0));
         const size_t now = typedLength(o);
-        for (size_t i = 0; i < v.size() && i < now; ++i) setAt(o, i, v[i]);
+        for (size_t i = 0; i < v.size() && i < now; ++i) setV(o, i, v[i]);
         return t;
     });
     method(P, u"toSorted", 1, [sortValues](Runtime& rt, const Value& t, Args a) {
         if (!arg(a, 0).isUndefined() && !rt.isCallable(arg(a, 0))) rt.throwError("TypeError", "toSorted's comparator must be a function");
         Object* o = validTyped(rt, t, "toSorted");
         Object* out = newTypedOfLength(rt, o->view_kind, typedLength(o));
-        const std::vector<double> v = sortValues(rt, o, arg(a, 0));
-        for (size_t i = 0; i < v.size(); ++i) setAt(out, i, v[i]);
+        const std::vector<Value> v = sortValues(rt, o, arg(a, 0));
+        for (size_t i = 0; i < v.size(); ++i) setV(out, i, v[i]);
         return Value::object(out);
     });
     method(P, u"toReversed", 0, [](Runtime& rt, const Value& t, Args) {
         Object* o = validTyped(rt, t, "toReversed");
         const size_t len = typedLength(o);
         Object* out = newTypedOfLength(rt, o->view_kind, len);
-        for (size_t i = 0; i < len; ++i) setAt(out, i, getAt(o, len - 1 - i));
+        for (size_t i = 0; i < len; ++i) setV(out, i, getV(o, len - 1 - i));
         return Value::object(out);
     });
     method(P, u"with", 2, [](Runtime& rt, const Value& t, Args a) {
@@ -683,10 +730,10 @@ void Runtime::installTypedArrays() {
         const size_t len = typedLength(o);
         const double rel = rt.toIntegerOrInfinity(arg(a, 0));
         const double index = rel >= 0 ? rel : static_cast<double>(len) + rel;
-        const double v = rt.toNumber(arg(a, 1));
+        const Value v = toElement(rt, o->view_kind, arg(a, 1));
         if (!typedValidIndex(o, index)) rt.throwError("RangeError", "an index out of range");
         Object* out = newTypedOfLength(rt, o->view_kind, len);
-        for (size_t i = 0; i < len; ++i) setAt(out, i, i == static_cast<size_t>(index) ? v : getAt(o, i));
+        for (size_t i = 0; i < len; ++i) setV(out, i, i == static_cast<size_t>(index) ? v : getV(o, i));
         return Value::object(out);
     });
 
@@ -758,9 +805,10 @@ void Runtime::installTypedArrays() {
             }
             if (src->cls == ObjectClass::TypedArray) {
                 if (detached(src)) rt.throwError("TypeError", "the source's buffer is detached");
+                if (isBigKind(src->view_kind) != isBigKind(kind)) rt.throwError("TypeError", "BigInt and number typed arrays don't mix");
                 const size_t n = typedLength(src);
                 Object* out = newTypedOfLength(rt, kind, n, p);
-                for (size_t i = 0; i < n; ++i) setAt(out, i, getAt(src, i));
+                for (size_t i = 0; i < n; ++i) setV(out, i, getV(src, i));
                 return Value::object(out);
             }
             std::vector<Value> values;
@@ -839,6 +887,37 @@ void Runtime::installTypedArrays() {
     });
     static const std::pair<const char16_t*, uint8_t> kViewTypes[] = {{u"Int8", Int8}, {u"Uint8", Uint8}, {u"Int16", Int16}, {u"Uint16", Uint16},
                                                                      {u"Int32", Int32}, {u"Uint32", Uint32}, {u"Float32", Float32}, {u"Float64", Float64}};
+    for (const uint8_t k : {uint8_t(BigInt64), uint8_t(BigUint64)}) {
+        const std::u16string name = k == BigInt64 ? u"BigInt64" : u"BigUint64";
+        method(data_view_prototype, (u"get" + name).c_str(), 1, [thisView, k](Runtime& rt, const Value& t, Args a) {
+            Object* v = thisView(rt, t);
+            const size_t index = toIndex(rt, arg(a, 0));
+            const bool little = rt.toBoolean(arg(a, 1));
+            bool oob;
+            const size_t n = viewBytes(v, oob);
+            if (oob) rt.throwError("TypeError", "the DataView's buffer is detached or too small");
+            if (index + 8 > n) rt.throwError("RangeError", "an offset outside the DataView");
+            uint8_t bytes[8];
+            std::memcpy(bytes, bufferOf(v)->bytes.data() + v->view_offset + index, 8);
+            if (!little) std::reverse(bytes, bytes + 8);
+            return readValue(bytes, k);
+        });
+        method(data_view_prototype, (u"set" + name).c_str(), 2, [thisView, k](Runtime& rt, const Value& t, Args a) {
+            Object* v = thisView(rt, t);
+            const size_t index = toIndex(rt, arg(a, 0));
+            const Value b = toBigInt(rt, arg(a, 1));
+            const bool little = rt.toBoolean(arg(a, 2));
+            bool oob;
+            const size_t n = viewBytes(v, oob);
+            if (oob) rt.throwError("TypeError", "the DataView's buffer is detached or too small");
+            if (index + 8 > n) rt.throwError("RangeError", "an offset outside the DataView");
+            uint8_t bytes[8];
+            writeValue(bytes, k, b);
+            if (!little) std::reverse(bytes, bytes + 8);
+            std::memcpy(bufferOf(v)->bytes.data() + v->view_offset + index, bytes, 8);
+            return Value::undefined();
+        });
+    }
     for (const auto& [name, kind] : kViewTypes) {
         const uint8_t k = kind;
         method(data_view_prototype, (std::u16string(u"get") + name).c_str(), 1, [thisView, k](Runtime& rt, const Value& t, Args a) {

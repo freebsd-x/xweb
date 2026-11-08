@@ -478,7 +478,7 @@ struct JsonWriter {
     std::vector<Object*> stack;
 
     bool write(const Value& holder, const PropertyKey& key, Value v, const std::u16string& indent, std::u16string& out) {
-        if (v.isObject()) {
+        if (v.isObject() || v.isBigInt()) {
             const Value to_json = rt.get(v, u"toJSON");
             if (rt.isCallable(to_json)) {
                 const Value k = Value::string(key.name);
@@ -493,8 +493,9 @@ struct JsonWriter {
             Object* o = v.asObject();
             if (o->cls == ObjectClass::Number) v = Value::number(rt.toNumber(v));
             else if (o->cls == ObjectClass::String) v = Value::string(rt.toString(v));
-            else if (o->cls == ObjectClass::Boolean) v = o->primitive;
+            else if (o->cls == ObjectClass::Boolean || o->cls == ObjectClass::BigInt) v = o->primitive;
         }
+        if (v.isBigInt()) rt.throwError("TypeError", "a BigInt can't be written as JSON");
         switch (v.type()) {
             case Value::Type::Null: out += u"null"; return true;
             case Value::Type::Boolean: out += v.asBoolean() ? u"true" : u"false"; return true;
@@ -1098,7 +1099,9 @@ void Runtime::installBuiltins() {
     number_prototype = allocate<Object>(object_prototype, ObjectClass::Number);
     number_prototype->primitive = Value::number(0);
     Object* number_ctor = ctor(u"Number", 1, [](Runtime& rt, const Value&, Args a) {
-        const Value n = Value::number(a.empty() ? 0 : rt.toNumber(a[0]));
+        // Number(1n) is the one place a BigInt becomes a number.
+        Value prim = a.empty() ? Value::number(0) : rt.toPrimitive(a[0], "number");
+        const Value n = Value::number(prim.isBigInt() ? bigintToNumber(prim) : rt.toNumber(prim));
         if (!rt.construct_target) return n;
         return Value::object(rt.toObject(n));
     }, number_prototype);
@@ -2298,6 +2301,7 @@ void Runtime::installBuiltins() {
                 const Value& v = a[i];
                 if (v.isString()) line += utf8(v.asString());
                 else if (v.isSymbol()) line += "Symbol(" + utf8(v.asSymbol()->description) + ")";
+                else if (v.isBigInt()) line += utf8(*rt.toString(v)) + "n";
                 else if (v.isObject() && v.asObject()->cls == ObjectClass::Error) line += describe(rt, v);
                 else if (v.isObject() && v.asObject()->cls == ObjectClass::RegExp) line += utf8(*rt.toString(v));
                 else if (v.isObject() && !rt.isCallable(v)) {
@@ -2321,6 +2325,7 @@ void Runtime::installBuiltins() {
     installDate();
     installTypedArrays();
     installProxyAndReflect();
+    installBigInt();
     installGenerators();
     (void)rt;
 }

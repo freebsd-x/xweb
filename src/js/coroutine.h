@@ -91,6 +91,14 @@ void unwindCoroutine(Coroutine& co);
 // The live part of a suspended coroutine's stack, for the collector.
 void scanCoroutineStack(const Coroutine& co, const std::function<void(uintptr_t)>& word);
 
+// The engine's own stack: JavaScript runs on a large one (only the pages it touches are
+// committed), so deep recursion in real pages (React renders) has room. Whoever calls
+// into the engine from outside gets switched onto it; calls from inside don't switch.
+bool onEngineStack() noexcept;
+// Deeper than this, on the engine's stack, is "too much recursion".
+const char* engineStackLimit() noexcept;
+void runOnEngineStack(const std::function<void()>& fn);
+
 // What a coroutine runs (async.cc).
 void runCoroutineBody(Coroutine& co);
 

@@ -25,6 +25,7 @@ struct Token {
     bool template_tail = false;   // a template part ending the literal
     bool cooked_ok = true;    // a template part with a valid escape everywhere
     bool legacy_octal = false;   // 0777: not in strict code
+    bool bigint = false;         // 123n: `value` holds its digits
     uint32_t line = 1;
     uint32_t begin = 0, end = 0;
 };
@@ -37,7 +38,7 @@ enum class N : uint8_t {
     Number, String, Template, TaggedTemplate, Regex, Identifier, This, Super, Array, Object, Property,
     FunctionExpr, Arrow, ClassExpr, Method, Unary, Update, Binary, Logical, Assign, Conditional, Call, New,
     Member, Sequence, Spread, NewTarget, Hole, Boolean, Null, Undefined, OptionalChain, Yield, Await,
-    ImportCall, ImportMeta,
+    ImportCall, ImportMeta, BigInt,
     // Modules
     ImportDecl, ExportDecl, ImportSpec, ExportSpec,
     // Patterns

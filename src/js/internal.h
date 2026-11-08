@@ -57,6 +57,9 @@ Value awaitValue(Runtime& rt, const Value& v);
 Value startCoroutineFunction(Runtime& rt, Object* f, Env* env);
 Value rejectedPromise(Runtime& rt, const Value& reason);
 
+// A BigInt's value as the nearest number, for Number(1n) (bigint_builtins.cc).
+double bigintToNumber(const Value& v);
+
 // A proxy's internal methods (proxy.cc).
 Object* proxyGetPrototypeOf(Runtime& rt, Object* p);
 bool proxySetPrototypeOf(Runtime& rt, Object* p, Object* proto);

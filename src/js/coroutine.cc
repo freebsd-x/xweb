@@ -6,6 +6,8 @@
 #include <unistd.h>
 
 #include <cstring>
+#include <exception>
+#include <functional>
 #include <new>
 
 #if defined(__has_feature)
@@ -82,14 +84,16 @@ namespace fbx::xweb::js {
 namespace {
 
 #ifdef FBX_JS_ASAN
-constexpr size_t kStackSize = 8u << 20;
+constexpr size_t kStackSize = 32u << 20;
 constexpr size_t kStackReserve = 1u << 20;   // left for natives below the recursion check
+constexpr size_t kEngineStackSize = 60u << 20;   // under ASan's 64 MB: deeper, it stops unpoisoning when exceptions unwind
 #else
-constexpr size_t kStackSize = 2u << 20;
+constexpr size_t kStackSize = 16u << 20;   // virtual: only the pages a body touches are committed
 constexpr size_t kStackReserve = 256u << 10;
+constexpr size_t kEngineStackSize = 512u << 20;
 #endif
 constexpr size_t kPoolMax = 32;
-constexpr size_t kMaxLiveStacks = 50'000;
+constexpr size_t kMaxLiveStacks = 50'000;   // 16 MB of address space each, little of it committed
 thread_local size_t live_stacks = 0;   // stacks handed out and not given back
 
 size_t pageSize() {
@@ -236,6 +240,87 @@ void unwindCoroutine(Coroutine& co) {
     co.mode = ResumeMode::Unwind;
     co.transfer = Value::undefined();
     resumeCoroutine(co);
+}
+
+// ── The engine's stack ──
+
+namespace {
+
+struct EngineStack {
+    char* mem = nullptr;
+    void* caller_sp = nullptr;
+    const std::function<void()>* fn = nullptr;
+    std::exception_ptr error;
+    const void* asan_caller_bottom = nullptr;
+    size_t asan_caller_size = 0;
+};
+thread_local EngineStack engine;
+
+[[noreturn]] void engineEntry(EngineStack* e) {
+#ifdef FBX_JS_ASAN
+    __sanitizer_finish_switch_fiber(nullptr, &e->asan_caller_bottom, &e->asan_caller_size);
+#endif
+    try {
+        (*e->fn)();
+    } catch (...) {
+        e->error = std::current_exception();
+    }
+#ifdef FBX_JS_ASAN
+    __sanitizer_start_switch_fiber(nullptr, e->asan_caller_bottom, e->asan_caller_size);
+#endif
+    void* dead = nullptr;
+    fbx_js_switch(&dead, e->caller_sp);
+    __builtin_trap();
+}
+
+}  // namespace
+
+bool onEngineStack() noexcept {
+    const char* sp = static_cast<const char*>(__builtin_frame_address(0));
+    return engine.mem && sp > engine.mem && sp < engine.mem + kEngineStackSize;
+}
+
+const char* engineStackLimit() noexcept { return engine.mem ? engine.mem + pageSize() + kStackReserve * 4 : nullptr; }
+
+void runOnEngineStack(const std::function<void()>& fn) {
+    if (!engine.mem) {
+        void* m = mmap(nullptr, kEngineStackSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (m == MAP_FAILED) {
+            fn();   // no room for it: run where we are, with the old limits
+            return;
+        }
+        mprotect(m, pageSize(), PROT_NONE);
+        engine.mem = static_cast<char*>(m);
+    }
+    // A fresh frame at the top each time: nothing stays on it between runs.
+    char* top = engine.mem + kEngineStackSize;
+    uintptr_t after_ret = (reinterpret_cast<uintptr_t>(top) - 64) & ~uintptr_t{15};
+    auto* frame = reinterpret_cast<uint64_t*>(after_ret - 72);
+    std::memset(frame, 0, 72);
+    const uint32_t mxcsr = 0x1F80;
+    const uint16_t fpucw = 0x037F;
+    std::memcpy(reinterpret_cast<char*>(frame), &mxcsr, 4);
+    std::memcpy(reinterpret_cast<char*>(frame) + 4, &fpucw, 2);
+    frame[4] = reinterpret_cast<uint64_t>(&engineEntry);
+    frame[5] = reinterpret_cast<uint64_t>(&engine);
+    frame[8] = reinterpret_cast<uint64_t>(&fbx_js_trampoline);
+    const std::function<void()>* saved_fn = engine.fn;
+    void* saved_caller = engine.caller_sp;
+    engine.fn = &fn;
+    engine.error = nullptr;
+#ifdef FBX_JS_ASAN
+    void* fake = nullptr;
+    __sanitizer_start_switch_fiber(&fake, engine.mem + pageSize(), kEngineStackSize - pageSize());
+#endif
+    fbx_js_switch(&engine.caller_sp, frame);
+#ifdef FBX_JS_ASAN
+    __sanitizer_finish_switch_fiber(fake, nullptr, nullptr);
+#endif
+    std::exception_ptr error = engine.error;
+    engine.error = nullptr;
+    engine.fn = saved_fn;
+    engine.caller_sp = saved_caller;
+    if (error) std::rethrow_exception(error);
 }
 
 __attribute__((no_sanitize("address"))) void scanCoroutineStack(const Coroutine& co, const std::function<void(uintptr_t)>& word) {

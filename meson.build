@@ -32,6 +32,8 @@ libxweb = static_library('xweb',
   'src/js/date.cc',
   'src/js/typedarray.cc',
   'src/js/proxy.cc',
+  'src/js/bigint.cc',
+  'src/js/bigint_builtins.cc',
   include_directories : xweb_inc,
 )
 

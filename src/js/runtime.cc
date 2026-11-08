@@ -8,11 +8,20 @@
 #include <limits>
 
 #include "ast.h"
+#include "bigint.h"
 #include "coroutine.h"
 #include "internal.h"
 #include "xweb/js.h"
 
 namespace fbx::xweb::js {
+
+// Near the end of the engine's stack (or, off it, of whatever stack this is: then only
+// the counts guard it).
+inline bool stackExhausted(const char* sp) {
+    const char* limit = engineStackLimit();
+    return limit && onEngineStack() && sp < limit;
+}
+
 
 // ── Strings ───────────────────────────────────────────────────────────────────
 
@@ -80,6 +89,7 @@ size_t ValueHash::operator()(const Value& v) const noexcept {
         }
         case Value::Type::Boolean: return v.asBoolean() ? 3 : 2;
         case Value::Type::Object: return std::hash<const void*>{}(v.asObject());
+        case Value::Type::BigInt: return std::hash<std::u16string>{}(v.bigintDigits()) ^ 0x5bd1e995;
         case Value::Type::Symbol: return std::hash<const void*>{}(v.asSymbol());
         default: return static_cast<size_t>(v.type()) + 7;
     }
@@ -550,6 +560,7 @@ Value Runtime::get(const Value& base, const PropertyKey& key) {
         case Value::Type::Number: return get(number_prototype, key, base);
         case Value::Type::Boolean: return get(boolean_prototype, key, base);
         case Value::Type::Symbol: return get(symbol_prototype, key, base);
+        case Value::Type::BigInt: return get(bigint_prototype, key, base);
         default:
             throwError("TypeError", "can't read property '" + (key.isSymbol() ? std::string("symbol") : utf8(key.name)) + "' of " +
                                         (base.isNull() ? "null" : "undefined"));
@@ -735,6 +746,7 @@ bool Runtime::toBoolean(const Value& v) const {
         case Value::Type::Number: return v.asNumber() != 0 && !std::isnan(v.asNumber());
         case Value::Type::String: return !v.asString().empty();
         case Value::Type::Object: case Value::Type::Symbol: return true;
+        case Value::Type::BigInt: return v.bigintDigits().size() > 1;   // a sign and no limbs is 0n
         default: return false;
     }
 }
@@ -866,6 +878,7 @@ double Runtime::toNumber(const Value& v) {
         case Value::Type::Boolean: return v.asBoolean() ? 1 : 0;
         case Value::Type::String: return stringToNumber(v.asString());
         case Value::Type::Symbol: throwError("TypeError", "can't convert a symbol to a number");
+        case Value::Type::BigInt: throwError("TypeError", "can't convert a BigInt to a number (use Number())");
         case Value::Type::Object: return toNumber(toPrimitive(v, "number"));
         default: return std::nan("");
     }
@@ -895,6 +908,7 @@ JSString Runtime::toString(const Value& v) {
         case Value::Type::Null: return std::make_shared<const std::u16string>(u"null");
         case Value::Type::Boolean: return std::make_shared<const std::u16string>(v.asBoolean() ? u"true" : u"false");
         case Value::Type::Symbol: throwError("TypeError", "can't convert a symbol to a string");
+        case Value::Type::BigInt: return std::make_shared<const std::u16string>(bigint::toString(bigint::decode(v.bigintDigits())));
         case Value::Type::Object: return toString(toPrimitive(v, "string"));
         default: return std::make_shared<const std::u16string>();
     }
@@ -907,6 +921,7 @@ Object* Runtime::toObject(const Value& v) {
         case Value::Type::Number: { Object* o = allocate<Object>(number_prototype, ObjectClass::Number); o->primitive = v; return o; }
         case Value::Type::Boolean: { Object* o = allocate<Object>(boolean_prototype, ObjectClass::Boolean); o->primitive = v; return o; }
         case Value::Type::Symbol: { Object* o = allocate<Object>(symbol_prototype, ObjectClass::Symbol); o->primitive = v; return o; }
+        case Value::Type::BigInt: { Object* o = allocate<Object>(bigint_prototype, ObjectClass::BigInt); o->primitive = v; return o; }
         default: throwError("TypeError", std::string("can't convert ") + (v.isNull() ? "null" : "undefined") + " to an object");
     }
 }
@@ -932,6 +947,7 @@ bool Runtime::strictEquals(const Value& a, const Value& b) {
         case Value::Type::Boolean: return a.asBoolean() == b.asBoolean();
         case Value::Type::Object: return a.asObject() == b.asObject();
         case Value::Type::Symbol: return a.asSymbol() == b.asSymbol();
+        case Value::Type::BigInt: return a.bigintDigits() == b.bigintDigits();   // the encoding is canonical
         default: return false;
     }
 }
@@ -955,6 +971,20 @@ bool Runtime::looseEquals(const Value& a, const Value& b) {
     if (a.type() == b.type()) return strictEquals(a, b);
     if (a.isNullish() && b.isNullish()) return true;
     if (a.isNullish() || b.isNullish()) return false;
+    if (a.isBigInt() || b.isBigInt()) {
+        // A BigInt equals a number of the same value, a string that parses to it.
+        const Value& big = a.isBigInt() ? a : b;
+        const Value& other = a.isBigInt() ? b : a;
+        const bigint::Big x = bigint::decode(big.bigintDigits());
+        if (other.isNumber()) return bigint::compareWithDouble(x, other.asNumber()) == 0;
+        if (other.isString()) {
+            const auto y = bigint::parse(other.asString());
+            return y && bigint::compare(x, *y) == 0;
+        }
+        if (other.isBoolean()) return bigint::compare(x, bigint::fromInt64(other.asBoolean() ? 1 : 0)) == 0;
+        if (other.isObject()) return looseEquals(big, toPrimitive(other));
+        return false;
+    }
     if (a.isNumber() && b.isString()) return a.asNumber() == stringToNumber(b.asString());
     if (a.isString() && b.isNumber()) return stringToNumber(a.asString()) == b.asNumber();
     if (a.isBoolean()) return looseEquals(Value::number(a.asBoolean() ? 1 : 0), b);
@@ -972,6 +1002,7 @@ Value Runtime::typeOf(const Value& v) {
         case Value::Type::Number: t = u"number"; break;
         case Value::Type::String: t = u"string"; break;
         case Value::Type::Symbol: t = u"symbol"; break;
+        case Value::Type::BigInt: t = u"bigint"; break;
         case Value::Type::Object: t = isCallable(v) ? u"function" : u"object"; break;
         default: break;
     }
@@ -981,9 +1012,16 @@ Value Runtime::typeOf(const Value& v) {
 // ── Calls ──
 
 Value Runtime::call(const Value& fnv, const Value& this_value, std::span<const Value> args) {
+    if (!current_co && !onEngineStack()) {
+        // In from outside: onto the engine's stack.
+        Value result;
+        runOnEngineStack([&] { result = call(fnv, this_value, args); });
+        return result;
+    }
     if (!isCallable(fnv)) throwError("TypeError", "not a function");
     Object* f = fnv.asObject();
-    if (call_depth >= kMaxCallDepth || (current_co && static_cast<char*>(__builtin_frame_address(0)) < current_co->stack_limit))
+    if (call_depth >= kMaxCallDepth || (current_co ? static_cast<char*>(__builtin_frame_address(0)) < current_co->stack_limit
+                                                   : stackExhausted(static_cast<char*>(__builtin_frame_address(0)))))
         throwError("RangeError", "too much recursion");
     ++call_depth;
     struct Down { size_t& d; ~Down() { --d; } } down{call_depth};
@@ -1004,10 +1042,17 @@ Value Runtime::call(const Value& fnv, const Value& this_value, std::span<const V
 }
 
 Value Runtime::construct(const Value& fnv, std::span<const Value> args, Object* new_target) {
+    if (!current_co && !onEngineStack()) {
+        Value result;
+        runOnEngineStack([&] { result = construct(fnv, args, new_target); });
+        return result;
+    }
     if (!isConstructor(fnv)) throwError("TypeError", "not a constructor");
     Object* f = fnv.asObject();
     if (!new_target) new_target = f;
-    if (call_depth >= kMaxCallDepth) throwError("RangeError", "too much recursion");
+    if (call_depth >= kMaxCallDepth || (current_co ? static_cast<char*>(__builtin_frame_address(0)) < current_co->stack_limit
+                                                   : stackExhausted(static_cast<char*>(__builtin_frame_address(0)))))
+        throwError("RangeError", "too much recursion");
     ++call_depth;
     struct Down { size_t& d; ~Down() { --d; } } down{call_depth};
     step();
@@ -1231,6 +1276,11 @@ void Runtime::collectGarbage() {
 // ── Evaluating scripts ────────────────────────────────────────────────────────
 
 Runtime::Result Runtime::evaluate(std::string_view source, std::string_view name) {
+    if (!current_co && !onEngineStack()) {
+        Result result;
+        runOnEngineStack([&] { result = evaluate(source, name); });
+        return result;
+    }
     Result result;
     std::string error;
     std::shared_ptr<Program> prog(parse(utf16(source), error).release());
@@ -1796,13 +1846,13 @@ Env* Interpreter::prepareCall(Object* f, const Value& this_value, std::span<cons
 // ── Statements ──
 
 // How deep evaluation may nest in C++ before it's an error rather than a crash.
-constexpr size_t kMaxEvalDepth = 2500;
+constexpr size_t kMaxEvalDepth = 1'000'000;   // the stack's own limit is what usually stops it
 
 struct EvalDepth {
     Runtime& rt;
     explicit EvalDepth(Runtime& r) : rt(r) {
-        if (++rt.eval_depth > kMaxEvalDepth ||
-            (rt.current_co && static_cast<char*>(__builtin_frame_address(0)) < rt.current_co->stack_limit)) {
+        const char* sp = static_cast<char*>(__builtin_frame_address(0));
+        if (++rt.eval_depth > kMaxEvalDepth || (rt.current_co ? sp < rt.current_co->stack_limit : stackExhausted(sp))) {
             --rt.eval_depth;
             rt.throwError("RangeError", "too much recursion");
         }
@@ -2245,8 +2295,13 @@ Value Interpreter::eval(Node* n, Env* env, bool strict) {
     EvalDepth depth(rt_);
     switch (n->kind) {
         case N::Number: return Value::number(n->number);
+        case N::BigInt: {
+            const auto b = bigint::parseLiteral(n->str);
+            if (!b) rt_.throwError("SyntaxError", "invalid BigInt literal");
+            return Value::bigint(std::make_shared<const std::u16string>(bigint::encode(*b)));
+        }
         case N::String: return Value::string(n->str);
-        case N::Boolean: return Value::boolean(n->flags != 0);
+        case N::Boolean: return Value::boolean((n->flags & 1) != 0);   // other bits: parenthesized
         case N::Null: return Value::null();
         case N::Identifier: return lookup(env, n->str);
         case N::This: return thisValue(env);
@@ -2345,9 +2400,91 @@ int lessThan(Runtime& rt, const Value& a, const Value& b, bool left_first) {
         pa = rt.toPrimitive(a, "number");
     }
     if (pa.isString() && pb.isString()) return pa.asString() < pb.asString() ? 1 : 0;
+    if (pa.isBigInt() || pb.isBigInt()) {
+        // A BigInt against a string (parsed), a number, or another BigInt.
+        if (pa.isBigInt() && pb.isString()) {
+            const auto y = bigint::parse(pb.asString());
+            if (!y) return -1;
+            return bigint::compare(bigint::decode(pa.bigintDigits()), *y) < 0 ? 1 : 0;
+        }
+        if (pa.isString() && pb.isBigInt()) {
+            const auto x = bigint::parse(pa.asString());
+            if (!x) return -1;
+            return bigint::compare(*x, bigint::decode(pb.bigintDigits())) < 0 ? 1 : 0;
+        }
+        if (pa.isBigInt() && pb.isBigInt()) return bigint::compare(bigint::decode(pa.bigintDigits()), bigint::decode(pb.bigintDigits())) < 0 ? 1 : 0;
+        if (pa.isBigInt()) {
+            const double y = rt.toNumber(pb);
+            const int c = bigint::compareWithDouble(bigint::decode(pa.bigintDigits()), y);
+            return c == 2 ? -1 : c < 0 ? 1 : 0;
+        }
+        const double x = rt.toNumber(pa);
+        const int c = bigint::compareWithDouble(bigint::decode(pb.bigintDigits()), x);
+        return c == 2 ? -1 : c > 0 ? 1 : 0;
+    }
     const double x = rt.toNumber(pa), y = rt.toNumber(pb);
     if (std::isnan(x) || std::isnan(y)) return -1;
     return x < y ? 1 : 0;
+}
+
+// A binary operator on BigInts; a TypeError when the other side isn't one.
+Value bigintOp(Runtime& rt, Op op, const Value& a, const Value& b) {
+    if (!a.isBigInt() || !b.isBigInt()) rt.throwError("TypeError", "can't mix BigInt and other types: use explicit conversions");
+    using namespace bigint;
+    const Big x = decode(a.bigintDigits()), y = decode(b.bigintDigits());
+    Big out;
+    switch (op) {
+        case Op::Add: out = add(x, y); break;
+        case Op::Sub: out = sub(x, y); break;
+        case Op::Mul:
+            if (bitLength(x) + bitLength(y) > kMaxBits) rt.throwError("RangeError", "Maximum BigInt size exceeded");
+            out = mul(x, y);
+            break;
+        case Op::Div: case Op::Mod: {
+            Big q, r;
+            if (!divmod(x, y, q, r)) rt.throwError("RangeError", "Division by zero");
+            out = op == Op::Div ? q : r;
+            break;
+        }
+        case Op::Exp: {
+            if (y.neg) rt.throwError("RangeError", "Exponent must be non-negative");
+            if (y.mag.size() > 1 && bitLength(x) > 1) rt.throwError("RangeError", "Maximum BigInt size exceeded");
+            uint64_t e = y.mag.empty() ? 0 : y.mag[0];
+            if (bitLength(x) > 1 && static_cast<double>(e) * static_cast<double>(bitLength(x)) > kMaxBits) rt.throwError("RangeError", "Maximum BigInt size exceeded");
+            Big base = x, acc = fromInt64(1);
+            if (y.mag.size() > 1) {   // base is 0, 1 or -1
+                const bool odd = y.mag[0] & 1;
+                out = x.isZero() ? Big{} : (x.neg && !odd) ? fromInt64(1) : x;
+                break;
+            }
+            while (e) {
+                if (e & 1) acc = mul(acc, base);
+                e >>= 1;
+                if (e) base = mul(base, base);
+            }
+            out = acc;
+            break;
+        }
+        case Op::Shl: case Op::Shr: {
+            if (y.mag.size() > 2 || bitLength(y) > 62) {
+                if ((op == Op::Shl) != y.neg) rt.throwError("RangeError", "Maximum BigInt size exceeded");
+                out = x.neg ? fromInt64(-1) : Big{};
+                break;
+            }
+            int64_t n = toInt64(y);
+            if (op == Op::Shr) n = -n;
+            if (n > 0 && bitLength(x) + static_cast<uint64_t>(n) > kMaxBits && !x.isZero()) rt.throwError("RangeError", "Maximum BigInt size exceeded");
+            out = shiftLeft(x, n);
+            break;
+        }
+        case Op::UShr: rt.throwError("TypeError", "BigInts have no unsigned right shift: use >> instead");
+        case Op::BitAnd: out = bitAnd(x, y); break;
+        case Op::BitOr: out = bitOr(x, y); break;
+        case Op::BitXor: out = bitXor(x, y); break;
+        default: rt.throwError("TypeError", "not an operator for BigInts");
+    }
+    if (bitLength(out) > kMaxBits) rt.throwError("RangeError", "Maximum BigInt size exceeded");
+    return Value::bigint(std::make_shared<const std::u16string>(encode(out)));
 }
 
 double jsPow(double x, double y) {
@@ -2373,22 +2510,37 @@ Value Interpreter::binaryOp(Op op, const Value& l, const Value& r) {
                 if (a->size() + b->size() > (1u << 29)) rt_.throwError("RangeError", "string too long");
                 return Value::string(*a + *b);
             }
+            if (pl.isBigInt() || pr.isBigInt()) return bigintOp(rt_, op, pl, pr);
             return Value::number(rt_.toNumber(pl) + rt_.toNumber(pr));
         }
-        case Op::Sub: return Value::number(rt_.toNumber(l) - rt_.toNumber(r));
-        case Op::Mul: return Value::number(rt_.toNumber(l) * rt_.toNumber(r));
-        case Op::Div: return Value::number(rt_.toNumber(l) / rt_.toNumber(r));
-        case Op::Mod: {
-            const double a = rt_.toNumber(l), b = rt_.toNumber(r);
-            return Value::number(std::fmod(a, b));
+        case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod: case Op::Exp: case Op::Shl: case Op::Shr: case Op::UShr:
+        case Op::BitAnd: case Op::BitOr: case Op::BitXor: {
+            // ToNumeric each side once: numbers, or BigInts (which only meet BigInts).
+            Value a = l, b = r;
+            if (!a.isNumber()) {
+                a = rt_.toPrimitive(a, "number");
+                if (!a.isBigInt()) a = Value::number(rt_.toNumber(a));
+            }
+            if (!b.isNumber()) {
+                b = rt_.toPrimitive(b, "number");
+                if (!b.isBigInt()) b = Value::number(rt_.toNumber(b));
+            }
+            if (a.isBigInt() || b.isBigInt()) return bigintOp(rt_, op, a, b);
+            const double x = a.asNumber(), y = b.asNumber();
+            switch (op) {
+                case Op::Sub: return Value::number(x - y);
+                case Op::Mul: return Value::number(x * y);
+                case Op::Div: return Value::number(x / y);
+                case Op::Mod: return Value::number(std::fmod(x, y));
+                case Op::Exp: return Value::number(jsPow(x, y));
+                case Op::Shl: return Value::number(static_cast<int32_t>(static_cast<uint32_t>(rt_.toInt32(a)) << (rt_.toUint32(b) & 31)));
+                case Op::Shr: return Value::number(rt_.toInt32(a) >> (rt_.toUint32(b) & 31));
+                case Op::UShr: return Value::number(rt_.toUint32(a) >> (rt_.toUint32(b) & 31));
+                case Op::BitAnd: return Value::number(rt_.toInt32(a) & rt_.toInt32(b));
+                case Op::BitOr: return Value::number(rt_.toInt32(a) | rt_.toInt32(b));
+                default: return Value::number(rt_.toInt32(a) ^ rt_.toInt32(b));
+            }
         }
-        case Op::Exp: return Value::number(jsPow(rt_.toNumber(l), rt_.toNumber(r)));
-        case Op::Shl: return Value::number(static_cast<int32_t>(static_cast<uint32_t>(rt_.toInt32(l)) << (rt_.toUint32(r) & 31)));
-        case Op::Shr: return Value::number(rt_.toInt32(l) >> (rt_.toUint32(r) & 31));
-        case Op::UShr: return Value::number(rt_.toUint32(l) >> (rt_.toUint32(r) & 31));
-        case Op::BitAnd: return Value::number(rt_.toInt32(l) & rt_.toInt32(r));
-        case Op::BitOr: return Value::number(rt_.toInt32(l) | rt_.toInt32(r));
-        case Op::BitXor: return Value::number(rt_.toInt32(l) ^ rt_.toInt32(r));
         case Op::Eq: return Value::boolean(rt_.looseEquals(l, r));
         case Op::Ne: return Value::boolean(!rt_.looseEquals(l, r));
         case Op::StrictEq: return Value::boolean(Runtime::strictEquals(l, r));
@@ -2623,9 +2775,17 @@ Value Interpreter::evalUnary(Node* n, Env* env, bool strict) {
         }
         case Op::Void: eval(n->a, env, strict); return Value::undefined();
         case Op::Not: return Value::boolean(!rt_.toBoolean(eval(n->a, env, strict)));
-        case Op::Neg: return Value::number(-rt_.toNumber(eval(n->a, env, strict)));
-        case Op::Plus: return Value::number(rt_.toNumber(eval(n->a, env, strict)));
-        case Op::BitNot: return Value::number(~rt_.toInt32(eval(n->a, env, strict)));
+        case Op::Neg: case Op::BitNot: {
+            Value v = eval(n->a, env, strict);
+            if (!v.isNumber()) v = rt_.toPrimitive(v, "number");
+            if (v.isBigInt()) {
+                const bigint::Big x = bigint::decode(v.bigintDigits());
+                return Value::bigint(std::make_shared<const std::u16string>(bigint::encode(n->op == Op::Neg ? bigint::negate(x) : bigint::bitNot(x))));
+            }
+            if (n->op == Op::Neg) return Value::number(-rt_.toNumber(v));
+            return Value::number(~rt_.toInt32(v));
+        }
+        case Op::Plus: return Value::number(rt_.toNumber(eval(n->a, env, strict)));   // a BigInt throws, as unary + must
         default: rt_.throwError("SyntaxError", "unknown unary operator");
     }
 }
@@ -2633,16 +2793,28 @@ Value Interpreter::evalUnary(Node* n, Env* env, bool strict) {
 Value Interpreter::evalUpdate(Node* n, Env* env, bool strict) {
     Node* t = n->a;
     const double delta = n->op == Op::Inc ? 1 : -1;
+    // ToNumeric: a number, or a BigInt that steps by 1n.
+    const auto step = [&](const Value& current, Value& old_numeric) {
+        Value v = current.isNumber() ? current : rt_.toPrimitive(current, "number");
+        if (v.isBigInt()) {
+            old_numeric = v;
+            const bigint::Big x = bigint::decode(v.bigintDigits());
+            return Value::bigint(std::make_shared<const std::u16string>(bigint::encode(bigint::add(x, bigint::fromInt64(n->op == Op::Inc ? 1 : -1)))));
+        }
+        old_numeric = Value::number(rt_.toNumber(v));
+        return Value::number(old_numeric.asNumber() + delta);
+    };
+    Value old;
     if (t->kind == N::Identifier) {
-        const double old = rt_.toNumber(lookup(env, t->str));
-        assignName(env, t->str, Value::number(old + delta), strict);
-        return Value::number((n->flags & kPrefix) ? old + delta : old);
+        const Value now = step(lookup(env, t->str), old);
+        assignName(env, t->str, now, strict);
+        return (n->flags & kPrefix) ? now : old;
     }
     const Value base = t->a->kind == N::Super ? thisValue(env) : eval(t->a, env, strict);
     const PropertyKey key = memberKey(t, env, strict);
-    const double old = rt_.toNumber(t->a->kind == N::Super ? rt_.get(superBase(env).asObject(), key, base) : rt_.get(base, key));
-    rt_.set(base, key, Value::number(old + delta), strict);
-    return Value::number((n->flags & kPrefix) ? old + delta : old);
+    const Value now = step(t->a->kind == N::Super ? rt_.get(superBase(env).asObject(), key, base) : rt_.get(base, key), old);
+    rt_.set(base, key, now, strict);
+    return (n->flags & kPrefix) ? now : old;
 }
 
 Value Interpreter::evalAssign(Node* n, Env* env, bool strict) {

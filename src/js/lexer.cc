@@ -276,7 +276,17 @@ Token Lexer::numberLiteral(Token t) {
         }
         t.number = std::strtod(digits.c_str(), nullptr);
     }
-    if (i_ < s_.size() && s_[i_] == u'n') ++i_;   // a BigInt: taken as a Number, for now
+    if (i_ < s_.size() && s_[i_] == u'n') {
+        // A BigInt: an integer, without a legacy octal's leading zero.
+        const bool hex = s_.substr(start, 2) == u"0x" || s_.substr(start, 2) == u"0X";
+        if (t.legacy_octal || digits.find('.') != std::string::npos || (!hex && digits.find('e') != std::string::npos))
+            error = "a BigInt literal must be an integer";
+        t.bigint = true;
+        const std::u16string_view written = s_.substr(start, i_ - start);
+        for (char16_t c : written)
+            if (c != u'_') t.value += c;
+        ++i_;
+    }
     if (i_ < s_.size() && (isIdStart(s_[i_]) || isDec(s_[i_]))) error = "identifier starts right after a number";
     if (!error.empty()) t.type = Tok::Eof;
     t.end = static_cast<uint32_t>(i_);

@@ -602,3 +602,21 @@ TEST(Js, ProxyAndReflect) {
     EXPECT_EQ(run("JSON.stringify(Object.groupBy([1, 2, 3, 4], x => x % 2 ? 'odd' : 'even')) + Map.groupBy([1, 2], x => x > 1).get(true)"),
               "{\"odd\":[1,3],\"even\":[2,4]}2");
 }
+
+TEST(Js, BigInt) {
+    EXPECT_EQ(run("String(2n ** 100n) + ' ' + typeof 1n + ' ' + (12345678901234567890n * 3n) + ' ' + (-7n / 2n) + ' ' + (-7n % 2n)"),
+              "1267650600228229401496703205376 bigint 37037036703703703670 -3 -1");
+    EXPECT_EQ(run("[1n << 70n, -9n >> 1n, 7n & 3n, -1n | 4n, 5n ^ -2n, ~5n, 0xFEn, 1_000n, (255n).toString(16)].join()"),
+              "1180591620717411303424,-5,3,-1,-5,-6,254,1000,ff");
+    EXPECT_EQ(run("[1n == 1, 1n === 1, 2n > 1, 1n < 1.5, 10n > '9', 0n ? 1 : 0, BigInt('0x10'), BigInt(2 ** 60), Number(2n ** 64n)].join()"),
+              "true,false,true,true,true,0,16,1152921504606846976,18446744073709552000");
+    EXPECT_EQ(run("try { 1n + 1 } catch (e) { e.name }"), "TypeError");
+    EXPECT_EQ(run("try { JSON.stringify(1n) } catch (e) { e.name }"), "TypeError");
+    EXPECT_EQ(run("try { 1n / 0n } catch (e) { e.name }"), "RangeError");
+    EXPECT_EQ(run("[BigInt.asIntN(8, 255n), BigInt.asUintN(8, -1n), BigInt.asIntN(64, 2n ** 63n)].join()"), "-1,255,-9223372036854775808");
+    EXPECT_EQ(run("let i = 9n; i++; ++i; [i, new Map([[1n, 'm']]).get(1n), new Set([1n, 1n]).size].join()"), "11,m,1");
+    EXPECT_EQ(run("const t = new BigInt64Array([1n, -2n, 2n ** 63n]); const d = new DataView(new ArrayBuffer(8)); d.setBigUint64(0, 0x0102030405060708n);"
+                  "[t.join(), d.getUint8(0), d.getBigUint64(0, true).toString(16)].join(' ')"),
+              "1,-2,-9223372036854775808 1 807060504030201");
+    EXPECT_EQ(run("(+(false)) + ' ' + (!(true))"), "0 false");
+}

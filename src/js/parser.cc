@@ -1800,6 +1800,12 @@ private:
         switch (cur_.type) {
             case Tok::Number: {
                 if (cur_.legacy_octal && strict_) fail("octal literals aren't allowed in strict code");
+                if (cur_.bigint) {
+                    Node* n = p_.make(N::BigInt, line);
+                    n->str = cur_.value;
+                    advance();
+                    return n;
+                }
                 Node* n = p_.make(N::Number, line);
                 n->number = cur_.number;
                 advance();

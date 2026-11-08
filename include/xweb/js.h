@@ -31,7 +31,7 @@ using JSString = std::shared_ptr<const std::u16string>;
 // A JavaScript value.
 class Value {
 public:
-    enum class Type : uint8_t { Undefined, Null, Boolean, Number, String, Symbol, Object, Empty };
+    enum class Type : uint8_t { Undefined, Null, Boolean, Number, String, Symbol, Object, Empty, BigInt };
 
     Value() = default;
     static Value undefined() { return {}; }
@@ -41,6 +41,8 @@ public:
     static Value number(double d) { Value v; v.type_ = Type::Number; v.n_ = d; return v; }
     static Value string(JSString s) { Value v; v.type_ = Type::String; v.s_ = std::move(s); return v; }
     static Value string(std::u16string s);
+    // A BigInt, its digits encoded (bigint.h) in the string slot.
+    static Value bigint(JSString digits) { Value v; v.type_ = Type::BigInt; v.s_ = std::move(digits); return v; }
     static Value object(Object* o) { Value v; v.type_ = o ? Type::Object : Type::Null; v.o_ = o; return v; }
     static Value symbol(Symbol* s) { Value v; v.type_ = Type::Symbol; v.sym_ = s; return v; }
 
@@ -54,6 +56,8 @@ public:
     [[nodiscard]] bool isSymbol() const noexcept { return type_ == Type::Symbol; }
     [[nodiscard]] bool isObject() const noexcept { return type_ == Type::Object; }
     [[nodiscard]] bool isEmpty() const noexcept { return type_ == Type::Empty; }
+    [[nodiscard]] bool isBigInt() const noexcept { return type_ == Type::BigInt; }
+    [[nodiscard]] const std::u16string& bigintDigits() const noexcept { return *s_; }
 
     [[nodiscard]] bool asBoolean() const noexcept { return b_; }
     [[nodiscard]] double asNumber() const noexcept { return n_; }
@@ -122,7 +126,7 @@ using NativeFunction = std::function<Value(Runtime&, const Value& this_value, st
 
 enum class ObjectClass : uint8_t {
     Ordinary, Array, Function, Error, Boolean, Number, String, Symbol, Arguments, Map, Set, Iterator, RegExp,
-    Promise, Generator, AsyncGenerator, Internal, WeakMap, WeakSet, WeakRef, Date, ArrayBuffer, TypedArray, DataView, Proxy,
+    Promise, Generator, AsyncGenerator, Internal, WeakMap, WeakSet, WeakRef, Date, ArrayBuffer, TypedArray, DataView, Proxy, BigInt,
 };
 
 // Map and Set keys: SameValueZero, hashed (strings by content, objects by identity).
@@ -404,6 +408,7 @@ public:
     Object* regexp_exec = nullptr;   // RegExp.prototype.exec, for the fast path
     Object* regexp_constructor = nullptr;
     Object* promise_prototype = nullptr;
+    Object* bigint_prototype = nullptr;
     Object* promise_constructor = nullptr;
     Object* promise_then = nullptr;   // Promise.prototype.then, as installed
     Object* generator_prototype = nullptr;              // %GeneratorPrototype%
@@ -415,7 +420,7 @@ public:
     Object* async_from_sync_iterator_prototype = nullptr;
     Object* array_buffer_prototype = nullptr;
     Object* typed_array_prototype = nullptr;     // %TypedArray%.prototype
-    Object* typed_array_constructors[9] = {};    // Int8Array … Float64Array
+    Object* typed_array_constructors[11] = {};   // Int8Array … Float64Array, BigInt64Array, BigUint64Array
     Object* data_view_prototype = nullptr;
     Object* eval_function = nullptr;   // the global eval, which a direct call recognizes
     std::unordered_map<std::string, Object*> error_prototypes;
@@ -473,7 +478,7 @@ public:
         if (console_) console_(level, text);
     }
 
-    static constexpr size_t kMaxCallDepth = 300;
+    static constexpr size_t kMaxCallDepth = 10'000;   // the stack itself is checked too
     static constexpr size_t kMaxCells = 20'000'000;
 
 private:
@@ -483,6 +488,7 @@ private:
     void installDate();
     void installTypedArrays();
     void installProxyAndReflect();
+    void installBigInt();
     void installGenerators();
     void markModules(std::vector<Cell*>& todo);
     std::deque<Job> jobs_;

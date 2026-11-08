@@ -590,6 +590,10 @@ void Runtime::rejectPromise(Object* p, const Value& reason) {
 void Runtime::runJobs() {
     // Only at a checkpoint: never while script is running (a nested event dispatch).
     if (call_depth > 0 || current_co) return;
+    if (!onEngineStack()) {
+        runOnEngineStack([this] { runJobs(); });
+        return;
+    }
     size_t ran = 0;
     while (!jobs_.empty()) {
         Job j = std::move(jobs_.front());

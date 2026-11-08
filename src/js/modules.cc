@@ -886,6 +886,10 @@ std::vector<std::string> moduleRequests(std::string_view source) {
 }
 
 void Runtime::evaluateModule(std::string_view source, const std::string& url, std::function<void(Result)> done) {
+    if (!current_co && !onEngineStack()) {
+        runOnEngineStack([&] { evaluateModule(source, url, done); });
+        return;
+    }
     auto& m = modulesForLoader();
     // Inline modules each get a record of their own, keyed apart from the page's URL.
     std::string key = url;
