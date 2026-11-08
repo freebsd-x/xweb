@@ -87,6 +87,11 @@ Property toDescriptor(Runtime& rt, const Value& d, uint8_t& present) {
 }
 
 void defineFromDescriptor(Runtime& rt, Object* o, const PropertyKey& key, const Value& desc) {
+    if (o->cls == ObjectClass::Proxy) {
+        if (!desc.isObject()) rt.throwError("TypeError", "a property descriptor must be an object");
+        if (!proxyDefineOwnProperty(rt, o, key, desc)) rt.throwError("TypeError", "the proxy refused to define " + utf8(keyString(key)));
+        return;
+    }
     uint8_t present = 0;
     Property p = toDescriptor(rt, desc, present);
     // A typed array's element: only as a plain, writable, enumerable, configurable value.
@@ -104,14 +109,43 @@ void defineFromDescriptor(Runtime& rt, Object* o, const PropertyKey& key, const 
     // An array's element or length.
     if (!key.isSymbol() && o->cls == ObjectClass::Array && !(p.flags & kAccessor)) {
         if (key.name == u"length") {
-            if (present & 16) rt.set(o, key, p.value, Value::object(o));
+            // length: writable, not enumerable, not configurable; it can become read-only.
+            if ((present & kConfigurable) && (p.flags & kConfigurable)) rt.throwError("TypeError", "an array's length can't be made configurable");
+            if ((present & kEnumerable) && (p.flags & kEnumerable)) rt.throwError("TypeError", "an array's length can't be made enumerable");
+            if (o->length_readonly) {
+                if ((present & kWritable) && (p.flags & kWritable)) rt.throwError("TypeError", "a read-only length can't become writable again");
+                if ((present & 16) && rt.toNumber(p.value) != static_cast<double>(o->elements.size())) rt.throwError("TypeError", "the array's length is read-only");
+                return;
+            }
+            if (present & 16) {
+                const double n = rt.toNumber(p.value);
+                if (n != rt.toUint32(p.value)) rt.throwError("RangeError", "invalid array length");
+                if (!rt.set(o, key, p.value, Value::object(o))) rt.throwError("TypeError", "the array has an element that can't be deleted");
+            }
+            if ((present & kWritable) && !(p.flags & kWritable)) o->length_readonly = true;
             return;
         }
         bool index = !key.name.empty() && key.name.size() < 10 && std::all_of(key.name.begin(), key.name.end(), [](char16_t c) { return c >= u'0' && c <= u'9'; }) &&
                      (key.name.size() == 1 || key.name[0] != u'0');
-        if (index && ((present & (kWritable | kEnumerable | kConfigurable)) == 0 || (p.flags & kDefaultFlags) == kDefaultFlags)) {
+        if (index && o->length_readonly && std::stoul(utf8(key.name)) >= o->elements.size())
+            rt.throwError("TypeError", "the array's length is read-only");
+        // A plain element stays in the dense part: an existing one keeps its flags when the
+        // descriptor leaves them out; a new one only if it asks for all three.
+        const bool exists = index && std::stoul(utf8(key.name)) < o->elements.size() && !o->elements[std::stoul(utf8(key.name))].isEmpty();
+        const uint8_t asked = present & (kWritable | kEnumerable | kConfigurable);
+        const bool plain = exists ? (p.flags & asked) == asked : (asked == (kWritable | kEnumerable | kConfigurable) && (p.flags & kDefaultFlags) == kDefaultFlags);
+        if (index && plain) {
             if (present & 16) rt.set(o, key, p.value, Value::object(o));
+            else if (!exists && !(present & 16)) rt.set(o, key, Value::undefined(), Value::object(o));
             return;
+        }
+        if (index && exists) {
+            // Moving out of the dense part: it keeps its value and its (all-true) flags first.
+            const size_t i = std::stoul(utf8(key.name));
+            o->define(key, {o->elements[i], nullptr, nullptr, kDefaultFlags});
+            o->elements[i] = Value::empty();
+        } else if (index && std::stoul(utf8(key.name)) >= o->elements.size()) {
+            o->elements.resize(std::stoul(utf8(key.name)) + 1, Value::empty());
         }
         if (index) {
             // A special element: out of the dense part, into the property map.
@@ -167,6 +201,7 @@ Value fromDescriptor(Runtime& rt, const Property& p) {
 
 // An own property, including an array's elements and a String's characters.
 bool ownProperty(Runtime& rt, Object* o, const PropertyKey& key, Property& out) {
+    if (o->cls == ObjectClass::Proxy) return proxyGetOwnProperty(rt, o, key, out);
     if (!key.isSymbol() && o->cls == ObjectClass::TypedArray) {
         double index;
         if (typedKey(key, index)) {
@@ -177,7 +212,7 @@ bool ownProperty(Runtime& rt, Object* o, const PropertyKey& key, Property& out) 
     }
     if (!key.isSymbol()) {
         if (o->cls == ObjectClass::Array && key.name == u"length") {
-            out = {Value::number(static_cast<double>(o->elements.size())), nullptr, nullptr, kWritable};
+            out = {Value::number(static_cast<double>(o->elements.size())), nullptr, nullptr, static_cast<uint8_t>(o->length_readonly ? 0 : kWritable)};
             return true;
         }
         if (!key.name.empty() && std::all_of(key.name.begin(), key.name.end(), [](char16_t c) { return c >= u'0' && c <= u'9'; }) &&
@@ -204,26 +239,84 @@ bool ownProperty(Runtime& rt, Object* o, const PropertyKey& key, Property& out) 
     return false;
 }
 
-std::vector<PropertyKey> ownKeysOf(Object* o) {
+std::vector<PropertyKey> ownKeysOf(Runtime& rt, Object* o) {
+    if (o->cls == ObjectClass::Proxy) return proxyOwnKeys(rt, o);
     std::vector<PropertyKey> keys = o->ownKeys();
     if (o->cls == ObjectClass::Array) keys.insert(keys.begin() + static_cast<std::ptrdiff_t>(std::count_if(keys.begin(), keys.end(), [](const PropertyKey& k) {
                                                                     return !k.isSymbol() && !k.name.empty() && k.name[0] >= u'0' && k.name[0] <= u'9';
                                                                 })),
                                                   PropertyKey(u"length"));
-    if (o->cls == ObjectClass::String) keys.push_back(PropertyKey(u"length"));
+    if (o->cls == ObjectClass::String && o->primitive.isString()) {
+        // A String's characters first, then length, then its other properties.
+        std::vector<PropertyKey> front;
+        for (size_t i = 0; i < o->primitive.asString().size(); ++i) front.emplace_back(Runtime::numberToString(static_cast<double>(i)));
+        front.emplace_back(u"length");
+        keys.insert(keys.begin(), front.begin(), front.end());
+    }
     keys.erase(std::remove_if(keys.begin(), keys.end(), [](const PropertyKey& k) { return !k.isSymbol() && k.name == u"__frozen"; }), keys.end());
     return keys;
 }
 
 std::vector<PropertyKey> enumerableOwnKeys(Runtime& rt, Object* o) {
     std::vector<PropertyKey> out;
-    for (const PropertyKey& k : ownKeysOf(o)) {
+    for (const PropertyKey& k : ownKeysOf(rt, o)) {
         if (k.isSymbol()) continue;
         Property p;
         if (ownProperty(rt, o, k, p) && (p.flags & kEnumerable)) out.push_back(k);
     }
     return out;
 }
+
+}  // namespace
+
+bool Runtime::getOwnProperty(Object* o, const PropertyKey& key, Property& out) { return ownProperty(*this, o, key, out); }
+std::vector<PropertyKey> Runtime::ownPropertyKeys(Object* o) { return ownKeysOf(*this, o); }
+
+bool Runtime::defineOwnProperty(Object* o, const PropertyKey& key, const Value& descriptor, bool throws) {
+    if (o->cls == ObjectClass::Proxy) {
+        if (!descriptor.isObject()) throwError("TypeError", "a property descriptor must be an object");
+        const bool ok = proxyDefineOwnProperty(*this, o, key, descriptor);
+        if (!ok && throws) throwError("TypeError", "the proxy refused to define " + utf8(keyString(key)));
+        return ok;
+    }
+    if (throws) {
+        defineFromDescriptor(*this, o, key, descriptor);
+        return true;
+    }
+    // Reflect.defineProperty's way: false rather than an error for what can't be done.
+    uint8_t present = 0;
+    toDescriptor(*this, descriptor, present);   // a malformed descriptor still throws
+    try {
+        defineFromDescriptor(*this, o, key, descriptor);
+    } catch (const Thrown&) {
+        return false;
+    }
+    return true;
+}
+
+Property descriptorToProperty(Runtime& rt, const Value& desc) {
+    uint8_t present = 0;
+    return toDescriptor(rt, desc, present);
+}
+
+Value normalizeDescriptor(Runtime& rt, const Value& desc) {
+    uint8_t present = 0;
+    const Property p = toDescriptor(rt, desc, present);
+    Object* d = rt.newObject();
+    if (present & 16) rt.put(d, u"value", p.value, kDefaultFlags);
+    if (present & kWritable) rt.put(d, u"writable", Value::boolean(p.flags & kWritable), kDefaultFlags);
+    if (present & 32) {
+        if (rt.has(desc.asObject(), u"get")) rt.put(d, u"get", p.getter ? Value::object(p.getter) : Value::undefined(), kDefaultFlags);
+        if (rt.has(desc.asObject(), u"set")) rt.put(d, u"set", p.setter ? Value::object(p.setter) : Value::undefined(), kDefaultFlags);
+    }
+    if (present & kEnumerable) rt.put(d, u"enumerable", Value::boolean(p.flags & kEnumerable), kDefaultFlags);
+    if (present & kConfigurable) rt.put(d, u"configurable", Value::boolean(p.flags & kConfigurable), kDefaultFlags);
+    return Value::object(d);
+}
+
+Value propertyToDescriptor(Runtime& rt, const Property& p) { return fromDescriptor(rt, p); }
+
+namespace {
 
 // ── JSON ──
 
@@ -416,7 +509,7 @@ struct JsonWriter {
         if (stack.size() > 512) rt.throwError("RangeError", "JSON nested too deeply");
         stack.push_back(o);
         const std::u16string inner = indent + gap;
-        if (o->cls == ObjectClass::Array) {
+        if (rt.isArray(v)) {
             out += u'[';
             const uint64_t len = rt.lengthOf(o);
             for (uint64_t i = 0; i < len; ++i) {
@@ -622,7 +715,7 @@ void Runtime::installBuiltins() {
         for (size_t i = 1; i < a.size(); ++i) {
             if (a[i].isNullish()) continue;
             Object* src = rt.toObject(a[i]);
-            for (const PropertyKey& k : ownKeysOf(src)) {
+            for (const PropertyKey& k : ownKeysOf(rt, src)) {
                 Property p;
                 if (ownProperty(rt, src, k, p) && (p.flags & kEnumerable)) rt.set(Value::object(target), k, rt.get(src, k, a[i]), true);
             }
@@ -653,14 +746,14 @@ void Runtime::installBuiltins() {
     method(object_ctor, u"getOwnPropertyNames", 1, [](Runtime& rt, const Value&, Args a) {
         Object* o = rt.toObject(arg(a, 0));
         std::vector<Value> out;
-        for (const PropertyKey& k : ownKeysOf(o))
+        for (const PropertyKey& k : ownKeysOf(rt, o))
             if (!k.isSymbol()) out.push_back(Value::string(k.name));
         return Value::object(rt.newArray(std::move(out)));
     });
     method(object_ctor, u"getOwnPropertySymbols", 1, [](Runtime& rt, const Value&, Args a) {
         Object* o = rt.toObject(arg(a, 0));
         std::vector<Value> out;
-        for (const PropertyKey& k : ownKeysOf(o))
+        for (const PropertyKey& k : ownKeysOf(rt, o))
             if (k.isSymbol()) out.push_back(Value::symbol(k.symbol));
         return Value::object(rt.newArray(std::move(out)));
     });
@@ -673,7 +766,7 @@ void Runtime::installBuiltins() {
     method(object_ctor, u"getOwnPropertyDescriptors", 1, [](Runtime& rt, const Value&, Args a) {
         Object* o = rt.toObject(arg(a, 0));
         Object* out = rt.newObject();
-        for (const PropertyKey& k : ownKeysOf(o)) {
+        for (const PropertyKey& k : ownKeysOf(rt, o)) {
             Property p;
             if (ownProperty(rt, o, k, p)) rt.put(out, k, fromDescriptor(rt, p), kDefaultFlags);
         }
@@ -681,17 +774,16 @@ void Runtime::installBuiltins() {
     });
     method(object_ctor, u"getPrototypeOf", 1, [](Runtime& rt, const Value&, Args a) {
         Object* o = rt.toObject(arg(a, 0));
-        return o->prototype ? Value::object(o->prototype) : Value::null();
+        Object* p = rt.getPrototypeOf(o);
+        return p ? Value::object(p) : Value::null();
     });
     method(object_ctor, u"setPrototypeOf", 2, [](Runtime& rt, const Value&, Args a) {
         const Value p = arg(a, 1);
+        if (arg(a, 0).isNullish()) rt.throwError("TypeError", "Object.setPrototypeOf called on null or undefined");
         if (!p.isObject() && !p.isNull()) rt.throwError("TypeError", "a prototype must be an object or null");
         if (!arg(a, 0).isObject()) return arg(a, 0);
-        Object* o = arg(a, 0).asObject();
-        for (Object* c = p.isObject() ? p.asObject() : nullptr; c; c = c->prototype)
-            if (c == o) rt.throwError("TypeError", "a prototype chain can't loop");
-        if (!o->extensible && o->prototype != (p.isObject() ? p.asObject() : nullptr)) rt.throwError("TypeError", "the object isn't extensible");
-        o->prototype = p.isObject() ? p.asObject() : nullptr;
+        if (!rt.setPrototypeOf(arg(a, 0).asObject(), p.isObject() ? p.asObject() : nullptr))
+            rt.throwError("TypeError", "the prototype can't be set (a cycle, or the object isn't extensible)");
         return arg(a, 0);
     });
     method(object_ctor, u"is", 2, [](Runtime&, const Value&, Args a) { return Value::boolean(Runtime::sameValue(arg(a, 0), arg(a, 1))); });
@@ -699,6 +791,20 @@ void Runtime::installBuiltins() {
         return [freeze](Runtime& rt, const Value&, Args a) {
             if (!arg(a, 0).isObject()) return arg(a, 0);
             Object* o = arg(a, 0).asObject();
+            if (o->cls == ObjectClass::Proxy) {
+                // SetIntegrityLevel, through the proxy's handler.
+                if (!rt.preventExtensions(o)) rt.throwError("TypeError", "the proxy refused to become non-extensible");
+                for (const PropertyKey& k : rt.ownPropertyKeys(o)) {
+                    Object* d = rt.newObject();
+                    rt.put(d, u"configurable", Value::boolean(false), kDefaultFlags);
+                    if (freeze) {
+                        Property cur;
+                        if (rt.getOwnProperty(o, k, cur) && !(cur.flags & kAccessor)) rt.put(d, u"writable", Value::boolean(false), kDefaultFlags);
+                    }
+                    rt.defineOwnProperty(o, k, Value::object(d), true);
+                }
+                return arg(a, 0);
+            }
             o->extensible = false;
             if (o->cls == ObjectClass::Array && freeze) rt.put(o, u"__frozen", Value::boolean(true), 0);
             for (const PropertyKey& k : o->ownKeys()) {
@@ -715,15 +821,22 @@ void Runtime::installBuiltins() {
     };
     method(object_ctor, u"freeze", 1, freezeLike(true));
     method(object_ctor, u"seal", 1, freezeLike(false));
-    method(object_ctor, u"preventExtensions", 1, [](Runtime&, const Value&, Args a) {
-        if (arg(a, 0).isObject()) arg(a, 0).asObject()->extensible = false;
+    method(object_ctor, u"preventExtensions", 1, [](Runtime& rt, const Value&, Args a) {
+        if (arg(a, 0).isObject() && !rt.preventExtensions(arg(a, 0).asObject())) rt.throwError("TypeError", "the object refused to become non-extensible");
         return arg(a, 0);
     });
-    method(object_ctor, u"isExtensible", 1, [](Runtime&, const Value&, Args a) { return Value::boolean(arg(a, 0).isObject() && arg(a, 0).asObject()->extensible); });
+    method(object_ctor, u"isExtensible", 1, [](Runtime& rt, const Value&, Args a) { return Value::boolean(arg(a, 0).isObject() && rt.isExtensible(arg(a, 0).asObject())); });
     method(object_ctor, u"isFrozen", 1, [](Runtime& rt, const Value&, Args a) {
         if (!arg(a, 0).isObject()) return Value::boolean(true);
         Object* o = arg(a, 0).asObject();
-        if (o->extensible) return Value::boolean(false);
+        if (rt.isExtensible(o)) return Value::boolean(false);
+        if (o->cls == ObjectClass::Proxy) {
+            for (const PropertyKey& k : rt.ownPropertyKeys(o)) {
+                Property p;
+                if (rt.getOwnProperty(o, k, p) && ((p.flags & kConfigurable) || (!(p.flags & kAccessor) && (p.flags & kWritable)))) return Value::boolean(false);
+            }
+            return Value::boolean(true);
+        }
         if (o->cls == ObjectClass::Array && !o->elements.empty() && !o->own(u"__frozen")) return Value::boolean(false);
         for (const PropertyKey& k : o->ownKeys()) {
             Property p;
@@ -731,10 +844,17 @@ void Runtime::installBuiltins() {
         }
         return Value::boolean(true);
     });
-    method(object_ctor, u"isSealed", 1, [](Runtime&, const Value&, Args a) {
+    method(object_ctor, u"isSealed", 1, [](Runtime& rt, const Value&, Args a) {
         if (!arg(a, 0).isObject()) return Value::boolean(true);
         Object* o = arg(a, 0).asObject();
-        if (o->extensible) return Value::boolean(false);
+        if (rt.isExtensible(o)) return Value::boolean(false);
+        if (o->cls == ObjectClass::Proxy) {
+            for (const PropertyKey& k : rt.ownPropertyKeys(o)) {
+                Property p;
+                if (rt.getOwnProperty(o, k, p) && (p.flags & kConfigurable)) return Value::boolean(false);
+            }
+            return Value::boolean(true);
+        }
         for (const PropertyKey& k : o->ownKeys())
             if (const Property* p = o->own(k); p && (p->flags & kConfigurable)) return Value::boolean(false);
         return Value::boolean(true);
@@ -753,7 +873,7 @@ void Runtime::installBuiltins() {
     method(object_prototype, u"isPrototypeOf", 1, [](Runtime& rt, const Value& t, Args a) {
         if (!arg(a, 0).isObject()) return Value::boolean(false);
         Object* self = thisObject(rt, t);
-        for (Object* o = arg(a, 0).asObject()->prototype; o; o = o->prototype)
+        for (Object* o = rt.getPrototypeOf(arg(a, 0).asObject()); o; o = rt.getPrototypeOf(o))
             if (o == self) return Value::boolean(true);
         return Value::boolean(false);
     });
@@ -768,7 +888,9 @@ void Runtime::installBuiltins() {
         const Value tag = rt.get(o, PropertyKey(rt.sym_to_string_tag), t);
         if (tag.isString()) return Value::string(u"[object " + tag.asString() + u"]");
         const char16_t* name = u"Object";
-        switch (o->cls) {
+        if (rt.isArray(Value::object(o))) name = u"Array";
+        else if (o->cls == ObjectClass::Proxy && rt.isCallable(Value::object(o))) name = u"Function";
+        else switch (o->cls) {
             case ObjectClass::Array: name = u"Array"; break;
             case ObjectClass::Function: name = u"Function"; break;
             case ObjectClass::Error: name = u"Error"; break;
@@ -787,15 +909,14 @@ void Runtime::installBuiltins() {
     object_prototype->define(u"__proto__", {Value::undefined(),
         newFunction(u"get __proto__", 0, [](Runtime& rt, const Value& t, Args) {
             Object* o = rt.toObject(t);
-            return o->prototype ? Value::object(o->prototype) : Value::null();
+            Object* p = rt.getPrototypeOf(o);
+            return p ? Value::object(p) : Value::null();
         }),
-        newFunction(u"set __proto__", 1, [](Runtime&, const Value& t, Args a) {
+        newFunction(u"set __proto__", 1, [](Runtime& rt, const Value& t, Args a) {
+            if (t.isNullish()) rt.throwError("TypeError", "set __proto__ called on null or undefined");
             const Value p = arg(a, 0);
-            if (t.isObject() && (p.isObject() || p.isNull())) {
-                for (Object* c = p.isObject() ? p.asObject() : nullptr; c; c = c->prototype)
-                    if (c == t.asObject()) return Value::undefined();
-                t.asObject()->prototype = p.isObject() ? p.asObject() : nullptr;
-            }
+            if (t.isObject() && (p.isObject() || p.isNull()) && !rt.setPrototypeOf(t.asObject(), p.isObject() ? p.asObject() : nullptr))
+                rt.throwError("TypeError", "the prototype can't be set");
             return Value::undefined();
         }),
         kConfigurable | kAccessor});
@@ -860,7 +981,7 @@ void Runtime::installBuiltins() {
         while (f->bound_target) f = f->bound_target;
         const Value proto = rt.get(Value::object(f), u"prototype");
         if (!proto.isObject()) rt.throwError("TypeError", "the function's prototype isn't an object");
-        for (Object* o = arg(a, 0).asObject()->prototype; o; o = o->prototype)
+        for (Object* o = rt.getPrototypeOf(arg(a, 0).asObject()); o; o = rt.getPrototypeOf(o))
             if (o == proto.asObject()) return Value::boolean(true);
         return Value::boolean(false);
     })), nullptr, nullptr, 0});
@@ -1315,7 +1436,7 @@ void Runtime::installBuiltins() {
         }
         return Value::object(arr);
     }, array_prototype);
-    method(array_ctor, u"isArray", 1, [](Runtime&, const Value&, Args a) { return Value::boolean(arg(a, 0).isObject() && arg(a, 0).asObject()->cls == ObjectClass::Array); });
+    method(array_ctor, u"isArray", 1, [](Runtime& rt, const Value&, Args a) { return Value::boolean(rt.isArray(arg(a, 0))); });
     method(array_ctor, u"of", 0, [](Runtime& rt, const Value&, Args a) { return Value::object(rt.newArray(std::vector<Value>(a.begin(), a.end()))); });
     method(array_ctor, u"from", 1, [](Runtime& rt, const Value&, Args a) {
         const Value src = arg(a, 0);
@@ -1411,7 +1532,7 @@ void Runtime::installBuiltins() {
     method(array_prototype, u"concat", 1, [](Runtime& rt, const Value& t, Args a) {
         std::vector<Value> out;
         const auto add = [&](const Value& v) {
-            if (v.isObject() && v.asObject()->cls == ObjectClass::Array) {
+            if (rt.isArray(v)) {
                 Object* o = v.asObject();
                 const uint64_t n = rt.lengthOf(o);
                 for (uint64_t i = 0; i < n; ++i) out.push_back(hasElement(rt, o, i) ? elementAt(rt, o, i) : Value::empty());
@@ -2124,7 +2245,7 @@ void Runtime::installBuiltins() {
             if (val.isObject()) {
                 Object* o = val.asObject();
                 std::vector<PropertyKey> keys;
-                if (o->cls == ObjectClass::Array) for (uint64_t i = 0; i < rt.lengthOf(o); ++i) keys.emplace_back(Runtime::numberToString(static_cast<double>(i)));
+                if (rt.isArray(val)) for (uint64_t i = 0; i < rt.lengthOf(o); ++i) keys.emplace_back(Runtime::numberToString(static_cast<double>(i)));
                 else keys = enumerableOwnKeys(rt, o);
                 for (const PropertyKey& k : keys) {
                     const Value nv = self(val, k, self);
@@ -2165,52 +2286,6 @@ void Runtime::installBuiltins() {
         return Value::string(std::move(out));
     });
 
-    // ── Reflect (the parts that are thin) ──
-    Object* reflect = newObject();
-    put(global_, u"Reflect", Value::object(reflect));
-    method(reflect, u"ownKeys", 1, [](Runtime& rt, const Value&, Args a) {
-        if (!arg(a, 0).isObject()) rt.throwError("TypeError", "Reflect.ownKeys needs an object");
-        std::vector<Value> out;
-        for (const PropertyKey& k : ownKeysOf(arg(a, 0).asObject())) out.push_back(k.isSymbol() ? Value::symbol(k.symbol) : Value::string(k.name));
-        return Value::object(rt.newArray(std::move(out)));
-    });
-    method(reflect, u"has", 2, [](Runtime& rt, const Value&, Args a) {
-        if (!arg(a, 0).isObject()) rt.throwError("TypeError", "Reflect.has needs an object");
-        return Value::boolean(rt.has(arg(a, 0).asObject(), rt.toPropertyKey(arg(a, 1))));
-    });
-    method(reflect, u"get", 2, [](Runtime& rt, const Value&, Args a) {
-        if (!arg(a, 0).isObject()) rt.throwError("TypeError", "Reflect.get needs an object");
-        return rt.get(arg(a, 0).asObject(), rt.toPropertyKey(arg(a, 1)), a.size() > 2 ? a[2] : arg(a, 0));
-    });
-    method(reflect, u"getPrototypeOf", 1, [](Runtime& rt, const Value&, Args a) {
-        if (!arg(a, 0).isObject()) rt.throwError("TypeError", "Reflect.getPrototypeOf needs an object");
-        Object* p = arg(a, 0).asObject()->prototype;
-        return p ? Value::object(p) : Value::null();
-    });
-    method(reflect, u"apply", 3, [](Runtime& rt, const Value&, Args a) {
-        std::vector<Value> list;
-        if (!arg(a, 2).isObject()) rt.throwError("TypeError", "Reflect.apply needs an argument list");
-        for (uint64_t i = 0; i < rt.lengthOf(arg(a, 2).asObject()); ++i) list.push_back(elementAt(rt, arg(a, 2).asObject(), i));
-        return rt.call(arg(a, 0), arg(a, 1), list);
-    });
-    method(reflect, u"construct", 2, [](Runtime& rt, const Value&, Args a) {
-        std::vector<Value> list;
-        if (!arg(a, 1).isObject()) rt.throwError("TypeError", "Reflect.construct needs an argument list");
-        for (uint64_t i = 0; i < rt.lengthOf(arg(a, 1).asObject()); ++i) list.push_back(elementAt(rt, arg(a, 1).asObject(), i));
-        const Value nt = a.size() > 2 ? a[2] : arg(a, 0);
-        if (!rt.isConstructor(nt)) rt.throwError("TypeError", "new.target must be a constructor");
-        return rt.construct(arg(a, 0), list, nt.asObject());
-    });
-    method(reflect, u"defineProperty", 3, [](Runtime& rt, const Value&, Args a) {
-        if (!arg(a, 0).isObject()) rt.throwError("TypeError", "Reflect.defineProperty needs an object");
-        try {
-            defineFromDescriptor(rt, arg(a, 0).asObject(), rt.toPropertyKey(arg(a, 1)), arg(a, 2));
-        } catch (const Thrown&) {
-            return Value::boolean(false);
-        }
-        return Value::boolean(true);
-    });
-
     // ── console ──
     Object* console = newObject();
     put(global_, u"console", Value::object(console));
@@ -2245,6 +2320,7 @@ void Runtime::installBuiltins() {
     installPromise();
     installDate();
     installTypedArrays();
+    installProxyAndReflect();
     installGenerators();
     (void)rt;
 }

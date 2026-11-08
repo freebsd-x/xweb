@@ -338,3 +338,22 @@ TEST(Script, CustomElementsShadowRootsAndObservers) {
         EXPECT_NE(p.console.find(want), std::string::npos) << want << "\n" << p.console;
     EXPECT_EQ(p.console.find("error"), std::string::npos) << p.console;
 }
+
+TEST(Script, CryptoAndIntl) {
+    Page p(R"(<body><script>
+        const a = crypto.getRandomValues(new Uint8Array(32));
+        console.log('random', a.some(x => x !== 0), /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(crypto.randomUUID()));
+        const d = Date.UTC(2026, 10, 8, 15, 4, 5);
+        console.log(new Intl.NumberFormat('en-US').format(1234567.891), new Intl.NumberFormat('en', {style: 'currency', currency: 'USD'}).format(-3.5),
+                    new Intl.NumberFormat('en', {notation: 'compact'}).format(12500), new Intl.NumberFormat('en', {style: 'percent'}).format(0.256));
+        console.log(new Intl.DateTimeFormat('en-US', {timeZone: 'UTC'}).format(d), '|',
+                    new Intl.DateTimeFormat('en', {timeZone: 'UTC', dateStyle: 'medium'}).format(d), '|',
+                    new Intl.DateTimeFormat('en', {timeZone: 'UTC', month: 'long', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit'}).format(d));
+        const rtf = new Intl.RelativeTimeFormat('en', {numeric: 'auto'});
+        console.log(rtf.format(-1, 'day'), '|', rtf.format(3, 'hours'), '|', rtf.format(-2, 'month'), '|', new Intl.ListFormat('en').format(['a', 'b', 'c']),
+                    '|', new Intl.PluralRules('en', {type: 'ordinal'}).select(22), ['b', 'a', 'C'].sort(new Intl.Collator('en').compare).join(''));
+        </script>)");
+    for (const char* want : {"log:random true true\n", "log:1,234,567.891 -$3.50 12.5K 26%\n",
+                             "log:11/8/2026 | Nov 8, 2026 | November 8, 2026, 3:04 PM\n", "log:yesterday | in 3 hours | 2 months ago | a, b, and c | two abC\n"})
+        EXPECT_NE(p.console.find(want), std::string::npos) << want << "\n" << p.console;
+}

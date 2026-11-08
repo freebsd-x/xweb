@@ -122,7 +122,7 @@ using NativeFunction = std::function<Value(Runtime&, const Value& this_value, st
 
 enum class ObjectClass : uint8_t {
     Ordinary, Array, Function, Error, Boolean, Number, String, Symbol, Arguments, Map, Set, Iterator, RegExp,
-    Promise, Generator, AsyncGenerator, Internal, WeakMap, WeakSet, WeakRef, Date, ArrayBuffer, TypedArray, DataView,
+    Promise, Generator, AsyncGenerator, Internal, WeakMap, WeakSet, WeakRef, Date, ArrayBuffer, TypedArray, DataView, Proxy,
 };
 
 // Map and Set keys: SameValueZero, hashed (strings by content, objects by identity).
@@ -171,6 +171,7 @@ public:
     std::vector<Value> bound_args;
     bool constructor = false;   // can be called with new
     bool class_constructor = false;   // can only be called with new
+    bool length_readonly = false;     // an array whose length was made non-writable
     bool derived = false;       // a class that extends another
 
     // Boolean, Number, String and Symbol wrappers' value; an iterator's state.
@@ -343,6 +344,17 @@ public:
     bool set(Object* o, const PropertyKey& key, const Value& v, const Value& receiver);
     bool has(Object* o, const PropertyKey& key);
     bool deleteProperty(Object* o, const PropertyKey& key);
+    // The rest of an object's internal methods, a proxy's going through its handler.
+    bool getOwnProperty(Object* o, const PropertyKey& key, Property& out);
+    std::vector<PropertyKey> ownPropertyKeys(Object* o);
+    // From a descriptor object; false (or a TypeError, when `throws`) if it can't be done.
+    bool defineOwnProperty(Object* o, const PropertyKey& key, const Value& descriptor, bool throws = true);
+    Object* getPrototypeOf(Object* o);
+    bool setPrototypeOf(Object* o, Object* proto);
+    bool isExtensible(Object* o);
+    bool preventExtensions(Object* o);
+    // IsArray: an Array, or a proxy for one.
+    bool isArray(const Value& v);
     Value call(const Value& fn, const Value& this_value, std::span<const Value> args);
     Value construct(const Value& fn, std::span<const Value> args, Object* new_target = nullptr);
     [[nodiscard]] bool isCallable(const Value& v) const;
@@ -470,6 +482,7 @@ private:
     void installPromise();
     void installDate();
     void installTypedArrays();
+    void installProxyAndReflect();
     void installGenerators();
     void markModules(std::vector<Cell*>& todo);
     std::deque<Job> jobs_;

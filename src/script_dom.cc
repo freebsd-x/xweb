@@ -5,6 +5,8 @@
 
 #include "script_impl.h"
 
+#include <stdlib.h>
+
 namespace fbx::xweb {
 
 namespace {
@@ -627,6 +629,38 @@ void PageScript::Impl::installDom() {
                 if (p.isObject()) p.asObject()->promise_handled = true;
                 return Value::boolean(true);
             });
+    }
+
+    // crypto: random values from the system (arc4random, which the sandbox allows).
+    {
+        Object* crypto = rt.newObject();
+        rt.put(crypto, PropertyKey(rt.sym_to_string_tag), str("Crypto"), js::kConfigurable);
+        method(crypto, u"getRandomValues", 1, [](Runtime& rt, const Value&, Args a) {
+            const Value v = arg(a, 0);
+            std::string probe;
+            if (!v.isObject() || v.asObject()->cls != js::ObjectClass::TypedArray || !rt.bufferBytes(v, probe))
+                rt.throwError("TypeError", "getRandomValues needs an integer typed array");
+            if (probe.size() > 65536) domError(rt, "QuotaExceededError", "getRandomValues takes at most 65536 bytes");
+            Object* ta = v.asObject();
+            uint8_t* p = ta->target->buffer->bytes.data() + ta->view_offset;
+            arc4random_buf(p, probe.size());
+            return v;
+        });
+        method(crypto, u"randomUUID", 0, [](Runtime&, const Value&, Args) {
+            uint8_t b[16];
+            arc4random_buf(b, sizeof b);
+            b[6] = static_cast<uint8_t>((b[6] & 0x0F) | 0x40);
+            b[8] = static_cast<uint8_t>((b[8] & 0x3F) | 0x80);
+            static const char* hex = "0123456789abcdef";
+            std::string out;
+            for (int i = 0; i < 16; ++i) {
+                if (i == 4 || i == 6 || i == 8 || i == 10) out += '-';
+                out += hex[b[i] >> 4];
+                out += hex[b[i] & 15];
+            }
+            return str(out);
+        });
+        rt.put(g, u"crypto", Value::object(crypto));
     }
 
     // customElements.

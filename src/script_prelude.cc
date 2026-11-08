@@ -801,6 +801,213 @@ const char* const kScriptPrelude = R"JS(
     if (!perf.timeOrigin) perf.timeOrigin = Date.now() - perf.now();
   }
 
+  // Intl, in English (US) whatever locale is asked for: the formats pages show dates,
+  // numbers and lists in, without the full locale data.
+  const Intl = {};
+  {
+    const locale = 'en-US';
+    const resolved = l => locale;
+    const pad2 = n => String(n).padStart(2, '0');
+    const groupDigits = s => s.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+    class NumberFormat {
+      constructor(locales, o = {}) {
+        this._o = { style: o.style || 'decimal', currency: (o.currency || 'USD').toUpperCase(), currencyDisplay: o.currencyDisplay || 'symbol',
+          notation: o.notation || 'standard', compactDisplay: o.compactDisplay || 'short', useGrouping: o.useGrouping !== false,
+          unit: o.unit, unitDisplay: o.unitDisplay || 'short', signDisplay: o.signDisplay || 'auto' };
+        const cur = this._o.style === 'currency';
+        this._min = o.minimumFractionDigits ?? (cur ? 2 : 0);
+        this._max = Math.max(this._min, o.maximumFractionDigits ?? (cur ? 2 : this._o.style === 'percent' ? 0 : 3));
+        if (o.maximumSignificantDigits) this._sig = o.maximumSignificantDigits;
+      }
+      format(n) {
+        n = Number(n);
+        if (Number.isNaN(n)) return 'NaN';
+        const o = this._o;
+        let suffix = '', prefix = '';
+        if (o.style === 'percent') n *= 100;
+        if (o.notation === 'compact') {
+          for (const [v, s, l] of [[1e12, 'T', ' trillion'], [1e9, 'B', ' billion'], [1e6, 'M', ' million'], [1e3, 'K', ' thousand']]) {
+            if (Math.abs(n) >= v) { n /= v; suffix = o.compactDisplay === 'long' ? l : s; break; }
+          }
+          if (!this._sig) { const r = Math.abs(n) < 100 ? Math.round(n * 10) / 10 : Math.round(n); n = r; }
+        }
+        const neg = n < 0 || Object.is(n, -0) && o.signDisplay === 'negative';
+        n = Math.abs(n);
+        let text;
+        if (!Number.isFinite(n)) text = '∞';
+        else if (this._sig) text = String(Number(n.toPrecision(this._sig)));
+        else {
+          text = n.toFixed(this._max);
+          if (text.includes('.')) { text = text.replace(/0+$/, ''); const dot = text.indexOf('.'); const have = dot < 0 ? 0 : text.length - dot - 1; if (have < this._min) text = (dot < 0 ? text + '.' : text) + '0'.repeat(this._min - have); if (text.endsWith('.')) text = text.slice(0, -1); }
+        }
+        const [int, frac] = text.split('.');
+        text = (o.useGrouping ? groupDigits(int) : int) + (frac ? '.' + frac : '');
+        if (o.style === 'percent') suffix += '%';
+        if (o.style === 'currency') {
+          const symbols = { USD: '$', EUR: '€', GBP: '£', JPY: '¥', KRW: '₩', CNY: 'CN¥', INR: '₹', CAD: 'CA$', AUD: 'A$' };
+          prefix = o.currencyDisplay === 'code' ? o.currency + ' ' : symbols[o.currency] || o.currency + ' ';
+        }
+        if (o.style === 'unit' && o.unit) suffix += (o.unitDisplay === 'long' ? ' ' + o.unit + (n === 1 ? '' : 's') : ' ' + o.unit);
+        const sign = neg ? '-' : (o.signDisplay === 'always' || (o.signDisplay === 'exceptZero' && n !== 0)) ? '+' : '';
+        return sign + prefix + text + suffix;
+      }
+      formatToParts(n) { return [{ type: 'literal', value: this.format(n) }]; }
+      resolvedOptions() { return { locale, numberingSystem: 'latn', ...this._o, minimumFractionDigits: this._min, maximumFractionDigits: this._max }; }
+      static supportedLocalesOf(l) { return [].concat(l || []).length ? [locale] : []; }
+    }
+    const monthsLong = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+    const daysLong = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+    class DateTimeFormat {
+      constructor(locales, o = {}) {
+        this._o = { ...o };
+        this._utc = o.timeZone && /^(utc|gmt|etc\/utc)$/i.test(o.timeZone);
+        const any = ['weekday', 'era', 'year', 'month', 'day', 'hour', 'minute', 'second', 'dateStyle', 'timeStyle'].some(k => o[k] !== undefined);
+        if (!any) Object.assign(this._o, { year: 'numeric', month: 'numeric', day: 'numeric' });
+        if (o.dateStyle) Object.assign(this._o, { full: { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }, long: { year: 'numeric', month: 'long', day: 'numeric' },
+          medium: { year: 'numeric', month: 'short', day: 'numeric' }, short: { year: '2-digit', month: 'numeric', day: 'numeric' } }[o.dateStyle] || {});
+        if (o.timeStyle) Object.assign(this._o, { hour: 'numeric', minute: '2-digit', ...(o.timeStyle === 'short' ? {} : { second: '2-digit' }) });
+      }
+      _fields(d) {
+        d = d === undefined ? new Date() : new Date(typeof d === 'object' ? d.getTime() : d);
+        if (Number.isNaN(d.getTime())) throw new RangeError('Invalid time value');
+        const u = this._utc;
+        return { y: u ? d.getUTCFullYear() : d.getFullYear(), m: u ? d.getUTCMonth() : d.getMonth(), d: u ? d.getUTCDate() : d.getDate(),
+                 w: u ? d.getUTCDay() : d.getDay(), h: u ? d.getUTCHours() : d.getHours(), mi: u ? d.getUTCMinutes() : d.getMinutes(),
+                 s: u ? d.getUTCSeconds() : d.getSeconds(), date: d };
+      }
+      formatToParts(date) {
+        const f = this._fields(date), o = this._o, parts = [];
+        const add = (type, value) => { if (parts.length) parts.push({ type: 'literal', value: type === 'dayPeriod' ? ' ' : parts[parts.length - 1].sep || ', ' }); parts.push({ type, value: String(value) }); };
+        const textMonth = o.month === 'long' || o.month === 'short' || o.month === 'narrow';
+        if (o.weekday) add('weekday', o.weekday === 'long' ? daysLong[f.w] : daysLong[f.w].slice(0, o.weekday === 'narrow' ? 1 : 3));
+        if (textMonth) {
+          const m = o.month === 'long' ? monthsLong[f.m] : monthsLong[f.m].slice(0, o.month === 'narrow' ? 1 : 3);
+          if (parts.length) parts.push({ type: 'literal', value: ', ' });
+          parts.push({ type: 'month', value: m });
+          if (o.day) parts.push({ type: 'literal', value: ' ' }, { type: 'day', value: String(o.day === '2-digit' ? pad2(f.d) : f.d) });
+          if (o.year) parts.push({ type: 'literal', value: o.day ? ', ' : ' ' }, { type: 'year', value: String(o.year === '2-digit' ? pad2(f.y % 100) : f.y) });
+        } else if (o.month || o.day || o.year) {
+          const bits = [];
+          if (o.month) bits.push(['month', o.month === '2-digit' ? pad2(f.m + 1) : f.m + 1]);
+          if (o.day) bits.push(['day', o.day === '2-digit' ? pad2(f.d) : f.d]);
+          if (o.year) bits.push(['year', o.year === '2-digit' ? pad2(f.y % 100) : f.y]);
+          if (parts.length) parts.push({ type: 'literal', value: ', ' });
+          bits.forEach(([t, v], i) => { if (i) parts.push({ type: 'literal', value: '/' }); parts.push({ type: t, value: String(v) }); });
+        }
+        if (o.hour || o.minute || o.second) {
+          const h12 = o.hour12 !== false && o.hourCycle !== 'h23';
+          if (parts.length) parts.push({ type: 'literal', value: ', ' });
+          const hv = h12 ? (f.h % 12 || 12) : f.h;
+          const tbits = [];
+          if (o.hour) tbits.push(['hour', o.hour === '2-digit' || !h12 ? pad2(hv) : hv]);
+          if (o.minute) tbits.push(['minute', pad2(f.mi)]);
+          if (o.second) tbits.push(['second', pad2(f.s)]);
+          tbits.forEach(([t, v], i) => { if (i) parts.push({ type: 'literal', value: ':' }); parts.push({ type: t, value: String(v) }); });
+          if (h12 && o.hour) parts.push({ type: 'literal', value: ' ' }, { type: 'dayPeriod', value: f.h < 12 ? 'AM' : 'PM' });
+        }
+        if (o.timeZoneName) parts.push({ type: 'literal', value: ' ' }, { type: 'timeZoneName', value: this._utc ? 'UTC' : (String(f.date).match(/\(([^)]+)\)/) || [, 'GMT'])[1] });
+        return parts;
+      }
+      format(date) { return this.formatToParts(date).map(p => p.value).join(''); }
+      formatRange(a, b) { return this.format(a) + ' – ' + this.format(b); }
+      resolvedOptions() { return { locale, calendar: 'gregory', numberingSystem: 'latn', timeZone: this._o.timeZone || (this._utc ? 'UTC' : 'UTC'), ...this._o }; }
+      static supportedLocalesOf(l) { return [].concat(l || []).length ? [locale] : []; }
+    }
+    class RelativeTimeFormat {
+      constructor(locales, o = {}) { this._numeric = o.numeric || 'always'; this._style = o.style || 'long'; }
+      format(v, unit) {
+        v = Number(v); unit = String(unit).replace(/s$/, '');
+        if (this._numeric === 'auto') {
+          const words = { day: { '-1': 'yesterday', '0': 'today', '1': 'tomorrow' }, year: { '-1': 'last year', '0': 'this year', '1': 'next year' },
+                          month: { '-1': 'last month', '0': 'this month', '1': 'next month' }, week: { '-1': 'last week', '0': 'this week', '1': 'next week' },
+                          second: { '0': 'now' }, minute: { '0': 'this minute' }, hour: { '0': 'this hour' } };
+          if (words[unit] && words[unit][String(v)] !== undefined) return words[unit][String(v)];
+        }
+        const n = Math.abs(v), label = n === 1 ? unit : unit + 's';
+        const shown = new NumberFormat().format(n) + ' ' + (this._style === 'long' ? label : { second: 'sec.', minute: 'min.', hour: 'hr.', day: n === 1 ? 'day' : 'days', week: 'wk.', month: 'mo.', year: 'yr.', quarter: 'qtr.' }[unit] || label);
+        return v < 0 || Object.is(v, -0) ? shown + ' ago' : 'in ' + shown;
+      }
+      formatToParts(v, unit) { return [{ type: 'literal', value: this.format(v, unit) }]; }
+      resolvedOptions() { return { locale, style: this._style, numeric: this._numeric, numberingSystem: 'latn' }; }
+    }
+    class PluralRules {
+      constructor(locales, o = {}) { this._type = o.type || 'cardinal'; }
+      select(n) {
+        n = Number(n);
+        if (this._type === 'ordinal') { const t = n % 10, h = n % 100; return t === 1 && h !== 11 ? 'one' : t === 2 && h !== 12 ? 'two' : t === 3 && h !== 13 ? 'few' : 'other'; }
+        return n === 1 ? 'one' : 'other';
+      }
+      resolvedOptions() { return { locale, type: this._type, pluralCategories: this._type === 'ordinal' ? ['few', 'one', 'two', 'other'] : ['one', 'other'] }; }
+    }
+    class ListFormat {
+      constructor(locales, o = {}) { this._type = o.type || 'conjunction'; this._style = o.style || 'long'; }
+      format(list) {
+        const a = Array.from(list, String), word = this._type === 'disjunction' ? 'or' : 'and';
+        if (this._type === 'unit') return a.join(this._style === 'narrow' ? ' ' : ', ');
+        if (a.length < 3) return a.join(' ' + word + ' ');
+        return a.slice(0, -1).join(', ') + ', ' + word + ' ' + a[a.length - 1];
+      }
+      formatToParts(list) { return [{ type: 'literal', value: this.format(list) }]; }
+    }
+    class Collator {
+      constructor(locales, o = {}) { this._sens = o.sensitivity || 'variant'; this._numeric = !!o.numeric; }
+      compare(a, b) {
+        a = String(a); b = String(b);
+        if (this._sens === 'base' || this._sens === 'accent') { a = a.toLowerCase(); b = b.toLowerCase(); }
+        if (this._numeric) {
+          const re = /(\d+|\D+)/g, x = a.match(re) || [], y = b.match(re) || [];
+          for (let i = 0; i < Math.min(x.length, y.length); i++) {
+            if (x[i] === y[i]) continue;
+            const nx = Number(x[i]), ny = Number(y[i]);
+            if (!Number.isNaN(nx) && !Number.isNaN(ny)) return nx < ny ? -1 : 1;
+            return x[i].toLowerCase() < y[i].toLowerCase() ? -1 : x[i].toLowerCase() > y[i].toLowerCase() ? 1 : x[i] < y[i] ? 1 : -1;
+          }
+          return x.length - y.length;
+        }
+        const la = a.toLowerCase(), lb = b.toLowerCase();
+        if (la !== lb) return la < lb ? -1 : 1;
+        return a === b ? 0 : a < b ? 1 : -1;   // lower case first, as ICU's root collation
+      }
+      resolvedOptions() { return { locale, usage: 'sort', sensitivity: this._sens, numeric: this._numeric }; }
+    }
+    class Segmenter {
+      constructor(locales, o = {}) { this._g = o.granularity || 'grapheme'; }
+      segment(text) {
+        text = String(text);
+        const out = [];
+        if (this._g === 'word') { const re = /[\p{L}\p{N}_']+|[^\p{L}\p{N}_']+/gu; let m; while ((m = re.exec(text))) out.push({ segment: m[0], index: m.index, input: text, isWordLike: /[\p{L}\p{N}]/u.test(m[0]) }); }
+        else if (this._g === 'sentence') { const re = /[^.!?]+[.!?]*\s*/g; let m; while ((m = re.exec(text))) out.push({ segment: m[0], index: m.index, input: text }); }
+        else { let i = 0; for (const ch of text) { out.push({ segment: ch, index: i, input: text }); i += ch.length; } }
+        out.containing = idx => out.find(s => idx >= s.index && idx < s.index + s.segment.length);
+        return out;
+      }
+    }
+    class DisplayNames {
+      constructor(locales, o = {}) { this._type = o.type; }
+      of(code) {
+        const names = { language: { en: 'English', ko: 'Korean', ja: 'Japanese', zh: 'Chinese', de: 'German', fr: 'French', es: 'Spanish' },
+                        region: { US: 'United States', KR: 'South Korea', JP: 'Japan', GB: 'United Kingdom', DE: 'Germany', FR: 'France' },
+                        currency: { USD: 'US Dollar', EUR: 'Euro', KRW: 'South Korean Won', JPY: 'Japanese Yen' } };
+        return (names[this._type] || {})[code] || code;
+      }
+    }
+    // compare and format are getters giving bound functions: they work as callbacks.
+    for (const [C, name] of [[Collator, 'compare'], [NumberFormat, 'format'], [DateTimeFormat, 'format']]) {
+      const plain = C.prototype[name];
+      const cache = Symbol(name);
+      Object.defineProperty(C.prototype, name, { configurable: true, get() { return this[cache] || (this[cache] = plain.bind(this)); } });
+    }
+    Object.assign(Intl, { NumberFormat, DateTimeFormat, RelativeTimeFormat, PluralRules, ListFormat, Collator, Segmenter, DisplayNames,
+      getCanonicalLocales: l => [].concat(l || []).map(String), supportedValuesOf: () => [] });
+    Object.defineProperty(Intl, Symbol.toStringTag, { value: 'Intl', configurable: true });
+    // The library's locale-sensitive methods, through the same formats.
+    Number.prototype.toLocaleString = function (l, o) { return new NumberFormat(l, o).format(this.valueOf()); };
+    Date.prototype.toLocaleDateString = function (l, o = {}) { return new DateTimeFormat(l, Object.keys(o).length ? o : { year: 'numeric', month: 'numeric', day: 'numeric' }).format(this); };
+    Date.prototype.toLocaleTimeString = function (l, o = {}) { return new DateTimeFormat(l, Object.keys(o).length ? o : { hour: 'numeric', minute: '2-digit', second: '2-digit' }).format(this); };
+    Date.prototype.toLocaleString = function (l, o = {}) { return new DateTimeFormat(l, Object.keys(o).length ? o : { year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: '2-digit', second: '2-digit' }).format(this); };
+    String.prototype.localeCompare = function (that, l, o) { return new Collator(l, o).compare(String(this), that); };
+  }
+
   // A link's address in parts, as HTMLAnchorElement and HTMLAreaElement have them.
   for (const name of ['HTMLAnchorElement', 'HTMLAreaElement']) {
     const proto = global[name] && global[name].prototype;
@@ -819,7 +1026,7 @@ const char* const kScriptPrelude = R"JS(
                                ['structuredClone', structuredClone], ['requestIdleCallback', requestIdleCallback],
                                ['cancelIdleCallback', cancelIdleCallback], ['IntersectionObserver', IntersectionObserver],
                                ['ResizeObserver', ResizeObserver], ['DOMException', DOMException],
-                               ['PerformanceObserver', PerformanceObserver]])
+                               ['PerformanceObserver', PerformanceObserver], ['Intl', Intl]])
     Object.defineProperty(global, name, { value, writable: true, configurable: true, enumerable: false });
   for (const [name, value] of [['URL', URL], ['URLSearchParams', URLSearchParams], ['AbortController', AbortController],
                                ['AbortSignal', AbortSignal], ['NodeFilter', NodeFilter], ['TreeWalker', TreeWalker],

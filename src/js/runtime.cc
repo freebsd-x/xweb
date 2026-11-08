@@ -483,7 +483,7 @@ void Runtime::step() {
 bool Runtime::isCallable(const Value& v) const {
     if (!v.isObject()) return false;
     const Object* o = v.asObject();
-    return o->cls == ObjectClass::Function;
+    return o->cls == ObjectClass::Function || (o->cls == ObjectClass::Proxy && (o->iter_kind & 1));
 }
 
 bool Runtime::isConstructor(const Value& v) const {
@@ -514,6 +514,7 @@ bool stringIndex(const Value& prim, const PropertyKey& key, Value& out) {
 
 Value Runtime::get(Object* o, const PropertyKey& key, const Value& receiver) {
     for (Object* cur = o; cur; cur = cur->prototype) {
+        if (cur->cls == ObjectClass::Proxy) return proxyGet(*this, cur, key, receiver);
         if (!key.isSymbol()) {
             if (cur->cls == ObjectClass::TypedArray) {
                 double index;
@@ -557,6 +558,7 @@ Value Runtime::get(const Value& base, const PropertyKey& key) {
 
 bool Runtime::has(Object* o, const PropertyKey& key) {
     for (Object* cur = o; cur; cur = cur->prototype) {
+        if (cur->cls == ObjectClass::Proxy) return proxyHas(*this, cur, key);
         if (!key.isSymbol()) {
             if (cur->cls == ObjectClass::TypedArray) {
                 double index;
@@ -576,6 +578,7 @@ bool Runtime::has(Object* o, const PropertyKey& key) {
 }
 
 bool Runtime::set(Object* o, const PropertyKey& key, const Value& v, const Value& receiver) {
+    if (o->cls == ObjectClass::Proxy) return proxySet(*this, o, key, v, receiver);
     // A typed array's elements: never up the chain, never a new property.
     if (!key.isSymbol() && o->cls == ObjectClass::TypedArray) {
         double index;
@@ -592,11 +595,32 @@ bool Runtime::set(Object* o, const PropertyKey& key, const Value& v, const Value
         if (key.name == u"length") {
             const double n = toNumber(v);
             if (n < 0 || n != std::floor(n) || n > 4294967295.0) throwError("RangeError", "invalid array length");
+            if (o->length_readonly) return n == static_cast<double>(o->elements.size());
             if (n > 100'000'000) throwError("RangeError", "array too long");
-            o->elements.resize(static_cast<size_t>(n), Value::empty());
-            return true;
+            // Elements kept as properties (special flags) go too, down to one that can't.
+            size_t to = static_cast<size_t>(n);
+            bool stopped = false;
+            if (to < o->elements.size()) {
+                std::vector<std::pair<int64_t, PropertyKey>> above;
+                for (const PropertyKey& k : o->ownKeys())
+                    if (!k.isSymbol())
+                        if (const int64_t i = arrayIndex(k.name); i >= 0 && static_cast<size_t>(i) >= to) above.emplace_back(i, k);
+                std::sort(above.begin(), above.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+                for (const auto& [i, k] : above) {
+                    const Property* p = o->own(k);
+                    if (p && !(p->flags & kConfigurable)) {
+                        to = static_cast<size_t>(i) + 1;
+                        stopped = true;
+                        break;
+                    }
+                    o->remove(k);
+                }
+            }
+            o->elements.resize(to, Value::empty());
+            return !stopped;
         }
         const int64_t i = arrayIndex(key.name);
+        if (i >= 0 && o->length_readonly && static_cast<size_t>(i) >= o->elements.size()) return false;
         if (i >= 0 && !o->own(key)) {
             if (!o->extensible && static_cast<size_t>(i) >= o->elements.size()) return false;
             if (static_cast<size_t>(i) >= o->elements.size()) {
@@ -607,8 +631,9 @@ bool Runtime::set(Object* o, const PropertyKey& key, const Value& v, const Value
             return true;
         }
     }
-    // A setter or a read-only property up the chain decides.
+    // A setter or a read-only property up the chain decides (a proxy there, its handler).
     for (Object* cur = o; cur; cur = cur->prototype) {
+        if (cur != o && cur->cls == ObjectClass::Proxy) return proxySet(*this, cur, key, v, receiver);
         if (const Property* p = cur->own(key)) {
             if (p->flags & kAccessor) {
                 if (!p->setter) return false;
@@ -625,6 +650,23 @@ bool Runtime::set(Object* o, const PropertyKey& key, const Value& v, const Value
     }
     if (!receiver.isObject()) return false;
     Object* r = receiver.asObject();
+    if (r != o && r->cls == ObjectClass::Proxy) {
+        // The receiver is a proxy (Reflect.set, or a proxy in a prototype chain): define
+        // the property on it through its handler.
+        Property existing;
+        if (getOwnProperty(r, key, existing)) {
+            if ((existing.flags & kAccessor) || !(existing.flags & kWritable)) return false;
+            Object* d = newObject();
+            put(d, u"value", v, kDefaultFlags);
+            return defineOwnProperty(r, key, Value::object(d), false);
+        }
+        Object* d = newObject();
+        put(d, u"value", v, kDefaultFlags);
+        put(d, u"writable", Value::boolean(true), kDefaultFlags);
+        put(d, u"enumerable", Value::boolean(true), kDefaultFlags);
+        put(d, u"configurable", Value::boolean(true), kDefaultFlags);
+        return defineOwnProperty(r, key, Value::object(d), false);
+    }
     if (Property* own = r->own(key)) {
         if (own->flags & kAccessor || !(own->flags & kWritable)) return false;
         own->value = v;
@@ -654,6 +696,7 @@ void Runtime::set(const Value& base, const PropertyKey& key, const Value& v, boo
 }
 
 bool Runtime::deleteProperty(Object* o, const PropertyKey& key) {
+    if (o->cls == ObjectClass::Proxy) return proxyDelete(*this, o, key);
     if (!key.isSymbol() && o->cls == ObjectClass::TypedArray) {
         double index;
         if (typedKey(key, index)) return !typedValidIndex(o, index);
@@ -950,6 +993,7 @@ Value Runtime::call(const Value& fnv, const Value& this_value, std::span<const V
         all.insert(all.end(), args.begin(), args.end());
         return call(Value::object(f->bound_target), f->bound_this, all);
     }
+    if (f->cls == ObjectClass::Proxy) return proxyCall(*this, f, this_value, args);
     if (f->native) return f->native(*this, this_value, args);
     if (f->code) {
         if (f->class_constructor) throwError("TypeError", "a class constructor must be called with new");
@@ -972,6 +1016,7 @@ Value Runtime::construct(const Value& fnv, std::span<const Value> args, Object* 
         all.insert(all.end(), args.begin(), args.end());
         return construct(Value::object(f->bound_target), all, new_target == f ? f->bound_target : new_target);
     }
+    if (f->cls == ObjectClass::Proxy) return proxyConstruct(*this, f, args, new_target);
     if (f->native) {
         // A built-in constructor knows it's constructing by construct_target.
         construct_target = new_target;
@@ -1436,10 +1481,10 @@ void Interpreter::bindPattern(Node* p, const Value& value, Env* env, bool strict
                 if (k->kind == N::Rest) {
                     Object* rest = rt_.newObject();
                     Object* src = rt_.toObject(value);
-                    for (const PropertyKey& key : src->ownKeys()) {
+                    for (const PropertyKey& key : rt_.ownPropertyKeys(src)) {
                         if (std::find(used.begin(), used.end(), key) != used.end()) continue;
-                        const Property* prop = src->own(key);
-                        if (prop && !(prop->flags & kEnumerable)) continue;
+                        Property prop;
+                        if (!rt_.getOwnProperty(src, key, prop) || !(prop.flags & kEnumerable)) continue;
                         rt_.put(rest, key, rt_.get(src, key, value), kDefaultFlags);
                     }
                     bindPattern(k->a, Value::object(rest), env, strict, kind);
@@ -1534,8 +1579,10 @@ void Interpreter::assignPattern(Node* p, const Value& value, Env* env, bool stri
                 if (k->kind == N::Rest) {
                     Object* rest = rt_.newObject();
                     Object* src = rt_.toObject(value);
-                    for (const PropertyKey& key : src->ownKeys()) {
+                    for (const PropertyKey& key : rt_.ownPropertyKeys(src)) {
                         if (std::find(used.begin(), used.end(), key) != used.end()) continue;
+                        Property prop;
+                        if (!rt_.getOwnProperty(src, key, prop) || !(prop.flags & kEnumerable)) continue;
                         rt_.put(rest, key, rt_.get(src, key, value), kDefaultFlags);
                     }
                     assignPattern(k->a, Value::object(rest), env, strict);
@@ -1989,12 +2036,12 @@ Completion Interpreter::forInOf(Node* n, Env* env, bool strict, const std::u16st
         // Enumerable string keys, own then inherited, each name once.
         Object* o = rt_.toObject(subject);
         std::vector<PropertyKey> seen;
-        for (Object* cur = o; cur; cur = cur->prototype) {
-            for (const PropertyKey& k : cur->ownKeys()) {
+        for (Object* cur = o; cur; cur = rt_.getPrototypeOf(cur)) {
+            for (const PropertyKey& k : rt_.ownPropertyKeys(cur)) {
                 if (k.isSymbol() || std::find(seen.begin(), seen.end(), k) != seen.end()) continue;
                 seen.push_back(k);
-                const Property* p = cur->own(k);
-                if (p && !(p->flags & kEnumerable)) continue;
+                Property p;
+                if (!rt_.getOwnProperty(cur, k, p) || !(p.flags & kEnumerable)) continue;
                 items.push_back(Value::string(k.name));
             }
         }
@@ -2364,7 +2411,7 @@ Value Interpreter::binaryOp(Op op, const Value& l, const Value& r) {
             if (!l.isObject()) return Value::boolean(false);
             const Value proto = rt_.get(Value::object(f), u"prototype");
             if (!proto.isObject()) rt_.throwError("TypeError", "the function's prototype isn't an object");
-            for (Object* o = l.asObject()->prototype; o; o = o->prototype)
+            for (Object* o = rt_.getPrototypeOf(l.asObject()); o; o = rt_.getPrototypeOf(o))
                 if (o == proto.asObject()) return Value::boolean(true);
             return Value::boolean(false);
         }
@@ -2433,9 +2480,9 @@ Value Interpreter::evalObject(Node* n, Env* env, bool strict) {
             const Value src = eval(p->b, env, strict);
             if (src.isNullish()) continue;
             Object* so = rt_.toObject(src);
-            for (const PropertyKey& k : so->ownKeys()) {
-                const Property* prop = so->own(k);
-                if (prop && !(prop->flags & kEnumerable)) continue;
+            for (const PropertyKey& k : rt_.ownPropertyKeys(so)) {
+                Property prop;
+                if (!rt_.getOwnProperty(so, k, prop) || !(prop.flags & kEnumerable)) continue;
                 o->define(k, {rt_.get(so, k, src)});
             }
             continue;

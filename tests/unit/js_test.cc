@@ -578,3 +578,27 @@ TEST(Js, EvalAndFunction) {
     EXPECT_EQ(run("const G = Object.getPrototypeOf(function* () {}).constructor; new G('yield 7')().next().value"), "7");
     EXPECT_EQ(run("var n = 0; for (let i = 0; i < 1000; i++) eval('n += ' + (i % 3)); n"), "999");
 }
+
+TEST(Js, ProxyAndReflect) {
+    EXPECT_EQ(run("const log = []; const p = new Proxy({a: 1}, {get(t, k, r) { log.push(String(k)); return k in t ? Reflect.get(t, k, r) : 'dflt'; },"
+                  "set(t, k, v, r) { return Reflect.set(t, k, v * 2, r); }, has(t, k) { return k !== 'h' && k in t; }});"
+                  "p.x = 5; [p.a, p.zz, p.x, 'a' in p, 'h' in p, log.join('')].join()"), "1,dflt,10,true,false,azzx");
+    EXPECT_EQ(run("const p = new Proxy({}, {ownKeys() { return ['b', 'a']; }, getOwnPropertyDescriptor(t, k) { return {value: k, enumerable: true, configurable: true}; }});"
+                  "Object.keys(p).join() + JSON.stringify({...p})"), "b,a{}");   // no get trap: the target has neither
+    EXPECT_EQ(run("const f = new Proxy(function (a, b) { return a + b; }, {apply(t, th, args) { return t(...args) * 10; }, construct(t, args) { return {m: args[0]}; }});"
+                  "[f(1, 2), new f(7).m, typeof f, Array.isArray(new Proxy([], {}))].join()"), "30,7,function,true");
+    EXPECT_EQ(run("const {proxy, revoke} = Proxy.revocable({}, {}); revoke(); try { proxy.x } catch (e) { e.name }"), "TypeError");
+    EXPECT_EQ(run("try { new Proxy(Object.freeze({k: 1}), {get() { return 2; }}).k } catch (e) { e.name }"), "TypeError");
+    EXPECT_EQ(run("const o = Object.create(new Proxy({}, {get(t, k) { return k === 'q' ? 'via proto' : undefined; }})); o.q"), "via proto");
+    EXPECT_EQ(run("class B { hi() { return 'hi ' + this.n; } } const i = new Proxy(new B(), {get(t, k, r) { return k === 'n' ? 'px' : Reflect.get(t, k, r); }});"
+                  "i.hi() + (i instanceof B)"), "hi pxtrue");
+    EXPECT_EQ(run("[Reflect.ownKeys({b: 1, 1: 2, [Symbol.iterator]: 0}).length, Reflect.defineProperty(Object.freeze({}), 'z', {value: 1}),"
+                  "Reflect.getPrototypeOf([]) === Array.prototype, Reflect.construct(Date, [0]).getTime(), Reflect.apply(Math.max, null, [1, 3])].join()"),
+              "3,false,true,0,3");
+    EXPECT_EQ(run("const a = [0, 1]; Object.defineProperty(a, '1', {value: 1, configurable: false}); let threw = false; 'use strict';"
+                  "try { Object.defineProperty(a, 'length', {value: 0}); } catch (e) { threw = true; } [threw, a.length].join()"), "true,2");
+    EXPECT_EQ(run("const a = []; Object.defineProperty(a, '0', {value: 7}); const d = Object.getOwnPropertyDescriptor(a, '0'); [d.writable, d.enumerable, d.configurable, a[0]].join()"),
+              "false,false,false,7");
+    EXPECT_EQ(run("JSON.stringify(Object.groupBy([1, 2, 3, 4], x => x % 2 ? 'odd' : 'even')) + Map.groupBy([1, 2], x => x > 1).get(true)"),
+              "{\"odd\":[1,3],\"even\":[2,4]}2");
+}

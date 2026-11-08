@@ -57,6 +57,28 @@ Value awaitValue(Runtime& rt, const Value& v);
 Value startCoroutineFunction(Runtime& rt, Object* f, Env* env);
 Value rejectedPromise(Runtime& rt, const Value& reason);
 
+// A proxy's internal methods (proxy.cc).
+Object* proxyGetPrototypeOf(Runtime& rt, Object* p);
+bool proxySetPrototypeOf(Runtime& rt, Object* p, Object* proto);
+bool proxyIsExtensible(Runtime& rt, Object* p);
+bool proxyPreventExtensions(Runtime& rt, Object* p);
+bool proxyGetOwnProperty(Runtime& rt, Object* p, const PropertyKey& key, Property& out);
+bool proxyDefineOwnProperty(Runtime& rt, Object* p, const PropertyKey& key, const Value& desc);
+bool proxyHas(Runtime& rt, Object* p, const PropertyKey& key);
+Value proxyGet(Runtime& rt, Object* p, const PropertyKey& key, const Value& receiver);
+bool proxySet(Runtime& rt, Object* p, const PropertyKey& key, const Value& v, const Value& receiver);
+bool proxyDelete(Runtime& rt, Object* p, const PropertyKey& key);
+std::vector<PropertyKey> proxyOwnKeys(Runtime& rt, Object* p);
+Value proxyCall(Runtime& rt, Object* p, const Value& this_value, std::span<const Value> args);
+Value proxyConstruct(Runtime& rt, Object* p, std::span<const Value> args, Object* new_target);
+
+// Property descriptors (builtins.cc): an object read as one; a fresh object with only what
+// a descriptor object said (ToPropertyDescriptor then FromPropertyDescriptor); a property
+// as a descriptor object.
+Property descriptorToProperty(Runtime& rt, const Value& desc);
+Value normalizeDescriptor(Runtime& rt, const Value& desc);
+Value propertyToDescriptor(Runtime& rt, const Property& p);
+
 // Typed arrays' integer-indexed elements (typedarray.cc). A key that's a canonical
 // numeric string is the typed array's business, valid index or not.
 bool typedKey(const PropertyKey& key, double& index);
