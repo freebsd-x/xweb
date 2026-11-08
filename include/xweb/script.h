@@ -36,6 +36,9 @@ public:
         std::function<void(const Node*)> focus;
         std::function<void(float x, float y)> scroll_to;
         std::function<float()> scroll_y;
+        // A script the page wants that wasn't fetched ahead (import(), a module's
+        // import): fetched now, its text (or nothing) handed back later on this thread.
+        std::function<void(const std::string& url, std::function<void(std::optional<std::string>)> done)> fetch_script;
     };
 
     PageScript(Document& doc, Host host);

@@ -15,10 +15,15 @@ struct Binding {
     Value value;
     bool is_mutable = true;
     bool initialized = true;
+    bool function_name = false;   // a named function expression's own name: sloppy writes are ignored
+    // A module's import: a live view of `import_name` in another module's scope.
+    Env* import_env = nullptr;
+    std::u16string import_name;
 };
 
 struct Env : Cell {
     explicit Env(Env* o) : outer(o) {}
+    [[nodiscard]] size_t cellSize() const noexcept override { return sizeof(Env); }
     Env* outer;
     std::unordered_map<std::u16string, Binding> vars;
     // A function's own: what `this`, `super` and `new.target` mean inside it.
@@ -39,5 +44,29 @@ struct FunctionData {
     std::shared_ptr<Program> program;   // keeps the tree alive
     Object* class_fields_home = nullptr;
 };
+
+// Runs a script function's body in the environment a call prepared (runtime.cc): for a
+// generator's or async function's coroutine.
+Value runFunctionBody(Runtime& rt, Object* f, Env* env);
+
+// yield, yield* and await, from the interpreter (async.cc).
+Value generatorYield(Runtime& rt, const Value& v);
+Value generatorDelegate(Runtime& rt, const Value& iterable);
+Value awaitValue(Runtime& rt, const Value& v);
+// A generator or async function's call, once its environment is ready (async.cc).
+Value startCoroutineFunction(Runtime& rt, Object* f, Env* env);
+Value rejectedPromise(Runtime& rt, const Value& reason);
+
+// A module's scope set up, and its statements run (runtime.cc).
+void instantiateModuleScope(Runtime& rt, const std::shared_ptr<Program>& prog, Env* env);
+void runModuleStatements(Runtime& rt, const std::shared_ptr<Program>& prog, Env* env);
+
+// A module's body, run in its coroutine (modules.cc).
+void runModuleBody(Runtime& rt, Coroutine& co);
+void markModule(void* record, std::vector<Cell*>& todo);
+// import.meta for the module at this URL (modules.cc).
+Object* importMeta(Runtime& rt, const std::string& url);
+// import(), from the interpreter: a promise for the namespace (modules.cc).
+Value dynamicImport(Runtime& rt, const Value& specifier, const std::string& referrer);
 
 }  // namespace fbx::xweb::js

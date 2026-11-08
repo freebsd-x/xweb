@@ -1,11 +1,13 @@
 #pragma once
 
 // Our JavaScript engine, written by hand like the rest of xweb: a lexer and parser for
-// the ES2020 language, and an interpreter that walks the tree it makes, with the
-// standard library's core and regular expressions. Not yet: generators, async
-// functions, Date and Promise.
+// the ES2022 language, and an interpreter that walks the tree it makes, with the
+// standard library's core, regular expressions, Promise, generators and async
+// functions (on coroutines of their own), modules and weak collections. Not yet: Date,
+// Proxy, typed arrays, eval.
 
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <span>
@@ -21,6 +23,7 @@ class Object;
 class Symbol;
 class Runtime;
 struct Env;
+struct Coroutine;
 namespace regex { struct Program; }
 
 using JSString = std::shared_ptr<const std::u16string>;
@@ -102,12 +105,15 @@ struct Property {
 class Cell {
 public:
     virtual ~Cell() = default;
+    // Its size, for the collector's scan of suspended coroutines' stacks.
+    [[nodiscard]] virtual size_t cellSize() const noexcept { return sizeof(Cell); }
     bool marked = false;
 };
 
 class Symbol : public Cell {
 public:
     explicit Symbol(std::u16string d, bool has) : description(std::move(d)), has_description(has) {}
+    [[nodiscard]] size_t cellSize() const noexcept override { return sizeof(Symbol); }
     std::u16string description;
     bool has_description;
 };
@@ -116,6 +122,15 @@ using NativeFunction = std::function<Value(Runtime&, const Value& this_value, st
 
 enum class ObjectClass : uint8_t {
     Ordinary, Array, Function, Error, Boolean, Number, String, Symbol, Arguments, Map, Set, Iterator, RegExp,
+    Promise, Generator, AsyncGenerator, Internal, WeakMap, WeakSet, WeakRef,
+};
+
+// Map and Set keys: SameValueZero, hashed (strings by content, objects by identity).
+struct ValueHash {
+    size_t operator()(const Value& v) const noexcept;
+};
+struct ValueSameZero {
+    bool operator()(const Value& a, const Value& b) const noexcept;
 };
 
 struct FunctionData;   // a script function's code and closure (runtime.cc)
@@ -124,6 +139,7 @@ class Object : public Cell {
 public:
     explicit Object(Object* proto, ObjectClass cls = ObjectClass::Ordinary) : prototype(proto), cls(cls) {}
     ~Object() override;
+    [[nodiscard]] size_t cellSize() const noexcept override { return sizeof(Object); }
 
     Object* prototype;
     ObjectClass cls;
@@ -151,12 +167,20 @@ public:
 
     // Boolean, Number, String and Symbol wrappers' value; an iterator's state.
     Value primitive;
-    std::vector<std::pair<Value, Value>> entries;   // Map and Set, in insertion order
+    std::vector<std::pair<Value, Value>> entries;   // Map and Set, in insertion order (deleted ones empty)
+    std::unordered_map<Value, size_t, ValueHash, ValueSameZero> index;   // a key's place in entries
     size_t cursor = 0;
     Object* target = nullptr;   // an iterator's subject
     uint8_t iter_kind = 0;
     // A RegExp's compiled pattern; its source is `primitive`.
     std::shared_ptr<const regex::Program> regexp;
+    // Internal slots: a built-in closure's captured values, a promise's reactions.
+    std::vector<Value> slots;
+    // A promise's state (pending, fulfilled, rejected); its result is `primitive`.
+    uint8_t promise_state = 0;
+    bool promise_handled = false;
+    // A generator's or async function's suspended body.
+    std::shared_ptr<Coroutine> co;
 
     // The embedder's: what a DOM wrapper stands for, and which kind of thing it is.
     void* host = nullptr;
@@ -180,6 +204,40 @@ struct Terminated {
 std::u16string utf16(std::string_view utf8);
 std::string utf8(std::u16string_view utf16);
 
+// A job for the microtask queue: a promise reaction, a thenable to follow, or a callback.
+struct Job {
+    uint8_t kind = 0;
+    Value a, b, c;
+};
+
+// A page's import maps (<script type="importmap">): bare names like "react", and
+// URL prefixes, mapped to where they really are; scoped by the importing module's URL.
+class ImportMap {
+public:
+    // Adds a map's JSON, its relative addresses read against `base`. False if it isn't a map.
+    bool add(std::string_view json, const std::string& base);
+    // A specifier resolved for a module at `referrer`: through the map, else as a URL
+    // ("./a.js", "/a.js", "https://…"). Empty if it can't be (a bare name nobody mapped).
+    [[nodiscard]] std::string resolve(const std::string& specifier, const std::string& referrer) const;
+    [[nodiscard]] bool empty() const noexcept { return imports_.empty() && scopes_.empty(); }
+
+private:
+    using Entries = std::vector<std::pair<std::string, std::string>>;   // longest key first
+    Entries imports_;
+    std::vector<std::pair<std::string, Entries>> scopes_;              // longest prefix first
+};
+
+// The specifiers a module's import and export-from declarations name, in order, or
+// nothing if it doesn't parse as a module. For loaders that fetch a graph ahead.
+std::vector<std::string> moduleRequests(std::string_view source);
+
+// What a module loader gives the runtime: the source at a URL, or an error.
+struct ModuleSource {
+    bool ok = false;
+    std::string source;
+    std::string error;
+};
+
 class Runtime {
 public:
     Runtime();
@@ -195,8 +253,48 @@ public:
     // Runs a script in the global scope.
     Result evaluate(std::string_view source, std::string_view name = "script");
 
+    // Modules. The loader fetches a module's source by its absolute URL and calls
+    // `done` with it, now or later (from the embedder's event loop). Without one,
+    // imports fail.
+    using ModuleLoader = std::function<void(const std::string& url, std::function<void(ModuleSource)> done)>;
+    void setModuleLoader(ModuleLoader loader) { module_loader_ = std::move(loader); }
+    // Runs a module (and what it imports) whose own URL is `url`. It finishes when its
+    // imports have loaded and any top-level await is done; `done` hears how it went.
+    void evaluateModule(std::string_view source, const std::string& url, std::function<void(Result)> done = {});
+    // How a specifier resolves against a referrer's URL ("./a.js", "/x.js", "https://...").
+    static std::string resolveSpecifier(const std::string& specifier, const std::string& referrer);
+    // What a classic script's import() resolves against when its own name isn't a URL.
+    std::string base_url;
+    // The page's import maps; every module specifier goes through them.
+    ImportMap import_map;
+    // The engine's own (modules.cc).
+    struct Modules;
+    struct ModulesDeleter { void operator()(Modules* m) const; };
+    Modules& modulesForLoader();
+    [[nodiscard]] const ModuleLoader& moduleLoader() const noexcept { return module_loader_; }
+    [[nodiscard]] Env* globalEnv() const noexcept { return global_env_; }
+
+    // Promises and the microtask queue.
+    Object* newPromise();
+    // As the promise's resolve function would: a thenable is followed, anything else fulfils.
+    void resolvePromise(Object* promise, const Value& resolution);
+    void rejectPromise(Object* promise, const Value& reason);
+    void enqueueJob(Job job) { jobs_.push_back(std::move(job)); }
+    void enqueueMicrotask(const Value& fn) { jobs_.push_back(Job{2, fn, {}, {}}); }
+    // Runs queued jobs until there are none; an uncaught error in one is reported to the
+    // console and the rest still run. Rejections nobody handled are reported after.
+    void runJobs();
+    [[nodiscard]] bool hasPendingJobs() const noexcept { return !jobs_.empty(); }
+
     // console.log and friends: level is "log", "warn", "error" and so on.
     void setConsole(std::function<void(std::string_view level, const std::string& text)> sink) { console_ = std::move(sink); }
+    // Where errors nothing caught go when no script is on the stack to throw to: a
+    // failing microtask, a promise rejected with no handler. The console by default.
+    void setErrorReporter(std::function<void(const std::string& message)> sink) { error_reporter_ = std::move(sink); }
+    void reportError(const std::string& message) {
+        if (error_reporter_) error_reporter_(message);
+        else emitConsole("error", message);
+    }
     // How much work one evaluate() may do before it's stopped.
     void setStepBudget(uint64_t steps) { step_budget_ = steps; }
     // A new task (an event, a timer) starts with the whole budget again.
@@ -272,6 +370,16 @@ public:
     Object* regexp_string_iterator_prototype = nullptr;
     Object* regexp_exec = nullptr;   // RegExp.prototype.exec, for the fast path
     Object* regexp_constructor = nullptr;
+    Object* promise_prototype = nullptr;
+    Object* promise_constructor = nullptr;
+    Object* promise_then = nullptr;   // Promise.prototype.then, as installed
+    Object* generator_prototype = nullptr;              // %GeneratorPrototype%
+    Object* async_generator_prototype = nullptr;        // %AsyncGeneratorPrototype%
+    Object* async_iterator_prototype = nullptr;
+    Object* generator_function_prototype = nullptr;
+    Object* async_function_prototype = nullptr;
+    Object* async_generator_function_prototype = nullptr;
+    Object* async_from_sync_iterator_prototype = nullptr;
     std::unordered_map<std::string, Object*> error_prototypes;
     Symbol* sym_iterator = nullptr;
     Symbol* sym_to_primitive = nullptr;
@@ -283,6 +391,7 @@ public:
     Symbol* sym_search = nullptr;
     Symbol* sym_split = nullptr;
     Symbol* sym_species = nullptr;
+    Symbol* sym_async_iterator = nullptr;
     std::unordered_map<std::u16string, Symbol*> symbol_registry;
 
     // Heap.
@@ -306,6 +415,12 @@ public:
         if (steps_ > step_budget_) throw Terminated{"the script ran too long"};
     }
     std::vector<Env*> env_stack;
+    // The coroutine running now (a generator's or async function's body), if any.
+    Coroutine* current_co = nullptr;
+    // Heap buffers of values the interpreter is using (TempRoots), for the collector.
+    std::vector<std::vector<Value>*> temp_lists;
+    // Promises rejected with no handler yet, reported after the jobs run.
+    std::vector<Object*> pending_rejections;
     size_t call_depth = 0;
     size_t eval_depth = 0;   // C++ recursion in the interpreter
     std::vector<Value> extra_roots;   // values bindings keep while a script runs
@@ -326,12 +441,19 @@ public:
 private:
     void installBuiltins();
     void installRegExp();
+    void installPromise();
+    void installGenerators();
+    void markModules(std::vector<Cell*>& todo);
+    std::deque<Job> jobs_;
+    ModuleLoader module_loader_;
+    std::unique_ptr<Modules, ModulesDeleter> modules_;
     std::vector<Cell*> cells_;
     size_t allocations_ = 0;
     std::vector<std::shared_ptr<struct Program>> programs_;   // every script's tree, kept for its functions
     Object* global_ = nullptr;
     Env* global_env_ = nullptr;
     std::function<void(std::string_view, const std::string&)> console_;
+    std::function<void(const std::string&)> error_reporter_;
     uint64_t step_budget_ = 200'000'000;
     uint64_t steps_ = 0;
     friend class Interpreter;

@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <map>
 #include <random>
 #include <string>
 
@@ -157,7 +158,7 @@ TEST(Js, Limits) {
     EXPECT_EQ(run("for (;;) { try { } catch (e) { } }"), "throws: Stopped: the script ran too long");
     std::string deep(5000, '(');
     deep += "1" + std::string(5000, ')');
-    EXPECT_EQ(run(deep), "throws: SyntaxError: too deeply nested (line 1)");
+    EXPECT_EQ(run(deep), "throws: SyntaxError: too deeply nested (line 1, column 80)");
     EXPECT_EQ(run("let s = 'x'; while (true) s += s"), "throws: RangeError: string too long");
     EXPECT_EQ(run("new Array(1e9)"), "throws: RangeError: array too long");
     EXPECT_EQ(run("const a = []; a.length = 4294967296"), "throws: RangeError: invalid array length");
@@ -308,4 +309,229 @@ TEST(Js, RegExpFuzz) {
     EXPECT_EQ(run("try { new RegExp('(?:(?:a|b){1000}){1000}') } catch (e) { e.message }"),
               "Invalid regular expression: /(?:(?:a|b){1000}){1000}/: regular expression too large");
     EXPECT_EQ(run("new RegExp('(?:'.repeat(400) + 'x' + ')'.repeat(400)).test('x')"), "true");
+}
+
+namespace {
+
+// Runs a script, then its promise jobs; what it logged, one line each.
+std::string runAsync(const std::string& src) {
+    Runtime rt;
+    rt.setStepBudget(5'000'000);
+    std::string out;
+    rt.setConsole([&](std::string_view, const std::string& text) { out += text + "\n"; });
+    rt.setErrorReporter([&](const std::string& message) { out += "! " + message + "\n"; });
+    const Runtime::Result r = rt.evaluate(src);
+    if (!r.ok) out += "throws: " + r.error + "\n";
+    rt.runJobs();
+    return out;
+}
+
+}  // namespace
+
+TEST(Js, Generators) {
+    EXPECT_EQ(run("function* g() { const x = yield 1; yield x * 2; return 'end'; } const it = g();"
+                  "[it.next().value, it.next(5).value, it.next().value, it.next().done].join()"), "1,10,end,true");
+    EXPECT_EQ(run("function* nat() { let i = 0; while (true) yield i++; } const out = []; for (const n of nat()) { if (n > 3) break; out.push(n); } out.join()"), "0,1,2,3");
+    EXPECT_EQ(run("let fin = 0; function* g() { try { yield 1; yield 2; } finally { fin++; } } for (const v of g()) break; fin"), "1");
+    EXPECT_EQ(run("function* g() { try { yield 1; } catch (e) { yield 'caught ' + e; } } const it = g(); it.next(); it.throw('x').value"), "caught x");
+    EXPECT_EQ(run("function* g() { try { yield 1; } finally { yield 'cleanup'; } } const it = g(); it.next(); [it.return(7).value, it.next().value].join()"), "cleanup,7");
+    EXPECT_EQ(run("function* inner() { const r = yield 'a'; return r + '!'; } function* outer() { const v = yield* inner(); yield v; }"
+                  "const it = outer(); [it.next().value, it.next('b').value].join()"), "a,b!");
+    EXPECT_EQ(run("const [a, , b, ...rest] = (function* () { yield 1; yield 2; yield 3; yield 4; yield 5; })(); [a, b, rest].join()"), "1,3,4,5");
+    EXPECT_EQ(run("function* g() { yield 1; } const it = g(); Object.prototype.toString.call(it) + ' ' + (it[Symbol.iterator]() === it)"), "[object Generator] true");
+    EXPECT_EQ(run("function* g() { yield g2.next(); } const g2 = g(); g2.next()"), "throws: TypeError: the generator is already running");
+    EXPECT_EQ(run("class C { *[Symbol.iterator]() { yield 'x'; yield 'y'; } } [...new C()].join('')"), "xy");
+}
+
+TEST(Js, AsyncFunctionsAndPromises) {
+    EXPECT_EQ(runAsync("async function f(x) { console.log('start'); const y = await x; console.log('got ' + y); return y * 2; }"
+                       "f(Promise.resolve(21)).then(v => console.log('result ' + v)); console.log('sync end');"),
+              "start\nsync end\ngot 21\nresult 42\n");
+    // The order of jobs, as the specification has it.
+    EXPECT_EQ(runAsync("const o = []; Promise.resolve().then(() => o.push(1)).then(() => o.push(3)); Promise.resolve().then(() => o.push(2));"
+                       "(async () => { o.push('a'); await null; o.push('b'); })();"
+                       "Promise.resolve().then(() => Promise.resolve().then(() => console.log(o.join(''))));"),
+              "a12b3\n");
+    EXPECT_EQ(runAsync("(async () => { try { await Promise.reject(new TypeError('boom')); } catch (e) { console.log('caught ' + e.message); } finally { console.log('finally'); } })()"),
+              "caught boom\nfinally\n");
+    EXPECT_EQ(runAsync("Promise.all([1, Promise.resolve(2), new Promise(r => r(3))]).then(v => console.log(v.join()));"
+                       "Promise.allSettled([Promise.reject(1), 2]).then(v => console.log(v.map(e => e.status).join()));"
+                       "Promise.any([Promise.reject(1), Promise.reject(2)]).catch(e => console.log(e.name + ' ' + e.errors.join()));"
+                       "Promise.race([new Promise(() => {}), Promise.resolve('fast')]).then(v => console.log(v));"),
+              "1,2,3\nrejected,fulfilled\nAggregateError 1,2\nfast\n");   // race settles a tick later, as the spec has it
+    EXPECT_EQ(runAsync("const {promise, resolve} = Promise.withResolvers(); promise.then(v => console.log(v)); resolve('later');"
+                       "Promise.resolve(1).finally(() => console.log('fin')).then(v => console.log('kept ' + v));"),
+              "later\nfin\nkept 1\n");
+    EXPECT_EQ(runAsync("const thenable = { then(r) { r('from thenable'); } }; (async () => console.log(await thenable))();"),
+              "from thenable\n");
+    EXPECT_EQ(runAsync("new Promise((_, reject) => reject(new Error('nobody listens')));"),
+              "! Uncaught (in promise) Error: nobody listens\n");
+    EXPECT_EQ(runAsync("async function* g() { yield 1; await null; yield 2; } (async () => { const o = []; for await (const v of g()) o.push(v);"
+                       "for await (const v of [Promise.resolve('p'), 'q']) o.push(v); console.log(o.join()); })()"),
+              "1,2,p,q\n");
+    EXPECT_EQ(runAsync("class P extends Promise {} const p = P.resolve(1).then(x => x); console.log(p instanceof P, Object.prototype.toString.call(p))"),
+              "true [object Promise]\n");
+    EXPECT_EQ(runAsync("async function r(n) { return n === 0 ? 0 : 1 + await r(n - 1); } r(200).then(v => console.log(v))"), "200\n");
+}
+
+TEST(Js, Modules) {
+    Runtime rt;
+    std::map<std::string, std::string> files = {
+        {"https://m.test/lib/a.js", "export let count = 0; export function inc() { count++; } export default function () { return 'def'; }"},
+        {"https://m.test/lib/b.js", "export { count as total } from './a.js'; export * from './c.js';"},
+        {"https://m.test/lib/c.js", "export const cc = 'C'; await null;"},
+        {"https://m.test/lib/cyc.js", "import { main } from '../main.js'; export const fromCycle = () => typeof main;"},
+        {"https://m.test/dyn.js", "export const x = 42;"},
+    };
+    int fetches = 0;
+    rt.setModuleLoader([&](const std::string& url, std::function<void(ModuleSource)> done) {
+        ++fetches;
+        const auto it = files.find(url);
+        done(it == files.end() ? ModuleSource{false, {}, "not found"} : ModuleSource{true, it->second, {}});
+    });
+    std::string out;
+    rt.setConsole([&](std::string_view, const std::string& text) { out += text + "\n"; });
+    bool finished = false;
+    rt.evaluateModule(R"(
+        import def, { count, inc } from './lib/a.js';
+        import * as ns from './lib/a.js';
+        import { total, cc } from './lib/b.js';
+        import { fromCycle } from './lib/cyc.js';
+        export function main() {}
+        inc();
+        console.log(def(), count, ns.count, total, cc, fromCycle(), typeof this, Object.keys(ns).join());
+        try { count = 9; } catch (e) { console.log(e.name); }
+        const m = await import('./dyn.js');
+        console.log('dynamic', m.x, import.meta.url);
+    )", "https://m.test/main.js", [&](Runtime::Result r) {
+        finished = true;
+        if (!r.ok) out += "failed: " + r.error + "\n";
+    });
+    rt.runJobs();
+    EXPECT_TRUE(finished);
+    EXPECT_EQ(out, "def 1 1 1 C function undefined count,default,inc\nTypeError\ndynamic 42 https://m.test/main.js\n");
+    EXPECT_EQ(fetches, 5);   // each module once, however often it's imported
+
+    std::string error;
+    rt.evaluateModule("import { nope } from './lib/c.js';", "https://m.test/bad.js", [&](Runtime::Result r) { error = r.error; });
+    rt.runJobs();
+    EXPECT_EQ(error, "SyntaxError: https://m.test/lib/c.js doesn't export 'nope' (imported by https://m.test/bad.js)");
+    rt.evaluateModule("import x from 'bare-name';", "https://m.test/bare.js", [&](Runtime::Result r) { error = r.error; });
+    rt.runJobs();
+    EXPECT_NE(error.find("can't resolve the module specifier 'bare-name'"), std::string::npos) << error;
+
+    // An import map names it.
+    ASSERT_TRUE(rt.import_map.add(R"({"imports": {"bare-name": "/lib/c.js", "lib/": "/lib/"}})", "https://m.test/"));
+    EXPECT_EQ(rt.import_map.resolve("bare-name", "https://m.test/x.js"), "https://m.test/lib/c.js");
+    EXPECT_EQ(rt.import_map.resolve("lib/a.js", "https://m.test/x.js"), "https://m.test/lib/a.js");
+    EXPECT_EQ(rt.import_map.resolve("../up.js", "https://m.test/d/x.js"), "https://m.test/up.js");
+    out.clear();
+    rt.evaluateModule("import { cc } from 'bare-name'; console.log('mapped', cc);", "https://m.test/mapped.js");
+    rt.runJobs();
+    EXPECT_EQ(out, "mapped C\n");
+    EXPECT_EQ(Runtime::resolveSpecifier("./a/../b.js?q#f", "https://h.test/x/y.js"), "https://h.test/x/b.js?q");
+    EXPECT_EQ(moduleRequests("import a from './a.js'; export * from \"./b.js\"; import './a.js';"), (std::vector<std::string>{"./a.js", "./b.js"}));
+}
+
+TEST(Js, CoroutinesAndTheCollector) {
+    Runtime rt;
+    rt.setStepBudget(50'000'000);
+    std::string out;
+    rt.setConsole([&](std::string_view, const std::string& text) { out += text + "\n"; });
+    // Values only a suspended frame holds: a member's base, call arguments, array
+    // elements, a for-of iterator, a binary operand.
+    ASSERT_TRUE(rt.evaluate(R"(
+        var gates = [];
+        const gate = () => new Promise(r => gates.push(r));
+        (async () => {
+            const a = ({id: 'base'})[await gate()];
+            const b = ((x, y, z) => x.v + y + z.v)({v: 1}, await gate(), {v: 100});
+            const c = [{n: 1}, await gate(), {n: 3}].map(o => o.n).join('');
+            const o = {same: true};
+            const d = o === await gate();
+            let e = '';
+            for (const v of [{k: 'p'}, {k: 'q'}]) { await gate(); e += v.k; }
+            console.log(a, b, c, d, e);
+        })();
+        var it = (function* () { const keep = {deep: {deeper: 'kept'}}; yield 1; yield keep.deep.deeper; })();
+        it.next();
+        var dropped = (function* () { try { yield 1; } finally { console.log('WRONG: ran at collection'); } })();
+        dropped.next();
+        dropped = null;
+        for (let i = 0; i < 100; i++) (async () => { const x = {i}; await new Promise(() => {}); return x; })();
+    )").ok);
+    const auto churn = [&] {
+        ASSERT_TRUE(rt.evaluate("for (let i = 0; i < 20000; i++) ({a: [i], s: 'x' + i});").ok);
+        rt.collectGarbage();
+    };
+    const size_t settled = rt.heapSize();
+    churn();
+    for (const char* v : {"'id'", "10", "({n: 2})", "undefined", "0", "0"}) {
+        churn();
+        const std::string resolve = std::string("gates.shift()(") + v + ")";
+        ASSERT_TRUE(rt.evaluate(resolve).ok) << resolve;
+        rt.runJobs();
+    }
+    churn();
+    const Runtime::Result r = rt.evaluate("it.next().value");
+    ASSERT_TRUE(r.ok);
+    EXPECT_EQ(utf8(r.value.asString()), "kept");
+    EXPECT_EQ(out, "base 111 123 false pq\n");
+    // The dropped generator and the forever-waiting async calls were collected.
+    EXPECT_LT(rt.heapSize(), settled + 2000);
+}
+
+TEST(Js, WeakCollectionsAndMapIndex) {
+    EXPECT_EQ(run("const wm = new WeakMap(); const k = {}; wm.set(k, 1); [wm.get(k), wm.has({}), wm.delete(k), wm.has(k)].join()"), "1,false,true,false");
+    EXPECT_EQ(run("try { new WeakMap().set(1, 1) } catch (e) { e.name }"), "TypeError");
+    EXPECT_EQ(run("const m = new Map(); for (let i = 0; i < 100000; i++) m.set('k' + i, i); for (let i = 0; i < 99990; i++) m.delete('k' + i); [m.size, m.get('k99999'), [...m.keys()].length].join()"), "10,99999,10");
+    EXPECT_EQ(run("const s = new Set([0, -0, NaN, NaN, '1', 1]); [s.size, s.has(-0)].join()"), "4,true");
+    Runtime rt;
+    ASSERT_TRUE(rt.evaluate("var wm = new WeakMap(); var keep = {}; wm.set(keep, {v: 'kept'}); for (let i = 0; i < 1000; i++) wm.set({}, {big: i});"
+                            "var chainA = {}; var chainB = {}; wm.set(chainA, chainB); wm.set(chainB, 'through a'); chainB = null;"
+                            "var ref = new WeakRef({}); var held = new WeakRef(keep);").ok);
+    const size_t before = rt.heapSize();
+    rt.collectGarbage();
+    EXPECT_LT(rt.heapSize(), before - 1500);
+    const Runtime::Result r = rt.evaluate("[wm.get(keep).v, wm.get(wm.get(chainA)), ref.deref(), held.deref() === keep].join()");
+    ASSERT_TRUE(r.ok);
+    EXPECT_EQ(utf8(r.value.asString()), "kept,through a,,true");
+}
+
+TEST(Js, EarlyErrors) {
+    for (const char* bad : {"function* g() { var yield; }", "async function f() { var await; }", "function f(a, a) { 'use strict'; }",
+                            "(a, a) => 1", "function f(a = 1) { 'use strict'; }", "a: a: ;", "break;", "while (1) { continue x; }",
+                            "function f() { super.x; }", "new.target", "let x; var x;", "for (;;) function f() {}",
+                            "function* g(x = yield) {}", "async function f(x = await 1) {}", "[...a, ] = []", "'use strict'; let = 1"}) {
+        const std::string r = run(bad);
+        EXPECT_EQ(r.rfind("throws: SyntaxError", 0), 0u) << bad << " → " << r;
+    }
+    for (const char* good : {"try {} catch { let t; } try { var t; } catch {}", "{ let r; } { var r; }", "function f(a) { var a; return a; } f(1)",
+                             "var yield = 1; yield", "function f() { { function g() {} } let h; }", "a: { break a; }",
+                             "x: for (;;) { for (;;) { continue x; } }", "class A { m() { return () => super.toString; } }", "(function () { new.target })"}) {
+        const std::string r = run(good);
+        EXPECT_NE(r.rfind("throws: SyntaxError", 0), 0u) << good << " → " << r;
+    }
+}
+
+TEST(Js, CoroutineFuzz) {
+    // Random mixes of generators, async functions, throws and returns: never a crash.
+    std::mt19937 rng(62);
+    const char* parts[] = {"yield 1;", "yield* [1, 2];", "await null;", "throw new Error('x');", "return 3;", "try { yield 2; } finally { await null; }",
+                           "for (const v of g()) { if (v) break; }", "await Promise.reject(1).catch(() => 0);", "[await 1, yield 4];",
+                           "f(); g().next();", "for await (const v of ag()) break;", "while (true) yield;"};
+    for (int round = 0; round < 60; ++round) {
+        std::string body;
+        for (int i = 0; i < 6; ++i) body += parts[rng() % std::size(parts)];
+        const std::string src = "async function* ag() { " + body + " }\nfunction* g() { yield 1; }\nasync function f() { try { const it = ag(); "
+                                "for (let i = 0; i < 5; i++) await it.next(); await it.return(9); } catch (e) {} }\nf(); f();";
+        Runtime rt;
+        rt.setStepBudget(400'000);
+        rt.evaluate(src);
+        try {
+            rt.runJobs();
+        } catch (const Terminated&) {
+        }
+        rt.collectGarbage();
+    }
 }

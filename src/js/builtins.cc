@@ -894,7 +894,9 @@ void Runtime::installBuiltins() {
     put(symbol_ctor, u"split", Value::symbol(sym_split), 0);
     sym_species = newSymbol(u"Symbol.species");
     put(symbol_ctor, u"species", Value::symbol(sym_species), 0);
-    for (const char16_t* name : {u"asyncIterator", u"unscopables", u"isConcatSpreadable"})
+    sym_async_iterator = newSymbol(u"Symbol.asyncIterator");
+    put(symbol_ctor, u"asyncIterator", Value::symbol(sym_async_iterator), 0);
+    for (const char16_t* name : {u"unscopables", u"isConcatSpreadable"})
         put(symbol_ctor, name, Value::symbol(newSymbol(std::u16string(u"Symbol.") + name)), 0);
     method(symbol_ctor, u"for", 1, [](Runtime& rt, const Value&, Args a) {
         const std::u16string key = *rt.toString(arg(a, 0));
@@ -1878,9 +1880,8 @@ void Runtime::installBuiltins() {
         return t.asObject();
     };
     const auto findEntry = [](Object* m, const Value& k) -> std::pair<Value, Value>* {
-        for (auto& e : m->entries)
-            if (!e.first.isEmpty() && Runtime::sameValueZero(e.first, k)) return &e;
-        return nullptr;
+        const auto it = m->index.find(k);
+        return it == m->index.end() ? nullptr : &m->entries[it->second];
     };
     const auto normalizeKey = [](const Value& k) { return k.isNumber() && k.asNumber() == 0 ? Value::number(0) : k; };
     for (int which = 0; which < 2; ++which) {
@@ -1889,19 +1890,25 @@ void Runtime::installBuiltins() {
         put(proto, PropertyKey(sym_to_string_tag), Value::string(which == 0 ? u"Map" : u"Set"), kConfigurable);
         method(proto, u"has", 1, [=](Runtime& rt, const Value& t, Args a) { return Value::boolean(findEntry(thisCollection(rt, t, cls), arg(a, 0)) != nullptr); });
         method(proto, u"delete", 1, [=](Runtime& rt, const Value& t, Args a) {
-            auto* e = findEntry(thisCollection(rt, t, cls), arg(a, 0));
+            Object* m = thisCollection(rt, t, cls);
+            auto* e = findEntry(m, arg(a, 0));
             if (!e) return Value::boolean(false);
+            m->index.erase(e->first);
             e->first = Value::empty();   // a hole: iterators in progress skip it
             e->second = Value::undefined();
             return Value::boolean(true);
         });
         method(proto, u"clear", 0, [=](Runtime& rt, const Value& t, Args) {
-            for (auto& e : thisCollection(rt, t, cls)->entries) e.first = Value::empty();
+            Object* m = thisCollection(rt, t, cls);
+            for (auto& e : m->entries) {
+                e.first = Value::empty();
+                e.second = Value::undefined();
+            }
+            m->index.clear();
             return Value::undefined();
         });
         getter(proto, u"size", [=](Runtime& rt, const Value& t, Args) {
-            Object* m = thisCollection(rt, t, cls);
-            return Value::number(static_cast<double>(std::count_if(m->entries.begin(), m->entries.end(), [](const auto& e) { return !e.first.isEmpty(); })));
+            return Value::number(static_cast<double>(thisCollection(rt, t, cls)->index.size()));
         });
         method(proto, u"forEach", 1, [=](Runtime& rt, const Value& t, Args a) {
             Object* m = thisCollection(rt, t, cls);
@@ -1929,8 +1936,12 @@ void Runtime::installBuiltins() {
             });
             method(proto, u"set", 2, [=](Runtime& rt, const Value& t, Args a) {
                 Object* m = thisCollection(rt, t, cls);
-                if (auto* e = findEntry(m, arg(a, 0))) e->second = arg(a, 1);
-                else m->entries.emplace_back(normalizeKey(arg(a, 0)), arg(a, 1));
+                if (auto* e = findEntry(m, arg(a, 0))) {
+                    e->second = arg(a, 1);
+                } else {
+                    m->index.emplace(normalizeKey(arg(a, 0)), m->entries.size());
+                    m->entries.emplace_back(normalizeKey(arg(a, 0)), arg(a, 1));
+                }
                 return t;
             });
             method(proto, u"values", 0, iter(4));
@@ -1940,7 +1951,10 @@ void Runtime::installBuiltins() {
         } else {
             method(proto, u"add", 1, [=](Runtime& rt, const Value& t, Args a) {
                 Object* m = thisCollection(rt, t, cls);
-                if (!findEntry(m, arg(a, 0))) m->entries.emplace_back(normalizeKey(arg(a, 0)), Value::undefined());
+                if (!findEntry(m, arg(a, 0))) {
+                    m->index.emplace(normalizeKey(arg(a, 0)), m->entries.size());
+                    m->entries.emplace_back(normalizeKey(arg(a, 0)), Value::undefined());
+                }
                 return t;
             });
             method(proto, u"values", 0, iter(7));
@@ -1948,6 +1962,118 @@ void Runtime::installBuiltins() {
             method(proto, u"entries", 0, iter(6));
             put(proto, PropertyKey(sym_iterator), get(proto, u"values", Value::object(proto)));
         }
+    }
+
+    // ── WeakMap, WeakSet, WeakRef, FinalizationRegistry ──
+    // Held weakly by the collector: an entry goes when nothing else keeps its key.
+    {
+        const auto canBeHeldWeakly = [](Runtime& rt, const Value& v) {
+            return v.isObject() || (v.isSymbol() && [&] {
+                for (auto& [k, s] : rt.symbol_registry)
+                    if (s == v.asSymbol()) return false;
+                return true;
+            }());
+        };
+        const auto weakCtor = [&](const char16_t* name, ObjectClass cls) {
+            Object* proto = newObject();
+            put(proto, PropertyKey(sym_to_string_tag), Value::string(name), kConfigurable);
+            Object* c = ctor(name, 0, [proto, cls](Runtime& rt, const Value&, Args a) -> Value {
+                Object* nt = rt.construct_target;
+                if (!nt) rt.throwError("TypeError", "it must be made with new");
+                const Value p = rt.get(Value::object(nt), u"prototype");
+                Object* m = rt.allocate<Object>(p.isObject() ? p.asObject() : proto, cls);
+                if (!arg(a, 0).isNullish() && cls != ObjectClass::WeakRef) {
+                    const Value adder = rt.get(Value::object(m), cls == ObjectClass::WeakMap ? u"set" : u"add");
+                    for (const Value& e : rt.iterateToList(arg(a, 0))) {
+                        if (cls == ObjectClass::WeakMap) {
+                            if (!e.isObject()) rt.throwError("TypeError", "a WeakMap entry must be an object");
+                            const Value kv[2] = {rt.get(e, u"0"), rt.get(e, u"1")};
+                            rt.call(adder, Value::object(m), kv);
+                        } else {
+                            rt.call(adder, Value::object(m), std::span<const Value>(&e, 1));
+                        }
+                    }
+                }
+                return Value::object(m);
+            }, proto);
+            return std::make_pair(c, proto);
+        };
+        const auto thisWeak = [](Runtime& rt, const Value& t, ObjectClass cls) {
+            if (!t.isObject() || t.asObject()->cls != cls) rt.throwError("TypeError", "the wrong kind of object for this method");
+            return t.asObject();
+        };
+        auto [wm_ctor, wm] = weakCtor(u"WeakMap", ObjectClass::WeakMap);
+        auto [ws_ctor, ws] = weakCtor(u"WeakSet", ObjectClass::WeakSet);
+        (void)wm_ctor;
+        (void)ws_ctor;
+        for (Object* proto : {wm, ws}) {
+            const ObjectClass cls = proto == wm ? ObjectClass::WeakMap : ObjectClass::WeakSet;
+            method(proto, u"has", 1, [=](Runtime& rt, const Value& t, Args a) {
+                return Value::boolean(thisWeak(rt, t, cls)->index.count(arg(a, 0)) != 0);
+            });
+            method(proto, u"delete", 1, [=](Runtime& rt, const Value& t, Args a) {
+                Object* m = thisWeak(rt, t, cls);
+                const auto it = m->index.find(arg(a, 0));
+                if (it == m->index.end()) return Value::boolean(false);
+                m->entries[it->second] = {Value::empty(), Value::undefined()};
+                m->index.erase(it);
+                return Value::boolean(true);
+            });
+        }
+        method(wm, u"get", 1, [=](Runtime& rt, const Value& t, Args a) {
+            Object* m = thisWeak(rt, t, ObjectClass::WeakMap);
+            const auto it = m->index.find(arg(a, 0));
+            return it == m->index.end() ? Value::undefined() : m->entries[it->second].second;
+        });
+        method(wm, u"set", 2, [=](Runtime& rt, const Value& t, Args a) {
+            Object* m = thisWeak(rt, t, ObjectClass::WeakMap);
+            if (!canBeHeldWeakly(rt, arg(a, 0))) rt.throwError("TypeError", "a WeakMap key must be an object or a symbol");
+            if (const auto it = m->index.find(arg(a, 0)); it != m->index.end()) {
+                m->entries[it->second].second = arg(a, 1);
+            } else {
+                m->index.emplace(arg(a, 0), m->entries.size());
+                m->entries.emplace_back(arg(a, 0), arg(a, 1));
+            }
+            return t;
+        });
+        method(ws, u"add", 1, [=](Runtime& rt, const Value& t, Args a) {
+            Object* m = thisWeak(rt, t, ObjectClass::WeakSet);
+            if (!canBeHeldWeakly(rt, arg(a, 0))) rt.throwError("TypeError", "a WeakSet value must be an object or a symbol");
+            if (!m->index.count(arg(a, 0))) {
+                m->index.emplace(arg(a, 0), m->entries.size());
+                m->entries.emplace_back(arg(a, 0), Value::undefined());
+            }
+            return t;
+        });
+        // WeakRef: its target is `primitive`, which the collector doesn't count as a reference.
+        Object* wr = newObject();
+        put(wr, PropertyKey(sym_to_string_tag), Value::string(u"WeakRef"), kConfigurable);
+        ctor(u"WeakRef", 1, [wr, canBeHeldWeakly](Runtime& rt, const Value&, Args a) -> Value {
+            Object* nt = rt.construct_target;
+            if (!nt) rt.throwError("TypeError", "WeakRef must be made with new");
+            if (!canBeHeldWeakly(rt, arg(a, 0))) rt.throwError("TypeError", "a WeakRef's target must be an object or a symbol");
+            const Value p = rt.get(Value::object(nt), u"prototype");
+            Object* r = rt.allocate<Object>(p.isObject() ? p.asObject() : wr, ObjectClass::WeakRef);
+            r->primitive = arg(a, 0);
+            return Value::object(r);
+        }, wr);
+        method(wr, u"deref", 0, [=](Runtime& rt, const Value& t, Args) { return thisWeak(rt, t, ObjectClass::WeakRef)->primitive; });
+        // FinalizationRegistry: registrations are kept, but cleanup callbacks never run
+        // (the specification allows a host never to call them).
+        Object* fr = newObject();
+        put(fr, PropertyKey(sym_to_string_tag), Value::string(u"FinalizationRegistry"), kConfigurable);
+        ctor(u"FinalizationRegistry", 1, [fr](Runtime& rt, const Value&, Args a) -> Value {
+            Object* nt = rt.construct_target;
+            if (!nt) rt.throwError("TypeError", "FinalizationRegistry must be made with new");
+            if (!rt.isCallable(arg(a, 0))) rt.throwError("TypeError", "FinalizationRegistry needs a cleanup function");
+            const Value p = rt.get(Value::object(nt), u"prototype");
+            return Value::object(rt.allocate<Object>(p.isObject() ? p.asObject() : fr));
+        }, fr);
+        method(fr, u"register", 2, [=](Runtime& rt, const Value&, Args a) {
+            if (!canBeHeldWeakly(rt, arg(a, 0))) rt.throwError("TypeError", "the target must be an object or a symbol");
+            return Value::undefined();
+        });
+        method(fr, u"unregister", 1, [](Runtime&, const Value&, Args) { return Value::boolean(false); });
     }
 
     // ── JSON ──
@@ -2083,6 +2209,8 @@ void Runtime::installBuiltins() {
         });
     }
     installRegExp();
+    installPromise();
+    installGenerators();
     (void)rt;
 }
 

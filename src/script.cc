@@ -17,6 +17,9 @@
 
 namespace fbx::xweb {
 
+extern const char* const kScriptPrelude;   // script_prelude.cc
+
+
 using js::Object;
 using js::PropertyKey;
 using js::Runtime;
@@ -187,7 +190,6 @@ struct PageScript::Impl {
     };
     std::vector<Timer> timers;
     std::vector<std::pair<int, Value>> frames;
-    std::vector<Value> microtasks;
     int next_timer = 1;
     size_t live_after_gc = 0;
 
@@ -223,12 +225,10 @@ struct PageScript::Impl {
         rt.eval_depth = evals;
     }
 
+    // A microtask checkpoint: promise reactions, await continuations, queueMicrotask.
+    // The engine skips it while script is still running (an event a script dispatched).
     void drainMicrotasks() {
-        for (size_t i = 0; i < microtasks.size() && i < 100'000; ++i) {
-            const Value fn = microtasks[i];
-            task([&] { rt.call(fn, Value::undefined(), {}); });
-        }
-        microtasks.clear();
+        task([&] { rt.runJobs(); });
     }
 
     void collect() {
@@ -240,7 +240,6 @@ struct PageScript::Impl {
             rt.extra_roots.insert(rt.extra_roots.end(), t.args.begin(), t.args.end());
         }
         for (auto& [id, fn] : frames) rt.extra_roots.push_back(fn);
-        rt.extra_roots.insert(rt.extra_roots.end(), microtasks.begin(), microtasks.end());
         rt.collectGarbage();
         rt.extra_roots.clear();
         live_after_gc = rt.heapSize();
@@ -541,12 +540,32 @@ struct PageScript::Impl {
 
     // ── Scripts ──
 
+    static std::string trimmed(const std::string& s) {
+        const size_t b = s.find_first_not_of(" \t\n\r\f");
+        const size_t e = s.find_last_not_of(" \t\n\r\f");
+        return b == std::string::npos ? std::string{} : s.substr(b, e - b + 1);
+    }
+
+    static bool isModule(const Node* s) {
+        const std::string* type = s->attr("type");
+        return type && lower(trimmed(*type)) == "module";
+    }
+
     static bool runnable(const Node* s) {
+        if (isModule(s)) return true;
+        if (s->attr("nomodule")) return false;   // the fallback for browsers without modules
         const std::string* type = s->attr("type");
         if (!type) return true;
-        const std::string t = lower(*type);
+        const std::string t = lower(trimmed(*type));
         return t.empty() || t == "text/javascript" || t == "application/javascript" || t == "text/ecmascript" ||
-               t == "application/x-javascript" || t == "module_unsupported";
+               t == "application/x-javascript";
+    }
+
+    // Deferred: modules, and external classic scripts with defer or async. They run
+    // once the document's parsed, in order.
+    static bool deferred(const Node* s) {
+        if (isModule(s)) return true;
+        return s->attr("src") && (s->attr("defer") || s->attr("async"));
     }
 
     std::function<std::optional<std::string>(const std::string&)> source;
@@ -570,8 +589,22 @@ struct PageScript::Impl {
             code = s->textContent();
         }
         Node* saved = current_script;
-        current_script = s;
         rt.setStepBudget(kTaskBudget);
+        if (isModule(s)) {
+            // document.currentScript is null for modules. Its imports load through the
+            // same fetch as scripts; it finishes when they've loaded and it's run.
+            const std::string url = s->attr("src") ? name : host.url;
+            const bool has_src = s->attr("src") != nullptr;
+            current_script = nullptr;
+            rt.evaluateModule(code, url, [this, name](Runtime::Result r) {
+                if (!r.ok) report(r.error + " (" + name + ")");
+            });
+            current_script = saved;
+            drainMicrotasks();
+            if (has_src) fire(s, u"load", false, false);
+            return;
+        }
+        current_script = s;
         const Runtime::Result r = rt.evaluate(code, name);
         if (!r.ok) report(r.error + " (" + name + ")");
         current_script = saved;
@@ -1627,7 +1660,7 @@ void PageScript::Impl::installWindow() {
     method(g, u"cancelIdleCallback", 1, clearTimer);
     method(g, u"queueMicrotask", 1, [self](Runtime& rt, const Value&, Args a) {
         if (!rt.isCallable(arg(a, 0))) rt.throwError("TypeError", "queueMicrotask needs a function");
-        self->microtasks.push_back(arg(a, 0));
+        rt.enqueueMicrotask(arg(a, 0));
         return Value::undefined();
     });
     method(g, u"alert", 1, [self](Runtime& rt, const Value&, Args a) {
@@ -1812,7 +1845,18 @@ void PageScript::Impl::installWindow() {
         rt.put(proto, u"constructor", Value::object(c));
         rt.put(g, name, Value::object(c));
     };
-    iface(u"EventTarget", proto_target);
+    {
+        // new EventTarget(), and classes that extend it, get the same listener machinery.
+        Object* c = rt.newFunction(u"EventTarget", 0, [this](Runtime& rt, const Value&, Args) -> Value {
+            Object* nt = rt.construct_target;
+            if (!nt) rt.throwError("TypeError", "EventTarget must be made with new");
+            const Value p = rt.get(Value::object(nt), u"prototype");
+            return Value::object(rt.newObject(p.isObject() ? p.asObject() : proto_target));
+        }, true);
+        rt.put(c, u"prototype", Value::object(proto_target), 0);
+        rt.put(proto_target, u"constructor", Value::object(c));
+        rt.put(g, u"EventTarget", Value::object(c));
+    }
     iface(u"Node", proto_node);
     iface(u"Element", proto_element);
     iface(u"HTMLElement", proto_element);
@@ -1841,10 +1885,39 @@ void PageScript::Impl::install() {
     rt.setConsole([this](std::string_view level, const std::string& text) {
         if (host.console) host.console(level, text);
     });
+    rt.setErrorReporter([this](const std::string& message) { report(message); });
+    rt.base_url = host.base;
+    rt.setModuleLoader([this](const std::string& url, std::function<void(js::ModuleSource)> done) {
+        if (std::optional<std::string> got = source ? source(url) : std::nullopt) {
+            done(js::ModuleSource{true, std::move(*got), {}});
+            return;
+        }
+        if (!host.fetch_script) {
+            done(js::ModuleSource{false, {}, "couldn't fetch it"});
+            return;
+        }
+        // Not fetched ahead: ask for it, and carry on as a task of its own when it comes.
+        host.fetch_script(url, [this, done](std::optional<std::string> got) {
+            js::ModuleSource src;
+            if (got) {
+                src.ok = true;
+                src.source = std::move(*got);
+            } else {
+                src.error = "couldn't fetch it";
+            }
+            rt.setStepBudget(kTaskBudget);
+            task([&] { done(std::move(src)); });
+            drainMicrotasks();
+            dirty = true;
+        });
+    });
     installNode();
     installElement();
     installDocument();
     installWindow();
+    // What's written in JavaScript itself (URL, URLSearchParams).
+    const Runtime::Result prelude = rt.evaluate(kScriptPrelude, "prelude");
+    if (!prelude.ok) report("the script prelude failed: " + prelude.error);
 }
 
 // ── The public face ───────────────────────────────────────────────────────────
@@ -1865,7 +1938,17 @@ void PageScript::run(const std::function<std::optional<std::string>(const std::s
         if (n->isHtml("script")) scripts.push_back(n);
         todo.insert(todo.end(), n->children.rbegin(), n->children.rend());
     }
-    for (Node* n : scripts) s.runScript(n);
+    // Import maps first: every module specifier goes through them.
+    for (Node* n : scripts) {
+        const std::string* type = n->attr("type");
+        if (type && lower(Impl::trimmed(*type)) == "importmap" && !s.rt.import_map.add(n->textContent(), s.host.base))
+            s.report("an import map that isn't valid JSON was ignored");
+    }
+    // Parser-blocking scripts in order, then the deferred ones (modules, defer, async).
+    for (Node* n : scripts)
+        if (!Impl::deferred(n)) s.runScript(n);
+    for (Node* n : scripts)
+        if (Impl::deferred(n)) s.runScript(n);
     s.running_scripts = false;
     s.ready_state = "interactive";
     s.fire(s.doc.root(), u"readystatechange", false, false);

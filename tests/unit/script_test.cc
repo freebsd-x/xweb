@@ -36,6 +36,8 @@ struct Page {
         script = std::make_unique<PageScript>(*doc, host);
         script->run([external](const std::string& url) -> std::optional<std::string> {
             if (url == "https://example.org/dir/lib.js") return external;
+            if (url == "https://example.org/dir/mod.js") return std::string("export const word = 'module'; export default (s) => s.toUpperCase();");
+            if (url == "https://example.org/vendor/dep.js") return std::string("export const dep = 'mapped';");
             return std::nullopt;
         });
     }
@@ -180,4 +182,34 @@ TEST(Script, InsertedScriptsRunAndRunawayIsStopped) {
     Page q(R"(<body><script>while (true) {}</script><script>console.log('after')</script>)");
     EXPECT_NE(q.console.find("Stopped: the script ran too long"), std::string::npos) << q.console;
     EXPECT_NE(q.console.find("log:after"), std::string::npos);
+}
+
+TEST(Script, ModulesPromisesAndThePrelude) {
+    Page p(R"(<body><div id=out></div>
+        <script type=importmap>{"imports": {"dep": "/vendor/dep.js"}}</script>
+        <script type=module>
+          import shout, { word } from './mod.js';
+          import { dep } from 'dep';
+          const parts = await Promise.all([shout(word), Promise.resolve(dep)]);
+          document.getElementById('out').textContent = parts.join(' ') + ' ' + (document.currentScript === null);
+        </script>
+        <script nomodule>console.log('WRONG: nomodule ran')</script>
+        <script>
+          console.log('classic first');
+          const u = new URL('../x/y?a=1#h', 'https://example.org/dir/page.html');
+          u.searchParams.append('b', '2');
+          console.log(u.href, u.origin);
+          const c = new AbortController();
+          c.signal.addEventListener('abort', () => console.log('aborted', c.signal.aborted, c.signal.reason.name));
+          c.abort();
+          const w = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
+          const tags = []; while (w.nextNode()) tags.push(w.currentNode.tagName);
+          console.log(tags.join(','));
+          (async () => { await null; console.log('microtask after the script'); })();
+          console.log('script end');
+        </script>)");
+    EXPECT_EQ(p.byId("out")->textContent(), "MODULE mapped true") << p.console;
+    EXPECT_EQ(p.console.find("WRONG"), std::string::npos) << p.console;
+    EXPECT_NE(p.console.find("log:classic first\nlog:https://example.org/x/y?a=1&b=2#h https://example.org\nlog:aborted true AbortError\n"
+                             "log:DIV,SCRIPT,SCRIPT,SCRIPT,SCRIPT\nlog:script end\nlog:microtask after the script\n"), std::string::npos) << p.console;
 }

@@ -8,6 +8,7 @@
 #include <limits>
 
 #include "ast.h"
+#include "coroutine.h"
 #include "internal.h"
 #include "xweb/js.h"
 
@@ -67,6 +68,24 @@ std::string utf8(std::u16string_view s) {
 }
 
 Value Value::string(std::u16string s) { return string(std::make_shared<const std::u16string>(std::move(s))); }
+
+size_t ValueHash::operator()(const Value& v) const noexcept {
+    switch (v.type()) {
+        case Value::Type::String: return std::hash<std::u16string>{}(v.asString());
+        case Value::Type::Number: {
+            const double d = v.asNumber();
+            if (d == 0) return 0;               // +0 and -0 are the same key
+            if (std::isnan(d)) return 1;
+            return std::hash<double>{}(d);
+        }
+        case Value::Type::Boolean: return v.asBoolean() ? 3 : 2;
+        case Value::Type::Object: return std::hash<const void*>{}(v.asObject());
+        case Value::Type::Symbol: return std::hash<const void*>{}(v.asSymbol());
+        default: return static_cast<size_t>(v.type()) + 7;
+    }
+}
+
+bool ValueSameZero::operator()(const Value& a, const Value& b) const noexcept { return Runtime::sameValueZero(a, b); }
 
 namespace {
 
@@ -190,6 +209,30 @@ public:
     }
 
     Object* makeFunction(FunctionInfo* info, Env* env, Object* home);
+
+    // A module's scope, before anything runs: its vars, its function declarations
+    // (callable from modules that import them even before this one runs), its lexical
+    // names in their dead zone, and the default export's slot.
+    void instantiateModule(Env* env) {
+        Program& p = *prog_;
+        for (const auto& name : p.top->var_names)
+            if (!env->vars.count(name)) env->vars[name] = Binding{};
+        // Lexical names first: a module's top-level functions are among them, and are
+        // initialized at once.
+        declareLexical(env, p.root->lexical.get());
+        for (Node* f : p.top->function_decls) env->vars[f->str] = Binding{Value::object(makeFunction(f->fn, env, nullptr))};
+        for (Node* s : p.root->kids) {
+            if (s->kind != N::ExportDecl || !(s->flags & kDefault) || !s->a || s->a->kind == N::FunctionDecl || s->a->kind == N::ClassDecl) continue;
+            if (s->flags & kHoisted) env->vars[u"*default*"] = Binding{Value::object(makeFunction(s->a->fn, env, nullptr))};
+            else env->vars[u"*default*"] = Binding{Value::undefined(), true, false};
+        }
+    }
+
+    void runModule(Env* env) {
+        EnvScope scope(rt_, env);
+        for (Node* s : prog_->root->kids) exec(s, env, true);
+    }
+
     Value callScript(Object* f, const Value& this_value, std::span<const Value> args, Object* new_target);
 
 private:
@@ -208,12 +251,21 @@ private:
 
     // ── Names ──
 
-    Binding* findBinding(Env* env, const std::u16string& name, Env** where) {
+    // The binding a name means here. An import is followed to the exporting module's
+    // binding (`imported` says it was one: those can't be assigned).
+    Binding* findBinding(Env* env, const std::u16string& name, Env** where, bool* imported = nullptr) {
         for (Env* e = env; e; e = e->outer) {
             const auto it = e->vars.find(name);
             if (it != e->vars.end()) {
                 if (where) *where = e;
-                return &it->second;
+                Binding* b = &it->second;
+                if (imported) *imported = b->import_env != nullptr;
+                for (int hops = 0; b->import_env; ++hops) {
+                    const auto jt = b->import_env->vars.find(b->import_name);
+                    if (jt == b->import_env->vars.end() || hops > 100) rt_.throwError("ReferenceError", "the import '" + utf8(name) + "' isn't there");
+                    b = &jt->second;
+                }
+                return b;
             }
         }
         return nullptr;
@@ -237,9 +289,14 @@ private:
     }
 
     void assignName(Env* env, const std::u16string& name, const Value& v, bool strict) {
-        if (Binding* b = findBinding(env, name, nullptr)) {
+        bool imported = false;
+        if (Binding* b = findBinding(env, name, nullptr, &imported)) {
+            if (imported) rt_.throwError("TypeError", "assignment to the import '" + utf8(name) + "'");
             if (!b->initialized) rt_.throwError("ReferenceError", "can't use '" + utf8(name) + "' before it's declared");
-            if (!b->is_mutable) rt_.throwError("TypeError", "assignment to constant '" + utf8(name) + "'");
+            if (!b->is_mutable) {
+                if (b->function_name && !strict) return;
+                rt_.throwError("TypeError", "assignment to constant '" + utf8(name) + "'");
+            }
             b->value = v;
             return;
         }
@@ -275,6 +332,7 @@ private:
     Completion execLoopBody(Node* body, Env* env, bool strict, const std::u16string* label, bool& stop, Value& last);
     Completion forStatement(Node* n, Env* env, bool strict, const std::u16string* label);
     Completion forInOf(Node* n, Env* env, bool strict, const std::u16string* label);
+    Completion forOf(Node* n, Env* env, bool strict, const std::u16string* label, const Value& subject, uint32_t decl);
     Completion tryStatement(Node* n, Env* env, bool strict);
     Completion switchStatement(Node* n, Env* env, bool strict, const std::u16string* label);
     void declare(Node* decl, Env* env, bool strict);
@@ -296,6 +354,31 @@ private:
     void assignPattern(Node* pattern, const Value& v, Env* env, bool strict);
     Value superBase(Env* env);
     PropertyKey memberKey(Node* m, Env* env, bool strict);
+
+    // ── Iteration, one value at a time (for-of, destructuring) ──
+    struct IterRec {
+        Value iterator, next;
+        Object* array = nullptr;   // an ordinary array with its own iterator: read directly
+        Value string;              // a string: by code points, directly
+        size_t index = 0;
+        bool done = false;
+        bool async = false;        // for await: results are awaited
+        bool sync_wrapped = false; // for await over a sync iterator: values are awaited
+    };
+    IterRec getIterator(const Value& v, bool async);
+    bool iterStep(IterRec& it, Value& out);
+    void iterClose(IterRec& it, bool suppress);
+    template <typename F>
+    void destructureArray(Node* p, const Value& value, F&& assign);
+
+  public:
+    Env* prepareCall(Object* f, const Value& this_value, std::span<const Value> args, Object* new_target);
+    Value runBody(FunctionInfo* info, Env* env);
+    Value runInEnv(FunctionInfo* info, Env* env) {
+        EnvScope scope(rt_, env);
+        return runBody(info, env);
+    }
+  private:
     Value binaryOp(Op op, const Value& l, const Value& r);
 
     Runtime& rt_;
@@ -306,6 +389,9 @@ private:
 // ── The runtime ───────────────────────────────────────────────────────────────
 
 Runtime::~Runtime() {
+    // Suspended coroutines' frames unwind first, while everything they refer to is there.
+    for (size_t i = 0; i < cells_.size(); ++i)
+        if (auto* o = dynamic_cast<Object*>(cells_[i]); o && o->co) unwindCoroutine(*o->co);
     for (Cell* c : cells_) delete c;
 }
 
@@ -786,7 +872,8 @@ Value Runtime::typeOf(const Value& v) {
 Value Runtime::call(const Value& fnv, const Value& this_value, std::span<const Value> args) {
     if (!isCallable(fnv)) throwError("TypeError", "not a function");
     Object* f = fnv.asObject();
-    if (call_depth >= kMaxCallDepth) throwError("RangeError", "too much recursion");
+    if (call_depth >= kMaxCallDepth || (current_co && static_cast<char*>(__builtin_frame_address(0)) < current_co->stack_limit))
+        throwError("RangeError", "too much recursion");
     ++call_depth;
     struct Down { size_t& d; ~Down() { --d; } } down{call_depth};
     step();
@@ -886,15 +973,51 @@ void Runtime::collectGarbage() {
     markCell(global_env_);
     for (Env* e : env_stack) markCell(e);
     for (const Value& v : extra_roots) markValue(v);
+    for (const auto* list : temp_lists)
+        for (const Value& v : *list) markValue(v);
+    for (const Job& j : jobs_) { markValue(j.a); markValue(j.b); markValue(j.c); }
+    for (Object* p : pending_rejections) markCell(p);
+    markModules(todo);
     for (Object* o : {object_prototype, function_prototype, array_prototype, string_prototype, number_prototype, boolean_prototype,
                       symbol_prototype, error_prototype, iterator_prototype, array_iterator_prototype, map_prototype, set_prototype, array_values_,
-                      regexp_prototype, regexp_string_iterator_prototype, regexp_exec, regexp_constructor})
+                      regexp_prototype, regexp_string_iterator_prototype, regexp_exec, regexp_constructor, promise_prototype,
+                      promise_constructor, promise_then, generator_prototype, async_generator_prototype, async_iterator_prototype,
+                      generator_function_prototype, async_function_prototype, async_generator_function_prototype,
+                      async_from_sync_iterator_prototype})
         markCell(o);
     for (auto& [k, o] : error_prototypes) markCell(o);
     for (Symbol* s : {sym_iterator, sym_to_primitive, sym_to_string_tag, sym_has_instance, sym_match, sym_match_all, sym_replace,
-                      sym_search, sym_split, sym_species})
+                      sym_search, sym_split, sym_species, sym_async_iterator})
         markCell(s);
     for (auto& [k, s] : symbol_registry) markCell(s);
+    // Suspended coroutines' stacks are scanned for anything that looks like a cell.
+    std::vector<Cell*> sorted;
+    std::vector<Object*> weak_collections, weak_refs;
+    const auto markCoroutine = [&](Coroutine& co) {
+        markCell(co.function);
+        markCell(co.env);
+        markCell(co.promise);
+        markCell(co.on_fulfilled);
+        markCell(co.on_rejected);
+        markValue(co.transfer);
+        for (const AsyncGenRequest& r : co.requests) { markValue(r.value); markCell(r.promise); }
+        if (co.state != CoState::Suspended) return;
+        for (Env* e : co.env_stack) markCell(e);
+        for (const auto* list : co.temp_lists)
+            for (const Value& v : *list) markValue(v);
+        if (sorted.empty()) {
+            sorted = cells_;
+            std::sort(sorted.begin(), sorted.end());
+        }
+        scanCoroutineStack(co, [&](uintptr_t w) {
+            auto it = std::upper_bound(sorted.begin(), sorted.end(), w, [](uintptr_t x, Cell* c) { return x < reinterpret_cast<uintptr_t>(c); });
+            if (it == sorted.begin()) return;
+            Cell* c = *--it;
+            if (w < reinterpret_cast<uintptr_t>(c) + c->cellSize()) todo.push_back(c);
+        });
+        if (co.module) markModule(co.module, todo);
+    };
+    const auto drain = [&] {
     while (!todo.empty()) {
         Cell* c = todo.back();
         todo.pop_back();
@@ -908,6 +1031,7 @@ void Runtime::collectGarbage() {
             markCell(e->home);
             markCell(e->new_target);
             markCell(e->global_object);
+            for (auto& [n, b] : e->vars) markCell(b.import_env);
         } else if (auto* o = dynamic_cast<Object*>(c)) {
             markCell(o->prototype);
             for (const auto& k : o->ownKeys()) {
@@ -922,15 +1046,59 @@ void Runtime::collectGarbage() {
             markCell(o->bound_target);
             markValue(o->bound_this);
             for (const Value& v : o->bound_args) markValue(v);
-            markValue(o->primitive);
-            for (auto& [k, v] : o->entries) { markValue(k); markValue(v); }
+            if (o->cls == ObjectClass::WeakMap || o->cls == ObjectClass::WeakSet) {
+                weak_collections.push_back(o);   // its entries live only as long as their keys
+            } else if (o->cls == ObjectClass::WeakRef) {
+                weak_refs.push_back(o);
+            } else {
+                markValue(o->primitive);
+                for (auto& [k, v] : o->entries) { markValue(k); markValue(v); }
+            }
             markCell(o->target);
+            for (const Value& v : o->slots) markValue(v);
             if (o->code) {
                 markCell(o->code->closure);
                 markCell(o->code->home);
                 markCell(o->code->class_fields_home);
             }
+            if (o->co) markCoroutine(*o->co);
         }
+    }
+    };
+    drain();
+    // Ephemerons: a weak collection's value is live when its key is, which can make
+    // more keys live; round again until nothing changes.
+    const auto reached = [](const Value& v) {
+        if (v.isObject()) return v.asObject()->marked;
+        if (v.isSymbol()) return v.asSymbol()->marked;
+        return true;
+    };
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (size_t i = 0; i < weak_collections.size(); ++i) {
+            for (const auto& [k, v] : weak_collections[i]->entries) {
+                if (k.isEmpty() || !reached(k) || reached(v)) continue;
+                markValue(v);
+                changed = true;
+            }
+        }
+        drain();
+    }
+    for (Object* m : weak_collections) {
+        std::vector<std::pair<Value, Value>> kept;
+        for (auto& e : m->entries)
+            if (!e.first.isEmpty() && reached(e.first)) kept.push_back(std::move(e));
+        m->entries = std::move(kept);
+        m->index.clear();
+        for (size_t i = 0; i < m->entries.size(); ++i) m->index.emplace(m->entries[i].first, i);
+    }
+    for (Object* r : weak_refs)
+        if (!reached(r->primitive)) r->primitive = Value::undefined();
+    // Coroutines nothing reaches unwind now, before what their frames refer to goes.
+    // Unwinding runs no JavaScript and makes nothing new.
+    for (size_t i = 0; i < cells_.size(); ++i) {
+        auto* o = dynamic_cast<Object*>(cells_[i]);
+        if (o && !o->marked && o->co && o->co->state == CoState::Suspended) unwindCoroutine(*o->co);
     }
     std::vector<Cell*> live;
     live.reserve(cells_.size());
@@ -960,6 +1128,7 @@ Runtime::Result Runtime::evaluate(std::string_view source, std::string_view name
     // Nested (a script run from an event a script dispatched): the outer one's state stays.
     const size_t saved_envs = env_stack.size(), saved_calls = call_depth, saved_eval = eval_depth;
     if (saved_envs == 0 && saved_calls == 0) steps_ = 0;
+    prog->url = std::string(name);
     programs_.push_back(prog);
     try {
         Interpreter interp(*this, prog);
@@ -1008,8 +1177,160 @@ Object* Interpreter::makeFunction(FunctionInfo* info, Env* env, Object* home) {
         Object* proto = rt_.newObject();
         proto->define(u"constructor", {Value::object(f), nullptr, nullptr, kWritable | kConfigurable});
         f->define(u"prototype", {Value::object(proto), nullptr, nullptr, kWritable});
+    } else if (info->is_generator) {
+        f->prototype = info->is_async ? rt_.async_generator_function_prototype : rt_.generator_function_prototype;
+        Object* proto = rt_.newObject(info->is_async ? rt_.async_generator_prototype : rt_.generator_prototype);
+        f->define(u"prototype", {Value::object(proto), nullptr, nullptr, kWritable});
+    } else if (info->is_async) {
+        f->prototype = rt_.async_function_prototype;
     }
     return f;
+}
+
+// ── Iteration ──
+
+namespace {
+
+// An abrupt completion caught on its way out, to be rethrown after cleanup (closing an
+// iterator, a finally block) that must not run inside a C++ catch handler: a coroutine
+// can't be suspended while one of its frames is handling an exception.
+struct Abrupt {
+    uint8_t kind = 0;   // 1 thrown, 2 a generator's return
+    Value value;
+    explicit operator bool() const { return kind != 0; }
+    [[noreturn]] void rethrow() const {
+        if (kind == 1) throw Thrown{value};
+        throw GeneratorReturn{value};
+    }
+};
+
+}  // namespace
+
+#define FBX_CATCH_ABRUPT(a)                                         \
+    catch (const Thrown& thrown_) { (a).kind = 1; (a).value = thrown_.value; } \
+    catch (const GeneratorReturn& ret_) { (a).kind = 2; (a).value = ret_.value; }
+
+Interpreter::IterRec Interpreter::getIterator(const Value& v, bool async) {
+    IterRec it;
+    it.async = async;
+    if (async) {
+        const Value m = v.isNullish() ? Value::undefined() : rt_.get(v, PropertyKey(rt_.sym_async_iterator));
+        if (!m.isNullish()) {
+            if (!rt_.isCallable(m)) rt_.throwError("TypeError", "Symbol.asyncIterator isn't a function");
+            it.iterator = rt_.call(m, v, {});
+            if (!it.iterator.isObject()) rt_.throwError("TypeError", "an async iterator must be an object");
+            it.next = rt_.get(it.iterator, u"next");
+            return it;
+        }
+        it.async = false;
+        it.sync_wrapped = true;
+    }
+    if (v.isString()) {
+        // Strings by code point, unless String.prototype[Symbol.iterator] was replaced.
+        const Value m = rt_.get(Value::object(rt_.string_prototype), PropertyKey(rt_.sym_iterator));
+        if (m.isObject() && m.asObject()->native && m.asObject()->own(u"name") &&
+            m.asObject()->own(u"name")->value.isString() && m.asObject()->own(u"name")->value.asString() == u"[Symbol.iterator]") {
+            it.string = v;
+            return it;
+        }
+    }
+    const Value m = v.isNullish() ? Value::undefined() : rt_.get(v, PropertyKey(rt_.sym_iterator));
+    if (!rt_.isCallable(m)) rt_.throwError("TypeError", "not iterable");
+    if (v.isObject() && v.asObject()->cls == ObjectClass::Array && m.asObject() == rt_.array_values_) {
+        it.array = v.asObject();
+        return it;
+    }
+    it.iterator = rt_.call(m, v, {});
+    if (!it.iterator.isObject()) rt_.throwError("TypeError", "an iterator must be an object");
+    it.next = rt_.get(it.iterator, u"next");
+    return it;
+}
+
+// The next value, or false at the end. A failure in next() leaves it done (not closed).
+bool Interpreter::iterStep(IterRec& it, Value& out) {
+    if (it.done) return false;
+    rt_.step();
+    if (it.array) {
+        if (it.index >= it.array->elements.size()) {
+            it.done = true;
+            return false;
+        }
+        const Value& e = it.array->elements[it.index++];
+        out = e.isEmpty() ? Value::undefined() : e;
+        if (it.sync_wrapped) out = awaitValue(rt_, out);
+        return true;
+    }
+    if (it.string.isString()) {
+        const auto& str = it.string.asString();
+        if (it.index >= str.size()) {
+            it.done = true;
+            return false;
+        }
+        size_t n = 1;
+        if (str[it.index] >= 0xD800 && str[it.index] <= 0xDBFF && it.index + 1 < str.size() && str[it.index + 1] >= 0xDC00 && str[it.index + 1] <= 0xDFFF) n = 2;
+        out = Value::string(str.substr(it.index, n));
+        it.index += n;
+        if (it.sync_wrapped) out = awaitValue(rt_, out);
+        return true;
+    }
+    it.done = true;
+    Value r = rt_.call(it.next, it.iterator, {});
+    if (it.async) r = awaitValue(rt_, r);
+    if (!r.isObject()) rt_.throwError("TypeError", "an iterator result must be an object");
+    if (rt_.toBoolean(rt_.get(r, u"done"))) return false;
+    out = rt_.get(r, u"value");
+    if (it.sync_wrapped) out = awaitValue(rt_, out);
+    it.done = false;
+    return true;
+}
+
+// IteratorClose: return(), if it has one. `suppress` for when an error is already on its way.
+void Interpreter::iterClose(IterRec& it, bool suppress) {
+    if (it.done || it.array || it.string.isString()) return;
+    it.done = true;
+    Abrupt error;
+    Value r;
+    try {
+        const Value ret = rt_.get(it.iterator, u"return");
+        if (ret.isNullish()) return;
+        r = rt_.call(ret, it.iterator, {});
+        if (it.async) r = awaitValue(rt_, r);
+    }
+    FBX_CATCH_ABRUPT(error)
+    if (suppress) return;
+    if (error) error.rethrow();
+    if (!r.isObject()) rt_.throwError("TypeError", "an iterator's return() must give an object");
+}
+
+template <typename F>
+void Interpreter::destructureArray(Node* p, const Value& value, F&& assign) {
+    IterRec it = getIterator(value, false);
+    Abrupt failed;
+    try {
+        for (size_t i = 0; i < p->kids.size(); ++i) {
+            Node* k = p->kids[i];
+            if (k && k->kind == N::Rest) {
+                std::vector<Value> rest;
+                {
+                    TempRoots roots(rt_, rest);
+                    Value v;
+                    while (iterStep(it, v)) rest.push_back(v);
+                }
+                assign(k->a, Value::object(rt_.newArray(std::move(rest))));
+                break;
+            }
+            Value v = Value::undefined();
+            Value got;
+            if (iterStep(it, got)) v = got;
+            if (k) assign(k, v);
+        }
+    }
+    FBX_CATCH_ABRUPT(failed)
+    if (failed) {
+        iterClose(it, failed.kind == 1);
+        failed.rethrow();
+    }
+    iterClose(it, false);
 }
 
 void Interpreter::bindPattern(Node* p, const Value& value, Env* env, bool strict, uint32_t kind) {
@@ -1031,21 +1352,9 @@ void Interpreter::bindPattern(Node* p, const Value& value, Env* env, bool strict
             bindPattern(p->a, v, env, strict, kind);
             return;
         }
-        case N::ArrayPattern: {
-            const std::vector<Value> items = rt_.iterateToList(value);
-            for (size_t i = 0; i < p->kids.size(); ++i) {
-                Node* k = p->kids[i];
-                if (!k) continue;
-                if (k->kind == N::Rest) {
-                    std::vector<Value> rest;
-                    for (size_t j = i; j < items.size(); ++j) rest.push_back(items[j]);
-                    bindPattern(k->a, Value::object(rt_.newArray(std::move(rest))), env, strict, kind);
-                    break;
-                }
-                bindPattern(k, i < items.size() ? items[i] : Value::undefined(), env, strict, kind);
-            }
+        case N::ArrayPattern:
+            destructureArray(p, value, [&](Node* target, const Value& v) { bindPattern(target, v, env, strict, kind); });
             return;
-        }
         case N::ObjectPattern: {
             if (value.isNullish()) rt_.throwError("TypeError", "can't destructure " + std::string(value.isNull() ? "null" : "undefined"));
             std::vector<PropertyKey> used;
@@ -1094,17 +1403,54 @@ void Interpreter::assignPattern(Node* p, const Value& value, Env* env, bool stri
             return;
         }
         case N::ArrayPattern: {
-            const std::vector<Value> items = rt_.iterateToList(value);
-            for (size_t i = 0; i < p->kids.size(); ++i) {
-                Node* k = p->kids[i];
-                if (!k) continue;
-                if (k->kind == N::Rest) {
-                    std::vector<Value> rest(items.begin() + static_cast<std::ptrdiff_t>(std::min(i, items.size())), items.end());
-                    assignPattern(k->a, Value::object(rt_.newArray(std::move(rest))), env, strict);
-                    break;
+            // As destructuring assignment orders it: a member target's reference is
+            // worked out before the iterator is asked for its value.
+            IterRec it = getIterator(value, false);
+            Abrupt failed;
+            try {
+                for (Node* k : p->kids) {
+                    Node* target = k;
+                    Node* dflt = nullptr;
+                    const bool rest = k && k->kind == N::Rest;
+                    if (rest) target = k->a;
+                    else if (k && k->kind == N::AssignPattern) { target = k->a; dflt = k->b; }
+                    const bool member = target && target->kind == N::Member;
+                    Value base;
+                    PropertyKey key;
+                    if (member) {
+                        base = target->a->kind == N::Super ? thisValue(env) : eval(target->a, env, strict);
+                        key = memberKey(target, env, strict);
+                    }
+                    Value v;
+                    if (rest) {
+                        std::vector<Value> items;
+                        {
+                            TempRoots roots(rt_, items);
+                            Value x;
+                            while (iterStep(it, x)) items.push_back(x);
+                        }
+                        v = Value::object(rt_.newArray(std::move(items)));
+                    } else {
+                        Value got;
+                        if (iterStep(it, got)) v = got;
+                    }
+                    if (!target) continue;
+                    if (dflt && v.isUndefined()) v = eval(dflt, env, strict);
+                    if (member) {
+                        if (target->a->kind == N::Super) rt_.set(superBase(env).asObject(), key, v, base);
+                        else rt_.set(base, key, v, strict);
+                    } else {
+                        assignPattern(target, v, env, strict);
+                    }
+                    if (rest) break;
                 }
-                assignPattern(k, i < items.size() ? items[i] : Value::undefined(), env, strict);
             }
+            FBX_CATCH_ABRUPT(failed)
+            if (failed) {
+                iterClose(it, failed.kind == 1);
+                failed.rethrow();
+            }
+            iterClose(it, false);
             return;
         }
         case N::ObjectPattern: {
@@ -1133,12 +1479,62 @@ void Interpreter::assignPattern(Node* p, const Value& value, Env* env, bool stri
 }
 
 Value Interpreter::callScript(Object* f, const Value& this_value, std::span<const Value> args, Object* new_target) {
+    FunctionInfo* info = f->code->info;
+    if (info->is_async || info->is_generator) {
+        // The parameters are bound now; the body runs on a coroutine of its own. An
+        // async function's failure here rejects its promise rather than throwing.
+        Env* env = nullptr;
+        if (info->is_async && !info->is_generator) {
+            Abrupt failed;
+            try {
+                env = prepareCall(f, this_value, args, nullptr);
+            }
+            FBX_CATCH_ABRUPT(failed)
+            if (failed) return rejectedPromise(rt_, failed.value);
+        } else {
+            env = prepareCall(f, this_value, args, nullptr);
+        }
+        return startCoroutineFunction(rt_, f, env);
+    }
+    Env* env = prepareCall(f, this_value, args, new_target);
+    EnvScope scope(rt_, env);
+    const Value result = runBody(info, env);
+    if (new_target) {
+        if (result.isObject()) return result;
+        if (info->derived && !result.isUndefined()) rt_.throwError("TypeError", "a derived constructor may only return an object or undefined");
+        if (!env->this_initialized) rt_.throwError("ReferenceError", "a derived constructor must call super()");
+        return env->this_value;
+    }
+    return result;
+}
+
+Value Interpreter::runBody(FunctionInfo* info, Env* env) {
+    if (info->expression_body) return eval(info->body, env, info->strict);
+    declareLexical(env, info->body->lexical.get());
+    Completion c = execBlock(info->body->kids, env, info->strict);
+    return c.type == CT::Return ? c.value : Value::undefined();
+}
+
+void instantiateModuleScope(Runtime& rt, const std::shared_ptr<Program>& prog, Env* env) {
+    Interpreter interp(rt, prog);
+    interp.instantiateModule(env);
+}
+
+void runModuleStatements(Runtime& rt, const std::shared_ptr<Program>& prog, Env* env) {
+    Interpreter interp(rt, prog);
+    interp.runModule(env);
+}
+
+Value runFunctionBody(Runtime& rt, Object* f, Env* env) {
+    Interpreter interp(rt, f->code->program);
+    return interp.runInEnv(f->code->info, env);
+}
+
+Env* Interpreter::prepareCall(Object* f, const Value& this_value, std::span<const Value> args, Object* new_target) {
     FunctionData& code = *f->code;
     FunctionInfo* info = code.info;
-    if (info->is_async || info->is_generator) rt_.throwError("TypeError", "async functions and generators aren't supported yet");
     const bool strict = info->strict;
     Env* env = newEnv(code.closure);
-    Value result_this;
     if (!info->arrow) {
         env->is_function = true;
         env->function = f;
@@ -1161,7 +1557,7 @@ Value Interpreter::callScript(Object* f, const Value& this_value, std::span<cons
             env->this_value = Value::object(rt_.toObject(this_value));
         }
     }
-    EnvScope scope(rt_, env);
+    EnvScope scope(rt_, env);   // while the parameters' defaults run
     // Parameters.
     if (info->simple_params) {
         for (size_t i = 0; i < info->params.size(); ++i) env->vars[info->params[i]->str] = Binding{i < args.size() ? args[i] : Value::undefined()};
@@ -1174,6 +1570,20 @@ Value Interpreter::callScript(Object* f, const Value& this_value, std::span<cons
         if (!env->vars.count(u"arguments")) env->vars[u"arguments"] = Binding{Value::object(a)};
     }
     if (!info->simple_params) {
+        // Every parameter is in its dead zone until its turn: `(a = b, b) => …` throws.
+        std::vector<Node*> todo(info->params.begin(), info->params.end());
+        while (!todo.empty()) {
+            Node* p = todo.back();
+            todo.pop_back();
+            if (!p) continue;
+            switch (p->kind) {
+                case N::Identifier: env->vars[p->str] = Binding{Value::undefined(), true, false}; break;
+                case N::AssignPattern: case N::Rest: todo.push_back(p->a); break;
+                case N::ArrayPattern: todo.insert(todo.end(), p->kids.begin(), p->kids.end()); break;
+                case N::ObjectPattern: for (Node* k : p->kids) todo.push_back(k->kind == N::PatternProperty ? k->b : k->a); break;
+                default: break;
+            }
+        }
         for (size_t i = 0; i < info->params.size(); ++i) {
             Node* p = info->params[i];
             if (p->kind == N::Rest) {
@@ -1198,21 +1608,7 @@ Value Interpreter::callScript(Object* f, const Value& this_value, std::span<cons
             obj->define(key, {v});
         }
     }
-    Value result = Value::undefined();
-    if (info->expression_body) {
-        result = eval(info->body, env, strict);
-    } else {
-        declareLexical(env, info->body->lexical.get());
-        Completion c = execBlock(info->body->kids, env, strict);
-        if (c.type == CT::Return) result = c.value;
-    }
-    if (new_target) {
-        if (result.isObject()) return result;
-        if (info->derived && !result.isUndefined()) rt_.throwError("TypeError", "a derived constructor may only return an object or undefined");
-        if (!env->this_initialized) rt_.throwError("ReferenceError", "a derived constructor must call super()");
-        return env->this_value;
-    }
-    return result;
+    return env;
 }
 
 // ── Statements ──
@@ -1223,7 +1619,8 @@ constexpr size_t kMaxEvalDepth = 2500;
 struct EvalDepth {
     Runtime& rt;
     explicit EvalDepth(Runtime& r) : rt(r) {
-        if (++rt.eval_depth > kMaxEvalDepth) {
+        if (++rt.eval_depth > kMaxEvalDepth ||
+            (rt.current_co && static_cast<char*>(__builtin_frame_address(0)) < rt.current_co->stack_limit)) {
             --rt.eval_depth;
             rt.throwError("RangeError", "too much recursion");
         }
@@ -1358,6 +1755,18 @@ Completion Interpreter::exec(Node* n, Env* env, bool strict) {
         case N::For: return forStatement(n, env, strict, nullptr);
         case N::ForIn: case N::ForOf: return forInOf(n, env, strict, nullptr);
         case N::Switch: return switchStatement(n, env, strict, nullptr);
+        case N::ImportDecl: return {CT::Normal, Value::empty()};   // bound when the module was linked
+        case N::ExportDecl: {
+            if (!n->a) return {CT::Normal, Value::empty()};
+            if (n->a->kind == N::VarDecl || n->a->kind == N::FunctionDecl || n->a->kind == N::ClassDecl) return exec(n->a, env, strict);
+            if (n->flags & kHoisted) return {CT::Normal, Value::empty()};   // made when the module was linked
+            // export default <expression>
+            const Value v = eval(n->a, env, strict);
+            Binding& b = env->vars[u"*default*"];
+            b.value = v;
+            b.initialized = true;
+            return {CT::Normal, Value::empty()};
+        }
         default: rt_.throwError("SyntaxError", "unexpected statement");
     }
 }
@@ -1437,6 +1846,7 @@ Completion Interpreter::forInOf(Node* n, Env* env, bool strict, const std::u16st
         }
     }
     const Value subject = eval(n->b, tdz, strict);
+    if (n->kind == N::ForOf) return forOf(n, env, strict, label, subject, decl);
     std::vector<Value> items;
     if (n->kind == N::ForIn) {
         if (subject.isNullish()) return {CT::Normal, Value::undefined()};
@@ -1452,8 +1862,6 @@ Completion Interpreter::forInOf(Node* n, Env* env, bool strict, const std::u16st
                 items.push_back(Value::string(k.name));
             }
         }
-    } else {
-        items = rt_.iterateToList(subject);
     }
     Value last;
     bool stop = false;
@@ -1474,37 +1882,68 @@ Completion Interpreter::forInOf(Node* n, Env* env, bool strict, const std::u16st
     return {CT::Normal, last};
 }
 
+// for (… of …) and for await (… of …): one value at a time, and the iterator closed
+// when the loop is left early.
+Completion Interpreter::forOf(Node* n, Env* env, bool strict, const std::u16string* label, const Value& subject, uint32_t decl) {
+    IterRec it = getIterator(subject, (n->flags & kAwait) != 0);
+    Value last;
+    bool stop = false;
+    while (true) {
+        Value item;
+        if (!iterStep(it, item)) break;
+        Completion c;
+        Abrupt abrupt;
+        try {
+            Env* iter = env;
+            if (decl & (kLet | kConst)) {
+                iter = newEnv(env);
+                bindPattern(n->a, item, iter, strict, decl);
+            } else if (decl == kVar) {
+                bindPattern(n->a, item, env, strict, kVar);
+            } else {
+                assignPattern(n->a, item, env, strict);
+            }
+            EnvScope scope(rt_, iter);
+            c = execLoopBody(n->c, iter, strict, label, stop, last);
+        }
+        FBX_CATCH_ABRUPT(abrupt)
+        if (abrupt) {
+            iterClose(it, abrupt.kind == 1);
+            abrupt.rethrow();
+        }
+        if (stop) {
+            iterClose(it, false);
+            return c;
+        }
+    }
+    return {CT::Normal, last};
+}
+
 Completion Interpreter::tryStatement(Node* n, Env* env, bool strict) {
+    // The catch and finally blocks run after the C++ handler has finished: a yield or
+    // await in them suspends the coroutine, which mustn't happen mid-handler.
     Completion result;
-    bool rethrow = false;
-    Value thrown;
+    Abrupt abrupt;
     try {
         result = exec(n->a, env, strict);
-    } catch (const Thrown& t) {
-        if (n->c) {
+    }
+    FBX_CATCH_ABRUPT(abrupt)
+    if (abrupt.kind == 1 && n->c) {
+        const Value thrown = abrupt.value;
+        abrupt = Abrupt{};
+        try {
             Env* catch_env = newEnv(env);
-            if (n->b) bindPattern(n->b, t.value, catch_env, strict, kLet);
             EnvScope scope(rt_, catch_env);
-            if (n->d) {
-                try {
-                    result = exec(n->c, catch_env, strict);
-                } catch (const Thrown& t2) {
-                    rethrow = true;
-                    thrown = t2.value;
-                }
-            } else {
-                result = exec(n->c, catch_env, strict);
-            }
-        } else {
-            rethrow = true;
-            thrown = t.value;
+            if (n->b) bindPattern(n->b, thrown, catch_env, strict, kLet);
+            result = exec(n->c, catch_env, strict);
         }
+        FBX_CATCH_ABRUPT(abrupt)
     }
     if (n->d) {
         Completion f = exec(n->d, env, strict);
         if (f.type != CT::Normal) return f;   // finally's own break, continue or return wins
     }
-    if (rethrow) throw Thrown{thrown};
+    if (abrupt) abrupt.rethrow();
     return result;
 }
 
@@ -1607,6 +2046,7 @@ Value Interpreter::superBase(Env* env) {
 std::vector<Value> Interpreter::evalArgs(const std::vector<Node*>& args, Env* env, bool strict) {
     std::vector<Value> out;
     out.reserve(args.size());
+    TempRoots roots(rt_, out);
     for (Node* a : args) {
         if (a->kind == N::Spread) {
             const std::vector<Value> items = rt_.iterateToList(eval(a->a, env, strict));
@@ -1637,7 +2077,9 @@ Value Interpreter::eval(Node* n, Env* env, bool strict) {
             // A named function expression sees its own name.
             Env* named = newEnv(env);
             Object* f = makeFunction(n->fn, named, nullptr);
-            named->vars[n->str] = Binding{Value::object(f), false, true};
+            Binding self{Value::object(f), false, true};
+            self.function_name = true;
+            named->vars[n->str] = self;
             return Value::object(f);
         }
         case N::Arrow: return Value::object(makeFunction(n->fn, env, nullptr));
@@ -1691,7 +2133,17 @@ Value Interpreter::eval(Node* n, Env* env, bool strict) {
             Env* f = functionEnv(env);
             return f && f->new_target ? Value::object(f->new_target) : Value::undefined();
         }
-        case N::Yield: case N::Await: rt_.throwError("SyntaxError", "yield and await aren't supported yet");
+        case N::Yield: {
+            const Value v = n->a ? eval(n->a, env, strict) : Value::undefined();
+            if (n->flags & kSpreadProp) return generatorDelegate(rt_, v);
+            return generatorYield(rt_, v);
+        }
+        case N::Await: return awaitValue(rt_, eval(n->a, env, strict));
+        case N::ImportCall: {
+            const Value spec = eval(n->a, env, strict);
+            return dynamicImport(rt_, spec, prog_->url);
+        }
+        case N::ImportMeta: return Value::object(importMeta(rt_, prog_->url));
         case N::Spread: rt_.throwError("SyntaxError", "unexpected ...");
         default: rt_.throwError("SyntaxError", "unexpected expression");
     }
@@ -1800,6 +2252,8 @@ Value Interpreter::evalTemplate(Node* n, Env* env, bool strict) {
 Value Interpreter::evalTagged(Node* n, Env* env, bool strict) {
     Value this_value;
     Value fn;
+    std::vector<Value> args;
+    TempRoots roots(rt_, args);
     if (n->a->kind == N::Member) {
         this_value = eval(n->a->a, env, strict);
         fn = rt_.get(this_value, memberKey(n->a, env, strict));
@@ -1808,7 +2262,6 @@ Value Interpreter::evalTagged(Node* n, Env* env, bool strict) {
     }
     Node* t = n->b;
     std::vector<Value> cooked, raw;
-    std::vector<Value> args;
     for (size_t i = 0; i < t->kids.size(); i += 2) {
         cooked.push_back((t->kids[i]->flags & kOptional) ? Value::undefined() : Value::string(t->kids[i]->str));
         raw.push_back(Value::string(t->kids[i]->str2));
@@ -1824,6 +2277,7 @@ Value Interpreter::evalTagged(Node* n, Env* env, bool strict) {
 Value Interpreter::evalArray(Node* n, Env* env, bool strict) {
     std::vector<Value> items;
     items.reserve(n->kids.size());
+    TempRoots roots(rt_, items);
     for (Node* k : n->kids) {
         if (k->kind == N::Hole) items.push_back(Value::empty());
         else if (k->kind == N::Spread) {

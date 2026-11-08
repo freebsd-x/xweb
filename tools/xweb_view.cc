@@ -41,6 +41,7 @@
 #include "xweb/encoding.h"
 #include "xweb/forms.h"
 #include "xweb/html_parser.h"
+#include "xweb/js.h"
 #include "xweb/layout.h"
 #include "xweb/paint.h"
 #include "xweb/script.h"
@@ -282,28 +283,66 @@ void loadSheets(Page& page, const std::atomic<uint64_t>& generation, uint64_t mi
     }
 }
 
-// The page's external scripts, fetched with its stylesheets, so they run in order.
+// The page's external scripts, fetched with its stylesheets, so they run in order;
+// and its modules with everything they import, so the graph is there when they run.
 void loadScripts(Page& page, const std::atomic<uint64_t>& generation, uint64_t mine) {
     constexpr size_t kMaxScripts = 100;
+    constexpr size_t kMaxModules = 400;
     constexpr size_t kMaxScriptBytes = 8 << 20;
+    constexpr size_t kMaxTotalBytes = 64 << 20;
     std::vector<const web::Node*> todo{page.doc->root()};
     std::vector<std::string> urls;
+    std::deque<std::pair<std::string, std::string>> modules;   // (its URL, its source if inline)
+    web::js::ImportMap import_map;
     while (!todo.empty() && urls.size() < kMaxScripts) {
         const web::Node* n = todo.back();
         todo.pop_back();
-        if (n->isHtml("script"))
-            if (const std::string* src = n->attr("src")) {
-                const std::string* type = n->attr("type");
-                const std::string t = type ? lowerCase(*type) : "";
-                if (t.empty() || t.find("javascript") != std::string::npos || t == "text/ecmascript") urls.push_back(web::resolveUrl(page.base, *src));
+        if (n->isHtml("script")) {
+            const std::string* type = n->attr("type");
+            const std::string t = type ? lowerCase(*type) : "";
+            const std::string* src = n->attr("src");
+            if (t == "importmap") {
+                import_map.add(n->textContent(), page.base);
+            } else if (t == "module") {
+                if (src) modules.emplace_back(web::resolveUrl(page.base, *src), std::string{});
+                else modules.emplace_back(std::string{}, n->textContent());
+            } else if (src && !n->attr("nomodule") && (t.empty() || t.find("javascript") != std::string::npos || t == "text/ecmascript")) {
+                urls.push_back(web::resolveUrl(page.base, *src));
             }
+        }
         todo.insert(todo.end(), n->children.rbegin(), n->children.rend());
     }
+    size_t total = 0;
+    const auto fetch = [&](const std::string& url) -> const std::string* {
+        if (const auto it = page.scripts.find(url); it != page.scripts.end()) return &it->second;
+        if (total > kMaxTotalBytes) return nullptr;
+        Resource got = load(url, web::sameSite(page.url, url));
+        if (!got.ok || got.http_status >= 400 || got.body.size() > kMaxScriptBytes) return nullptr;
+        total += got.body.size();
+        return &(page.scripts[url] = web::decodeToUtf8(got.body, got.content_type));
+    };
     for (const std::string& url : urls) {
         if (generation.load() != mine) return;
-        if (page.scripts.count(url)) continue;
-        Resource got = load(url, web::sameSite(page.url, url));
-        if (got.ok && got.http_status < 400 && got.body.size() <= kMaxScriptBytes) page.scripts[url] = web::decodeToUtf8(got.body, got.content_type);
+        fetch(url);
+    }
+    // Breadth first through the module graph.
+    std::set<std::string> seen;
+    size_t fetched = 0;
+    while (!modules.empty() && fetched < kMaxModules && generation.load() == mine) {
+        auto [url, inline_source] = modules.front();
+        modules.pop_front();
+        const std::string* source = &inline_source;
+        std::string base = url.empty() ? page.url : url;
+        if (!url.empty()) {
+            if (!seen.insert(url).second) continue;
+            ++fetched;
+            source = fetch(url);
+            if (!source) continue;
+        }
+        for (const std::string& spec : web::js::moduleRequests(*source)) {
+            const std::string dep = import_map.resolve(spec, base);
+            if (!dep.empty() && !seen.count(dep)) modules.emplace_back(dep, std::string{});
+        }
     }
 }
 
@@ -1201,6 +1240,23 @@ private:
         };
         host.scroll_to = [this](float, float y) { node_->scrollTo(y); };
         host.scroll_y = [this] { return node_->scrollY(); };
+        // import() and anything else not fetched ahead: off the UI thread, back on it.
+        std::weak_ptr<Page> weak = page;
+        const std::string page_url = page->url;
+        host.fetch_script = [this, weak, page_url](const std::string& url, std::function<void(std::optional<std::string>)> done) {
+            std::thread([this, weak, page_url, url, done = std::move(done)] {
+                Resource got = load(url, web::sameSite(page_url, url));
+                std::optional<std::string> body;
+                if (got.ok && got.http_status < 400 && got.body.size() <= (8u << 20)) body = web::decodeToUtf8(got.body, got.content_type);
+                XApplication::post([this, weak, url, done, body = std::move(body)] {
+                    std::shared_ptr<Page> p = weak.lock();
+                    if (!p || !p->script) return;   // the page is gone
+                    if (body) p->scripts[url] = *body;
+                    done(body);
+                    if (p->script->takeDirty()) node_->invalidate();
+                });
+            }).detach();
+        };
         page->script = std::make_unique<web::PageScript>(*page->doc, std::move(host));
         page->script->run([raw](const std::string& url) -> std::optional<std::string> {
             const auto it = raw->scripts.find(url);

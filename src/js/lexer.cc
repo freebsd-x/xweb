@@ -91,9 +91,17 @@ bool Lexer::skipSpace(bool& newline) {
                 return false;
             }
         } else if (c == u'<' && s_.substr(i_, 4) == u"<!--") {
-            // HTML-like comments, as browsers still allow in scripts.
+            // HTML-like comments, as browsers still allow in scripts (not modules).
+            if (module) {
+                error = "HTML-like comments aren't allowed in modules";
+                return false;
+            }
             while (i_ < s_.size() && !isLineTerminator(s_[i_])) ++i_;
         } else if (c == u'-' && newline && s_.substr(i_, 3) == u"-->") {
+            if (module) {
+                error = "HTML-like comments aren't allowed in modules";
+                return false;
+            }
             while (i_ < s_.size() && !isLineTerminator(s_[i_])) ++i_;
         } else {
             break;

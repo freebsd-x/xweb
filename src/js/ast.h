@@ -37,6 +37,9 @@ enum class N : uint8_t {
     Number, String, Template, TaggedTemplate, Regex, Identifier, This, Super, Array, Object, Property,
     FunctionExpr, Arrow, ClassExpr, Method, Unary, Update, Binary, Logical, Assign, Conditional, Call, New,
     Member, Sequence, Spread, NewTarget, Hole, Boolean, Null, Undefined, OptionalChain, Yield, Await,
+    ImportCall, ImportMeta,
+    // Modules
+    ImportDecl, ExportDecl, ImportSpec, ExportSpec,
     // Patterns
     ArrayPattern, ObjectPattern, PatternProperty, AssignPattern, Rest,
 };
@@ -83,6 +86,10 @@ enum : uint32_t {
     kStatic = 64, kGetter = 128, kSetter = 256, kShorthand = 512, kMethodProp = 1024, kSpreadProp = 2048,
     kParenthesized = 4096,
     kField = 8192,                            // a class field
+    kAwait = 16384,                           // for await (… of …)
+    kDefault = 32768,                         // export default
+    kNamespace = 65536,                       // import * as ns, export * as ns
+    kHoisted = 131072,                        // export default function () {}: made at link time
 };
 
 struct FunctionInfo {
@@ -108,6 +115,8 @@ struct FunctionInfo {
 };
 
 struct Program {
+    std::string url;                 // a module's (or a script's) URL, for import() and import.meta
+    bool module = false;
     std::deque<Node> nodes;
     std::deque<FunctionInfo> functions;
     Node* root = nullptr;
@@ -129,6 +138,7 @@ public:
     [[nodiscard]] size_t pos() const noexcept { return i_; }
     void reset(size_t pos, uint32_t line) { i_ = pos; line_ = line; }
     std::string error;
+    bool module = false;   // module code: no HTML-like comments
 
 private:
     bool skipSpace(bool& newline);
@@ -144,7 +154,7 @@ private:
 };
 
 // Parses a script. On a syntax error, `error` says what and where, and the result is null.
-std::unique_ptr<Program> parse(std::u16string_view source, std::string& error, bool strict = false);
+std::unique_ptr<Program> parse(std::u16string_view source, std::string& error, bool strict = false, bool module = false);
 
 [[nodiscard]] bool isIdStart(char32_t c);
 [[nodiscard]] bool isIdPart(char32_t c);
