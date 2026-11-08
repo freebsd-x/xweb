@@ -28,6 +28,8 @@ libxweb = static_library('xweb',
   'src/js/coroutine.cc',
   'src/js/async.cc',
   'src/js/modules.cc',
+  'src/js/date.cc',
+  'src/js/typedarray.cc',
   include_directories : xweb_inc,
 )
 

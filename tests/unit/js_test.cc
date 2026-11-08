@@ -535,3 +535,46 @@ TEST(Js, CoroutineFuzz) {
         rt.collectGarbage();
     }
 }
+
+TEST(Js, Date) {
+    EXPECT_EQ(run("new Date(Date.UTC(2026, 10, 8, 4, 5, 6, 789)).toISOString()"), "2026-11-08T04:05:06.789Z");
+    EXPECT_EQ(run("Date.parse('2026-11-08T04:05:06.789+09:00')"), "1794078306789");
+    EXPECT_EQ(run("Date.parse('2026-11-08')"), "1794096000000");
+    EXPECT_EQ(run("const d = new Date(1794110706789); Date.parse(d.toUTCString()) === 1794110706000 && Date.parse(String(d)) === 1794110706000"), "true");
+    EXPECT_EQ(run("new Date(2024, 1, 29, 12).getDate() + ',' + new Date(2024, 0, 31).getMonth()"), "29,0");
+    EXPECT_EQ(run("const e = new Date(2024, 1, 29); e.setFullYear(2025); [e.getMonth(), e.getDate()].join()"), "2,1");
+    EXPECT_EQ(run("const h = new Date(0); h.setUTCHours(25, 61, 61, 1001); h.toISOString()"), "1970-01-02T02:02:02.001Z");
+    EXPECT_EQ(run("[new Date('nope').getTime(), String(new Date(NaN)), new Date(8.64e15 + 1).getTime()].join()"), "NaN,Invalid Date,NaN");
+    EXPECT_EQ(run("JSON.stringify({d: new Date(0)}) + typeof (new Date() + 1) + Object.prototype.toString.call(new Date())"), "{\"d\":\"1970-01-01T00:00:00.000Z\"}string[object Date]");
+    EXPECT_EQ(run("[new Date('Nov 8, 2026 10:30 PM').getHours(), new Date('2026/11/08').getDate(), new Date(-62198755200000).toISOString()].join()"),
+              "22,8,-000001-01-01T00:00:00.000Z");
+}
+
+TEST(Js, TypedArraysAndText) {
+    EXPECT_EQ(run("const u = new Uint8Array([1, 2, 300, -1]); [u.join(), u.length, u[9], Object.prototype.toString.call(u)].join(' ')"), "1,2,44,255 4  [object Uint8Array]");
+    EXPECT_EQ(run("new Uint8ClampedArray([1.5, 2.5, 300, -5, NaN]).join()"), "2,2,255,0,0");
+    EXPECT_EQ(run("const b = new ArrayBuffer(8); const v = new DataView(b); v.setUint16(0, 0x1234); v.setFloat32(4, 1.5, true);"
+                  "[new Uint8Array(b).join(), v.getUint16(0, true), new Int32Array(b, 4, 1)[0]].join(' ')"), "18,52,0,0,0,0,192,63 13330 1069547520");
+    EXPECT_EQ(run("const m = new Int16Array([5, 1, 4]).map(x => x * 2).sort(); m.join() + (m instanceof Int16Array) + [...m.keys()]"), "2,8,10true0,1,2");
+    EXPECT_EQ(run("const s = new Uint8Array(6); s.set([9, 8], 1); s.set(new Uint8Array([7]), 5); [s.join(), s.subarray(1, 3).join(), s.slice(-1).join()].join(' ')"),
+              "0,9,8,0,0,7 9,8 7");
+    EXPECT_EQ(run("const e = new TextEncoder().encode('h\\u00e9 \\u{1F600}'); e.length + ' ' + new TextDecoder().decode(e).length"), "8 5");
+    EXPECT_EQ(run("new TextDecoder().decode(new Uint8Array([0x61, 0xff, 0x62]))"), "a\uFFFDb");
+    EXPECT_EQ(run("const r = new ArrayBuffer(4, {maxByteLength: 16}); const t = new Uint8Array(r); r.resize(10); const m2 = r.transfer(); [t.length, r.detached, m2.byteLength].join()"),
+              "0,true,10");
+    EXPECT_EQ(run("try { new Uint8Array(-1) } catch (e) { e.name }"), "RangeError");
+    EXPECT_EQ(run("const t = new Float64Array(2); t.x = 1; t[5] = 9; t['-0'] = 9; Object.keys(t).join() + ',' + t[5]"), "0,1,x,undefined");
+}
+
+TEST(Js, EvalAndFunction) {
+    EXPECT_EQ(run("function f(a) { var local = 10; eval('var made = a + local; let inner = 5;'); return made + typeof inner; } f(2)"), "12undefined");
+    EXPECT_EQ(run("[eval('1; 2 * 3'), (0, eval)('typeof f'), eval(42)].join()"), "6,undefined,42");
+    EXPECT_EQ(run("function s() { 'use strict'; eval('var x = 1'); return typeof x; } s()"), "undefined");
+    EXPECT_EQ(run("var g = 1; function h() { var g = 2; return (0, eval)('g'); } h()"), "1");
+    EXPECT_EQ(run("new Function('a', 'b', 'return a + b')(2, 3)"), "5");
+    EXPECT_EQ(run("try { new Function('a', '}); x = 1; ({') } catch (e) { e.name }"), "SyntaxError");
+    EXPECT_EQ(run("try { eval('let = ;') } catch (e) { e.name }"), "SyntaxError");
+    EXPECT_EQ(run("class A { m() { return eval('super.toString === Object.prototype.toString'); } } new A().m()"), "true");
+    EXPECT_EQ(run("const G = Object.getPrototypeOf(function* () {}).constructor; new G('yield 7')().next().value"), "7");
+    EXPECT_EQ(run("var n = 0; for (let i = 0; i < 1000; i++) eval('n += ' + (i % 3)); n"), "999");
+}

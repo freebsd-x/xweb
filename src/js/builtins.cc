@@ -89,6 +89,18 @@ Property toDescriptor(Runtime& rt, const Value& d, uint8_t& present) {
 void defineFromDescriptor(Runtime& rt, Object* o, const PropertyKey& key, const Value& desc) {
     uint8_t present = 0;
     Property p = toDescriptor(rt, desc, present);
+    // A typed array's element: only as a plain, writable, enumerable, configurable value.
+    if (!key.isSymbol() && o->cls == ObjectClass::TypedArray) {
+        double index;
+        if (typedKey(key, index)) {
+            if (!typedValidIndex(o, index)) rt.throwError("TypeError", "not a valid index of the typed array");
+            if ((p.flags & kAccessor) || ((present & kConfigurable) && !(p.flags & kConfigurable)) ||
+                ((present & kEnumerable) && !(p.flags & kEnumerable)) || ((present & kWritable) && !(p.flags & kWritable)))
+                rt.throwError("TypeError", "a typed array's element can't be redefined that way");
+            if (present & 16) typedSet(rt, o, index, p.value);
+            return;
+        }
+    }
     // An array's element or length.
     if (!key.isSymbol() && o->cls == ObjectClass::Array && !(p.flags & kAccessor)) {
         if (key.name == u"length") {
@@ -155,6 +167,14 @@ Value fromDescriptor(Runtime& rt, const Property& p) {
 
 // An own property, including an array's elements and a String's characters.
 bool ownProperty(Runtime& rt, Object* o, const PropertyKey& key, Property& out) {
+    if (!key.isSymbol() && o->cls == ObjectClass::TypedArray) {
+        double index;
+        if (typedKey(key, index)) {
+            if (!typedValidIndex(o, index)) return false;
+            out = {typedGet(o, index), nullptr, nullptr, kDefaultFlags};
+            return true;
+        }
+    }
     if (!key.isSymbol()) {
         if (o->cls == ObjectClass::Array && key.name == u"length") {
             out = {Value::number(static_cast<double>(o->elements.size())), nullptr, nullptr, kWritable};
@@ -756,6 +776,7 @@ void Runtime::installBuiltins() {
             case ObjectClass::Number: name = u"Number"; break;
             case ObjectClass::String: name = u"String"; break;
             case ObjectClass::Arguments: name = u"Arguments"; break;
+            case ObjectClass::Date: name = u"Date"; break;
             case ObjectClass::RegExp: name = u"RegExp"; break;
             default: break;
         }
@@ -780,12 +801,24 @@ void Runtime::installBuiltins() {
         kConfigurable | kAccessor});
 
     // ── Function ──
-    Object* function_ctor = ctor(u"Function", 1, [](Runtime& rt, const Value&, Args) -> Value {
-        rt.throwError("EvalError", "new Function() isn't allowed");
-    }, function_prototype);
-    (void)function_ctor;
+    // Functions from source, in the global scope; and eval (a direct call in calls).
+    ctor(u"Function", 1, [](Runtime& rt, const Value&, Args a) { return dynamicFunction(rt, a, "function"); }, function_prototype);
+    eval_function = newFunction(u"eval", 1, [](Runtime& rt, const Value&, Args a) {
+        if (a.empty() || !a[0].isString()) return arg(a, 0);
+        return evalCode(rt, a[0].asString(), nullptr, false, false);
+    });
+    put(global_, u"eval", Value::object(eval_function));
     put(function_prototype, u"length", Value::number(0), kConfigurable);
     put(function_prototype, u"name", Value::string(u""), kConfigurable);
+    // %ThrowTypeError%: caller and arguments, which strict code may not reach for.
+    {
+        Object* thrower = newFunction(u"", 0, [](Runtime& rt, const Value&, Args) -> Value {
+            rt.throwError("TypeError", "'caller' and 'arguments' can't be used on strict functions or their calls");
+        });
+        thrower->extensible = false;
+        for (const char16_t* name : {u"caller", u"arguments"})
+            function_prototype->define(name, {Value::undefined(), thrower, thrower, kConfigurable | kAccessor});
+    }
     method(function_prototype, u"call", 1, [](Runtime& rt, const Value& t, Args a) {
         return rt.call(t, arg(a, 0), a.size() > 1 ? a.subspan(1) : Args{});
     });
@@ -2210,6 +2243,8 @@ void Runtime::installBuiltins() {
     }
     installRegExp();
     installPromise();
+    installDate();
+    installTypedArrays();
     installGenerators();
     (void)rt;
 }

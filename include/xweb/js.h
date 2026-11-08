@@ -3,8 +3,8 @@
 // Our JavaScript engine, written by hand like the rest of xweb: a lexer and parser for
 // the ES2022 language, and an interpreter that walks the tree it makes, with the
 // standard library's core, regular expressions, Promise, generators and async
-// functions (on coroutines of their own), modules and weak collections. Not yet: Date,
-// Proxy, typed arrays, eval.
+// functions (on coroutines of their own), modules, weak collections, Date, typed arrays
+// and eval. Not yet: BigInt, Proxy.
 
 #include <cstdint>
 #include <deque>
@@ -122,7 +122,7 @@ using NativeFunction = std::function<Value(Runtime&, const Value& this_value, st
 
 enum class ObjectClass : uint8_t {
     Ordinary, Array, Function, Error, Boolean, Number, String, Symbol, Arguments, Map, Set, Iterator, RegExp,
-    Promise, Generator, AsyncGenerator, Internal, WeakMap, WeakSet, WeakRef,
+    Promise, Generator, AsyncGenerator, Internal, WeakMap, WeakSet, WeakRef, Date, ArrayBuffer, TypedArray, DataView,
 };
 
 // Map and Set keys: SameValueZero, hashed (strings by content, objects by identity).
@@ -134,6 +134,14 @@ struct ValueSameZero {
 };
 
 struct FunctionData;   // a script function's code and closure (runtime.cc)
+
+// An ArrayBuffer's bytes, shared by the views on it.
+struct BufferData {
+    std::vector<uint8_t> bytes;
+    bool detached = false;
+    bool resizable = false;
+    size_t max_length = 0;
+};
 
 class Object : public Cell {
 public:
@@ -179,6 +187,14 @@ public:
     // A promise's state (pending, fulfilled, rejected); its result is `primitive`.
     uint8_t promise_state = 0;
     bool promise_handled = false;
+    // An ArrayBuffer's bytes; a typed array's or DataView's window on its buffer (`target`):
+    // its kind, where it starts, and its length (elements, or bytes for a DataView), or
+    // all the rest of a resizable buffer when it tracks it.
+    std::shared_ptr<BufferData> buffer;
+    uint8_t view_kind = 0;
+    bool view_tracking = false;
+    size_t view_offset = 0;
+    size_t view_length = 0;
     // A generator's or async function's suspended body.
     std::shared_ptr<Coroutine> co;
 
@@ -310,6 +326,11 @@ public:
     Symbol* newSymbol(std::u16string description, bool has_description = true);
     // A RegExp, as /source/flags would make it; a bad pattern throws a SyntaxError.
     Object* newRegExp(const std::u16string& source, const std::u16string& flags);
+    // Detaches an ArrayBuffer (its bytes go; views on it read as empty). False if it isn't one.
+    bool detachArrayBuffer(const Value& buffer);
+    // An ArrayBuffer holding these bytes; and the bytes an ArrayBuffer or a view on one holds.
+    Object* newArrayBuffer(std::string_view bytes);
+    bool bufferBytes(const Value& source, std::string& out);
     // IsRegExp: an object with a truthy Symbol.match, or else a RegExp.
     bool isRegExp(const Value& v);
     void put(Object* o, const PropertyKey& key, Value v, uint8_t flags = kWritable | kConfigurable);
@@ -380,6 +401,11 @@ public:
     Object* async_function_prototype = nullptr;
     Object* async_generator_function_prototype = nullptr;
     Object* async_from_sync_iterator_prototype = nullptr;
+    Object* array_buffer_prototype = nullptr;
+    Object* typed_array_prototype = nullptr;     // %TypedArray%.prototype
+    Object* typed_array_constructors[9] = {};    // Int8Array … Float64Array
+    Object* data_view_prototype = nullptr;
+    Object* eval_function = nullptr;   // the global eval, which a direct call recognizes
     std::unordered_map<std::string, Object*> error_prototypes;
     Symbol* sym_iterator = nullptr;
     Symbol* sym_to_primitive = nullptr;
@@ -442,6 +468,8 @@ private:
     void installBuiltins();
     void installRegExp();
     void installPromise();
+    void installDate();
+    void installTypedArrays();
     void installGenerators();
     void markModules(std::vector<Cell*>& todo);
     std::deque<Job> jobs_;
@@ -450,6 +478,8 @@ private:
     std::vector<Cell*> cells_;
     size_t allocations_ = 0;
     std::vector<std::shared_ptr<struct Program>> programs_;   // every script's tree, kept for its functions
+    std::unordered_map<std::u16string, std::shared_ptr<struct Program>> eval_cache_;   // eval'd source, parsed once
+    friend Value evalCode(Runtime& rt, const std::u16string& source, Env* env, bool strict, bool direct);
     Object* global_ = nullptr;
     Env* global_env_ = nullptr;
     std::function<void(std::string_view, const std::string&)> console_;

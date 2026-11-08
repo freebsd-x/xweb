@@ -976,13 +976,12 @@ void Runtime::installGenerators() {
     async_function_prototype = newObject(function_prototype);
     tag(async_function_prototype, u"AsyncFunction");
 
-    // Their constructors exist (code finds them through a function's prototype) but,
-    // like Function, can't make code from a string.
+    // Their constructors, which code finds through a function's prototype.
     const Value function_ctor = get(Value::object(global_), u"Function");
     const auto dynamicCtor = [&](const char16_t* name, Object* fn_proto) {
-        Object* c = newFunction(name, 1, [](Runtime& rt, const Value&, Args) -> Value {
-            rt.throwError("EvalError", "functions can't be made from strings");
-        }, true);
+        const char* kind = name == std::u16string_view(u"GeneratorFunction") ? "function*"
+                           : name == std::u16string_view(u"AsyncGeneratorFunction") ? "async function*" : "async function";
+        Object* c = newFunction(name, 1, [kind](Runtime& rt, const Value&, Args a) { return dynamicFunction(rt, a, kind); }, true);
         if (function_ctor.isObject()) c->prototype = function_ctor.asObject();
         put(c, u"prototype", Value::object(fn_proto), 0);
         put(fn_proto, u"constructor", Value::object(c), kConfigurable);

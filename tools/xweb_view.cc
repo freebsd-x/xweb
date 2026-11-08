@@ -183,7 +183,7 @@ Resource load(const std::string& address, bool cookies = false) {
 }
 
 // A form's POST: only to the web, never to a file.
-Resource loadPost(const web::FormSubmission& sub) {
+Resource loadPost(const web::FormSubmission& sub, bool cookies = true) {
     Resource r;
     r.final_url = sub.url;
     const web::Url url = web::parseUrl(sub.url);
@@ -191,7 +191,7 @@ Resource loadPost(const web::FormSubmission& sub) {
         r.error = "This form can't be sent from here.";
         return r;
     }
-    auto got = postWebBlocking(url.withoutFragment(), sub.content_type, sub.body);
+    auto got = postWebBlocking(url.withoutFragment(), sub.content_type, sub.body, cookies);
     r.http_status = got.http_status;
     if (got.status == fbx::shared::FetchStatus::Ok) {
         r.ok = true;
@@ -1253,6 +1253,62 @@ private:
                     if (!p || !p->script) return;   // the page is gone
                     if (body) p->scripts[url] = *body;
                     done(body);
+                    if (p->script->takeDirty()) node_->invalidate();
+                });
+            }).detach();
+        };
+        // fetch() and XMLHttpRequest. The broker can't show us a response's headers, so
+        // there's no CORS check to make; instead: cookies only for the page's own origin,
+        // and nothing on this machine or the local network for a page that isn't there.
+        host.fetch = [this, weak, page_url](const web::PageScript::Host::Request& req, std::function<void(web::PageScript::Host::Response)> done) {
+            web::PageScript::Host::Response refused;
+            const web::Url target = web::parseUrl(req.url);
+            const web::Url origin = web::parseUrl(page_url);
+            const auto local = [](const std::string& authority) {
+                std::string host = authority.substr(0, authority.rfind(':') == std::string::npos || authority.find(']') != std::string::npos ? authority.size() : authority.rfind(':'));
+                if (host.starts_with("[")) return host == "[::1]" || host.starts_with("[fc") || host.starts_with("[fd") || host.starts_with("[fe80");
+                if (host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local")) return true;
+                int a = -1, b = -1;
+                if (std::sscanf(host.c_str(), "%d.%d.", &a, &b) == 2)
+                    return a == 127 || a == 10 || a == 0 || (a == 192 && b == 168) || (a == 172 && b >= 16 && b <= 31) || (a == 169 && b == 254);
+                return false;
+            };
+            const bool same_origin = target.scheme == origin.scheme && target.authority == origin.authority;
+            if (target.scheme != "http" && target.scheme != "https") {
+                refused.error = "only http and https can be fetched";
+            } else if (req.method != "GET" && req.method != "POST" && req.method != "HEAD") {
+                refused.error = "the method " + req.method + " isn't supported yet";
+            } else if (!same_origin && local(target.authority) && !local(origin.authority)) {
+                refused.error = "a page on the web can't reach this machine or the local network";
+            }
+            if (!refused.error.empty()) {
+                XApplication::post([weak, done, refused] {
+                    if (weak.lock()) done(refused);
+                });
+                return;
+            }
+            std::thread([this, weak, req, same_origin, done = std::move(done)] {
+                Resource got;
+                if (req.method == "POST") {
+                    web::FormSubmission sub;
+                    sub.url = req.url;
+                    sub.content_type = req.content_type.empty() ? "text/plain;charset=UTF-8" : req.content_type;
+                    sub.body = req.body;
+                    got = loadPost(sub, same_origin);
+                } else {
+                    got = load(req.url, same_origin);
+                }
+                web::PageScript::Host::Response r;
+                r.ok = got.ok;
+                r.status = got.http_status ? static_cast<int>(got.http_status) : (got.ok ? 200 : 0);
+                r.url = got.final_url;
+                r.content_type = got.content_type;
+                r.body = std::move(got.body);
+                r.error = got.error;
+                XApplication::post([this, weak, done, r = std::move(r)] {
+                    std::shared_ptr<Page> p = weak.lock();
+                    if (!p || !p->script) return;
+                    done(r);
                     if (p->script->takeDirty()) node_->invalidate();
                 });
             }).detach();

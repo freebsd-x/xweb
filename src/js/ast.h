@@ -154,7 +154,14 @@ private:
 };
 
 // Parses a script. On a syntax error, `error` says what and where, and the result is null.
-std::unique_ptr<Program> parse(std::u16string_view source, std::string& error, bool strict = false, bool module = false);
+// Where eval code sits: inside a function, a method, a derived class's constructor.
+struct EvalContext {
+    bool new_target = false;
+    bool super_property = false;
+    bool super_call = false;
+};
+std::unique_ptr<Program> parse(std::u16string_view source, std::string& error, bool strict = false, bool module = false,
+                               const EvalContext* eval = nullptr);
 
 [[nodiscard]] bool isIdStart(char32_t c);
 [[nodiscard]] bool isIdPart(char32_t c);

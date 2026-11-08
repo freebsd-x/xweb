@@ -39,6 +39,23 @@ public:
         // A script the page wants that wasn't fetched ahead (import(), a module's
         // import): fetched now, its text (or nothing) handed back later on this thread.
         std::function<void(const std::string& url, std::function<void(std::optional<std::string>)> done)> fetch_script;
+        // fetch() and XMLHttpRequest: the request, and later on this thread its response.
+        // The browser decides what a page may reach (see the viewer's policy).
+        struct Request {
+            std::string url;            // absolute
+            std::string method = "GET";
+            std::string content_type;
+            std::string body;
+        };
+        struct Response {
+            bool ok = false;            // a response came back (any status)
+            int status = 0;
+            std::string url;            // after redirects
+            std::string content_type;
+            std::string body;
+            std::string error;          // when not ok: why
+        };
+        std::function<void(const Request&, std::function<void(Response)> done)> fetch;
     };
 
     PageScript(Document& doc, Host host);

@@ -57,6 +57,19 @@ Value awaitValue(Runtime& rt, const Value& v);
 Value startCoroutineFunction(Runtime& rt, Object* f, Env* env);
 Value rejectedPromise(Runtime& rt, const Value& reason);
 
+// Typed arrays' integer-indexed elements (typedarray.cc). A key that's a canonical
+// numeric string is the typed array's business, valid index or not.
+bool typedKey(const PropertyKey& key, double& index);
+size_t typedLength(const Object* ta);
+bool typedValidIndex(const Object* ta, double index);
+Value typedGet(const Object* ta, double index);
+bool typedSet(Runtime& rt, Object* ta, double index, const Value& v);
+
+// eval: direct (in the caller's scope, `env`) or indirect (the global scope); and the
+// Function constructors' functions made from source (runtime.cc).
+Value evalCode(Runtime& rt, const std::u16string& source, Env* env, bool strict, bool direct);
+Value dynamicFunction(Runtime& rt, std::span<const Value> args, const char* kind);
+
 // A module's scope set up, and its statements run (runtime.cc).
 void instantiateModuleScope(Runtime& rt, const std::shared_ptr<Program>& prog, Env* env);
 void runModuleStatements(Runtime& rt, const std::shared_ptr<Program>& prog, Env* env);

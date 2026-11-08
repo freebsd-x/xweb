@@ -20,6 +20,15 @@ struct Page {
     std::string console;
     std::string navigated;
     std::vector<const Node*> activated, submitted;
+    std::vector<std::string> fetched;
+    std::vector<std::function<void()>> pending;   // network answers, delivered by deliver()
+    void deliver() {
+        while (!pending.empty()) {
+            auto todo = std::move(pending);
+            pending.clear();
+            for (auto& f : todo) f();
+        }
+    }
     std::unique_ptr<PageScript> script;
 
     explicit Page(const std::string& html, const std::string& external = "") {
@@ -33,6 +42,16 @@ struct Page {
         host.rect = [](const Node*) { return std::optional<ElementRect>(ElementRect{10, 20, 300, 40}); };
         host.activate = [this](const Node* n) { activated.push_back(n); };
         host.submit = [this](const Node* n) { submitted.push_back(n); };
+        // A network that answers at once, from a table; what was asked is kept.
+        host.fetch = [this](const PageScript::Host::Request& r, std::function<void(PageScript::Host::Response)> done) {
+            fetched.push_back(r.method + " " + r.url + " " + r.content_type + " " + r.body);
+            PageScript::Host::Response res;
+            if (r.url == "https://example.org/dir/data.json") res = {true, 200, r.url, "application/json", R"({"items":[1,2,3],"name":"x"})", ""};
+            else if (r.url == "https://example.org/api") res = {true, 201, r.url, "text/plain", "made " + r.body, ""};
+            else if (r.url == "https://example.org/missing") res = {true, 404, r.url, "text/html", "nope", ""};
+            else res.error = "unreachable";
+            pending.push_back([done, res] { done(res); });
+        };
         script = std::make_unique<PageScript>(*doc, host);
         script->run([external](const std::string& url) -> std::optional<std::string> {
             if (url == "https://example.org/dir/lib.js") return external;
@@ -212,4 +231,29 @@ TEST(Script, ModulesPromisesAndThePrelude) {
     EXPECT_EQ(p.console.find("WRONG"), std::string::npos) << p.console;
     EXPECT_NE(p.console.find("log:classic first\nlog:https://example.org/x/y?a=1&b=2#h https://example.org\nlog:aborted true AbortError\n"
                              "log:DIV,SCRIPT,SCRIPT,SCRIPT,SCRIPT\nlog:script end\nlog:microtask after the script\n"), std::string::npos) << p.console;
+}
+
+TEST(Script, FetchAndXMLHttpRequest) {
+    Page p(R"(<body><script>
+        fetch('data.json').then(r => { console.log('status', r.status, r.ok, r.headers.get('Content-Type')); return r.json(); })
+          .then(j => console.log('json', j.items.length, j.name));
+        fetch('/api', {method: 'POST', body: JSON.stringify({a: 1}), headers: {'Content-Type': 'application/json'}})
+          .then(r => r.text()).then(t => console.log('posted', t));
+        fetch('/missing').then(r => console.log('missing', r.status, r.ok));
+        fetch('https://elsewhere.test/').catch(e => console.log('failed', e.name, e.message));
+        const c = new AbortController(); fetch('data.json', {signal: c.signal}).catch(e => console.log('aborted', e.name)); c.abort();
+        const x = new XMLHttpRequest();
+        x.onload = () => console.log('xhr', x.status, x.response.name, x.readyState);
+        x.responseType = 'json';
+        x.open('GET', 'data.json'); x.send();
+        new Response('{"z":9}').json().then(j => console.log('response', j.z));
+        new Blob(['ab', new Uint8Array([99])]).text().then(t => console.log('blob', t));
+        </script>)");
+    p.deliver();
+    p.script->tick();
+    for (const char* want : {"log:status 200 true application/json\n", "log:json 3 x\n", "log:posted made {\"a\":1}\n", "log:missing 404 false\n",
+                             "log:failed TypeError Failed to fetch: unreachable\n", "log:aborted AbortError\n", "log:xhr 200 x 4\n",
+                             "log:response 9\n", "log:blob abc\n"})
+        EXPECT_NE(p.console.find(want), std::string::npos) << want << "\n" << p.console;
+    EXPECT_NE(std::find(p.fetched.begin(), p.fetched.end(), "POST https://example.org/api application/json {\"a\":1}"), p.fetched.end());
 }

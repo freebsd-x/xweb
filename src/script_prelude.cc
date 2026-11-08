@@ -412,6 +412,251 @@ const char* const kScriptPrelude = R"JS(
     docProto.createNodeIterator = function (root, whatToShow = 0xFFFFFFFF, filter = null) { return new NodeIterator(root, whatToShow, filter); };
   }
 
+  // Blob, FormData, Headers, Request, Response, fetch and XMLHttpRequest, over the
+  // browser's __xwebFetch.
+  const native = global.__xwebFetch;
+  delete global.__xwebFetch;
+  const bytes = Symbol('bytes');
+  function toBytes(part) {
+    if (part instanceof Blob) return part[bytes];
+    if (part instanceof ArrayBuffer) return new Uint8Array(part.slice(0));
+    if (ArrayBuffer.isView(part)) return new Uint8Array(part.buffer.slice(part.byteOffset, part.byteOffset + part.byteLength));
+    return new TextEncoder().encode(String(part));
+  }
+  class Blob {
+    constructor(parts = [], options = {}) {
+      const chunks = Array.from(parts, toBytes);
+      const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+      let at = 0;
+      for (const c of chunks) { out.set(c, at); at += c.length; }
+      this[bytes] = out;
+      this.type = options.type ? String(options.type).toLowerCase() : '';
+    }
+    get size() { return this[bytes].length; }
+    slice(start, end, type) { const b = new Blob([], { type }); b[bytes] = this[bytes].slice(start, end); return b; }
+    text() { return Promise.resolve(new TextDecoder().decode(this[bytes])); }
+    arrayBuffer() { return Promise.resolve(this[bytes].slice().buffer); }
+    bytes() { return Promise.resolve(this[bytes].slice()); }
+    get [Symbol.toStringTag]() { return 'Blob'; }
+  }
+  class File extends Blob {
+    constructor(parts, name, options = {}) { super(parts, options); this.name = String(name); this.lastModified = options.lastModified ?? Date.now(); }
+    get [Symbol.toStringTag]() { return 'File'; }
+  }
+  class FormData {
+    constructor(form) {
+      this._entries = [];
+      if (form && form.elements) {
+        for (const el of Array.from(form.elements)) {
+          if (!el.name || el.disabled) continue;
+          const type = (el.type || '').toLowerCase();
+          if ((type === 'checkbox' || type === 'radio') && !el.checked) continue;
+          if (type === 'submit' || type === 'button' || type === 'reset' || type === 'file') continue;
+          this._entries.push([el.name, String(el.value ?? '')]);
+        }
+      }
+    }
+    append(k, v) { this._entries.push([String(k), v instanceof Blob ? v : String(v)]); }
+    delete(k) { k = String(k); this._entries = this._entries.filter(e => e[0] !== k); }
+    get(k) { k = String(k); const e = this._entries.find(e => e[0] === k); return e ? e[1] : null; }
+    getAll(k) { k = String(k); return this._entries.filter(e => e[0] === k).map(e => e[1]); }
+    has(k) { k = String(k); return this._entries.some(e => e[0] === k); }
+    set(k, v) { this.delete(k); this.append(k, v); }
+    forEach(fn, thisArg) { for (const [k, v] of this._entries) fn.call(thisArg, v, k, this); }
+    keys() { return this._entries.map(e => e[0])[Symbol.iterator](); }
+    values() { return this._entries.map(e => e[1])[Symbol.iterator](); }
+    entries() { return this._entries.map(e => [e[0], e[1]])[Symbol.iterator](); }
+    [Symbol.iterator]() { return this.entries(); }
+    get [Symbol.toStringTag]() { return 'FormData'; }
+  }
+  class Headers {
+    constructor(init) {
+      this._list = [];
+      if (init instanceof Headers) init.forEach((v, k) => this.append(k, v));
+      else if (init && typeof init[Symbol.iterator] === 'function') for (const [k, v] of init) this.append(k, v);
+      else if (init && typeof init === 'object') for (const k of Object.keys(init)) this.append(k, init[k]);
+    }
+    append(k, v) { this._list.push([String(k).toLowerCase(), String(v).trim()]); }
+    delete(k) { k = String(k).toLowerCase(); this._list = this._list.filter(e => e[0] !== k); }
+    get(k) { k = String(k).toLowerCase(); const v = this._list.filter(e => e[0] === k).map(e => e[1]); return v.length ? v.join(', ') : null; }
+    has(k) { k = String(k).toLowerCase(); return this._list.some(e => e[0] === k); }
+    set(k, v) { this.delete(k); this.append(k, v); }
+    getSetCookie() { return []; }
+    _sorted() {
+      const names = [...new Set(this._list.map(e => e[0]))].sort();
+      return names.map(n => [n, this.get(n)]);
+    }
+    forEach(fn, thisArg) { for (const [k, v] of this._sorted()) fn.call(thisArg, v, k, this); }
+    keys() { return this._sorted().map(e => e[0])[Symbol.iterator](); }
+    values() { return this._sorted().map(e => e[1])[Symbol.iterator](); }
+    entries() { return this._sorted()[Symbol.iterator](); }
+    [Symbol.iterator]() { return this.entries(); }
+    get [Symbol.toStringTag]() { return 'Headers'; }
+  }
+  // A body and the content type it implies.
+  function extractBody(body) {
+    if (body === undefined || body === null) return [null, null];
+    if (typeof body === 'string') return [body, 'text/plain;charset=UTF-8'];
+    if (body instanceof URLSearchParams) return [body.toString(), 'application/x-www-form-urlencoded;charset=UTF-8'];
+    if (body instanceof Blob) return [body[bytes].slice().buffer, body.type || null];
+    if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) return [body, null];
+    if (body instanceof FormData) {
+      const boundary = '----xweb' + Math.random().toString(16).slice(2) + Date.now().toString(16);
+      let out = '';
+      for (const [k, v] of body._entries) {
+        const name = k.replace(/"/g, '%22');
+        if (v instanceof Blob) {
+          out += '--' + boundary + '\r\nContent-Disposition: form-data; name="' + name + '"; filename="' + (v.name || 'blob').replace(/"/g, '%22') + '"\r\nContent-Type: ' + (v.type || 'application/octet-stream') + '\r\n\r\n' + new TextDecoder('latin1').decode(v[bytes]) + '\r\n';
+        } else {
+          out += '--' + boundary + '\r\nContent-Disposition: form-data; name="' + name + '"\r\n\r\n' + v + '\r\n';
+        }
+      }
+      out += '--' + boundary + '--\r\n';
+      return [out, 'multipart/form-data; boundary=' + boundary];
+    }
+    return [String(body), 'text/plain;charset=UTF-8'];
+  }
+  const bodyData = Symbol('body');
+  class Body {
+    get bodyUsed() { return this._used === true; }
+    _take() {
+      if (this._used) return Promise.reject(new TypeError('the body has already been read'));
+      this._used = true;
+      return Promise.resolve(this[bodyData] || new Uint8Array(0));
+    }
+    arrayBuffer() { return this._take().then(b => b.slice().buffer); }
+    bytes() { return this._take().then(b => b.slice()); }
+    text() { return this._take().then(b => new TextDecoder().decode(b)); }
+    json() { return this.text().then(t => JSON.parse(t)); }
+    blob() { return this._take().then(b => { const x = new Blob([], { type: this.headers.get('content-type') || '' }); x[bytes] = b.slice(); return x; }); }
+    formData() { return this.text().then(t => { const f = new FormData(); for (const [k, v] of new URLSearchParams(t)) f.append(k, v); return f; }); }
+  }
+  class Request extends Body {
+    constructor(input, init = {}) {
+      super();
+      const from = input instanceof Request ? input : null;
+      this.url = from ? from.url : new URL(String(input), document.baseURI).href;
+      this.method = String(init.method || (from && from.method) || 'GET').toUpperCase();
+      this.headers = new Headers(init.headers || (from && from.headers) || undefined);
+      this.signal = init.signal || (from && from.signal) || null;
+      this.credentials = init.credentials || 'same-origin';
+      this.mode = init.mode || 'cors';
+      this.cache = init.cache || 'default';
+      this.redirect = init.redirect || 'follow';
+      this.referrer = 'about:client';
+      const [b, type] = extractBody(init.body !== undefined ? init.body : from ? from._source : undefined);
+      if (b !== null && (this.method === 'GET' || this.method === 'HEAD')) throw new TypeError('a GET or HEAD request can\'t have a body');
+      this._source = b;
+      if (type && !this.headers.has('content-type')) this.headers.set('content-type', type);
+      this[bodyData] = b === null ? null : toBytes(b);
+    }
+    clone() { return new Request(this); }
+    get [Symbol.toStringTag]() { return 'Request'; }
+  }
+  const statusTexts = { 200: 'OK', 201: 'Created', 204: 'No Content', 301: 'Moved Permanently', 302: 'Found', 304: 'Not Modified',
+                        400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found', 500: 'Internal Server Error' };
+  class Response extends Body {
+    constructor(body = null, init = {}) {
+      super();
+      const status = init.status === undefined ? 200 : Number(init.status);
+      if (status < 200 || status > 599) throw new RangeError('a status must be from 200 to 599');
+      this.status = status;
+      this.statusText = init.statusText !== undefined ? String(init.statusText) : '';
+      this.headers = new Headers(init.headers);
+      const [b, type] = extractBody(body);
+      if (type && !this.headers.has('content-type')) this.headers.set('content-type', type);
+      this[bodyData] = b === null ? null : toBytes(b);
+      this.url = ''; this.redirected = false; this.type = 'default';
+    }
+    get ok() { return this.status >= 200 && this.status < 300; }
+    clone() { if (this._used) throw new TypeError('the body has already been read'); const r = new Response(null, this); r[bodyData] = this[bodyData]; r.url = this.url; r.type = this.type; r.redirected = this.redirected; return r; }
+    static json(data, init = {}) { const h = new Headers(init.headers); if (!h.has('content-type')) h.set('content-type', 'application/json'); return new Response(JSON.stringify(data), { ...init, headers: h }); }
+    static error() { const r = new Response(null, { status: 200 }); r.status = 0; r.type = 'error'; return r; }
+    static redirect(url, status = 302) { return new Response(null, { status, headers: { location: new URL(url, document.baseURI).href } }); }
+    get [Symbol.toStringTag]() { return 'Response'; }
+  }
+  function abortError(signal) { return signal.reason !== undefined ? signal.reason : domException('The operation was aborted.', 'AbortError'); }
+  function fetch(input, init) {
+    let req;
+    try { req = new Request(input, init); } catch (e) { return Promise.reject(e); }
+    if (req.signal && req.signal.aborted) return Promise.reject(abortError(req.signal));
+    const done = native(req.url, req.method, req.headers.get('content-type'), req._source).then(([status, url, type, buf]) => {
+      if (req.signal && req.signal.aborted) throw abortError(req.signal);
+      const res = new Response(null, { status: status >= 200 && status <= 599 ? status : 200, statusText: statusTexts[status] || '', headers: type ? { 'content-type': type } : {} });
+      res.status = status;
+      res[bodyData] = new Uint8Array(buf);
+      res.url = url; res.redirected = url !== req.url.split('#')[0]; res.type = 'basic';
+      return res;
+    });
+    if (!req.signal) return done;
+    return new Promise((resolve, reject) => {
+      req.signal.addEventListener('abort', () => reject(abortError(req.signal)));
+      done.then(resolve, reject);
+    });
+  }
+  class XMLHttpRequest extends EventTarget {
+    constructor() {
+      super();
+      this.readyState = 0; this.status = 0; this.statusText = ''; this.responseType = ''; this.responseURL = '';
+      this.timeout = 0; this.withCredentials = false; this.upload = new EventTarget();
+      this._headers = new Headers(); this._response = null; this._type = '';
+      for (const n of ['onreadystatechange', 'onload', 'onerror', 'onabort', 'onloadend', 'onloadstart', 'onprogress', 'ontimeout']) this[n] = null;
+    }
+    _fire(type) {
+      const e = new Event(type);
+      const h = this['on' + type];
+      if (typeof h === 'function') { try { h.call(this, e); } catch (err) { console.error(err); } }
+      this.dispatchEvent(e);
+    }
+    _state(n) { this.readyState = n; this._fire('readystatechange'); }
+    open(method, url, async = true) {
+      this._method = String(method).toUpperCase(); this._url = new URL(String(url), document.baseURI).href;
+      this._headers = new Headers(); this._aborted = false; this._response = null; this.status = 0;
+      this._state(1);
+    }
+    setRequestHeader(k, v) { if (this.readyState !== 1) throw new Error('InvalidStateError'); this._headers.append(k, v); }
+    getResponseHeader(k) { return String(k).toLowerCase() === 'content-type' && this._type ? this._type : null; }
+    getAllResponseHeaders() { return this._type ? 'content-type: ' + this._type + '\r\n' : ''; }
+    overrideMimeType(t) { this._override = t; }
+    send(body) {
+      if (this.readyState !== 1) throw new Error('InvalidStateError');
+      const [b, type] = extractBody(this._method === 'GET' || this._method === 'HEAD' ? null : body);
+      this._fire('loadstart');
+      native(this._url, this._method, this._headers.get('content-type') || type, b).then(([status, url, ctype, buf]) => {
+        if (this._aborted) return;
+        this.status = status; this.statusText = statusTexts[status] || ''; this.responseURL = url; this._type = ctype;
+        this._bytes = new Uint8Array(buf);
+        this._state(2); this._state(3); this._state(4);
+        this._fire('load'); this._fire('loadend');
+      }, () => {
+        if (this._aborted) return;
+        this._state(4); this._fire('error'); this._fire('loadend');
+      });
+    }
+    abort() { this._aborted = true; if (this.readyState > 0 && this.readyState < 4) { this._state(4); this._fire('abort'); this._fire('loadend'); } this.readyState = 0; }
+    get responseText() {
+      if (this.responseType !== '' && this.responseType !== 'text') throw new Error('InvalidStateError');
+      return this._bytes ? new TextDecoder().decode(this._bytes) : '';
+    }
+    get response() {
+      if (!this._bytes) return this.responseType === '' || this.responseType === 'text' ? '' : null;
+      switch (this.responseType) {
+        case 'json': try { return JSON.parse(new TextDecoder().decode(this._bytes)); } catch (e) { return null; }
+        case 'arraybuffer': return this._bytes.slice().buffer;
+        case 'blob': { const b = new Blob([], { type: this._type }); b[bytes] = this._bytes.slice(); return b; }
+        case 'document': return null;
+        default: return new TextDecoder().decode(this._bytes);
+      }
+    }
+    get responseXML() { return null; }
+  }
+  for (const [k, v] of [['UNSENT', 0], ['OPENED', 1], ['HEADERS_RECEIVED', 2], ['LOADING', 3], ['DONE', 4]]) {
+    XMLHttpRequest[k] = v; XMLHttpRequest.prototype[k] = v;
+  }
+
+  for (const [name, value] of [['Blob', Blob], ['File', File], ['FormData', FormData], ['Headers', Headers], ['Request', Request],
+                               ['Response', Response], ['fetch', fetch], ['XMLHttpRequest', XMLHttpRequest]])
+    Object.defineProperty(global, name, { value, writable: true, configurable: true, enumerable: false });
   for (const [name, value] of [['URL', URL], ['URLSearchParams', URLSearchParams], ['AbortController', AbortController],
                                ['AbortSignal', AbortSignal], ['NodeFilter', NodeFilter], ['TreeWalker', TreeWalker],
                                ['NodeIterator', NodeIterator]])

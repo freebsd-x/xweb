@@ -82,6 +82,22 @@ int main(int argc, char** argv) {
         timers.erase(std::remove_if(timers.begin(), timers.end(), [id](const Timer& t) { return t.id == id; }), timers.end());
         return Value::undefined();
     });
+    // $262, the host hooks test262 asks a shell for.
+    {
+        Object* host = rt.newObject();
+        rt.method(host, u"detachArrayBuffer", 1, [](Runtime& r, const Value&, std::span<const Value> a) {
+            if (a.empty() || !r.detachArrayBuffer(a[0])) r.throwError("TypeError", "not an ArrayBuffer");
+            return Value::null();
+        });
+        rt.method(host, u"evalScript", 1, [](Runtime& r, const Value&, std::span<const Value> a) {
+            const Runtime::Result res = r.evaluate(utf8(*r.toString(a.empty() ? Value::undefined() : a[0])), "evalScript");
+            if (!res.ok) r.throwError(res.error.rfind("SyntaxError", 0) == 0 ? "SyntaxError" : "Error", res.error);
+            return res.value;
+        });
+        rt.method(host, u"gc", 0, [](Runtime&, const Value&, std::span<const Value>) { return Value::undefined(); });
+        rt.put(host, u"global", Value::object(rt.global()));
+        rt.put(rt.global(), u"$262", Value::object(host));
+    }
     // print(), as other engines' shells have it.
     rt.method(rt.global(), u"print", 1, [](Runtime& r, const Value&, std::span<const Value> a) {
         std::string line;

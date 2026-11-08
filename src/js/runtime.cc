@@ -152,6 +152,8 @@ bool Object::remove(const PropertyKey& key) {
 std::vector<PropertyKey> Object::ownKeys() const {
     std::vector<PropertyKey> out;
     std::vector<std::pair<int64_t, PropertyKey>> indexed;
+    if (cls == ObjectClass::TypedArray)
+        for (size_t i = 0, n = typedLength(this); i < n; ++i) out.emplace_back(indexKey(i));
     for (size_t i = 0; i < elements.size(); ++i)
         if (!elements[i].isEmpty()) out.emplace_back(indexKey(i));
     for (const auto& [k, p] : props_)
@@ -226,6 +228,49 @@ public:
             if (s->flags & kHoisted) env->vars[u"*default*"] = Binding{Value::object(makeFunction(s->a->fn, env, nullptr))};
             else env->vars[u"*default*"] = Binding{Value::undefined(), true, false};
         }
+    }
+
+    // Eval code: let, const and class in a scope of its own (`lex`); var and function
+    // declarations in the caller's variable scope (`var_env`, or the global object), or
+    // in `lex` too when it's strict.
+    Value runEval(Env* lex, Env* var_env, Object* var_object, bool strict) {
+        Program& p = *prog_;
+        for (const auto& name : p.top->var_names) {
+            if (var_object) {
+                if (!rt_.has(var_object, name)) var_object->define(name, {Value::undefined(), nullptr, nullptr, kDefaultFlags});
+            } else if (!var_env->vars.count(name)) {
+                var_env->vars[name] = Binding{};
+            }
+        }
+        declareLexical(lex, p.root->lexical.get());
+        for (Node* f : p.top->function_decls) {
+            const Value fn = Value::object(makeFunction(f->fn, lex, nullptr));
+            if (var_object) var_object->define(f->str, {fn, nullptr, nullptr, kDefaultFlags});
+            else var_env->vars[f->str] = Binding{fn};
+        }
+        EnvScope scope(rt_, lex);
+        Value last;
+        for (Node* s : p.root->kids) {
+            Completion c = exec(s, lex, strict);
+            if (!c.value.isEmpty() && c.type == CT::Normal && s->kind != N::FunctionDecl) last = c.value;
+        }
+        return last;
+    }
+
+    // What eval code may use from where it's called.
+    EvalContext evalContextOf(Env* env) {
+        EvalContext ctx;
+        Env* f = functionEnv(env);
+        if (f && f->is_function && f->function) {
+            ctx.new_target = true;
+            ctx.super_property = f->home != nullptr;
+            ctx.super_call = f->function->derived && f->function->code && f->function->code->info->is_class_constructor;
+        }
+        return ctx;
+    }
+    Env* varScopeOf(Env* env) {
+        Env* f = functionEnv(env);
+        return f;
     }
 
     void runModule(Env* env) {
@@ -470,6 +515,10 @@ bool stringIndex(const Value& prim, const PropertyKey& key, Value& out) {
 Value Runtime::get(Object* o, const PropertyKey& key, const Value& receiver) {
     for (Object* cur = o; cur; cur = cur->prototype) {
         if (!key.isSymbol()) {
+            if (cur->cls == ObjectClass::TypedArray) {
+                double index;
+                if (typedKey(key, index)) return typedGet(cur, index);
+            }
             if (cur->cls == ObjectClass::Array || !cur->elements.empty()) {
                 if (key.name == u"length" && cur->cls == ObjectClass::Array) return Value::number(static_cast<double>(cur->elements.size()));
                 const int64_t i = arrayIndex(key.name);
@@ -509,6 +558,10 @@ Value Runtime::get(const Value& base, const PropertyKey& key) {
 bool Runtime::has(Object* o, const PropertyKey& key) {
     for (Object* cur = o; cur; cur = cur->prototype) {
         if (!key.isSymbol()) {
+            if (cur->cls == ObjectClass::TypedArray) {
+                double index;
+                if (typedKey(key, index)) return typedValidIndex(cur, index);
+            }
             if (cur->cls == ObjectClass::Array && key.name == u"length") return true;
             const int64_t i = arrayIndex(key.name);
             if (i >= 0 && static_cast<size_t>(i) < cur->elements.size() && !cur->elements[static_cast<size_t>(i)].isEmpty()) return true;
@@ -523,6 +576,17 @@ bool Runtime::has(Object* o, const PropertyKey& key) {
 }
 
 bool Runtime::set(Object* o, const PropertyKey& key, const Value& v, const Value& receiver) {
+    // A typed array's elements: never up the chain, never a new property.
+    if (!key.isSymbol() && o->cls == ObjectClass::TypedArray) {
+        double index;
+        if (typedKey(key, index)) {
+            if (receiver.isObject() && receiver.asObject() == o) {
+                typedSet(*this, o, index, v);
+                return true;
+            }
+            if (!typedValidIndex(o, index)) return true;
+        }
+    }
     // An array's elements and length.
     if (!key.isSymbol() && o->cls == ObjectClass::Array && receiver.isObject() && receiver.asObject() == o) {
         if (key.name == u"length") {
@@ -590,6 +654,10 @@ void Runtime::set(const Value& base, const PropertyKey& key, const Value& v, boo
 }
 
 bool Runtime::deleteProperty(Object* o, const PropertyKey& key) {
+    if (!key.isSymbol() && o->cls == ObjectClass::TypedArray) {
+        double index;
+        if (typedKey(key, index)) return !typedValidIndex(o, index);
+    }
     if (!key.isSymbol()) {
         const int64_t i = arrayIndex(key.name);
         if (i >= 0 && static_cast<size_t>(i) < o->elements.size()) {
@@ -981,11 +1049,12 @@ void Runtime::collectGarbage() {
     for (Object* o : {object_prototype, function_prototype, array_prototype, string_prototype, number_prototype, boolean_prototype,
                       symbol_prototype, error_prototype, iterator_prototype, array_iterator_prototype, map_prototype, set_prototype, array_values_,
                       regexp_prototype, regexp_string_iterator_prototype, regexp_exec, regexp_constructor, promise_prototype,
-                      promise_constructor, promise_then, generator_prototype, async_generator_prototype, async_iterator_prototype,
+                      promise_constructor, promise_then, eval_function, array_buffer_prototype, typed_array_prototype, data_view_prototype, generator_prototype, async_generator_prototype, async_iterator_prototype,
                       generator_function_prototype, async_function_prototype, async_generator_function_prototype,
                       async_from_sync_iterator_prototype})
         markCell(o);
     for (auto& [k, o] : error_prototypes) markCell(o);
+    for (Object* c : typed_array_constructors) markCell(c);
     for (Symbol* s : {sym_iterator, sym_to_primitive, sym_to_string_tag, sym_has_instance, sym_match, sym_match_all, sym_replace,
                       sym_search, sym_split, sym_species, sym_async_iterator})
         markCell(s);
@@ -1173,6 +1242,11 @@ Object* Interpreter::makeFunction(FunctionInfo* info, Env* env, Object* home) {
     f->constructor = !info->arrow && !info->is_method && !info->is_async && !info->is_generator;
     f->define(u"length", {Value::number(info->length), nullptr, nullptr, kConfigurable});
     f->define(u"name", {Value::string(info->name), nullptr, nullptr, kConfigurable});
+    // A sloppy function's own caller and arguments: null, as browsers have them.
+    if (!info->strict && !info->arrow && !info->is_method && !info->is_async && !info->is_generator) {
+        f->define(u"caller", {Value::null(), nullptr, nullptr, 0});
+        f->define(u"arguments", {Value::null(), nullptr, nullptr, 0});
+    }
     if (f->constructor) {
         Object* proto = rt_.newObject();
         proto->define(u"constructor", {Value::object(f), nullptr, nullptr, kWritable | kConfigurable});
@@ -1515,6 +1589,67 @@ Value Interpreter::runBody(FunctionInfo* info, Env* env) {
     return c.type == CT::Return ? c.value : Value::undefined();
 }
 
+Value evalCode(Runtime& rt, const std::u16string& source, Env* env, bool strict, bool direct) {
+    Interpreter probe(rt, nullptr);
+    EvalContext ctx;
+    if (direct) ctx = probe.evalContextOf(env);
+    else {
+        env = rt.global_env_;
+        strict = false;
+    }
+    // Parsed once per source (and context): eval in a loop doesn't parse again.
+    std::u16string key = source;
+    key += strict ? u"\x01s" : u"\x01l";
+    key += ctx.new_target ? u'n' : u'-';
+    key += ctx.super_property ? u'p' : u'-';
+    key += ctx.super_call ? u'c' : u'-';
+    std::shared_ptr<Program> prog;
+    if (const auto it = rt.eval_cache_.find(key); it != rt.eval_cache_.end()) {
+        prog = it->second;
+    } else {
+        std::string error;
+        prog.reset(parse(source, error, strict, false, &ctx).release());
+        if (!prog) {
+            const std::string prefix = "SyntaxError: ";
+            rt.throwError("SyntaxError", error.rfind(prefix, 0) == 0 ? error.substr(prefix.size()) : error);
+        }
+        prog->url = "eval";
+        if (rt.eval_cache_.size() > 512) rt.eval_cache_.clear();
+        rt.eval_cache_[key] = prog;
+    }
+    const bool code_strict = strict || prog->top->strict;
+    Interpreter interp(rt, prog);
+    Env* lex = rt.allocate<Env>(env);
+    if (code_strict) return interp.runEval(lex, lex, nullptr, true);
+    Env* var_env = direct ? interp.varScopeOf(env) : rt.global_env_;
+    Object* var_object = var_env && var_env->global_object ? var_env->global_object : nullptr;
+    if (!var_env) {
+        var_env = rt.global_env_;
+        var_object = rt.global();
+    }
+    return interp.runEval(lex, var_env, var_object, false);
+}
+
+Value dynamicFunction(Runtime& rt, std::span<const Value> args, const char* kind) {
+    std::u16string params;
+    for (size_t i = 0; i + 1 < args.size(); ++i) {
+        if (i) params += u",";
+        params += *rt.toString(args[i]);
+    }
+    const std::u16string body = args.empty() ? u"" : *rt.toString(args.back());
+    const std::u16string source = u"(" + std::u16string(utf16(kind)) + u" anonymous(" + params + u"\n) {\n" + body + u"\n})";
+    // It must be one function and nothing else: parameters or a body that close it
+    // early (`}); more code; ({`) are a syntax error, not code that runs.
+    {
+        std::string error;
+        std::unique_ptr<Program> p = parse(source, error);
+        if (!p) rt.throwError("SyntaxError", error.rfind("SyntaxError: ", 0) == 0 ? error.substr(13) : error);
+        if (p->root->kids.size() != 1 || p->root->kids[0]->kind != N::ExprStmt || p->root->kids[0]->a->kind != N::FunctionExpr)
+            rt.throwError("SyntaxError", "the parameters or body of a function made from source close it early");
+    }
+    return evalCode(rt, source, nullptr, false, false);
+}
+
 void instantiateModuleScope(Runtime& rt, const std::shared_ptr<Program>& prog, Env* env) {
     Interpreter interp(rt, prog);
     interp.instantiateModule(env);
@@ -1674,6 +1809,7 @@ Completion Interpreter::exec(Node* n, Env* env, bool strict) {
             // Hoisted already at its function's start; a block's at the block's start.
             // Annex B: the name is also the enclosing function's var.
             Env* where = nullptr;
+            if (strict) return {CT::Normal, Value::empty()};
             if (Binding* b = findBinding(env, n->str, &where)) {
                 Env* fenv = functionEnv(env);
                 if (fenv && fenv != where && fenv->vars.count(n->str)) fenv->vars[n->str].value = b->value;
@@ -2385,6 +2521,11 @@ Value Interpreter::evalCall(Node* n, Env* env, bool strict) {
     }
     if ((n->flags & kOptional) && fn.isNullish()) throw ShortCircuit{};
     const std::vector<Value> args = evalArgs(n->kids, env, strict);
+    // eval(...) by that name, meaning the real eval: code in this very scope.
+    if (callee->kind == N::Identifier && callee->str == u"eval" && fn.isObject() && fn.asObject() == rt_.eval_function) {
+        if (args.empty() || !args[0].isString()) return args.empty() ? Value::undefined() : args[0];
+        return evalCode(rt_, args[0].asString(), env, strict, true);
+    }
     if (!rt_.isCallable(fn)) {
         std::string what = callee->kind == N::Identifier ? utf8(callee->str)
                            : callee->kind == N::Member && !(callee->flags & kComputed) ? utf8(callee->str) : std::string("expression");

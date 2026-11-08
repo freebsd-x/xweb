@@ -27,6 +27,11 @@ public:
     Parser(std::u16string_view src, Program& prog, bool strict) : src_(src), lex_(src), p_(prog), strict_(strict) {}
 
     void setModule() { lex_.module = true; }
+    void setEvalContext(const EvalContext& e) {
+        if (e.new_target) non_arrow_depth_ = 1;
+        super_property_ok_ = e.super_property;
+        super_call_ok_ = e.super_call;
+    }
 
     Node* program() {
         FunctionInfo* top = newFunction();
@@ -846,8 +851,8 @@ private:
             }
             addVar(n->str);
             fn_->function_decls.push_back(n);
-        } else {
-            addVar(n->str);   // and visible to the function, as browsers do (Annex B)
+        } else if (!strict_) {
+            addVar(n->str);   // and visible to the function, as browsers do (Annex B; not in strict code)
         }
         return n;
     }
@@ -2048,11 +2053,12 @@ private:
 
 }  // namespace
 
-std::unique_ptr<Program> parse(std::u16string_view source, std::string& error, bool strict, bool module) {
+std::unique_ptr<Program> parse(std::u16string_view source, std::string& error, bool strict, bool module, const EvalContext* eval) {
     auto prog = std::make_unique<Program>();
     prog->module = module;
     Parser parser(source, *prog, strict);
     if (module) parser.setModule();
+    if (eval) parser.setEvalContext(*eval);
     try {
         prog->root = parser.program();
     } catch (const ParseError& e) {
