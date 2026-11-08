@@ -38,6 +38,90 @@ std::string Node::textContent() const {
     return out;
 }
 
+const Node* Node::containingShadowRoot() const noexcept {
+    const Node* n = this;
+    while (n->parent) n = n->parent;
+    return n->type == NodeType::Fragment && n->shadow_host ? n : nullptr;
+}
+
+namespace {
+
+std::string slotName(const Node* n) {
+    const std::string* v = n->attr(n->isHtml("slot") ? "name" : "slot");
+    return v ? *v : std::string{};
+}
+
+// The first <slot> in tree order in `root`'s tree with this name.
+const Node* firstSlotNamed(const Node* root, const std::string& name) {
+    std::vector<const Node*> todo(root->children.rbegin(), root->children.rend());
+    while (!todo.empty()) {
+        const Node* n = todo.back();
+        todo.pop_back();
+        if (n->isHtml("slot") && slotName(n) == name) return n;
+        todo.insert(todo.end(), n->children.rbegin(), n->children.rend());
+    }
+    return nullptr;
+}
+
+}  // namespace
+
+void assignedNodes(const Node* slot, std::vector<const Node*>& out) {
+    const Node* root = slot->containingShadowRoot();
+    if (!root) return;
+    const Node* host = root->shadow_host;
+    const std::string name = slotName(slot);
+    if (firstSlotNamed(root, name) != slot) return;
+    for (const Node* c : host->children) {
+        if (c->type == NodeType::Text) {
+            if (name.empty()) out.push_back(c);
+        } else if (c->isElement() && slotName(c) == name) {
+            out.push_back(c);
+        }
+    }
+}
+
+void composedChildren(const Node* n, std::vector<const Node*>& out) {
+    out.clear();
+    if (n->shadow_root) {
+        out.assign(n->shadow_root->children.begin(), n->shadow_root->children.end());
+        return;
+    }
+    if (n->isHtml("slot") && n->containingShadowRoot()) {
+        assignedNodes(n, out);
+        if (!out.empty()) return;
+    }
+    out.assign(n->children.begin(), n->children.end());
+}
+
+void attachDeclarativeShadowRoots(Document& doc) {
+    std::vector<Node*> todo{doc.root()};
+    std::vector<Node*> templates;
+    while (!todo.empty()) {
+        Node* n = todo.back();
+        todo.pop_back();
+        if (n->isHtml("template") && n->attr("shadowrootmode") && n->parent && n->parent->isElement()) templates.push_back(n);
+        todo.insert(todo.end(), n->children.rbegin(), n->children.rend());
+        if (n->template_content) todo.push_back(n->template_content);
+    }
+    // Innermost first, so a nested declarative root lands in its own template's content.
+    for (auto it = templates.rbegin(); it != templates.rend(); ++it) {
+        Node* t = *it;
+        Node* host = t->parent;
+        if (!host || host->shadow_root) continue;
+        const std::string mode = *t->attr("shadowrootmode");
+        if (mode != "open" && mode != "closed") continue;
+        Node* root = doc.make(NodeType::Fragment);
+        root->shadow_host = host;
+        root->shadow_open = mode == "open";
+        if (Node* content = t->template_content) {
+            const std::vector<Node*> kids = content->children;
+            for (Node* k : kids) root->append(k);
+        }
+        host->shadow_root = root;
+        host->remove(t);
+    }
+}
+
 Document::Document() {
     root_ = make(NodeType::Document);
 }

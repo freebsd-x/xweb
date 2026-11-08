@@ -1449,15 +1449,38 @@ struct Buckets {
     [[nodiscard]] bool empty() const { return by_id.empty() && by_class.empty() && by_type.empty() && universal.empty(); }
 };
 
+// ::slotted(sel) rule: what the slot must match (the selector without ::slotted), and
+// what the slotted element must (its argument).
+struct SlottedRule {
+    ComplexSelector slot_side;
+    const SimpleSelector* slotted;
+    const css::Rule* rule;
+    Origin origin;
+    size_t order;
+};
+
+// The rules of one tree: the user agent's, the document's, or a shadow root's. A shadow
+// tree's rules only reach into it, and to its host through :host.
+struct Scope {
+    Buckets normal, before, after;
+    std::vector<IndexedSelector> host;      // rules whose subject is :host(...)
+    std::deque<SlottedRule> slotted;
+    const Node* host_el = nullptr;          // a shadow scope's host
+};
+
 class StyleResolver {
 public:
     StyleResolver(const Document& doc, StyledDocument& out, const StyledDocument::SheetLoader& loader)
         : doc_(doc), out_(out), loader_(loader) {
         lengths_.viewport_w = out.media_.width;
         lengths_.viewport_h = out.media_.height;
+        target_ = &ua_;
         addSheet(css::parseStylesheet(detail::kUserAgentStyle), Origin::UserAgent, 0);
         if (doc.quirks) addSheet(css::parseStylesheet(detail::kQuirksStyle), Origin::UserAgent, 0);
-        collectSheets();
+        target_ = &doc_scope_;
+        collectSheets(doc_.root());
+        for (const std::string& css : doc_.root()->adopted_css) addSheet(css::parseStylesheet(css), Origin::Author, 0);   // document.adoptedStyleSheets
+        collectShadowScopes();
         indexSiblings();
     }
 
@@ -1466,7 +1489,7 @@ public:
         if (!root) return;
         ComputedStyle initial;
         std::vector<const Node*> stack;
-        walk(root, initial, 0);
+        walk(root, initial, 0, &doc_scope_, nullptr);
     }
 
 private:
@@ -1502,14 +1525,33 @@ private:
 
     void index(const ComplexSelector& sel, const css::Rule& rule, Origin origin) {
         const CompoundSelector& last = sel.parts.back();
-        Buckets* buckets = &normal_;
+        Buckets* buckets = &target_->normal;
         for (const SimpleSelector& s : last.simple) {
             if (s.kind != SimpleKind::PseudoElement) continue;
-            if (s.name == "before") buckets = &before_;
-            else if (s.name == "after") buckets = &after_;
-            else return;   // ::marker, ::placeholder and so on: nothing to style yet
+            if (s.name == "before") buckets = &target_->before;
+            else if (s.name == "after") buckets = &target_->after;
+            else if (s.name == "slotted" && target_->host_el) {
+                SlottedRule r{sel, &s, &rule, origin, ++order_};
+                auto& simple = r.slot_side.parts.back().simple;
+                simple.erase(std::remove_if(simple.begin(), simple.end(), [](const SimpleSelector& x) {
+                    return x.kind == SimpleKind::PseudoElement && x.name == "slotted";
+                }), simple.end());
+                target_->slotted.push_back(std::move(r));
+                target_->slotted.back().slotted = nullptr;
+                for (const SimpleSelector& x : last.simple)
+                    if (x.kind == SimpleKind::PseudoElement && x.name == "slotted") target_->slotted.back().slotted = &x;
+                return;
+            } else {
+                return;   // ::marker, ::placeholder and so on: nothing to style yet
+            }
         }
         const IndexedSelector entry{&sel, &rule, origin, ++order_};
+        if (target_->host_el && buckets == &target_->normal)
+            for (const SimpleSelector& s : last.simple)
+                if (s.kind == SimpleKind::PseudoClass && (s.name == "host" || s.name == "host-context")) {
+                    target_->host.push_back(entry);
+                    return;
+                }
         for (const SimpleSelector& s : last.simple) {
             if (s.kind == SimpleKind::Id) { buckets->by_id[s.name].push_back(entry); return; }
         }
@@ -1522,8 +1564,10 @@ private:
         buckets->universal.push_back(entry);
     }
 
-    void collectSheets() {
-        std::vector<const Node*> todo{doc_.root()};
+    // A tree's <style> and <link rel=stylesheet>, into target_ (not into shadow trees:
+    // they aren't children).
+    void collectSheets(const Node* root) {
+        std::vector<const Node*> todo{root};
         while (!todo.empty()) {
             const Node* n = todo.back();
             todo.pop_back();
@@ -1542,6 +1586,36 @@ private:
             }
             todo.insert(todo.end(), n->children.rbegin(), n->children.rend());
         }
+    }
+
+    // Every shadow root's scope, its sheets and its adopted ones.
+    void collectShadowScopes() {
+        std::vector<const Node*> todo{doc_.root()};
+        size_t count = 0;
+        while (!todo.empty() && count < 10'000) {
+            const Node* n = todo.back();
+            todo.pop_back();
+            if (n->shadow_root) {
+                ++count;
+                auto scope = std::make_unique<Scope>();
+                scope->host_el = n;
+                target_ = scope.get();
+                collectSheets(n->shadow_root);
+                for (const std::string& css : n->shadow_root->adopted_css) addSheet(css::parseStylesheet(css), Origin::Author, 0);
+                shadow_scopes_[n->shadow_root] = std::move(scope);
+                todo.push_back(n->shadow_root);
+            }
+            todo.insert(todo.end(), n->children.rbegin(), n->children.rend());
+        }
+        target_ = &doc_scope_;
+    }
+
+    const Scope* scopeFor(const Node* el) const {
+        if (const Node* root = el->containingShadowRoot()) {
+            const auto it = shadow_scopes_.find(root);
+            if (it != shadow_scopes_.end()) return it->second.get();
+        }
+        return &doc_scope_;
     }
 
     struct SiblingInfo {
@@ -1570,6 +1644,7 @@ private:
             }
             for (const Node* c : n->children)
                 if (c->isElement()) siblings_[c].count = index;
+            if (n->shadow_root) todo.push_back(n->shadow_root);
         }
     }
 
@@ -1636,6 +1711,23 @@ private:
             return false;
         }
         if (n == "root") return el->parent && el->parent->type == NodeType::Document;
+        if (n == "host" || n == "host-context") {
+            if (el != host_context_) return false;
+            if (s.args.empty()) return true;
+            // The argument is matched against the host in its own tree.
+            const Node* saved = host_context_;
+            host_context_ = nullptr;
+            bool hit = false;
+            for (const Node* p = el; p && !hit; p = n == "host" ? nullptr : p->parent)
+                for (const ComplexSelector& a : s.args)
+                    if (p->isElement() && matchComplex(p, a)) hit = true;
+            host_context_ = saved;
+            return hit;
+        }
+        if (n == "defined") {
+            // Custom element names aren't defined until upgraded.
+            return !(el->ns == Namespace::Html && el->name.find('-') != std::string::npos && el->custom_state != 2);
+        }
         if (n == "first-child") return info.index == 1;
         if (n == "last-child") return info.index == info.count;
         if (n == "only-child") return info.count == 1;
@@ -1673,6 +1765,10 @@ private:
     }
 
     bool matchCompound(const Node* el, const CompoundSelector& c) {
+        // Seen from inside its shadow tree, the host is featureless: only :host matches it.
+        if (el == host_context_)
+            for (const SimpleSelector& s : c.simple)
+                if (!(s.kind == SimpleKind::PseudoClass && (s.name == "host" || s.name == "host-context"))) return false;
         for (const SimpleSelector& s : c.simple) {
             if (--fuel_ < 0) return false;
             if (!matchSimple(el, s)) return false;
@@ -1686,11 +1782,13 @@ private:
         const size_t before = part - 1;
         switch (sel.parts[part].combinator) {
             case Combinator::Descendant:
-                for (const Node* p = el->parent; p && p->isElement(); p = p->parent)
+                for (const Node* p = matchParent(el); p; p = matchParent(p))
                     if (matchFrom(p, sel, before)) return true;
                 return false;
-            case Combinator::Child:
-                return el->parent && el->parent->isElement() && matchFrom(el->parent, sel, before);
+            case Combinator::Child: {
+                const Node* p = matchParent(el);
+                return p && matchFrom(p, sel, before);
+            }
             case Combinator::NextSibling: {
                 const auto it = siblings_.find(el);
                 return it != siblings_.end() && it->second.prev && matchFrom(it->second.prev, sel, before);
@@ -1703,6 +1801,16 @@ private:
             }
         }
         return false;
+    }
+
+    // An element's parent for selector matching: within its tree, and from a shadow
+    // tree's top to its host (which only :host can match).
+    const Node* matchParent(const Node* el) const {
+        if (el == host_context_) return nullptr;
+        const Node* p = el->parent;
+        if (p && p->isElement()) return p;
+        if (p && p->type == NodeType::Fragment && p->shadow_host && p->shadow_host == host_context_) return p->shadow_host;
+        return nullptr;
     }
 
     bool matchComplex(const Node* el, const ComplexSelector& sel) {
@@ -3070,10 +3178,45 @@ private:
         s.stroke_dasharray = parent.stroke_dasharray;
     }
 
-    void resolveInto(const Node* el, const ComputedStyle& parent, ComputedStyle& s) {
+    void resolveInto(const Node* el, const ComputedStyle& parent, ComputedStyle& s, const Scope* scope, const Node* slot) {
         inherit(parent, s);
         std::vector<MatchedDecl> matched;
-        collect(el, normal_, matched);
+        host_context_ = nullptr;
+        collect(el, ua_.normal, matched);
+        host_context_ = scope->host_el;
+        collect(el, scope->normal, matched);
+        // A host's own :host rules, below the rules of the tree it's in.
+        if (el->shadow_root) {
+            const auto it = shadow_scopes_.find(el->shadow_root);
+            if (it != shadow_scopes_.end()) {
+                host_context_ = el;
+                fuel_ = kSelectorFuel;
+                std::vector<MatchedDecl> host_matched;
+                gather(el, it->second->host, host_matched);
+                for (MatchedDecl& m : host_matched) {
+                    if (!m.important) m.origin = Origin::Hint;
+                    matched.push_back(m);
+                }
+            }
+        }
+        // ::slotted() rules of the shadow tree whose slot this element went into.
+        if (slot) {
+            const Scope* slot_scope = scopeFor(slot);
+            for (const SlottedRule& r : slot_scope->slotted) {
+                if (!r.slotted) continue;
+                host_context_ = nullptr;
+                fuel_ = kSelectorFuel;
+                bool hit = false;
+                for (const ComplexSelector& a : r.slotted->args)
+                    if (matchComplex(el, a)) hit = true;
+                if (!hit) continue;
+                host_context_ = slot_scope->host_el;
+                if (!matchComplex(slot, r.slot_side)) continue;
+                for (const Declaration& d : r.rule->declarations)
+                    matched.push_back({&d, d.important, d.important ? r.origin : Origin::Hint, r.slot_side.specificity.key(), r.order});
+            }
+        }
+        host_context_ = scope->host_el;
 
         std::string hint_text;
         hints(el, hint_text);
@@ -3288,10 +3431,13 @@ private:
         s.line_through = s.line_through || parent.line_through;
     }
 
-    void resolvePseudo(const Node* el, const ComputedStyle& s, const Buckets& buckets,
+    void resolvePseudo(const Node* el, const ComputedStyle& s, const Buckets& ua, const Buckets& buckets, const Node* host,
                        std::unordered_map<const Node*, const ComputedStyle*>& into) {
-        if (buckets.empty()) return;
+        if (ua.empty() && buckets.empty()) return;
         std::vector<MatchedDecl> matched;
+        host_context_ = nullptr;
+        collect(el, ua, matched);
+        host_context_ = host;
         collect(el, buckets, matched);
         if (matched.empty()) return;
         ComputedStyle pseudo;
@@ -3304,25 +3450,47 @@ private:
         into[el] = &out_.storage_.back();
     }
 
-    void walk(const Node* el, const ComputedStyle& parent, size_t depth) {
+    // Down the composed tree: a host's shadow tree (in its scope), a slot's assigned
+    // nodes (in the host's tree's scope), everyone else's children.
+    void walk(const Node* el, const ComputedStyle& parent, size_t depth, const Scope* scope, const Node* slot) {
         if (depth > kMaxStyledDepth) return;
         out_.storage_.emplace_back();
         ComputedStyle& s = out_.storage_.back();
-        resolveInto(el, parent, s);
+        resolveInto(el, parent, s, scope, slot);
         out_.styles_[el] = &s;
         // Nothing below gets a box; but an SVG's hidden parts can still be drawn by <use>.
         if (s.display == Display::None && el->ns != Namespace::Svg) return;
-        resolvePseudo(el, s, before_, out_.before_);
-        resolvePseudo(el, s, after_, out_.after_);
+        resolvePseudo(el, s, ua_.before, scope->before, scope->host_el, out_.before_);
+        resolvePseudo(el, s, ua_.after, scope->after, scope->host_el, out_.after_);
+        if (el->shadow_root) {
+            const auto it = shadow_scopes_.find(el->shadow_root);
+            const Scope* inner = it == shadow_scopes_.end() ? scope : it->second.get();
+            for (const Node* c : el->shadow_root->children)
+                if (c->isElement()) walk(c, s, depth + 1, inner, nullptr);
+            return;
+        }
+        if (el->isHtml("slot") && scope->host_el) {
+            std::vector<const Node*> assigned;
+            assignedNodes(el, assigned);
+            if (!assigned.empty()) {
+                const Scope* outer = scopeFor(scope->host_el);
+                for (const Node* c : assigned)
+                    if (c->isElement()) walk(c, s, depth + 1, outer, el);
+                return;
+            }
+        }
         for (const Node* c : el->children)
-            if (c->isElement()) walk(c, s, depth + 1);
+            if (c->isElement()) walk(c, s, depth + 1, scope, nullptr);
     }
 
     const Document& doc_;
     StyledDocument& out_;
     const StyledDocument::SheetLoader& loader_;
     std::vector<std::unique_ptr<css::Stylesheet>> sheets_;
-    Buckets normal_, before_, after_;
+    Scope ua_, doc_scope_;
+    Scope* target_ = &ua_;   // where addSheet puts rules
+    std::unordered_map<const Node*, std::unique_ptr<Scope>> shadow_scopes_;   // by shadow root
+    const Node* host_context_ = nullptr;   // the host of the shadow tree being matched in
     const Node* current_element_ = nullptr;
     bool resolving_pseudo_ = false;
     std::unordered_map<const Node*, SiblingInfo> siblings_;

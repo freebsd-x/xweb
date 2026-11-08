@@ -231,13 +231,28 @@ const char* const kScriptPrelude = R"JS(
     get [Symbol.toStringTag]() { return 'URL'; }
   }
 
+  // DOMException, with its legacy codes.
+  const exceptionCodes = { IndexSizeError: 1, HierarchyRequestError: 3, WrongDocumentError: 4, InvalidCharacterError: 5,
+    NoModificationAllowedError: 7, NotFoundError: 8, NotSupportedError: 9, InvalidStateError: 11, SyntaxError: 12,
+    InvalidModificationError: 13, NamespaceError: 14, InvalidAccessError: 15, TypeMismatchError: 17, SecurityError: 18,
+    NetworkError: 19, AbortError: 20, URLMismatchError: 21, QuotaExceededError: 22, TimeoutError: 23,
+    InvalidNodeTypeError: 24, DataCloneError: 25 };
+  class DOMException extends Error {
+    constructor(message = '', name = 'Error') {
+      super(String(message));
+      Object.defineProperty(this, 'name', { value: String(name), writable: true, configurable: true });
+      Object.defineProperty(this, 'code', { value: exceptionCodes[name] || 0, configurable: true });
+    }
+    get [Symbol.toStringTag]() { return 'DOMException'; }
+  }
+  for (const [name, code] of Object.entries(exceptionCodes)) {
+    const constant = name.replace(/([a-z])([A-Z])/g, '$1_$2').toUpperCase().replace(/_ERROR$/, '_ERR');
+    DOMException[constant] = code; DOMException.prototype[constant] = code;
+  }
+
   // AbortController and AbortSignal.
   const signalState = Symbol('signal');
-  function domException(message, name) {
-    const e = new Error(message);
-    e.name = name;
-    return e;
-  }
+  function domException(message, name) { return new DOMException(message, name); }
   class AbortSignal extends EventTarget {
     constructor(key) {
       if (key !== signalState) throw new TypeError('Illegal constructor');
@@ -654,8 +669,157 @@ const char* const kScriptPrelude = R"JS(
     XMLHttpRequest[k] = v; XMLHttpRequest.prototype[k] = v;
   }
 
+  // structuredClone: the structured clone algorithm's common cases, cycles included.
+  function structuredClone(value, options) {
+    const seen = new Map();
+    const fail = what => { throw domException(what + ' could not be cloned.', 'DataCloneError'); };
+    function clone(v) {
+      if (v === null || (typeof v !== 'object' && typeof v !== 'function')) {
+        if (typeof v === 'symbol') fail('A symbol');
+        return v;
+      }
+      if (typeof v === 'function') fail('A function');
+      if (seen.has(v)) return seen.get(v);
+      let out;
+      if (Array.isArray(v)) { out = new Array(v.length); seen.set(v, out); for (let i = 0; i < v.length; i++) if (i in v) out[i] = clone(v[i]); return out; }
+      if (v instanceof Date) out = new Date(v.getTime());
+      else if (v instanceof RegExp) out = new RegExp(v.source, v.flags);
+      else if (v instanceof ArrayBuffer) out = v.slice(0);
+      else if (ArrayBuffer.isView(v)) { const C = v.constructor; out = v instanceof DataView ? new DataView(v.buffer.slice(0), v.byteOffset, v.byteLength) : new C(v); }
+      else if (v instanceof Map) { out = new Map(); seen.set(v, out); for (const [k, x] of v) out.set(clone(k), clone(x)); return out; }
+      else if (v instanceof Set) { out = new Set(); seen.set(v, out); for (const x of v) out.add(clone(x)); return out; }
+      else if (v instanceof Error) { out = new (global[v.name] || Error)(v.message); if ('cause' in v) out.cause = clone(v.cause); }
+      else if (v instanceof Blob) out = v.slice(0, v.size, v.type);
+      else if (v instanceof Boolean || v instanceof Number || v instanceof String) out = Object(v.valueOf());
+      else if (typeof Node !== 'undefined' && v instanceof Node) fail('A DOM node');
+      else if (v instanceof Promise || v instanceof WeakMap || v instanceof WeakSet) fail('This object');
+      else { out = {}; seen.set(v, out); for (const k of Object.keys(v)) out[k] = clone(v[k]); return out; }
+      seen.set(v, out);
+      return out;
+    }
+    return clone(value);
+  }
+
+  // requestIdleCallback: soon, with time to spare.
+  let idleId = 0;
+  const idleTimers = new Map();
+  function requestIdleCallback(cb, options) {
+    const id = ++idleId;
+    idleTimers.set(id, setTimeout(() => {
+      idleTimers.delete(id);
+      const end = Date.now() + 50;
+      cb({ didTimeout: false, timeRemaining: () => Math.max(0, end - Date.now()) });
+    }, 1));
+    return id;
+  }
+  function cancelIdleCallback(id) { clearTimeout(idleTimers.get(id)); idleTimers.delete(id); }
+
+  // IntersectionObserver and ResizeObserver: each target reported once after it's
+  // observed, from its laid-out box (enough for lazy loading and layout code to go on).
+  function entryRect(el) {
+    const r = el.getBoundingClientRect();
+    return { x: r.x, y: r.y, width: r.width, height: r.height, top: r.top, left: r.left, right: r.right, bottom: r.bottom };
+  }
+  class IntersectionObserver {
+    constructor(callback, options = {}) {
+      if (typeof callback !== 'function') throw new TypeError('IntersectionObserver needs a callback');
+      this._cb = callback; this._targets = new Set(); this._queued = [];
+      this.root = options.root || null; this.rootMargin = options.rootMargin || '0px';
+      this.thresholds = [].concat(options.threshold ?? 0);
+    }
+    observe(el) {
+      if (this._targets.has(el)) return;
+      this._targets.add(el);
+      this._queued.push(el);
+      if (this._queued.length === 1) setTimeout(() => this._flush(), 0);
+    }
+    _flush() {
+      const els = this._queued.filter(e => this._targets.has(e)); this._queued = [];
+      if (!els.length) return;
+      const vh = global.innerHeight, vw = global.innerWidth;
+      const entries = els.map(target => {
+        const r = entryRect(target);
+        const visible = r.bottom > 0 && r.top < vh && r.right > 0 && r.left < vw;
+        return { target, isIntersecting: visible, intersectionRatio: visible ? 1 : 0, boundingClientRect: r,
+                 intersectionRect: visible ? r : { x: 0, y: 0, width: 0, height: 0, top: 0, left: 0, right: 0, bottom: 0 },
+                 rootBounds: { x: 0, y: 0, width: vw, height: vh, top: 0, left: 0, right: vw, bottom: vh }, time: performance.now() };
+      });
+      this._cb(entries, this);
+    }
+    unobserve(el) { this._targets.delete(el); }
+    disconnect() { this._targets.clear(); this._queued = []; }
+    takeRecords() { return []; }
+  }
+  class ResizeObserver {
+    constructor(callback) {
+      if (typeof callback !== 'function') throw new TypeError('ResizeObserver needs a callback');
+      this._cb = callback; this._targets = new Set(); this._queued = [];
+    }
+    observe(el) {
+      if (this._targets.has(el)) return;
+      this._targets.add(el);
+      this._queued.push(el);
+      if (this._queued.length === 1) setTimeout(() => this._flush(), 0);
+    }
+    _flush() {
+      const els = this._queued.filter(e => this._targets.has(e)); this._queued = [];
+      if (!els.length) return;
+      const entries = els.map(target => {
+        const r = entryRect(target);
+        const size = [{ inlineSize: r.width, blockSize: r.height }];
+        return { target, contentRect: r, borderBoxSize: size, contentBoxSize: size, devicePixelContentBoxSize: size };
+      });
+      this._cb(entries, this);
+    }
+    unobserve(el) { this._targets.delete(el); }
+    disconnect() { this._targets.clear(); this._queued = []; }
+  }
+
+  // PerformanceObserver and the performance timeline: there are no entries to give, but
+  // pages that ask get the shape they expect.
+  class PerformanceObserver {
+    constructor(callback) { if (typeof callback !== 'function') throw new TypeError('PerformanceObserver needs a callback'); this._cb = callback; }
+    observe() {}
+    disconnect() {}
+    takeRecords() { return []; }
+    static get supportedEntryTypes() { return []; }
+  }
+  if (global.performance) {
+    const perf = global.performance;
+    const marks = [];
+    if (!perf.mark) perf.mark = (name, options = {}) => { const e = { name, entryType: 'mark', startTime: options.startTime ?? perf.now(), duration: 0, detail: options.detail ?? null }; marks.push(e); return e; };
+    if (!perf.measure) perf.measure = (name, start, end) => {
+      const at = n => typeof n === 'string' ? (marks.filter(m => m.name === n).pop() || { startTime: 0 }).startTime : (n ?? perf.now());
+      const s0 = typeof start === 'object' && start ? at(start.start) : at(start ?? 0), s1 = typeof start === 'object' && start ? at(start.end) : at(end);
+      const e = { name, entryType: 'measure', startTime: s0, duration: s1 - s0 }; marks.push(e); return e;
+    };
+    if (!perf.getEntries) perf.getEntries = () => marks.slice();
+    if (!perf.getEntriesByType) perf.getEntriesByType = t => marks.filter(m => m.entryType === t);
+    if (!perf.getEntriesByName) perf.getEntriesByName = (n, t) => marks.filter(m => m.name === n && (!t || m.entryType === t));
+    if (!perf.clearMarks) perf.clearMarks = n => { for (let i = marks.length; i--;) if (marks[i].entryType === 'mark' && (n === undefined || marks[i].name === n)) marks.splice(i, 1); };
+    if (!perf.clearMeasures) perf.clearMeasures = n => { for (let i = marks.length; i--;) if (marks[i].entryType === 'measure' && (n === undefined || marks[i].name === n)) marks.splice(i, 1); };
+    if (!perf.timeOrigin) perf.timeOrigin = Date.now() - perf.now();
+  }
+
+  // A link's address in parts, as HTMLAnchorElement and HTMLAreaElement have them.
+  for (const name of ['HTMLAnchorElement', 'HTMLAreaElement']) {
+    const proto = global[name] && global[name].prototype;
+    if (!proto) continue;
+    const url = el => { try { return new URL(el.getAttribute('href') || '', document.baseURI); } catch (e) { return null; } };
+    for (const part of ['protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash', 'origin', 'username', 'password']) {
+      Object.defineProperty(proto, part, {
+        get() { const u = url(this); return u ? u[part] : ''; },
+        set(v) { const u = url(this); if (u && part !== 'origin') { u[part] = v; this.setAttribute('href', u.href); } },
+        configurable: true, enumerable: true });
+    }
+  }
+
   for (const [name, value] of [['Blob', Blob], ['File', File], ['FormData', FormData], ['Headers', Headers], ['Request', Request],
-                               ['Response', Response], ['fetch', fetch], ['XMLHttpRequest', XMLHttpRequest]])
+                               ['Response', Response], ['fetch', fetch], ['XMLHttpRequest', XMLHttpRequest],
+                               ['structuredClone', structuredClone], ['requestIdleCallback', requestIdleCallback],
+                               ['cancelIdleCallback', cancelIdleCallback], ['IntersectionObserver', IntersectionObserver],
+                               ['ResizeObserver', ResizeObserver], ['DOMException', DOMException],
+                               ['PerformanceObserver', PerformanceObserver]])
     Object.defineProperty(global, name, { value, writable: true, configurable: true, enumerable: false });
   for (const [name, value] of [['URL', URL], ['URLSearchParams', URLSearchParams], ['AbortController', AbortController],
                                ['AbortSignal', AbortSignal], ['NodeFilter', NodeFilter], ['TreeWalker', TreeWalker],

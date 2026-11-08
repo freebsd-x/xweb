@@ -414,3 +414,25 @@ TEST(Contents, HasNoBoxButPassesOnItsStyle) {
     }
     EXPECT_FLOAT_EQ(r.box("b").w, 400);
 }
+
+TEST(ShadowDom, ComposedTreeScopedStylesAndSlots) {
+    const auto r = layout(R"(<style>p { height: 99px } .outer { height: 3px } x-card { display: block } .light { width: 50px }</style>
+        <x-card id=card><template shadowrootmode=open>
+          <style>:host { width: 300px; padding: 1px } p { height: 20px; margin: 0 } .inner { height: 5px }
+                 ::slotted(span) { display: block; width: 77px; height: 7px } slot[name=title] { color: red }</style>
+          <p id=sp>shadow</p><div id=si class=inner></div><slot name=title></slot><slot></slot></template>
+          <span id=title slot=title></span><span id=light class=light></span><em id=unslotted slot=nowhere>gone</em></x-card>
+        <p id=outer class=outer></p>)");
+    // :host gave the host its size; the document's p rule didn't reach into the shadow tree.
+    EXPECT_FLOAT_EQ(r.box("card").w, 302);
+    EXPECT_FLOAT_EQ(r.box("sp").h, 20);
+    EXPECT_FLOAT_EQ(r.box("si").y, 21);
+    // ::slotted() styled the slotted spans; the document's own rule wins over it.
+    EXPECT_FLOAT_EQ(r.box("title").w, 77);
+    EXPECT_FLOAT_EQ(r.box("title").y, 26);
+    EXPECT_FLOAT_EQ(r.box("light").w, 50);
+    EXPECT_FLOAT_EQ(r.box("light").y, 33);
+    // A child no slot takes isn't rendered; the shadow tree's p rule didn't leak out.
+    for (const auto& b : r.page.boxes) EXPECT_FALSE(b.node->attr("id") && *b.node->attr("id") == "unslotted");
+    EXPECT_FLOAT_EQ(r.box("outer").h, 3);
+}

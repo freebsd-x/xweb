@@ -1782,7 +1782,9 @@ private:
 }  // namespace
 
 std::unique_ptr<Document> parseHtml(std::string_view html, ParseOptions options) {
-    return TreeBuilder(html, options).run();
+    std::unique_ptr<Document> doc = TreeBuilder(html, options).run();
+    attachDeclarativeShadowRoots(*doc);
+    return doc;
 }
 
 std::unique_ptr<Document> parseFragment(std::string_view html, std::string_view context, Namespace context_ns,

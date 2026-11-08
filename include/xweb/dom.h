@@ -30,6 +30,14 @@ public:
     Node* parent = nullptr;
     std::vector<Node*> children;
     Node* template_content = nullptr;   // <template>'s children live here
+    // Shadow DOM: a host's shadow root (a Fragment), and a shadow root's host.
+    Node* shadow_root = nullptr;
+    Node* shadow_host = nullptr;
+    bool shadow_open = true;            // a shadow root's mode
+    std::vector<std::string> adopted_css;   // a shadow root's adoptedStyleSheets, as text
+    // A custom element's state: 0 none (or not yet looked at), 1 undefined (a custom
+    // element name waiting for its definition), 2 custom (upgraded), 3 failed.
+    uint8_t custom_state = 0;
 
     [[nodiscard]] bool isElement() const noexcept { return type == NodeType::Element; }
     [[nodiscard]] bool isHtml(std::string_view tag) const noexcept {
@@ -43,7 +51,21 @@ public:
 
     // All descendant text, in order. Doesn't recurse, so depth can't overflow it.
     [[nodiscard]] std::string textContent() const;
+
+    // The shadow root this node's tree hangs from, or null if it's in the document's tree.
+    [[nodiscard]] const Node* containingShadowRoot() const noexcept;
 };
+
+// The children a node has in the composed tree, the one that's rendered: a shadow host's
+// are its shadow root's children; a <slot>'s are the host's children assigned to it (or
+// its own, when none are); anyone else's are its own.
+void composedChildren(const Node* n, std::vector<const Node*>& out);
+// What a <slot> in a shadow tree has assigned: its host's children that name it (text
+// and unnamed elements go to the unnamed slot), each to the first such slot.
+void assignedNodes(const Node* slot, std::vector<const Node*>& out);
+// <template shadowrootmode=open|closed> in a parsed document: its content becomes its
+// parent's shadow root, as declarative shadow DOM has it.
+void attachDeclarativeShadowRoots(class Document& doc);
 
 class Document {
 public:

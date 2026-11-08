@@ -118,6 +118,8 @@ private:
             return false;
         }
         if (n == "root") return el->parent && el->parent->type == NodeType::Document;
+        if (n == "defined") return !(el->ns == Namespace::Html && el->name.find('-') != std::string::npos && el->custom_state != 2);
+        if (n == "host") return false;   // from outside a shadow tree, nothing is its host
         if (n == "scope") return false;
         const Position p = positionOf(el);
         if (n == "first-child") return p.index == 1;

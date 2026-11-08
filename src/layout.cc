@@ -396,7 +396,10 @@ private:
     // An element's content as boxes in `box`, which is its own unless it has none.
     void addChildren(const Node* el, const ComputedStyle& style, Box& box, int depth, int& counter) {
         if (const ComputedStyle* before = styles_.beforeOf(el)) box.kids.push_back(pseudoBox(*before));
-        for (const Node* c : el->children) {
+        // The composed tree: a host's shadow tree, a slot's assigned nodes.
+        std::vector<const Node*> kids;
+        composedChildren(el, kids);
+        for (const Node* c : kids) {
             if (c->type == NodeType::Text) {
                 if (c->data.empty()) continue;
                 auto t = std::make_unique<Box>();

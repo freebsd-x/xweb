@@ -257,3 +257,84 @@ TEST(Script, FetchAndXMLHttpRequest) {
         EXPECT_NE(p.console.find(want), std::string::npos) << want << "\n" << p.console;
     EXPECT_NE(std::find(p.fetched.begin(), p.fetched.end(), "POST https://example.org/api application/json {\"a\":1}"), p.fetched.end());
 }
+
+TEST(Script, CustomElementsShadowRootsAndObservers) {
+    Page p(R"(<body><my-early id=early title=t1></my-early><div id=host></div>
+        <section id=dsd><template shadowrootmode=open><p id=inside>declarative</p><slot></slot></template><b>light</b></section>
+        <script>
+          const log = [];
+          class MyEarly extends HTMLElement {
+            static observedAttributes = ['title'];
+            constructor() { super(); log.push('ctor:' + this.id); }
+            connectedCallback() { log.push('connected:' + this.id); }
+            disconnectedCallback() { log.push('disconnected:' + this.id); }
+            attributeChangedCallback(n, o, v) { log.push('attr:' + n + ':' + o + '>' + v); }
+          }
+          console.log('before', document.getElementById('early') instanceof MyEarly, document.querySelectorAll(':defined').length > 0);
+          customElements.whenDefined('my-early').then(c => log.push('whenDefined:' + (c === MyEarly)));
+          customElements.define('my-early', MyEarly);
+          const early = document.getElementById('early');
+          early.title = 't2';
+          early.remove();
+          document.body.append(early);
+          const made = document.createElement('my-early');
+          made.id = 'made';
+          document.body.appendChild(made);
+          console.log(log.join(' '));
+          console.log('upgraded', early instanceof MyEarly, early instanceof HTMLElement, made instanceof MyEarly, customElements.get('my-early') === MyEarly);
+          try { customElements.define('nodash', class extends HTMLElement {}); } catch (e) { console.log('bad name', e.name); }
+          try { new HTMLDivElement(); } catch (e) { console.log('illegal', e.name); }
+
+          const host = document.getElementById('host');
+          const root = host.attachShadow({mode: 'open'});
+          root.innerHTML = '<span id=s>shadow</span><slot name=x></slot>';
+          console.log('shadow', host.shadowRoot === root, root.host === host, root.mode, root.getElementById('s').textContent,
+                      document.getElementById('s'), root.querySelector('span').id, root instanceof ShadowRoot, root instanceof DocumentFragment);
+          const light = document.createElement('i'); light.slot = 'x'; host.append(light);
+          console.log('slot', root.querySelector('slot').assignedNodes().length, light.assignedSlot === root.querySelector('slot'),
+                      root.querySelector('span').getRootNode() === root);
+          const dsd = document.getElementById('dsd');
+          console.log('declarative', dsd.shadowRoot.getElementById('inside').textContent, dsd.shadowRoot.querySelector('slot').assignedElements()[0].tagName);
+          try { host.attachShadow({mode: 'open'}); } catch (e) { console.log('twice', e.name); }
+
+          const seen = [];
+          const mo = new MutationObserver((records, o) => {
+            for (const r of records) seen.push(r.type + ':' + (r.attributeName || '') + ':' + (r.oldValue ?? '') + ':' + r.addedNodes.length + '/' + r.removedNodes.length);
+            console.log('observed', seen.join(' '), o === mo);
+          });
+          mo.observe(document.body, {childList: true, subtree: true, attributes: true, attributeOldValue: true, attributeFilter: ['data-x']});
+          const d = document.createElement('div');
+          document.body.append(d);
+          d.setAttribute('data-x', '1');
+          d.setAttribute('data-x', '2');
+          d.setAttribute('other', '3');
+          d.remove();
+          console.log('sync end', seen.length);
+
+          console.log(document.createElement('dialog') instanceof HTMLDialogElement, document.createElement('img') instanceof HTMLImageElement,
+                      document.createElement('video') instanceof HTMLMediaElement, document.createElement('foo') instanceof HTMLUnknownElement,
+                      document.createElement('article').constructor === HTMLElement, Object.prototype.toString.call(new DocumentFragment()));
+          const dlg = document.createElement('dialog'); dlg.showModal(); const was = dlg.open; dlg.close('ok');
+          console.log('dialog', was, dlg.open, dlg.returnValue);
+          const tpl = document.createElement('template'); tpl.innerHTML = '<b>x</b>';
+          console.log('template', tpl.content.firstChild.tagName, tpl.childNodes.length);
+          const a = document.createElement('a'); a.href = 'https://h.test:8080/p/q?z=1#f';
+          console.log('link', a.host, a.pathname, a.search, a.hash);
+          const sc = structuredClone({m: new Map([[1, {d: new Date(0)}]]), arr: [1, [2]], self: null});
+          console.log('clone', sc.m.get(1).d.getTime(), sc.arr[1][0]);
+          const sheet = new CSSStyleSheet(); sheet.replaceSync('span { color: red }'); root.adoptedStyleSheets = [sheet];
+          console.log('adopted', root.adoptedStyleSheets.length);
+        </script>)");
+    p.script->tick();
+    for (const char* want : {
+             "log:before false true\n",
+             "log:ctor:early attr:title:null>t1 connected:early attr:title:t1>t2 disconnected:early connected:early ctor: connected:made\n",
+             "log:upgraded true true true true\n", "log:bad name SyntaxError\n", "log:illegal TypeError\n",
+             "log:shadow true true open shadow null s true true\n", "log:slot 1 true true\n", "log:declarative declarative B\n",
+             "log:twice NotSupportedError\n", "log:sync end 0\n",
+             "log:observed childList:::1/0 attributes:data-x::0/0 attributes:data-x:1:0/0 childList:::0/1 true\n",
+             "log:true true true true true [object DocumentFragment]\n", "log:dialog true false ok\n", "log:template B 0\n",
+             "log:link h.test:8080 /p/q ?z=1 #f\n", "log:clone 0 2\n", "log:adopted 1\n"})
+        EXPECT_NE(p.console.find(want), std::string::npos) << want << "\n" << p.console;
+    EXPECT_EQ(p.console.find("error"), std::string::npos) << p.console;
+}

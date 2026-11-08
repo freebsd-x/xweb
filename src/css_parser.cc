@@ -653,6 +653,10 @@ private:
                 if (ss.name == "not") return false;
                 ss.args.clear();   // :is() and :where() forgive: this matches nothing
             }
+        } else if (ss.name == "host" || ss.name == "host-context" || ss.name == "slotted") {
+            // Shadow DOM's: :host(sel), :host-context(sel), ::slotted(sel).
+            SelectorParser inner(tokens, arg_begin, arg_end, depth_ + 1);
+            if (!inner.list(ss.args)) return false;
         } else if (ss.name.starts_with("nth-")) {
             std::string text;
             for (size_t i = arg_begin; i < arg_end && i < tokens.size(); ++i) {
@@ -1166,5 +1170,11 @@ bool mediaMatchesAt(const std::vector<Token>& query, const MediaContext& context
 }
 
 }  // namespace
+
+// CSS.supports(): "(display: grid)", or a property and a value.
+bool supportsCondition(std::string_view condition) {
+    const std::vector<Token> tokens = tokenize(condition);
+    return supportsMatches(tokens);
+}
 
 }  // namespace fbx::xweb::css

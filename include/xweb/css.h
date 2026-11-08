@@ -104,5 +104,7 @@ struct MediaContext {
 
 // One @media prelude, or a <link media=...>'s value once tokenized.
 [[nodiscard]] bool mediaMatches(const std::vector<Token>& query, const MediaContext& context);
+// What @supports and CSS.supports() answer for a condition ("(display: grid)").
+[[nodiscard]] bool supportsCondition(std::string_view condition);
 
 }  // namespace fbx::xweb::css

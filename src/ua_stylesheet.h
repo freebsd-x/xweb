@@ -17,6 +17,7 @@ td, th { display: table-cell; padding: 1px; vertical-align: inherit; }
 th { font-weight: bold; text-align: center; }
 head, link, meta, script, style, title, template, area, base, basefont, datalist, noembed, noframes, param, rp,
 source, track, option, dialog:not([open]), [hidden] { display: none; }
+slot { display: contents; }
 li { display: list-item; }
 html { color: black; }
 body { margin: 8px; }
