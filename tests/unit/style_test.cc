@@ -343,3 +343,17 @@ TEST(Mask, AMaskedColourIsKeptForTheMask) {
     EXPECT_TRUE(styles.styleOf(find("b"))->background.visible());
     EXPECT_TRUE(styles.styleOf(find("c"))->background.visible());
 }
+
+TEST(Values, LogicalPropertiesAreTheirPhysicalOnes) {
+    const auto s = style("<style>#a{margin-left:0;margin-inline-start:20px;padding-block-end:3px;inline-size:50px;max-block-size:9px;"
+                         "border-inline-end:2px solid red;inset-inline-start:4px;inset-block:1px 2px}#b{inset:5px}</style><div id=a></div><div id=b></div>");
+    EXPECT_FLOAT_EQ(s.of("a").margin[Left].px, 20);
+    EXPECT_FLOAT_EQ(s.of("a").padding[Bottom].px, 3);
+    EXPECT_FLOAT_EQ(s.of("a").width.px, 50);
+    EXPECT_FLOAT_EQ(s.of("a").max_height.px, 9);
+    EXPECT_FLOAT_EQ(s.of("a").border_width[Right], 2);
+    EXPECT_FLOAT_EQ(s.of("a").offset[Left].px, 4);
+    EXPECT_FLOAT_EQ(s.of("a").offset[Top].px, 1);
+    EXPECT_FLOAT_EQ(s.of("a").offset[Bottom].px, 2);
+    EXPECT_FLOAT_EQ(s.of("b").offset[Right].px, 5);
+}

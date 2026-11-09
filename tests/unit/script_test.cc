@@ -410,3 +410,20 @@ TEST(Script, DetailsToggleTellsThePage) {
     EXPECT_FALSE(p.byId("d")->attr("open"));
     EXPECT_EQ(p.console, "log:toggle true\nlog:toggle false\n");
 }
+
+TEST(Script, SelectsAndOptionsAsPagesBuildThem) {
+    Page p(R"(<body><select id=s><option>a</option></select><script>
+        const log = (...a) => console.log(...a);
+        const s = document.getElementById('s');
+        const o = document.createElement('option');
+        o.value = 'v2'; o.text = '  Two  '; o.selected = true;
+        s.add(o);
+        s.add(new Option('Zero', 'v0'), 0);
+        log(s.length, s.options[0].text, s.options[2].value, s.options[2].text, s.selectedIndex, o.index, o.selected);
+        s.selectedIndex = 0;
+        log(o.selected, s.options[0].selected, s.value);
+        s.remove(0);
+        log(s.length, s.item(0).text, new Image(3, 4).getAttribute('width'), o instanceof HTMLOptionElement);
+        </script>)");
+    EXPECT_EQ(p.console, "log:3 Zero v2 Two 2 2 true\nlog:false true v0\nlog:2 a 3 true\n");
+}

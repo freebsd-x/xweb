@@ -1024,6 +1024,76 @@ const char* const kScriptPrelude = R"JS(
     }
   }
 
+  // <select> and <option>, over the element's attributes and selectedIndex (which goes
+  // through the page's form state).
+  if (typeof HTMLSelectElement === 'function' && typeof HTMLOptionElement === 'function') {
+    const def = (proto, name, get, set) => Object.defineProperty(proto, name, { get, set, configurable: true, enumerable: true });
+    const S = HTMLSelectElement.prototype, O = HTMLOptionElement.prototype;
+    const ownerSelect = o => {
+      let p = o.parentNode;
+      if (p && p.localName === 'optgroup') p = p.parentNode;
+      return p && p.localName === 'select' ? p : null;
+    };
+    const collapse = t => String(t).replace(/[ \t\n\f\r]+/g, ' ').trim();
+    def(O, 'text', function () { return collapse(this.textContent); }, function (v) { this.textContent = String(v); });
+    def(O, 'label', function () { return this.hasAttribute('label') ? this.getAttribute('label') : this.text; },
+        function (v) { this.setAttribute('label', String(v)); });
+    def(O, 'value', function () { return this.hasAttribute('value') ? this.getAttribute('value') : this.text; },
+        function (v) { this.setAttribute('value', String(v)); });
+    def(O, 'defaultSelected', function () { return this.hasAttribute('selected'); },
+        function (v) { if (v) this.setAttribute('selected', ''); else this.removeAttribute('selected'); });
+    def(O, 'index', function () { const s = ownerSelect(this); return s ? Array.prototype.indexOf.call(s.options, this) : 0; });
+    def(O, 'form', function () { const s = ownerSelect(this); return s ? s.form : null; });
+    def(O, 'selected', function () {
+      const s = ownerSelect(this);
+      return s ? s.selectedIndex === this.index : this.hasAttribute('selected');
+    }, function (v) {
+      const s = ownerSelect(this);
+      if (!s) { this.defaultSelected = v; return; }
+      if (v) s.selectedIndex = this.index;
+      else if (s.selectedIndex === this.index) s.selectedIndex = -1;
+    });
+    def(S, 'length', function () { return this.options.length; });
+    def(S, 'selectedOptions', function () { return Array.prototype.filter.call(this.options, o => o.selected); });
+    S.item = function (i) { return this.options[i >>> 0] || null; };
+    S.namedItem = function (name) {
+      return Array.prototype.find.call(this.options, o => o.id === name || o.getAttribute('name') === name) || null;
+    };
+    S.add = function (element, before) {
+      let ref = null;
+      if (typeof before === 'number') ref = this.options[before] || null;
+      else if (before != null) ref = before;
+      if (ref) ref.parentNode.insertBefore(element, ref);
+      else this.appendChild(element);
+    };
+    const removeNode = Element.prototype.remove;
+    S.remove = function (index) {
+      if (arguments.length === 0) return removeNode.call(this);
+      const o = this.options[index];
+      if (o) o.remove();
+    };
+    global.Option = function Option(text, value, defaultSelected, selected) {
+      if (!new.target) throw new TypeError("Constructor Option requires 'new'");
+      const o = document.createElement('option');
+      if (text !== undefined && text !== '') o.text = text;
+      if (value !== undefined) o.value = value;
+      if (defaultSelected) o.defaultSelected = true;
+      if (selected) o.setAttribute('selected', '');
+      return o;
+    };
+    global.Option.prototype = O;
+  }
+  if (typeof HTMLImageElement === 'function') {
+    global.Image = function Image(width, height) {
+      if (!new.target) throw new TypeError("Constructor Image requires 'new'");
+      const img = document.createElement('img');
+      if (width !== undefined) img.setAttribute('width', String(width >>> 0));
+      if (height !== undefined) img.setAttribute('height', String(height >>> 0));
+      return img;
+    };
+    global.Image.prototype = HTMLImageElement.prototype;
+  }
+
   for (const [name, value] of [['Blob', Blob], ['File', File], ['FormData', FormData], ['Headers', Headers], ['Request', Request],
                                ['Response', Response], ['fetch', fetch], ['XMLHttpRequest', XMLHttpRequest],
                                ['structuredClone', structuredClone], ['requestIdleCallback', requestIdleCallback],

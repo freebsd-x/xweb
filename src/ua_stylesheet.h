@@ -26,7 +26,7 @@ body { margin: 8px; }
 address, cite, dfn, em, i, var { font-style: italic; }
 b, strong { font-weight: bold; }
 blockquote, figure { margin: 1em 40px; }
-center { text-align: center; }
+center { text-align: -webkit-center; }
 code, kbd, listing, plaintext, pre, samp, tt, xmp { font-family: monospace; }
 dd { margin-left: 40px; }
 dir, dl, listing, menu, ol, p, plaintext, pre, ul, xmp { margin-top: 1em; margin-bottom: 1em; }

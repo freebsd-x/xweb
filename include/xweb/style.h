@@ -189,6 +189,10 @@ struct ComputedStyle {
     float line_height = 0;             // px; 0 with a zero factor means "normal"
     float line_height_factor = 0;      // a unitless line-height inherits as the number
     TextAlign text_align = TextAlign::Left;
+    // text-align: -webkit-center / -webkit-right (as <center> and align= give it): block
+    // children are aligned too. 0 none, 1 centre, 2 right. Inherited; `parent_block_align`
+    // is the parent's, which is what places this box.
+    uint8_t block_align = 0, parent_block_align = 0;
     TextTransform text_transform = TextTransform::None;
     WhiteSpace white_space = WhiteSpace::Normal;
     ListStyle list_style = ListStyle::Disc;

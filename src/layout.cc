@@ -700,6 +700,11 @@ private:
                 b.margin[Left] = free_space - b.margin[Right];
             } else if (mr_auto) {
                 b.margin[Right] = free_space - b.margin[Left];
+            } else if (s.parent_block_align != 0 && free_space > b.margin[Left] + b.margin[Right]) {
+                // Inside <center> or align=center: the box itself goes to the middle (or right).
+                const float spare = free_space - b.margin[Left] - b.margin[Right];
+                b.margin[Left] += s.parent_block_align == 1 ? spare / 2 : spare;
+                b.margin[Right] += s.parent_block_align == 1 ? spare / 2 : 0;
             }
         }
 
@@ -1398,10 +1403,29 @@ private:
             for (size_t k = 0; k < grid.columns; ++k)
                 if (!set[k]) widths[k] = std::max(0.0f, inner - claimed) / static_cast<float>(unclaimed);
         } else {
+            // Columns a cell gives a fixed width: more room goes to the others first.
+            std::vector<bool> fixed_col(grid.columns, false);
+            for (const TableCell& c : grid.cells)
+                if (c.colspan == 1 && !c.box->style->width.is_auto && !c.box->style->width.hasPercent()) fixed_col[c.col] = true;
+            float auto_max = 0;
+            size_t auto_cols = 0;
+            for (size_t k = 0; k < grid.columns; ++k)
+                if (percent[k] <= 0 && !fixed_col[k]) {
+                    auto_max += maxes[k];
+                    ++auto_cols;
+                }
             for (size_t k = 0; k < grid.columns; ++k) {
                 if (percent[k] > 0) continue;
-                if (rest >= sum_max) {
-                    // More room than wanted: a table given a width spreads it out.
+                if (rest >= sum_max && auto_cols > 0) {
+                    // More room than wanted: a table given a width spreads it over its
+                    // auto columns.
+                    if (fixed_col[k]) {
+                        widths[k] = maxes[k];
+                    } else {
+                        const float share = auto_max > 0 ? maxes[k] / auto_max : 1.0f / static_cast<float>(auto_cols);
+                        widths[k] = maxes[k] + share * (rest - sum_max);
+                    }
+                } else if (rest >= sum_max) {
                     const float share = sum_max > 0 ? maxes[k] / sum_max : 1.0f / static_cast<float>(grid.columns);
                     widths[k] = maxes[k] + share * (rest - sum_max);
                 } else if (rest > sum_min) {
@@ -1692,6 +1716,13 @@ private:
                 line_cross[li] = std::max(line_cross[li], it->cross_outer);
             }
         }
+        // A single line with no definite height of its own is still held to the
+        // container's min-height and max-height (a sidebar capped at 100vh).
+        if (row && !cross_avail && lines.size() == 1 && !s.flex_wrap) {
+            const float frame = s.border_box ? c.frameHeight() : 0;
+            if (!s.max_height.is_auto && !s.max_height.hasPercent()) line_cross[0] = std::min(line_cross[0], std::max(0.0f, s.max_height.px - frame));
+            if (!s.min_height.is_auto && !s.min_height.hasPercent()) line_cross[0] = std::max(line_cross[0], std::max(0.0f, s.min_height.px - frame));
+        }
         float cross_total = gap_cross * static_cast<float>(lines.empty() ? 0 : lines.size() - 1);
         for (const float v : line_cross) cross_total += v;
 
@@ -1773,7 +1804,13 @@ private:
                 const bool cross_auto = row ? ks.height.is_auto : ks.width.is_auto;
                 const bool cross_margin_auto = row ? (ks.margin[Top].is_auto || ks.margin[Bottom].is_auto) : (ks.margin[Left].is_auto || ks.margin[Right].is_auto);
                 if (align == FlexAlign::Stretch && cross_auto && !cross_margin_auto) {
-                    const float inner_cross = std::max(0.0f, line_cross[li] - it->frame_cross);
+                    float inner_cross = std::max(0.0f, line_cross[li] - it->frame_cross);
+                    // Stretched, but within its own max and min (min winning).
+                    const Length& max_cross = row ? ks.max_height : ks.max_width;
+                    const Length& min_cross = row ? ks.min_height : ks.min_width;
+                    const float own_frame = ks.border_box ? (row ? k.frameHeight() : k.frameWidth()) : 0;
+                    if (!max_cross.is_auto && !max_cross.hasPercent()) inner_cross = std::min(inner_cross, std::max(0.0f, max_cross.px - own_frame));
+                    if (!min_cross.is_auto && !min_cross.hasPercent()) inner_cross = std::max(inner_cross, std::max(0.0f, min_cross.px - own_frame));
                     if (row) {
                         if (std::abs(k.height - inner_cross) > 0.01f) layoutItem(k, it->main, inner_cross);
                     } else if (std::abs(k.width - inner_cross) > 0.01f) {
@@ -1828,8 +1865,9 @@ private:
         } else {
             h = own_height.value_or(main_extent);
         }
-        if (!s.min_height.hasPercent()) h = std::max(h, std::max(0.0f, s.min_height.px - (s.border_box ? c.frameHeight() : 0)));
+        // max first, so min wins.
         if (!s.max_height.is_auto && !s.max_height.hasPercent()) h = std::min(h, std::max(0.0f, s.max_height.px - (s.border_box ? c.frameHeight() : 0)));
+        if (!s.min_height.hasPercent()) h = std::max(h, std::max(0.0f, s.min_height.px - (s.border_box ? c.frameHeight() : 0)));
         c.height = clampCoord(h);
     }
 

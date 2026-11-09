@@ -2065,8 +2065,11 @@ private:
             const std::string a = lower(*v);
             if ((n == "div" || n == "p" || n == "h1" || n == "h2" || n == "h3" || n == "h4" || n == "h5" || n == "h6" ||
                  n == "td" || n == "th" || n == "tr") &&
-                (a == "center" || a == "left" || a == "right"))
-                css_text += "text-align:" + a + ";";
+                (a == "center" || a == "left" || a == "right")) {
+                // A div's or a cell's aligns its blocks too.
+                const bool blocks = n == "div" || n == "td" || n == "th" || n == "tr";
+                css_text += "text-align:" + (blocks && a != "left" ? "-webkit-" + a : a) + ";";
+            }
         }
         if (n == "img" || n == "table") {
             if (const std::string* v = el->attr("border")) {
@@ -2725,7 +2728,10 @@ private:
         } else if (p == "line-height") {
             to.line_height = from.line_height;
             to.line_height_factor = from.line_height_factor;
-        } else if (p == "text-align") to.text_align = from.text_align;
+        } else if (p == "text-align") {
+            to.text_align = from.text_align;
+            to.block_align = from.block_align;
+        }
         else if (p == "text-transform") to.text_transform = from.text_transform;
         else if (p == "white-space") to.white_space = from.white_space;
         else if (p == "text-overflow") to.text_overflow_ellipsis = from.text_overflow_ellipsis;
@@ -2819,7 +2825,38 @@ private:
         else if (p == "left") to.offset[Left] = from.offset[Left];
     }
 
-    void apply(ComputedStyle& s, const ComputedStyle& parent, const std::string& p, const Tokens& raw) {
+    // A logical property's physical one, for horizontal left-to-right text; others as they are.
+    static const std::string& physical(const std::string& p) {
+        static const std::unordered_map<std::string, std::string> map = [] {
+            std::unordered_map<std::string, std::string> m;
+            const std::pair<const char*, const char*> sides[] = {
+                {"inline-start", "left"}, {"inline-end", "right"}, {"block-start", "top"}, {"block-end", "bottom"}};
+            for (const auto& [logical, phys] : sides) {
+                m[std::string("margin-") + logical] = std::string("margin-") + phys;
+                m[std::string("padding-") + logical] = std::string("padding-") + phys;
+                m[std::string("inset-") + logical] = phys;
+                m[std::string("border-") + logical] = std::string("border-") + phys;
+                for (const char* part : {"-width", "-style", "-color"})
+                    m[std::string("border-") + logical + part] = std::string("border-") + phys + part;
+            }
+            m["inline-size"] = "width";
+            m["block-size"] = "height";
+            m["min-inline-size"] = "min-width";
+            m["max-inline-size"] = "max-width";
+            m["min-block-size"] = "min-height";
+            m["max-block-size"] = "max-height";
+            m["border-start-start-radius"] = "border-top-left-radius";
+            m["border-start-end-radius"] = "border-top-right-radius";
+            m["border-end-start-radius"] = "border-bottom-left-radius";
+            m["border-end-end-radius"] = "border-bottom-right-radius";
+            return m;
+        }();
+        const auto it = map.find(p);
+        return it == map.end() ? p : it->second;
+    }
+
+    void apply(ComputedStyle& s, const ComputedStyle& parent, const std::string& logical, const Tokens& raw) {
+        const std::string& p = physical(logical);
         Tokens substituted;
         const Tokens* vp = &raw;
         if (hasVar(raw)) {
@@ -3204,6 +3241,14 @@ private:
             s.margin[Right] = pair[Right];
             return;
         }
+        if (p == "inset" || p == "inset-inline" || p == "inset-block") {
+            Length sides[4];
+            setBoxSides(sides, v, c, true);
+            if (p == "inset") std::copy(std::begin(sides), std::end(sides), s.offset);
+            if (p == "inset-inline") { s.offset[Left] = sides[Top]; s.offset[Right] = sides[Right]; }
+            if (p == "inset-block") { s.offset[Top] = sides[Top]; s.offset[Bottom] = sides[Right]; }
+            return;
+        }
         if (p == "margin-block") {
             Length pair[4];
             setBoxSides(pair, v, c, true);
@@ -3325,6 +3370,7 @@ private:
             if (kw == "left" || kw == "start" || kw == "justify" || kw == "-webkit-auto") s.text_align = TextAlign::Left;
             else if (kw == "right" || kw == "end" || kw == "-webkit-right") s.text_align = TextAlign::Right;
             else if (kw == "center" || kw == "-webkit-center") s.text_align = TextAlign::Center;
+            s.block_align = kw == "-webkit-center" ? 1 : kw == "-webkit-right" ? 2 : 0;
             return;
         }
         if (p == "text-transform") {
@@ -3394,6 +3440,8 @@ private:
         s.line_height = parent.line_height;
         s.line_height_factor = parent.line_height_factor;
         s.text_align = parent.text_align;
+        s.block_align = parent.block_align;
+        s.parent_block_align = parent.block_align;
         s.text_transform = parent.text_transform;
         s.white_space = parent.white_space;
         s.list_style = parent.list_style;
