@@ -436,3 +436,35 @@ TEST(ShadowDom, ComposedTreeScopedStylesAndSlots) {
     for (const auto& b : r.page.boxes) EXPECT_FALSE(b.node->attr("id") && *b.node->attr("id") == "unslotted");
     EXPECT_FLOAT_EQ(r.box("outer").h, 3);
 }
+
+// A flex row sized to its content counts its gaps: without them its items shrank to
+// fit, and one with overflow hidden lost the end of its text.
+TEST(Flex, ContentSizedRowCountsItsGaps) {
+    const auto r = layout("<div style=display:flex><div id=row style='display:flex;gap:8px'>"
+                          "<div id=a style='min-width:0;overflow:hidden'>abcd</div><div id=b>efgh</div></div></div>");
+    EXPECT_FLOAT_EQ(r.box("row").w, 48);
+    EXPECT_FLOAT_EQ(r.box("a").w, 20);
+    EXPECT_FLOAT_EQ(r.box("b").x, 28);
+}
+
+// text-overflow: ellipsis ends a clipped line in "…" (in the block's font), keeping
+// the characters that fit with it; clip, the default, keeps the text as it is.
+TEST(Inline, TextOverflowEllipsis) {
+    const std::string style = "width:50px;white-space:nowrap;overflow:hidden";
+    auto r = layout("<div style='" + style + ";text-overflow:ellipsis'>abcdefghijklmnop</div>");
+    EXPECT_EQ(r.texts(), (std::vector<std::string>{"abcdefghi", "…"}));
+    r = layout("<div style='" + style + ";text-overflow:ellipsis'>ab cd <b>efgh ijkl</b></div>");
+    EXPECT_EQ(r.texts(), (std::vector<std::string>{"ab cd ", "efg", "…"}));
+    r = layout("<div style='" + style + ";text-overflow:ellipsis'>short</div>");
+    EXPECT_EQ(r.texts(), (std::vector<std::string>{"short"}));
+    r = layout("<div style='" + style + "'>abcdefghijklmnop</div>");
+    EXPECT_EQ(r.texts(), (std::vector<std::string>{"abcdefghijklmnop"}));
+}
+
+// Buttons are border-box, as in other browsers: a width is the whole button's.
+TEST(Forms, ButtonsAreBorderBox) {
+    const auto r = layout("<button id=b style='width:100px;height:30px'>x</button><input id=i type=submit style=width:80px>");
+    EXPECT_FLOAT_EQ(r.box("b").w, 100);
+    EXPECT_FLOAT_EQ(r.box("b").h, 30);
+    EXPECT_FLOAT_EQ(r.box("i").w, 80);
+}

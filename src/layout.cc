@@ -46,6 +46,7 @@ struct Box {
     bool anonymous_table_part = false;
     bool quirky_no_top_margin = false, quirky_no_bottom_margin = false;
     float static_y = 0;            // where an absolutely positioned box would have gone
+    float static_x = 0;            // across, for one that was inline-level (else 0)
     float pref_width = -1;         // max-content width, once computed
     float min_content = -1;        // min-content width, once computed
     int list_number = 0;
@@ -734,6 +735,7 @@ private:
 
         if (inline_content) {
             content_h = layoutInline(b, flow);
+            applyEllipsis(b);
             if (content_h == 0 && can_collapse_through) {
                 b.collapses_through = true;
                 mt = collapse(mt, mb);
@@ -1004,13 +1006,20 @@ private:
         }
         if (b.isFlex()) {
             const bool row = !b.style->flex_column;
+            const bool summed = row && (max_content || !b.style->flex_wrap);
             float total = 0;
+            int items = 0;
             for (auto& k : b.kids) {
                 if (k->outOfFlow()) continue;
                 const float w = outerIntrinsic(*k, max_content);
-                if (row && (max_content || !b.style->flex_wrap)) total += w;
+                ++items;
+                if (summed) total += w;
                 else total = std::max(total, w);
             }
+            // Side by side, the gaps between them count too: without them a row sized to
+            // its content came out short by them, and its items shrank to fit (a label
+            // with text-overflow lost its last letter).
+            if (summed && items > 1) total += b.style->column_gap * static_cast<float>(items - 1);
             return total;
         }
         if (b.isGrid()) return gridIntrinsicWidth(b, max_content);
@@ -2657,6 +2666,78 @@ private:
         }
     }
 
+    // text-overflow: ellipsis. A clipping block's line that runs past its content box
+    // ends in "…" instead: the fragments that still fit with it stay, the one across
+    // the edge keeps the characters that fit, the rest of the line goes. The ellipsis
+    // takes the block's own font and colour. (Left to right only.)
+    void applyEllipsis(Box& b) {
+        const ComputedStyle& s = *b.style;
+        if (!s.overflow_clip || !s.text_overflow_ellipsis || b.fragments.empty()) return;
+        static const std::string kEllipsis = "\u2026";
+        const float ellipsis_w = text_.width(kEllipsis, fontOf(s));
+        std::vector<Box::Fragment> out;
+        out.reserve(b.fragments.size() + 1);
+        size_t i = 0;
+        while (i < b.fragments.size()) {
+            // One line: the fragments on the same y.
+            size_t end = i + 1;
+            while (end < b.fragments.size() && std::abs(b.fragments[end].y - b.fragments[i].y) < 0.5f) ++end;
+            float right = 0;
+            for (size_t k = i; k < end; ++k) right = std::max(right, b.fragments[k].x + b.fragments[k].w);
+            if (right <= b.width + 0.5f) {
+                out.insert(out.end(), b.fragments.begin() + static_cast<ptrdiff_t>(i), b.fragments.begin() + static_cast<ptrdiff_t>(end));
+                i = end;
+                continue;
+            }
+            const float avail = b.width - ellipsis_w;
+            const Box::Fragment* last = nullptr;
+            float at = 0;
+            for (size_t k = i; k < end; ++k) {
+                Box::Fragment f = b.fragments[k];
+                if (f.x + f.w <= avail) {
+                    out.push_back(std::move(f));
+                    last = &out.back();
+                    at = last->x + last->w;
+                    continue;
+                }
+                if (f.atomic || f.x >= avail) break;
+                // Across the edge: as many whole characters as fit.
+                const FontSpec font = fontOf(*f.style);
+                std::string kept;
+                for (size_t c = 0; c < f.text.size();) {
+                    size_t n = 1;
+                    const auto lead = static_cast<unsigned char>(f.text[c]);
+                    if (lead >= 0xF0) n = 4;
+                    else if (lead >= 0xE0) n = 3;
+                    else if (lead >= 0xC0) n = 2;
+                    const std::string next = kept + f.text.substr(c, n);
+                    if (f.x + text_.width(next, font) > avail) break;
+                    kept = next;
+                    c += n;
+                }
+                while (!kept.empty() && kept.back() == ' ') kept.pop_back();
+                if (!kept.empty()) {
+                    f.text = kept;
+                    f.w = text_.width(kept, font);
+                    out.push_back(std::move(f));
+                    last = &out.back();
+                    at = last->x + last->w;
+                }
+                break;
+            }
+            Box::Fragment e = last ? *last : b.fragments[i];
+            e.x = last ? at : 0;
+            e.w = ellipsis_w;
+            e.text = kEllipsis;
+            e.style = &s;
+            e.atomic = nullptr;
+            e.background = Color{0, 0, 0, 0};
+            out.push_back(std::move(e));
+            i = end;
+        }
+        b.fragments = std::move(out);
+    }
+
     // Returns the height of the lines; fills b.fragments.
     float layoutInline(Box& b, Flow flow) {
         b.fragments.clear();
@@ -2716,10 +2797,18 @@ private:
                     endLine(true);
                     break;
                 case InlineItem::Positioned:
-                    // Its static position: where the next block would have started.
                     flushRun();
                     l_.layoutOutOfFlow(*it.atomic, b_.width);
-                    it.atomic->static_y = y_ + (line_.empty() ? 0 : l_.lineHeightOf(*b_.style));
+                    if (it.atomic->style->inline_level_origin) {
+                        // Inline-level: where it would have been on this line (an icon
+                        // after a link's text).
+                        it.atomic->static_x = x_;
+                        it.atomic->static_y = y_;
+                    } else {
+                        // Its static position: where the next block would have started.
+                        it.atomic->static_x = 0;
+                        it.atomic->static_y = y_ + (line_.empty() ? 0 : l_.lineHeightOf(*b_.style));
+                    }
                     break;
                 case InlineItem::Floated: addFloat(*it.atomic); break;
             }
@@ -3654,7 +3743,7 @@ private:
         for (const auto& kp : b.kids) {
             const Box& k = *kp;
             if (k.outOfFlow()) {
-                positioned_.push_back({&k, cx, cy + k.static_y, cb, opacity, order_++, clipsFor(k)});
+                positioned_.push_back({&k, cx + k.static_x, cy + k.static_y, cb, opacity, order_++, clipsFor(k)});
                 continue;
             }
             if (k.floating()) {
@@ -3689,7 +3778,7 @@ private:
     // Absolute and floated boxes inside inline elements still need painting.
     void collectOutOfFlowIn(const Box& b, float cx, float cy, const Rect& cb, float opacity) {
         for (const auto& kp : b.kids) {
-            if (kp->outOfFlow()) positioned_.push_back({kp.get(), cx, cy + kp->static_y, cb, opacity, order_++, clipsFor(*kp)});
+            if (kp->outOfFlow()) positioned_.push_back({kp.get(), cx + kp->static_x, cy + kp->static_y, cb, opacity, order_++, clipsFor(*kp)});
             else if (kp->floating()) pending_floats_.push_back({kp.get(), cx, cy, cb, opacity});
             else if (kp->kind == BoxKind::Inline) collectOutOfFlowIn(*kp, cx, cy, cb, opacity);
         }

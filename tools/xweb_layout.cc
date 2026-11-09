@@ -30,8 +30,11 @@ namespace {
 
 int main(int argc, char** argv) {
     using namespace fbx::xweb;
-    if (argc != 4) {
-        std::cerr << "usage: xweb_layout file.html width height\n";
+    // --fonts: each box's font too (size, weight, the family list and the family that
+    // draws it), for text that measures one way and draws another.
+    const bool fonts = argc == 5 && std::string(argv[4]) == "--fonts";
+    if (argc != 4 && !fonts) {
+        std::cerr << "usage: xweb_layout file.html width height [--fonts]\n";
         return 2;
     }
     std::ifstream in(argv[1], std::ios::binary);
@@ -81,8 +84,19 @@ int main(int argc, char** argv) {
         const Node* n = todo.back();
         todo.pop_back();
         const auto it = by_node.find(n);
-        if (it != by_node.end())
-            std::printf("%s %.2f %.2f %.2f %.2f\n", n->name.c_str(), it->second->x, it->second->y, it->second->w, it->second->h);
+        if (it != by_node.end()) {
+            std::printf("%s %.2f %.2f %.2f %.2f", n->name.c_str(), it->second->x, it->second->y, it->second->w, it->second->h);
+            if (const ComputedStyle* s = fonts ? styles.styleOf(n) : nullptr) {
+                FontSpec f;
+                f.size = s->font_size;
+                f.weight = s->font_weight;
+                f.italic = s->italic;
+                f.family = s->font_family;
+                const std::vector<FontRun> runs = fontRuns("x", f);
+                std::printf(" | %.2fpx %d [%s] -> %s", s->font_size, s->font_weight, s->font_family.c_str(), runs.empty() ? "" : runs[0].family.c_str());
+            }
+            std::printf("\n");
+        }
         todo.insert(todo.end(), n->children.rbegin(), n->children.rend());
     }
     std::printf("#page %.2f %.2f ops=%zu links=%zu\n", page.width, page.height, page.ops.size(), page.links.size());

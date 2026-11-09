@@ -229,6 +229,10 @@ struct ComputedStyle {
     Float float_side = Float::None;
     Clear clear = Clear::None;
     bool overflow_clip = false;        // overflow other than visible; we don't draw scrollbars
+    bool text_overflow_ellipsis = false;
+    // Absolutely positioned, and inline-level before that made it a block: its static
+    // position is where it would have been on its line, not the start of the next one.
+    bool inline_level_origin = false;   // text-overflow: ellipsis (with overflow_clip, on a line too long)
     Length radius[4][2];   // corners top-left, top-right, bottom-right, bottom-left; horizontal and vertical
     BorderStyle border_style[4] = {BorderStyle::None, BorderStyle::None, BorderStyle::None, BorderStyle::None};
     std::shared_ptr<const std::vector<BoxShadow>> box_shadow;   // first on top

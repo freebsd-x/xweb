@@ -218,6 +218,7 @@ struct LengthContext {
     float root_font_size = 16;
     float viewport_w = 0, viewport_h = 0;
     float ch = 0;   // the width of "0" in this font, if known
+    float line_height = 0, root_line_height = 0;   // for lh and rlh (0: 1.2 of the font size)
 };
 
 bool dimensionPx(const Token& t, const LengthContext& c, float& out) {
@@ -228,6 +229,8 @@ bool dimensionPx(const Token& t, const LengthContext& c, float& out) {
     else if (u == "rem") out = v * c.root_font_size;
     else if (u == "ch") out = v * (c.ch > 0 ? c.ch : c.font_size * 0.5f);
     else if (u == "ex") out = v * c.font_size * 0.5f;
+    else if (u == "lh") out = v * (c.line_height > 0 ? c.line_height : c.font_size * 1.2f);
+    else if (u == "rlh") out = v * (c.root_line_height > 0 ? c.root_line_height : c.root_font_size * 1.2f);
     else if (u == "pt") out = v * 96.0f / 72.0f;
     else if (u == "pc") out = v * 16.0f;
     else if (u == "in") out = v * 96.0f;
@@ -1996,6 +1999,7 @@ private:
     [[nodiscard]] LengthContext lengthContext(const ComputedStyle& s) const {
         LengthContext c = lengths_;
         c.font_size = s.font_size;
+        c.line_height = s.usedLineHeight();
         if (out_.measure_ch_) c.ch = out_.measure_ch_(s);
         return c;
     }
@@ -2539,6 +2543,9 @@ private:
         if (!s.has_content) return;
         for (size_t i = 0; i < v.size(); ++i) {
             const Token& t = v[i];
+            // content: "\200b" / " (external)": what follows the slash is alternative
+            // text for assistive technology, not shown.
+            if (t.type == TokenType::Delim && t.text == "/") break;
             if (t.type == TokenType::String) {
                 s.content += t.text;
             } else if (t.type == TokenType::Ident) {
@@ -2573,6 +2580,7 @@ private:
         } else if (p == "text-align") to.text_align = from.text_align;
         else if (p == "text-transform") to.text_transform = from.text_transform;
         else if (p == "white-space") to.white_space = from.white_space;
+        else if (p == "text-overflow") to.text_overflow_ellipsis = from.text_overflow_ellipsis;
         else if (p == "list-style-type" || p == "list-style") to.list_style = from.list_style;
         else if (p == "text-indent") to.text_indent = from.text_indent;
         else if (p == "visibility") to.hidden = from.hidden;
@@ -3105,6 +3113,12 @@ private:
             else if (kw == "capitalize") s.text_transform = TextTransform::Capitalize;
             return;
         }
+        if (p == "text-overflow") {
+            // ellipsis or clip; a string or two values (one per end) count by their first.
+            if (kw == "ellipsis") s.text_overflow_ellipsis = true;
+            else if (kw == "clip") s.text_overflow_ellipsis = false;
+            return;
+        }
         if (p == "white-space") {
             if (kw == "normal") s.white_space = WhiteSpace::Normal;
             else if (kw == "pre") s.white_space = WhiteSpace::Pre;
@@ -3388,7 +3402,10 @@ private:
             }
         }
         finishFontSize(s);
-        if (!resolving_pseudo_ && el->parent && el->parent->type == NodeType::Document) lengths_.root_font_size = s.font_size;
+        if (!resolving_pseudo_ && el->parent && el->parent->type == NodeType::Document) {
+            lengths_.root_font_size = s.font_size;
+            lengths_.root_line_height = s.usedLineHeight();
+        }
 
         // Borders default to the text's colour, medium, and no style: a width only
         // shows once there's a style, and setting one doesn't change the other.
@@ -3411,6 +3428,9 @@ private:
         // Absolute, fixed and floated boxes are blocks, whatever they said.
         const bool out_of_flow = s.position == Position::Absolute || s.position == Position::Fixed;
         if (out_of_flow) s.float_side = Float::None;
+        if (out_of_flow)
+            s.inline_level_origin = s.display == Display::Inline || s.display == Display::InlineBlock || s.display == Display::InlineFlex ||
+                                    s.display == Display::InlineGrid || s.display == Display::InlineTable;
         if (out_of_flow || s.float_side != Float::None) {
             switch (s.display) {
                 case Display::Inline:
