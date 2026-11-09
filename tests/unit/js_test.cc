@@ -678,3 +678,35 @@ TEST(Js, IteratorsAndLimits) {
                   "let r; try { C.m(); } catch (e) { r = e.name; } [r, n].join()"),
               "TypeError,1");
 }
+
+// Collections while a script runs: at a loop's next round or a call's start, with the
+// running stacks scanned and each call's arguments rooted. Here one runs every few
+// hundred allocations, under everything that holds values mid-flight.
+TEST(Js, CollectsWhileAScriptRuns) {
+    Runtime rt;
+    rt.setStepBudget(50'000'000);
+    rt.setGcGrowth(300);
+    const Runtime::Result r = rt.evaluate(
+        // Closures kept and dropped, scopes a call frees itself, garbage per round.
+        "const keep = []; let sum = 0;"
+        "function leaf(a, b) { let t = {a, b}; return t.a + t.b; }"
+        "for (let i = 0; i < 20000; i++) { const f = () => i; if (i % 1000 === 0) keep.push(f); sum += leaf(i, 1); [i, {i}]; }"
+        // A generator suspended across collections, and one dropped half-way.
+        "function* count() { let n = 0; while (true) yield {n: n++}; }"
+        "const g = count(); for (let i = 0; i < 3000; i++) g.next(); count().next();"
+        // A thrown object waiting while finally makes garbage; a WeakMap's live key.
+        "let caught; try { try { throw {msg: 'kept'}; } finally { for (let i = 0; i < 2000; i++) ({i}); } } catch (e) { caught = e.msg; }"
+        "const wk = {}; const wm = new WeakMap([[wk, 'v']]); for (let i = 0; i < 2000; i++) ({i});"
+        // Arguments in a heap list while default parameters run and collect.
+        "function late(a, b = (() => { for (let i = 0; i < 2000; i++) ({i}); return 2; })(), c) { return [a.x, b, c.y].join('/'); }"
+        "const args = late.apply(null, [{x: 'ax'}, undefined, {y: 'cy'}]);"
+        // A long forEach and a bound function.
+        "let fe = 0; Array.from({length: 3000}, (_, i) => ({i})).forEach(o => { fe += o.i; ({o}); });"
+        "const bound = function (p, q) { for (let i = 0; i < 2000; i++) ({i}); return p.v + q.v; }.bind(null, {v: 1});"
+        "[keep.length, keep[7](), sum, g.next().value.n, caught, wm.get(wk), args, fe, bound({v: 2})].join()");
+    ASSERT_TRUE(r.ok) << r.error;
+    EXPECT_EQ(utf8(rt.toStringValue(r.value)), "20,7000,200010000,3000,kept,v,ax/2/cy,4498500,3");
+    EXPECT_GT(rt.mid_script_collections, 50u);
+    // What the loop made and dropped is gone already, not waiting for the script's end.
+    EXPECT_LT(rt.heapSize(), 50'000u);
+}

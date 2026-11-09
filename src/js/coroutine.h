@@ -88,6 +88,9 @@ void resumeCoroutine(Coroutine& co);
 void suspendCoroutine(Coroutine& co);
 // Unwinds a suspended coroutine's frames without running any JavaScript.
 void unwindCoroutine(Coroutine& co);
+// The stacks a running script is using (the current one and each resumer's), word by
+// word, for a collection mid-script. False if they aren't as expected: don't collect.
+bool scanActiveStacks(const Runtime& rt, const std::function<void(uintptr_t)>& word);
 // The live part of a suspended coroutine's stack, for the collector.
 void scanCoroutineStack(const Coroutine& co, const std::function<void(uintptr_t)>& word);
 

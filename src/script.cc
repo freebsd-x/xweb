@@ -1046,6 +1046,9 @@ void PageScript::Impl::installWindow() {
     method(g, u"cancelAnimationFrame", 1, [self](Runtime& rt, const Value&, Args a) {
         const int id = static_cast<int>(rt.toIntegerOrInfinity(arg(a, 0)));
         std::erase_if(self->frames, [id](const auto& f) { return f.first == id; });
+        // One still waiting in the round that's running now is skipped too.
+        for (auto& [fid, fn] : self->running_frames)
+            if (fid == id) fn = Value::undefined();
         return Value::undefined();
     });
     method(g, u"requestIdleCallback", 1, addTimer(false));
@@ -1419,10 +1422,15 @@ void PageScript::tick() {
         s.drainMicrotasks();
     }
     if (!s.frames.empty()) {
-        std::vector<std::pair<int, Value>> frames;
-        frames.swap(s.frames);
+        s.running_frames.clear();
+        s.running_frames.swap(s.frames);
         const Value stamp = Value::number(now);
-        for (auto& [id, fn] : frames) s.task([&] { s.rt.call(fn, Value::undefined(), std::span<const Value>(&stamp, 1)); });
+        for (size_t i = 0; i < s.running_frames.size(); ++i) {
+            const Value fn = s.running_frames[i].second;
+            if (!s.rt.isCallable(fn)) continue;   // cancelled during this round
+            s.task([&] { s.rt.call(fn, Value::undefined(), std::span<const Value>(&stamp, 1)); });
+        }
+        s.running_frames.clear();
         s.drainMicrotasks();
     }
     s.collect();

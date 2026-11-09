@@ -650,6 +650,7 @@ void Runtime::runJobs() {
     // Rejections still unhandled now that everything ran.
     std::vector<Object*> rejected;
     rejected.swap(pending_rejections);
+    NoGc no_gc(*this);   // describe() may run script; these promises are only in this list
     for (Object* p : rejected) {
         if (p->promise_handled) continue;
         std::string message = "Uncaught (in promise)";

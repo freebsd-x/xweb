@@ -156,7 +156,27 @@ inline const char* kStyleProperties[] = {
 using namespace script_detail;
 
 struct PageScript::Impl {
-    Impl(Document& d, Host h) : doc(d), host(std::move(h)), start(std::chrono::steady_clock::now()) {}
+    Impl(Document& d, Host h) : doc(d), host(std::move(h)), start(std::chrono::steady_clock::now()) {
+        // What the page holds outside the engine, for every collection (including one
+        // mid-script, while an event handler or timer runs).
+        rt.host_roots = [this](std::vector<Value>& roots) { hostRoots(roots); };
+    }
+
+    void hostRoots(std::vector<Value>& roots) {
+        for (auto& [n, w] : wrappers) roots.push_back(Value::object(w));
+        domRoots(roots);
+        for (const Timer& t : timers) {
+            roots.push_back(t.fn);
+            roots.insert(roots.end(), t.args.begin(), t.args.end());
+        }
+        for (auto& [id, fn] : frames) roots.push_back(fn);
+        for (auto& [id, fn] : running_frames) roots.push_back(fn);
+        for (Object* p : pending_fetches) roots.push_back(Value::object(p));
+        for (Object* p : {proto_target, proto_node, proto_element, proto_document, proto_text, proto_event, proto_style, proto_classlist,
+                          proto_html_element, proto_svg_element, proto_unknown, proto_fragment, proto_shadow_root})
+            if (p) roots.push_back(Value::object(p));
+        for (auto& [name, p] : interface_protos) roots.push_back(Value::object(p));
+    }
 
     Runtime rt;
     Document& doc;
@@ -190,6 +210,9 @@ struct PageScript::Impl {
     };
     std::vector<Timer> timers;
     std::vector<std::pair<int, Value>> frames;
+    // This round's animation frame callbacks, while they run (the next round's go to
+    // frames): a rooted place, as a collection may run inside any of them.
+    std::vector<std::pair<int, Value>> running_frames;
     std::vector<Object*> pending_fetches;   // fetch promises waiting on the browser
     std::shared_ptr<bool> alive = std::make_shared<bool>(true);
     int next_timer = 1;
@@ -235,17 +258,7 @@ struct PageScript::Impl {
 
     void collect() {
         if (rt.heapSize() < live_after_gc * 2 + 200'000) return;
-        rt.extra_roots.clear();
-        for (auto& [n, w] : wrappers) rt.extra_roots.push_back(Value::object(w));
-        domRoots(rt.extra_roots);
-        for (const Timer& t : timers) {
-            rt.extra_roots.push_back(t.fn);
-            rt.extra_roots.insert(rt.extra_roots.end(), t.args.begin(), t.args.end());
-        }
-        for (auto& [id, fn] : frames) rt.extra_roots.push_back(fn);
-        for (Object* p : pending_fetches) rt.extra_roots.push_back(Value::object(p));
-        rt.collectGarbage();
-        rt.extra_roots.clear();
+        rt.collectGarbage();   // the page's own values come from host_roots
         live_after_gc = rt.heapSize();
     }
 

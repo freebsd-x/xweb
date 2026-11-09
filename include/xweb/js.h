@@ -169,6 +169,9 @@ public:
 
     // Functions.
     NativeFunction native;
+    // A built-in that keeps nothing in its own heap buffers while it calls back into
+    // JavaScript (or roots what it keeps): a collection may run inside it.
+    bool gc_safe = false;
     std::shared_ptr<FunctionData> code;
     Object* bound_target = nullptr;
     Value bound_this;
@@ -460,10 +463,48 @@ public:
         cells_.push_back(c);
         return c;
     }
-    // Frees what nothing reachable refers to. Only between scripts: values held in C++
-    // locals while a script runs aren't roots.
+    // Frees what nothing reachable refers to. Between scripts, or at a safe point while
+    // one runs (safePoint): then the running stacks are scanned for cells
+    // (conservatively), along with each call's function, this and arguments, the
+    // interpreter's heap buffers (TempRoots) and the embedder's (host_roots).
     void collectGarbage();
     [[nodiscard]] size_t heapSize() const noexcept { return cells_.size(); }
+    // Called by the interpreter where a collection may run mid-script (a loop's next
+    // round, a call's start): it does once the heap has grown enough, unless C++ that
+    // holds values where the collector can't see them is on the stack (NoGc).
+    void safePoint() {
+        if (cells_.size() >= gc_next_ && gc_inhibit == 0) collectMidScript();
+    }
+    // While one lives, no collection runs mid-script: a built-in that keeps values in
+    // its own heap buffers while calling back into JavaScript holds one.
+    struct NoGc {
+        Runtime& rt;
+        explicit NoGc(Runtime& r) : rt(r) { ++rt.gc_inhibit; }
+        ~NoGc() { --rt.gc_inhibit; }
+        NoGc(const NoGc&) = delete;
+        NoGc& operator=(const NoGc&) = delete;
+    };
+    size_t gc_inhibit = 0;
+    // The embedder's values (wrappers, timers, pending callbacks), for every collection.
+    std::function<void(std::vector<Value>&)> host_roots;
+    // How many collections ran mid-script (for tests), and the smallest heap growth that
+    // starts one (lowered by XWEB_GC_STRESS to collect at nearly every safe point).
+    size_t mid_script_collections = 0;
+    size_t gc_min_growth = 500'000;
+    void setGcGrowth(size_t cells) {
+        gc_min_growth = cells ? cells : 1;
+        gc_next_ = cells_.size() + gc_min_growth;
+    }
+    // What each call in progress was given: kept alive while it runs, whoever holds it.
+    struct CallRoots {
+        const Value* fn;
+        const Value* self;
+        const Value* args;
+        size_t count;
+    };
+    std::vector<CallRoots> call_roots;
+    // Scopes a call keeps off the collected heap (they die with it): roots while it runs.
+    std::vector<std::vector<Env*>*> owned_scopes;
 
     // The interpreter's own (runtime.cc).
     void step();
@@ -511,6 +552,9 @@ private:
     std::unique_ptr<Modules, ModulesDeleter> modules_;
     std::vector<Cell*> cells_;
     size_t allocations_ = 0;
+    size_t gc_next_ = 500'000;   // the heap size at which a safe point collects
+    void collectMidScript();
+    void collect(bool mid_script);
     std::vector<std::shared_ptr<struct Program>> programs_;   // every script's tree, kept for its functions
     std::unordered_map<std::u16string, std::shared_ptr<struct Program>> eval_cache_;   // eval'd source, parsed once
     friend Value evalCode(Runtime& rt, const std::u16string& source, Env* env, bool strict, bool direct);

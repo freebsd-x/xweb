@@ -8,8 +8,10 @@
 #include <random>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
+#include "coroutine.h"
 #include "internal.h"
 #include "xweb/js.h"
 
@@ -666,6 +668,9 @@ Runtime::Runtime() {
     global_env_ = allocate<Env>(nullptr);
     global_env_->global_object = global_;
     installBuiltins();
+    // XWEB_GC_STRESS=n: collect mid-script whenever the heap has grown by n cells (1:
+    // at nearly every safe point), to shake out anything the collector can't see.
+    if (const char* stress = std::getenv("XWEB_GC_STRESS"); stress && *stress) setGcGrowth(std::strtoull(stress, nullptr, 10));
 }
 
 void Runtime::installBuiltins() {
@@ -1633,6 +1638,7 @@ void Runtime::installBuiltins() {
             const Value fn = callback(rt, arg(a, 0));
             const Value self = arg(a, 1);
             std::vector<Value> out;
+            TempRoots roots(rt, out);   // results so far, while the callback runs
             if (kind == Each::Map) {
                 checkNewArrayLength(rt, len);
                 out.assign(len, Value::empty());
@@ -1700,6 +1706,11 @@ void Runtime::installBuiltins() {
     };
     method(array_prototype, u"reduce", 1, reduce(false));
     method(array_prototype, u"reduceRight", 1, reduce(true));
+    // These keep nothing the collector can't see while they call back (their results in
+    // TempRoots, their arguments in the call's roots): a long loop inside one can collect.
+    for (const char16_t* name : {u"forEach", u"map", u"filter", u"some", u"every", u"find", u"findIndex", u"findLast", u"findLastIndex", u"reduce", u"reduceRight"})
+        get(Value::object(array_prototype), name).asObject()->gc_safe = true;
+    for (const char16_t* name : {u"call", u"apply"}) get(Value::object(function_prototype), name).asObject()->gc_safe = true;
     method(array_prototype, u"sort", 1, [](Runtime& rt, const Value& t, Args a) {
         Object* o = thisObject(rt, t);
         const Value cmp = arg(a, 0);

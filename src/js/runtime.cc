@@ -249,6 +249,7 @@ public:
     // code, a local, a parameter), and a call shouldn't pay for a refcount round trip.
     explicit Interpreter(Runtime& rt, const std::shared_ptr<Program>& prog) : rt_(rt), prog_(prog) {}
     ~Interpreter() {
+        if (owns_scopes_) rt_.owned_scopes.pop_back();
         for (Env* e : owned_) delete e;
     }
     Interpreter(const Interpreter&) = delete;
@@ -1095,6 +1096,21 @@ Value Runtime::typeOf(const Value& v) {
 
 // ── Calls ──
 
+namespace {
+// A call's function, this and arguments, as roots while it runs: they may live in a
+// caller's heap buffer (an argument list, a bound function's), where the collector
+// can't see them.
+struct CallRootsScope {
+    Runtime& rt;
+    CallRootsScope(Runtime& r, const Value* fn, const Value* self, std::span<const Value> args) : rt(r) {
+        rt.call_roots.push_back({fn, self, args.data(), args.size()});
+    }
+    ~CallRootsScope() { rt.call_roots.pop_back(); }
+    CallRootsScope(const CallRootsScope&) = delete;
+    CallRootsScope& operator=(const CallRootsScope&) = delete;
+};
+}  // namespace
+
 Value Runtime::call(const Value& fnv, const Value& this_value, std::span<const Value> args) {
     if (!current_co && !onEngineStack()) {
         // In from outside: onto the engine's stack.
@@ -1109,14 +1125,22 @@ Value Runtime::call(const Value& fnv, const Value& this_value, std::span<const V
         throwError("RangeError", "too much recursion");
     ++call_depth;
     struct Down { size_t& d; ~Down() { --d; } } down{call_depth};
+    CallRootsScope roots(*this, &fnv, &this_value, args);
     step();
     if (f->bound_target) {
         std::vector<Value> all = f->bound_args;
         all.insert(all.end(), args.begin(), args.end());
         return call(Value::object(f->bound_target), f->bound_this, all);
     }
-    if (f->cls == ObjectClass::Proxy) return proxyCall(*this, f, this_value, args);
-    if (f->native) return f->native(*this, this_value, args);
+    if (f->cls == ObjectClass::Proxy) {
+        NoGc no_gc(*this);
+        return proxyCall(*this, f, this_value, args);
+    }
+    if (f->native) {
+        if (f->gc_safe) return f->native(*this, this_value, args);
+        NoGc no_gc(*this);
+        return f->native(*this, this_value, args);
+    }
     if (f->code) {
         if (f->class_constructor) throwError("TypeError", "a class constructor must be called with new");
         Interpreter interp(*this, f->code->program);
@@ -1139,14 +1163,19 @@ Value Runtime::construct(const Value& fnv, std::span<const Value> args, Object* 
         throwError("RangeError", "too much recursion");
     ++call_depth;
     struct Down { size_t& d; ~Down() { --d; } } down{call_depth};
+    CallRootsScope roots(*this, &fnv, nullptr, args);
     step();
     if (f->bound_target) {
         std::vector<Value> all = f->bound_args;
         all.insert(all.end(), args.begin(), args.end());
         return construct(Value::object(f->bound_target), all, new_target == f ? f->bound_target : new_target);
     }
-    if (f->cls == ObjectClass::Proxy) return proxyConstruct(*this, f, args, new_target);
+    if (f->cls == ObjectClass::Proxy) {
+        NoGc no_gc(*this);
+        return proxyConstruct(*this, f, args, new_target);
+    }
     if (f->native) {
+        NoGc no_gc(*this);
         // A built-in constructor knows it's constructing by construct_target.
         construct_target = new_target;
         struct Reset { Object*& t; ~Reset() { t = nullptr; } } reset{construct_target};
@@ -1189,6 +1218,7 @@ std::vector<Value> Runtime::iterateToList(const Value& iterable) {
     const Value it = call(method, iterable, {});
     if (!it.isObject()) throwError("TypeError", "an iterator must be an object");
     const Value next = get(it, u"next");
+    TempRoots roots(*this, out);   // the values so far, while next() runs
     while (true) {
         step();
         const Value r = call(next, it, {});
@@ -1245,8 +1275,38 @@ void Runtime::iterate(const Value& iterable, const std::function<void(const Valu
 
 // ── Garbage collection ──
 
-void Runtime::collectGarbage() {
+void Runtime::collectGarbage() { collect(false); }
+
+void Runtime::collectMidScript() {
+    if (!current_co && !onEngineStack()) return;   // only from the interpreter, on its stacks
+    collect(true);
+}
+
+void Runtime::collect(bool mid_script) {
     std::vector<Cell*> todo;
+    // Every cell by address, for the conservative scans of machine stacks.
+    std::vector<Cell*> sorted;
+    const auto sortCells = [&] {
+        if (sorted.empty()) {
+            sorted = cells_;
+            std::sort(sorted.begin(), sorted.end());
+        }
+    };
+    const auto markWord = [&](uintptr_t w) {
+        auto it = std::upper_bound(sorted.begin(), sorted.end(), w, [](uintptr_t x, Cell* c) { return x < reinterpret_cast<uintptr_t>(c); });
+        if (it == sorted.begin()) return;
+        Cell* c = *--it;
+        if (w < reinterpret_cast<uintptr_t>(c) + c->cellSize()) todo.push_back(c);
+    };
+    if (mid_script) {
+        // The running stacks first: if they aren't as expected, no collection.
+        sortCells();
+        if (!scanActiveStacks(*this, markWord)) {
+            gc_next_ = cells_.size() + gc_min_growth;
+            return;
+        }
+        ++mid_script_collections;
+    }
     const auto markValue = [&](const Value& v) {
         if (v.isObject() && v.asObject()) todo.push_back(v.asObject());
         else if (v.isSymbol()) todo.push_back(v.asSymbol());
@@ -1258,6 +1318,32 @@ void Runtime::collectGarbage() {
     markCell(global_env_);
     for (Env* e : env_stack) markCell(e);
     for (const Value& v : extra_roots) markValue(v);
+    if (host_roots) {
+        std::vector<Value> host;
+        host_roots(host);
+        for (const Value& v : host) markValue(v);
+    }
+    for (const CallRoots& r : call_roots) {
+        if (r.fn) markValue(*r.fn);
+        if (r.self) markValue(*r.self);
+        for (size_t i = 0; i < r.count; ++i) markValue(r.args[i]);
+    }
+    for (const auto* list : owned_scopes)
+        for (Env* e : *list) markCell(e);
+    // The coroutines running now, each resumed by the next: their holders, what they
+    // run, and the state they swapped out (their resumer's scopes and buffers).
+    for (Coroutine* c = current_co; c; c = c->resumer) {
+        markCell(c->holder);
+        markCell(c->function);
+        markCell(c->env);
+        markCell(c->promise);
+        markCell(c->on_fulfilled);
+        markCell(c->on_rejected);
+        markValue(c->transfer);
+        for (Env* e : c->env_stack) markCell(e);
+        for (const auto* list : c->temp_lists)
+            for (const Value& v : *list) markValue(v);
+    }
     for (const auto* list : temp_lists)
         for (const Value& v : *list) markValue(v);
     for (const Job& j : jobs_) { markValue(j.a); markValue(j.b); markValue(j.c); }
@@ -1277,7 +1363,6 @@ void Runtime::collectGarbage() {
         markCell(s);
     for (auto& [k, s] : symbol_registry) markCell(s);
     // Suspended coroutines' stacks are scanned for anything that looks like a cell.
-    std::vector<Cell*> sorted;
     std::vector<Object*> weak_collections, weak_refs;
     const auto markCoroutine = [&](Coroutine& co) {
         markCell(co.function);
@@ -1291,16 +1376,8 @@ void Runtime::collectGarbage() {
         for (Env* e : co.env_stack) markCell(e);
         for (const auto* list : co.temp_lists)
             for (const Value& v : *list) markValue(v);
-        if (sorted.empty()) {
-            sorted = cells_;
-            std::sort(sorted.begin(), sorted.end());
-        }
-        scanCoroutineStack(co, [&](uintptr_t w) {
-            auto it = std::upper_bound(sorted.begin(), sorted.end(), w, [](uintptr_t x, Cell* c) { return x < reinterpret_cast<uintptr_t>(c); });
-            if (it == sorted.begin()) return;
-            Cell* c = *--it;
-            if (w < reinterpret_cast<uintptr_t>(c) + c->cellSize()) todo.push_back(c);
-        });
+        sortCells();
+        scanCoroutineStack(co, markWord);
         if (co.module) markModule(co.module, todo);
     };
     const auto drain = [&] {
@@ -1389,7 +1466,10 @@ void Runtime::collectGarbage() {
     std::vector<Cell*> live;
     live.reserve(cells_.size());
     for (Cell* c : cells_) {
-        if (c->marked) {
+        // Mid-script, symbols stay: one may be in use as a key in a C++ list (an object's
+        // keys being walked) that no root reaches. They're small; the next collection
+        // between tasks frees them.
+        if (c->marked || (mid_script && dynamic_cast<Symbol*>(c))) {
             c->marked = false;
             live.push_back(c);
         } else {
@@ -1397,7 +1477,11 @@ void Runtime::collectGarbage() {
         }
     }
     cells_.swap(live);
+    // The scopes calls keep off the heap aren't swept, so their marks are cleared here.
+    for (const auto* list : owned_scopes)
+        for (Env* e : *list) e->marked = false;
     allocations_ = cells_.size();
+    gc_next_ = std::max(cells_.size() * 2, cells_.size() + gc_min_growth);
 }
 
 // ── Evaluating scripts ────────────────────────────────────────────────────────
@@ -1798,8 +1882,10 @@ Value Interpreter::callScript(Object* f, const Value& this_value, std::span<cons
         return startCoroutineFunction(rt_, f, env);
     }
     owns_scopes_ = ownsScopes(info);
+    if (owns_scopes_) rt_.owned_scopes.push_back(&owned_);   // roots while the call runs
     Env* env = prepareCall(f, this_value, args, new_target);
     EnvScope scope(rt_, env);
+    rt_.safePoint();
     const Value result = runBody(info, env);
     if (new_target) {
         if (result.isObject()) return result;
@@ -2138,6 +2224,7 @@ Completion Interpreter::exec(Node* n, Env* env, bool strict) {
 
 // A loop body's completion: `stop` when the loop should end (with that completion).
 Completion Interpreter::execLoopBody(Node* body, Env* env, bool strict, const std::u16string* label, bool& stop, Value& last) {
+    rt_.safePoint();   // each round of a loop: where a long script makes its garbage
     Completion c = exec(body, env, strict);
     if (!c.value.isEmpty()) last = c.value;
     stop = false;

@@ -5,6 +5,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <csetjmp>
 #include <cstring>
 #include <exception>
 #include <functional>
@@ -278,6 +279,47 @@ thread_local EngineStack engine;
 }
 
 }  // namespace
+
+// The stacks a running script is using, scanned for a collection mid-script: from here
+// to the top of the stack in use (a coroutine's, or the engine's), then for each
+// coroutine resumed along the way, its resumer's from where it switched. Registers are
+// spilled first (setjmp), so a cell only a register held is seen. Anything not where it
+// should be, and the collection is skipped rather than risked.
+// (Under ASan, locals live on the real stack unless detect_stack_use_after_return is on,
+// which it isn't by default here; with it, frames move to a heap the scan doesn't see.)
+// Word by word over live stack memory, redzones and all: not instrumented (a lambda
+// wouldn't inherit the attribute).
+__attribute__((no_sanitize("address"), noinline)) static void scanRange(const char* from, const char* to, const std::function<void(uintptr_t)>& word) {
+    for (auto* p = reinterpret_cast<const uintptr_t*>(reinterpret_cast<uintptr_t>(from) & ~uintptr_t{7}); p < reinterpret_cast<const uintptr_t*>(to); ++p)
+        word(*p);
+}
+
+__attribute__((no_sanitize("address"), noinline)) bool scanActiveStacks(const Runtime& rt, const std::function<void(uintptr_t)>& word) {
+    jmp_buf regs;
+    setjmp(regs);
+    const auto scan = [&](const char* from, const char* to) { scanRange(from, to, word); };
+    const auto inside = [](const char* p, const char* lo, const char* hi) { return p >= lo && p < hi; };
+    const char* engine_lo = engine.mem;
+    const char* engine_hi = engine.mem ? engine.mem + kEngineStackSize : nullptr;
+    const char* here = reinterpret_cast<const char*>(&regs);
+    const Coroutine* co = rt.current_co;
+    if (co) {
+        if (!co->mem || !inside(here, co->mem, co->mem + co->mem_size)) return false;
+        scan(here, co->mem + co->mem_size);
+    } else {
+        if (!engine_lo || !inside(here, engine_lo, engine_hi)) return false;
+        scan(here, engine_hi);
+    }
+    for (; co; co = co->resumer) {
+        const char* sp = static_cast<const char*>(co->caller_sp);
+        const Coroutine* r = co->resumer;
+        const char* lo = r ? r->mem : engine_lo;
+        const char* hi = r ? r->mem + r->mem_size : engine_hi;
+        if (!lo || !sp || !inside(sp, lo, hi)) return false;
+        scan(sp, hi);
+    }
+    return true;
+}
 
 bool onEngineStack() noexcept {
     const char* sp = static_cast<const char*>(__builtin_frame_address(0));
