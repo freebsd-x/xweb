@@ -6,6 +6,8 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <new>
+#include <unordered_set>
 
 #include "ast.h"
 #include "bigint.h"
@@ -127,35 +129,80 @@ std::u16string indexKey(uint64_t i) {
 
 Object::~Object() = default;
 
+size_t Object::keyHash(const PropertyKey& k) noexcept {
+    if (k.symbol) return (reinterpret_cast<uintptr_t>(k.symbol) >> 4) * 0x9E3779B97F4A7C15ull;
+    size_t h = 1469598103934665603ull;
+    for (const char16_t c : k.name) h = (h ^ c) * 1099511628211ull;
+    return h;
+}
+
+ptrdiff_t Object::find(const PropertyKey& key) const noexcept {
+    if (index_.empty()) {
+        for (size_t i = 0; i < props_.size(); ++i)
+            if (props_[i].second.flags != kTombstone && props_[i].first == key) return static_cast<ptrdiff_t>(i);
+        return -1;
+    }
+    const size_t mask = index_.size() - 1;
+    for (size_t i = keyHash(key) & mask;; i = (i + 1) & mask) {
+        const uint32_t at = index_[i];
+        if (!at) return -1;
+        const auto& [k, p] = props_[at - 1];
+        if (p.flags != kTombstone && k == key) return at - 1;
+    }
+}
+
+void Object::place(uint32_t pos) noexcept {
+    const size_t mask = index_.size() - 1;
+    size_t i = keyHash(props_[pos].first) & mask;
+    while (index_[i]) i = (i + 1) & mask;
+    index_[i] = pos + 1;
+}
+
+// Drops the tombstones and, for a big object, builds the index afresh (at most half full).
+void Object::reindex() {
+    if (dead_) {
+        std::erase_if(props_, [](const auto& e) { return e.second.flags == kTombstone; });
+        dead_ = 0;
+    }
+    index_.clear();
+    if (props_.size() <= kScanMax) return;
+    size_t cap = 32;
+    while (cap < props_.size() * 2) cap *= 2;
+    index_.assign(cap, 0);
+    for (uint32_t i = 0; i < props_.size(); ++i) place(i);
+}
+
 Property* Object::own(const PropertyKey& key) {
-    const auto it = index_.find(key);
-    return it == index_.end() ? nullptr : &props_[it->second].second;
+    const ptrdiff_t at = find(key);
+    return at < 0 ? nullptr : &props_[static_cast<size_t>(at)].second;
 }
 
 const Property* Object::own(const PropertyKey& key) const {
-    const auto it = index_.find(key);
-    return it == index_.end() ? nullptr : &props_[it->second].second;
+    const ptrdiff_t at = find(key);
+    return at < 0 ? nullptr : &props_[static_cast<size_t>(at)].second;
 }
 
 Property& Object::define(const PropertyKey& key, Property p) {
-    const auto it = index_.find(key);
-    if (it != index_.end()) {
-        props_[it->second].second = std::move(p);
-        return props_[it->second].second;
+    if (const ptrdiff_t at = find(key); at >= 0) {
+        props_[static_cast<size_t>(at)].second = std::move(p);
+        return props_[static_cast<size_t>(at)].second;
     }
-    index_[key] = props_.size();
     props_.emplace_back(key, std::move(p));
+    if (props_.size() > kScanMax && index_.size() < props_.size() * 2) reindex();
+    else if (!index_.empty()) place(static_cast<uint32_t>(props_.size() - 1));
     return props_.back().second;
 }
 
 bool Object::remove(const PropertyKey& key) {
-    const auto it = index_.find(key);
-    if (it == index_.end()) return false;
-    const size_t at = it->second;
-    props_.erase(props_.begin() + static_cast<std::ptrdiff_t>(at));
-    index_.erase(it);
-    for (auto& [k, i] : index_)
-        if (i > at) --i;
+    const ptrdiff_t at = find(key);
+    if (at < 0) return false;
+    auto& [k, p] = props_[static_cast<size_t>(at)];
+    p = Property{};
+    p.flags = kTombstone;
+    k = PropertyKey();
+    ++dead_;
+    // The tombstone keeps its place in the probe chains until the next compaction.
+    if (dead_ > 8 && dead_ * 2 > props_.size()) reindex();
     return true;
 }
 
@@ -167,7 +214,7 @@ std::vector<PropertyKey> Object::ownKeys() const {
     for (size_t i = 0; i < elements.size(); ++i)
         if (!elements[i].isEmpty()) out.emplace_back(indexKey(i));
     for (const auto& [k, p] : props_)
-        if (!k.isSymbol())
+        if (p.flags != kTombstone && !k.isSymbol())
             if (const int64_t i = arrayIndex(k.name); i >= 0) indexed.emplace_back(i, k);
     std::sort(indexed.begin(), indexed.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
     for (auto& [i, k] : indexed) out.push_back(k);
@@ -178,9 +225,9 @@ std::vector<PropertyKey> Object::ownKeys() const {
         out.insert(out.begin(), chars.begin(), chars.end());
     }
     for (const auto& [k, p] : props_)
-        if (!k.isSymbol() && arrayIndex(k.name) < 0) out.push_back(k);
+        if (p.flags != kTombstone && !k.isSymbol() && arrayIndex(k.name) < 0) out.push_back(k);
     for (const auto& [k, p] : props_)
-        if (k.isSymbol()) out.push_back(k);
+        if (p.flags != kTombstone && k.isSymbol()) out.push_back(k);
     return out;
 }
 
@@ -198,7 +245,14 @@ struct ShortCircuit {};   // an optional chain's nullish link
 
 class Interpreter {
 public:
-    explicit Interpreter(Runtime& rt, std::shared_ptr<Program> prog) : rt_(rt), prog_(std::move(prog)) {}
+    // prog is held by reference: every caller's outlives the Interpreter (a function's
+    // code, a local, a parameter), and a call shouldn't pay for a refcount round trip.
+    explicit Interpreter(Runtime& rt, const std::shared_ptr<Program>& prog) : rt_(rt), prog_(prog) {}
+    ~Interpreter() {
+        for (Env* e : owned_) delete e;
+    }
+    Interpreter(const Interpreter&) = delete;
+    Interpreter& operator=(const Interpreter&) = delete;
 
     Value runScript(Env* global_env) {
         Program& p = *prog_;
@@ -297,7 +351,21 @@ private:
         ~EnvScope() { rt.env_stack.pop_back(); }
     };
 
-    Env* newEnv(Env* outer) { return rt_.allocate<Env>(outer); }
+    // A call whose scopes can't outlive it (ownsScopes) keeps them off the collected
+    // heap: they're freed when the call's Interpreter goes, not at the next collection.
+    Env* newEnv(Env* outer) {
+        if (!owns_scopes_) return rt_.allocate<Env>(outer);
+        owned_.push_back(new Env(outer));
+        return owned_.back();
+    }
+    // Nothing in the function can capture its scope: no nested function, class or
+    // method, no direct eval, and no coroutine to keep it after a suspension. A class
+    // constructor's instance fields are parsed as functions of their own but run in
+    // its scope, so a constructor with fields keeps its scopes. (A collection only runs
+    // between tasks, never while a call is on the stack.)
+    static bool ownsScopes(const FunctionInfo* info) {
+        return !info->scope_escapes && !info->is_async && !info->is_generator && info->fields.empty();
+    }
 
     void declareLexical(Env* env, const std::vector<std::u16string>* names) {
         if (!names) return;
@@ -309,15 +377,15 @@ private:
     // The binding a name means here. An import is followed to the exporting module's
     // binding (`imported` says it was one: those can't be assigned).
     Binding* findBinding(Env* env, const std::u16string& name, Env** where, bool* imported = nullptr) {
+        const size_t h = VarMap::hashOf(name);
         for (Env* e = env; e; e = e->outer) {
-            const auto it = e->vars.find(name);
-            if (it != e->vars.end()) {
+            if (VarMap::Entry* it = e->vars.find(name, h)) {
                 if (where) *where = e;
                 Binding* b = &it->second;
                 if (imported) *imported = b->import_env != nullptr;
                 for (int hops = 0; b->import_env; ++hops) {
-                    const auto jt = b->import_env->vars.find(b->import_name);
-                    if (jt == b->import_env->vars.end() || hops > 100) rt_.throwError("ReferenceError", "the import '" + utf8(name) + "' isn't there");
+                    VarMap::Entry* jt = b->import_env->vars.find(b->import_name);
+                    if (!jt || hops > 100) rt_.throwError("ReferenceError", "the import '" + utf8(name) + "' isn't there");
                     b = &jt->second;
                 }
                 return b;
@@ -339,7 +407,12 @@ private:
         }
         Object* g = globalObject(env);
         if (name == u"undefined") return Value::undefined();
-        if (rt_.has(g, name)) return rt_.get(g, name, Value::object(g));
+        const PropertyKey key(name);
+        // The usual case, in one lookup: an ordinary global's own data property is
+        // what has() then get() would find first.
+        if (g->cls != ObjectClass::Proxy && g->cls != ObjectClass::TypedArray && g->cls != ObjectClass::String && g->elements.empty())
+            if (const Property* p = g->own(key); p && !(p->flags & kAccessor)) return p->value;
+        if (rt_.has(g, key)) return rt_.get(g, key, Value::object(g));
         rt_.throwError("ReferenceError", utf8(name) + " is not defined");
     }
 
@@ -408,6 +481,13 @@ private:
     std::vector<Value> evalArgs(const std::vector<Node*>& args, Env* env, bool strict);
     void assignPattern(Node* pattern, const Value& v, Env* env, bool strict);
     Value superBase(Env* env);
+    // super.x's object: a home object whose prototype is null has none (TypeError, as
+    // ToObject(null) would be).
+    Object* superObject(Env* env) {
+        Object* o = superBase(env).asObject();
+        if (!o) rt_.throwError("TypeError", "super has no prototype here");
+        return o;
+    }
     PropertyKey memberKey(Node* m, Env* env, bool strict);
 
     // ── Iteration, one value at a time (for-of, destructuring) ──
@@ -437,7 +517,9 @@ private:
     Value binaryOp(Op op, const Value& l, const Value& r);
 
     Runtime& rt_;
-    std::shared_ptr<Program> prog_;
+    const std::shared_ptr<Program>& prog_;
+    bool owns_scopes_ = false;
+    std::vector<Env*> owned_;
     friend class Runtime;
 };
 
@@ -714,7 +796,9 @@ bool Runtime::deleteProperty(Object* o, const PropertyKey& key) {
     }
     if (!key.isSymbol()) {
         const int64_t i = arrayIndex(key.name);
-        if (i >= 0 && static_cast<size_t>(i) < o->elements.size()) {
+        // A hole in the dense part may be a special element (an accessor, odd flags)
+        // kept in the property map: that one is deleted as a property, below.
+        if (i >= 0 && static_cast<size_t>(i) < o->elements.size() && !o->elements[static_cast<size_t>(i)].isEmpty()) {
             if (!o->extensible && o->cls == ObjectClass::Array && !o->elements[static_cast<size_t>(i)].isEmpty()) {
                 // A frozen array keeps its elements.
                 if (o->own(u"__frozen")) return false;
@@ -1116,6 +1200,49 @@ std::vector<Value> Runtime::iterateToList(const Value& iterable) {
     return out;
 }
 
+void Runtime::iterate(const Value& iterable, const std::function<void(const Value&)>& each) {
+    if (iterable.isString()) {
+        for (const Value& v : iterateToList(iterable)) each(v);
+        return;
+    }
+    if (iterable.isObject() && iterable.asObject()->cls == ObjectClass::Array &&
+        get(iterable, PropertyKey(sym_iterator)).asObject() == array_values_) {
+        // An ordinary array with its own iterator, read live as that iterator would:
+        // `each` may change the array as it goes.
+        Object* arr = iterable.asObject();
+        for (size_t i = 0; i < arr->elements.size(); ++i) {
+            step();
+            const Value v = arr->elements[i].isEmpty() ? get(arr, PropertyKey(indexKey(i)), iterable) : arr->elements[i];
+            each(v);
+        }
+        return;
+    }
+    const Value method = iterable.isNullish() ? Value::undefined() : get(iterable, PropertyKey(sym_iterator));
+    if (!isCallable(method)) throwError("TypeError", "not iterable");
+    const Value it = call(method, iterable, {});
+    if (!it.isObject()) throwError("TypeError", "an iterator must be an object");
+    const Value next = get(it, u"next");
+    while (true) {
+        step();
+        const Value r = call(next, it, {});
+        if (!r.isObject()) throwError("TypeError", "an iterator result must be an object");
+        if (toBoolean(get(r, u"done"))) return;
+        const Value v = get(r, u"value");
+        try {
+            each(v);
+        } catch (const Thrown&) {
+            // IteratorClose with a throw completion: whatever return() does, the
+            // original exception is the one that goes on.
+            try {
+                const Value ret = get(it, u"return");
+                if (isCallable(ret)) call(ret, it, {});
+            } catch (const Thrown&) {
+            }
+            throw;
+        }
+    }
+}
+
 // ── Garbage collection ──
 
 void Runtime::collectGarbage() {
@@ -1184,13 +1311,13 @@ void Runtime::collectGarbage() {
         c->marked = true;
         if (auto* e = dynamic_cast<Env*>(c)) {
             markCell(e->outer);
-            for (auto& [n, b] : e->vars) markValue(b.value);
+            for (auto& en : e->vars) markValue(en.second.value);
             markValue(e->this_value);
             markCell(e->function);
             markCell(e->home);
             markCell(e->new_target);
             markCell(e->global_object);
-            for (auto& [n, b] : e->vars) markCell(b.import_env);
+            for (auto& en : e->vars) markCell(en.second.import_env);
         } else if (auto* o = dynamic_cast<Object*>(c)) {
             markCell(o->prototype);
             for (const auto& k : o->ownKeys()) {
@@ -1306,6 +1433,9 @@ Runtime::Result Runtime::evaluate(std::string_view source, std::string_view name
         }
     } catch (const Terminated& t) {
         result.error = "Stopped: " + t.why;
+    } catch (const std::bad_alloc&) {
+        // A script that asks for more memory than there is stops; the page goes on.
+        result.error = "Stopped: out of memory";
     }
     env_stack.resize(saved_envs);
     call_depth = saved_calls;
@@ -1559,7 +1689,7 @@ void Interpreter::assignPattern(Node* p, const Value& value, Env* env, bool stri
             const Value base = p->a->kind == N::Super ? thisValue(env) : eval(p->a, env, strict);
             const PropertyKey key = memberKey(p, env, strict);
             if (p->a->kind == N::Super) {
-                rt_.set(superBase(env).asObject(), key, value, base);
+                rt_.set(superObject(env), key, value, base);
                 return;
             }
             rt_.set(base, key, value, strict);
@@ -1606,7 +1736,7 @@ void Interpreter::assignPattern(Node* p, const Value& value, Env* env, bool stri
                     if (!target) continue;
                     if (dflt && v.isUndefined()) v = eval(dflt, env, strict);
                     if (member) {
-                        if (target->a->kind == N::Super) rt_.set(superBase(env).asObject(), key, v, base);
+                        if (target->a->kind == N::Super) rt_.set(superObject(env), key, v, base);
                         else rt_.set(base, key, v, strict);
                     } else {
                         assignPattern(target, v, env, strict);
@@ -1667,6 +1797,7 @@ Value Interpreter::callScript(Object* f, const Value& this_value, std::span<cons
         }
         return startCoroutineFunction(rt_, f, env);
     }
+    owns_scopes_ = ownsScopes(info);
     Env* env = prepareCall(f, this_value, args, new_target);
     EnvScope scope(rt_, env);
     const Value result = runBody(info, env);
@@ -1789,6 +1920,7 @@ Env* Interpreter::prepareCall(Object* f, const Value& this_value, std::span<cons
             env->this_value = Value::object(rt_.toObject(this_value));
         }
     }
+    env->vars.reserve(info->params.size() + info->var_names.size() + info->function_decls.size() + (info->uses_arguments ? 1 : 0));
     EnvScope scope(rt_, env);   // while the parameters' defaults run
     // Parameters.
     if (info->simple_params) {
@@ -2085,11 +2217,10 @@ Completion Interpreter::forInOf(Node* n, Env* env, bool strict, const std::u16st
         if (subject.isNullish()) return {CT::Normal, Value::undefined()};
         // Enumerable string keys, own then inherited, each name once.
         Object* o = rt_.toObject(subject);
-        std::vector<PropertyKey> seen;
+        std::unordered_set<std::u16string> seen;
         for (Object* cur = o; cur; cur = rt_.getPrototypeOf(cur)) {
             for (const PropertyKey& k : rt_.ownPropertyKeys(cur)) {
-                if (k.isSymbol() || std::find(seen.begin(), seen.end(), k) != seen.end()) continue;
-                seen.push_back(k);
+                if (k.isSymbol() || !seen.insert(k.name).second) continue;
                 Property p;
                 if (!rt_.getOwnProperty(cur, k, p) || !(p.flags & kEnumerable)) continue;
                 items.push_back(Value::string(k.name));
@@ -2338,6 +2469,12 @@ Value Interpreter::eval(Node* n, Env* env, bool strict) {
             return l.isNullish() ? eval(n->b, env, strict) : l;
         }
         case N::Binary: {
+            // The usual case, a single operator: no list to build.
+            if (n->a->kind != N::Binary) {
+                const Value l = eval(n->a, env, strict);
+                const Value r = eval(n->b, env, strict);
+                return binaryOp(n->op, l, r);
+            }
             // A long left-leaning chain (a + b + c + ...) in a loop, not by recursion.
             std::vector<Node*> spine;
             Node* left = n;
@@ -2353,7 +2490,7 @@ Value Interpreter::eval(Node* n, Env* env, bool strict) {
             return acc;
         }
         case N::Member: {
-            if (n->a->kind == N::Super) return rt_.get(superBase(env).asObject(), memberKey(n, env, strict), thisValue(env));
+            if (n->a->kind == N::Super) return rt_.get(superObject(env), memberKey(n, env, strict), thisValue(env));
             const Value base = eval(n->a, env, strict);
             if ((n->flags & kOptional) && base.isNullish()) throw ShortCircuit{};
             return rt_.get(base, memberKey(n, env, strict));
@@ -2700,7 +2837,7 @@ Value Interpreter::evalCall(Node* n, Env* env, bool strict) {
     if (callee->kind == N::Member) {
         if (callee->a->kind == N::Super) {
             this_value = thisValue(env);
-            fn = rt_.get(superBase(env).asObject(), memberKey(callee, env, strict), this_value);
+            fn = rt_.get(superObject(env), memberKey(callee, env, strict), this_value);
         } else {
             this_value = eval(callee->a, env, strict);
             if ((callee->flags & kOptional) && this_value.isNullish()) throw ShortCircuit{};
@@ -2812,7 +2949,7 @@ Value Interpreter::evalUpdate(Node* n, Env* env, bool strict) {
     }
     const Value base = t->a->kind == N::Super ? thisValue(env) : eval(t->a, env, strict);
     const PropertyKey key = memberKey(t, env, strict);
-    const Value now = step(t->a->kind == N::Super ? rt_.get(superBase(env).asObject(), key, base) : rt_.get(base, key), old);
+    const Value now = step(t->a->kind == N::Super ? rt_.get(superObject(env), key, base) : rt_.get(base, key), old);
     rt_.set(base, key, now, strict);
     return (n->flags & kPrefix) ? now : old;
 }
@@ -2831,7 +2968,7 @@ Value Interpreter::evalAssign(Node* n, Env* env, bool strict) {
             const PropertyKey key = memberKey(t, env, strict);
             const Value v = eval(n->b, env, strict);
             if (t->a->kind == N::Super) {
-                rt_.set(superBase(env).asObject(), key, v, base);
+                rt_.set(superObject(env), key, v, base);
                 return v;
             }
             rt_.set(base, key, v, strict);

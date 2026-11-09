@@ -17,6 +17,15 @@ namespace fbx::xweb::js {
 
 namespace {
 
+// ArraySpeciesCreate's length check, before a result is built element by element: past
+// 2^32 - 1 it's a RangeError by the spec, and past the engine's limit on a dense array
+// one too (rather than a C++ allocation the size of whatever `length` claims).
+void checkNewArrayLength(Runtime& rt, uint64_t n) {
+    if (n > 4294967295ull) rt.throwError("RangeError", "invalid array length");
+    if (n > 100'000'000) rt.throwError("RangeError", "array too long");
+}
+
+
 using Args = std::span<const Value>;
 
 Value arg(Args a, size_t i) { return i < a.size() ? a[i] : Value::undefined(); }
@@ -107,8 +116,10 @@ void defineFromDescriptor(Runtime& rt, Object* o, const PropertyKey& key, const 
         }
     }
     // An array's element or length.
-    if (!key.isSymbol() && o->cls == ObjectClass::Array && !(p.flags & kAccessor)) {
+    if (!key.isSymbol() && o->cls == ObjectClass::Array) {
         if (key.name == u"length") {
+            // length is a non-configurable data property: it can't become an accessor.
+            if (p.flags & kAccessor) rt.throwError("TypeError", "an array's length can't become an accessor");
             // length: writable, not enumerable, not configurable; it can become read-only.
             if ((present & kConfigurable) && (p.flags & kConfigurable)) rt.throwError("TypeError", "an array's length can't be made configurable");
             if ((present & kEnumerable) && (p.flags & kEnumerable)) rt.throwError("TypeError", "an array's length can't be made enumerable");
@@ -133,7 +144,10 @@ void defineFromDescriptor(Runtime& rt, Object* o, const PropertyKey& key, const 
         // descriptor leaves them out; a new one only if it asks for all three.
         const bool exists = index && std::stoul(utf8(key.name)) < o->elements.size() && !o->elements[std::stoul(utf8(key.name))].isEmpty();
         const uint8_t asked = present & (kWritable | kEnumerable | kConfigurable);
-        const bool plain = exists ? (p.flags & asked) == asked : (asked == (kWritable | kEnumerable | kConfigurable) && (p.flags & kDefaultFlags) == kDefaultFlags);
+        // An accessor is never plain: it leaves the dense part, or get() would still
+        // find the old value there before the getter.
+        const bool plain = !(p.flags & kAccessor) &&
+                           (exists ? (p.flags & asked) == asked : (asked == (kWritable | kEnumerable | kConfigurable) && (p.flags & kDefaultFlags) == kDefaultFlags));
         if (index && plain) {
             if (present & 16) rt.set(o, key, p.value, Value::object(o));
             else if (!exists && !(present & 16)) rt.set(o, key, Value::undefined(), Value::object(o));
@@ -1448,19 +1462,25 @@ void Runtime::installBuiltins() {
         std::vector<Value> items;
         if (src.isNullish()) rt.throwError("TypeError", "Array.from needs an array-like or iterable");
         const Value iter = src.isString() ? Value::object(rt.function_prototype) : rt.get(src, PropertyKey(rt.sym_iterator));
+        // Each value mapped as it comes: a mapFn that throws stops an endless iterator
+        // (and closes it).
+        const auto add = [&](const Value& v) {
+            if (fn.isUndefined()) {
+                items.push_back(v);
+            } else {
+                const Value args[2] = {v, Value::number(static_cast<double>(items.size()))};
+                items.push_back(rt.call(fn, arg(a, 2), args));
+            }
+            if (items.size() > 100'000'000) rt.throwError("RangeError", "array too long");
+        };
         if (!iter.isNullish()) {
-            items = rt.iterateToList(src);
+            rt.iterate(src, add);
         } else {
             Object* o = rt.toObject(src);
             const uint64_t n = rt.lengthOf(o);
             if (n > 100'000'000) rt.throwError("RangeError", "array too long");
-            for (uint64_t i = 0; i < n; ++i) items.push_back(elementAt(rt, o, i));
+            for (uint64_t i = 0; i < n; ++i) add(elementAt(rt, o, i));
         }
-        if (!fn.isUndefined())
-            for (size_t i = 0; i < items.size(); ++i) {
-                const Value args[2] = {items[i], Value::number(static_cast<double>(i))};
-                items[i] = rt.call(fn, arg(a, 2), args);
-            }
         return Value::object(rt.newArray(std::move(items)));
     });
     method(array_prototype, u"push", 1, [](Runtime& rt, const Value& t, Args a) {
@@ -1515,6 +1535,7 @@ void Runtime::installBuiltins() {
         Object* o = thisObject(rt, t);
         const uint64_t len = rt.lengthOf(o);
         const uint64_t b = relative(rt, arg(a, 0), len, 0), e = relative(rt, arg(a, 1), len, len);
+        if (e > b) checkNewArrayLength(rt, e - b);
         std::vector<Value> out;
         for (uint64_t i = b; i < e; ++i) out.push_back(hasElement(rt, o, i) ? elementAt(rt, o, i) : Value::empty());
         return Value::object(rt.newArray(std::move(out)));
@@ -1612,7 +1633,10 @@ void Runtime::installBuiltins() {
             const Value fn = callback(rt, arg(a, 0));
             const Value self = arg(a, 1);
             std::vector<Value> out;
-            if (kind == Each::Map) out.assign(len, Value::empty());
+            if (kind == Each::Map) {
+                checkNewArrayLength(rt, len);
+                out.assign(len, Value::empty());
+            }
             const bool backwards = kind == Each::FindLast || kind == Each::FindLastIndex;
             for (uint64_t step = 0; step < len; ++step) {
                 const uint64_t i = backwards ? len - 1 - step : step;
@@ -2017,7 +2041,8 @@ void Runtime::installBuiltins() {
             Object* m = rt.allocate<Object>(p.isObject() ? p.asObject() : proto, cls);
             if (!arg(a, 0).isNullish()) {
                 const Value adder = rt.get(Value::object(m), cls == ObjectClass::Map ? u"set" : u"add");
-                for (const Value& e : rt.iterateToList(arg(a, 0))) {
+                if (!rt.isCallable(adder)) rt.throwError("TypeError", cls == ObjectClass::Map ? "Map.prototype.set isn't a function" : "Set.prototype.add isn't a function");
+                rt.iterate(arg(a, 0), [&](const Value& e) {
                     if (cls == ObjectClass::Map) {
                         if (!e.isObject()) rt.throwError("TypeError", "a Map entry must be an object");
                         const Value kv[2] = {rt.get(e, u"0"), rt.get(e, u"1")};
@@ -2025,7 +2050,7 @@ void Runtime::installBuiltins() {
                     } else {
                         rt.call(adder, Value::object(m), std::span<const Value>(&e, 1));
                     }
-                }
+                });
             }
             return Value::object(m);
         }, proto);

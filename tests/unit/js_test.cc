@@ -620,3 +620,61 @@ TEST(Js, BigInt) {
               "1,-2,-9223372036854775808 1 807060504030201");
     EXPECT_EQ(run("(+(false)) + ' ' + (!(true))"), "0 false");
 }
+
+// The scope and property storage behind the speed-ups: a call's scopes freed when it
+// returns unless something can hold them, properties scanned or indexed, deletes as
+// tombstones.
+TEST(Js, ScopesAndPropertyStorage) {
+    // A function that makes no closure gets its scopes freed; one that does keeps them.
+    EXPECT_EQ(run("function leaf(a) { let b = a + 1; { let c = b * 2; return c; } }"
+                  "function maker(a) { let b = a; return () => b++; }"
+                  "const m = maker(5); let s = 0; for (let i = 0; i < 1000; i++) s += leaf(i); m(); [s, m(), m()].join()"),
+              "1001000,6,7");
+    // A direct eval can capture the scope too; an indirect one can't see it.
+    EXPECT_EQ(run("function f(x) { return eval('() => x * 2'); } const g = f(21); g()"), "42");
+    EXPECT_EQ(run("function f(x) { return (0, eval)('typeof x'); } f(1)"), "undefined");
+    // Many properties: lookups past the scan limit, deletes, re-adds, and order kept.
+    EXPECT_EQ(run("const o = {}; for (let i = 0; i < 100; i++) o['k' + i] = i;"
+                  "for (let i = 0; i < 100; i += 2) delete o['k' + i];"
+                  "o.k4 = 'again'; let sum = 0; for (const k in o) sum += typeof o[k] === 'number' ? o[k] : 0;"
+                  "[Object.keys(o).length, Object.keys(o)[0], Object.keys(o).at(-1), sum, 'k2' in o, o.k99].join()"),
+              "51,k1,k4,2500,false,99");
+    // A small object: delete, then the same key back at the end.
+    EXPECT_EQ(run("const o = {a: 1, b: 2, c: 3}; delete o.a; o.a = 4; delete o.b; JSON.stringify(o)"), "{\"c\":3,\"a\":4}");
+    // Symbols and integer keys among many names.
+    EXPECT_EQ(run("const s = Symbol('s'); const o = {[s]: 1}; for (let i = 0; i < 20; i++) o['p' + i] = i; o[2] = 'two'; o[1] = 'one';"
+                  "delete o.p0; [Reflect.ownKeys(o).slice(0, 3).map(String).join('|'), o[s], Object.getOwnPropertySymbols(o).length].join()"),
+              "1|2|p1,1,1");
+    // for-in over a big object stays linear and visits each name once, own before inherited.
+    EXPECT_EQ(run("const p = {z: 1, k3: 9}; const o = Object.create(p); for (let i = 0; i < 20000; i++) o['k' + i] = i;"
+                  "let n = 0, z = 0; for (const k in o) { n++; if (k === 'z') z++; } [n, z].join()"),
+              "20001,1");
+}
+
+// Engine safety found by test262 under a memory limit: iterators taken one value at a
+// time and closed on failure, lengths checked before a result is built, accessors on
+// array elements, and super with no prototype.
+TEST(Js, IteratorsAndLimits) {
+    // An endless iterator stops (and is closed) when the adder or mapFn throws.
+    EXPECT_EQ(run("let closed = 0; const it = {[Symbol.iterator]() { return {next() { return {value: [1, 2], done: false}; }, return() { closed++; return {}; }}; }};"
+                  "const set = Map.prototype.set; Map.prototype.set = function () { throw new Error('no'); };"
+                  "let e1; try { new Map(it); } catch (e) { e1 = e.message; } Map.prototype.set = set;"
+                  "let n = 0, e2; try { Array.from(it, () => { if (++n > 3) throw new Error('enough'); return n; }); } catch (e) { e2 = e.message; }"
+                  "[e1, e2, closed, n].join()"),
+              "no,enough,2,4");
+    EXPECT_EQ(run("try { new Set(1); } catch (e) { e.name }"), "TypeError");
+    // Array.from reads an array live, as its iterator does.
+    EXPECT_EQ(run("const a = [1, 2, 3]; Array.from(a, (v, i) => { if (i === 0) a[2] = 30; return v; }).join()"), "1,2,30");
+    // A length past 2^32 - 1 is a RangeError, not an allocation.
+    EXPECT_EQ(run("const r = []; for (const f of [() => Array.prototype.map.call({length: Infinity}, x => x), () => Array.prototype.slice.call({length: 2 ** 40})])"
+                  "  try { f(); r.push('no error'); } catch (e) { r.push(e.name); } r.join()"),
+              "RangeError,RangeError");
+    // An accessor on an existing element replaces the element.
+    EXPECT_EQ(run("const a = ['foo', 'bar']; Object.defineProperty(a, 0, {get() { return 'got'; }}); [a[0], a.length, 'get' in Object.getOwnPropertyDescriptor(a, 0)].join()"),
+              "got,2,true");
+    EXPECT_EQ(run("try { Object.defineProperty([], 'length', {get() {}}); } catch (e) { e.name }"), "TypeError");
+    // super.x where the home object has no prototype: a TypeError, after the right side.
+    EXPECT_EQ(run("let n = 0; class C { static m() { super.x = n += 1; } } Object.setPrototypeOf(C, null);"
+                  "let r; try { C.m(); } catch (e) { r = e.name; } [r, n].join()"),
+              "TypeError,1");
+}

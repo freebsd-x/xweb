@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <map>
+#include <new>
 #include <set>
 #include <unordered_map>
 
@@ -577,13 +578,13 @@ struct Linker {
                 const std::u16string& b = getter->slots[0].asString();
                 Env* env = mod->env;
                 for (int hops = 0; env && hops < 100; ++hops) {
-                    const auto it = env->vars.find(b);
-                    if (it == env->vars.end()) break;
+                    const VarMap::Entry* it = env->vars.find(b);
+                    if (!it) break;
                     const Binding& bind = it->second;
                     if (bind.import_env) {
                         // Follow the chain by hand: imports of imports.
-                        const auto jt = bind.import_env->vars.find(bind.import_name);
-                        if (jt == bind.import_env->vars.end()) break;
+                        const VarMap::Entry* jt = bind.import_env->vars.find(bind.import_name);
+                        if (!jt) break;
                         if (!jt->second.initialized) rt.throwError("ReferenceError", "'" + utf8(b) + "' isn't initialized yet");
                         if (!jt->second.import_env) return jt->second.value;
                         env = jt->second.import_env;
@@ -942,6 +943,10 @@ void Runtime::evaluateModule(std::string_view source, const std::string& url, st
     } catch (const Terminated& t) {
         Result r;
         r.error = "Stopped: " + t.why;
+        if (done) done(r);
+    } catch (const std::bad_alloc&) {
+        Result r;
+        r.error = "Stopped: out of memory";
         if (done) done(r);
     }
 }

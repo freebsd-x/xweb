@@ -131,6 +131,8 @@ private:
     };
 
     FunctionInfo* newFunction() {
+        // Whatever is being parsed now encloses the new function, which closes over it.
+        if (fn_) fn_->scope_escapes = true;
         p_.functions.emplace_back();
         return &p_.functions.back();
     }
@@ -1837,6 +1839,7 @@ private:
                 Node* n = p_.make(N::Identifier, line);
                 n->str = cur_.value;
                 if (n->str == u"arguments") markArguments();
+                if (n->str == u"eval") fn_->scope_escapes = true;   // a direct eval can declare and capture
                 advance();
                 return n;
             }

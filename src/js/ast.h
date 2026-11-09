@@ -102,6 +102,9 @@ struct FunctionInfo {
     bool strict = false;
     bool uses_arguments = false;      // reads `arguments`
     bool uses_this = false;
+    // Makes a function (or class, or method) or names `eval`: something may hold on
+    // to its scope after the call. Without it, the call's scopes die with the call.
+    bool scope_escapes = false;
     bool is_method = false;
     bool is_class_constructor = false;
     bool is_async = false;

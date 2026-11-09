@@ -4,7 +4,9 @@
 
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <vector>
 
 #include "ast.h"
 #include "xweb/js.h"
@@ -21,11 +23,112 @@ struct Binding {
     std::u16string import_name;
 };
 
+// A scope's names. Most scopes hold a handful, found by a scan of stored hashes; a
+// scope that grows past that gets an open-addressing index. Entries never move once made: a Binding* stays good while
+// its scope lives, whatever is declared after it. A name is hashed once per lookup,
+// however many scopes the lookup walks (find with the hash).
+class VarMap {
+public:
+    struct Entry {
+        std::u16string first;
+        Binding second;
+    };
+    struct Slot {
+        Entry e;
+        size_t h = 0;
+    };
+
+    [[nodiscard]] static size_t hashOf(std::u16string_view s) noexcept {
+        size_t h = 1469598103934665603ull;
+        for (const char16_t c : s) h = (h ^ c) * 1099511628211ull;
+        return h;
+    }
+
+    VarMap() = default;
+    VarMap(const VarMap& o) { *this = o; }
+    VarMap& operator=(const VarMap& o) {
+        if (this == &o) return *this;
+        slots_.clear();
+        index_.clear();
+        slots_.reserve(o.slots_.size());
+        for (const auto& s : o.slots_) add(s->e.first, s->h).second = s->e.second;
+        return *this;
+    }
+
+    [[nodiscard]] Entry* find(const std::u16string& name, size_t h) noexcept {
+        if (index_.empty()) {
+            for (const auto& s : slots_)
+                if (s->h == h && s->e.first == name) return &s->e;
+            return nullptr;
+        }
+        const size_t mask = index_.size() - 1;
+        for (size_t i = h & mask;; i = (i + 1) & mask) {
+            Slot* s = index_[i];
+            if (!s) return nullptr;
+            if (s->h == h && s->e.first == name) return &s->e;
+        }
+    }
+    [[nodiscard]] Entry* find(const std::u16string& name) noexcept { return find(name, hashOf(name)); }
+    [[nodiscard]] size_t count(const std::u16string& name) noexcept { return find(name) ? 1 : 0; }
+
+    Binding& operator[](const std::u16string& name) {
+        const size_t h = hashOf(name);
+        if (Entry* e = find(name, h)) return e->second;
+        return add(name, h).second;
+    }
+
+    [[nodiscard]] size_t size() const noexcept { return slots_.size(); }
+    void reserve(size_t n) { slots_.reserve(n); }
+
+    class iterator {
+    public:
+        explicit iterator(const std::unique_ptr<Slot>* p) : p_(p) {}
+        Entry& operator*() const { return (*p_)->e; }
+        iterator& operator++() { ++p_; return *this; }
+        bool operator!=(const iterator& o) const { return p_ != o.p_; }
+    private:
+        const std::unique_ptr<Slot>* p_;
+    };
+    iterator begin() { return iterator(slots_.data()); }
+    iterator end() { return iterator(slots_.data() + slots_.size()); }
+
+private:
+    static constexpr size_t kScanMax = 8;   // beyond this, keep an index
+
+    Entry& add(const std::u16string& name, size_t h) {
+        slots_.push_back(std::make_unique<Slot>());
+        Slot* s = slots_.back().get();
+        s->e.first = name;
+        s->h = h;
+        if (slots_.size() > kScanMax) {
+            if (index_.size() < slots_.size() * 2) {
+                size_t cap = 32;
+                while (cap < slots_.size() * 4) cap *= 2;
+                index_.assign(cap, nullptr);
+                for (const auto& t : slots_) place(t.get());
+            } else {
+                place(s);
+            }
+        }
+        return s->e;
+    }
+    void place(Slot* s) noexcept {
+        const size_t mask = index_.size() - 1;
+        size_t i = s->h & mask;
+        while (index_[i]) i = (i + 1) & mask;
+        index_[i] = s;
+    }
+
+    // Each name its own node, so an Entry never moves.
+    std::vector<std::unique_ptr<Slot>> slots_;
+    std::vector<Slot*> index_;
+};
+
 struct Env : Cell {
     explicit Env(Env* o) : outer(o) {}
     [[nodiscard]] size_t cellSize() const noexcept override { return sizeof(Env); }
     Env* outer;
-    std::unordered_map<std::u16string, Binding> vars;
+    VarMap vars;
     // A function's own: what `this`, `super` and `new.target` mean inside it.
     bool is_function = false;
     Value this_value;

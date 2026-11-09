@@ -208,8 +208,19 @@ public:
     uint8_t host_kind = 0;
 
 private:
+    // In the order they were made. A removed one stays as a tombstone (flags
+    // kTombstone) until enough have piled up to compact, so a delete is O(1).
     std::vector<std::pair<PropertyKey, Property>> props_;
-    std::unordered_map<PropertyKey, size_t, PropertyKeyHash> index_;
+    // Positions in props_ (plus one; 0 is empty), by key hash with linear probing.
+    // Only once there are enough properties for a scan to be slow.
+    std::vector<uint32_t> index_;
+    uint32_t dead_ = 0;
+    static constexpr uint8_t kTombstone = 0xFF;
+    static constexpr size_t kScanMax = 8;
+    [[nodiscard]] static size_t keyHash(const PropertyKey& k) noexcept;
+    [[nodiscard]] ptrdiff_t find(const PropertyKey& key) const noexcept;
+    void place(uint32_t pos) noexcept;
+    void reindex();
 };
 
 // A thrown JavaScript value, as it travels through the C++ that runs it.
@@ -388,6 +399,10 @@ public:
 
     // Iteration, through Symbol.iterator.
     std::vector<Value> iterateToList(const Value& iterable);
+    // One value at a time, as the spec's loops over an iterator go: an endless iterator
+    // is fine as long as `each` stops it by throwing, and the iterator is closed (its
+    // return()) when `each` throws, the original exception winning.
+    void iterate(const Value& iterable, const std::function<void(const Value&)>& each);
     Object* createIterResult(const Value& value, bool done);
 
     // Well-known objects and symbols.

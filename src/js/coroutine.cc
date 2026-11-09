@@ -262,6 +262,10 @@ thread_local EngineStack engine;
 #endif
     try {
         (*e->fn)();
+    } catch (const std::bad_alloc&) {
+        // Out of memory reaches the embedder as a stopped script (evaluate() catches its
+        // own), as a coroutine's does, rather than ending the process.
+        e->error = std::make_exception_ptr(Terminated{"out of memory"});
     } catch (...) {
         e->error = std::current_exception();
     }
