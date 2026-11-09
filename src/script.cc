@@ -1050,42 +1050,9 @@ void PageScript::Impl::installWindow() {
     });
     method(g, u"requestIdleCallback", 1, addTimer(false));
     method(g, u"cancelIdleCallback", 1, clearTimer);
-    // The browser's side of fetch() and XMLHttpRequest (the prelude builds them on this):
-    // __xwebFetch(url, method, contentType, body) → a promise of [status, url, contentType,
-    // ArrayBuffer], rejected with a TypeError when no response comes back.
-    method(g, u"__xwebFetch", 4, [self](Runtime& rt, const Value&, Args a) {
-        Object* promise = rt.newPromise();
-        PageScript::Host::Request req;
-        req.url = resolveUrl(self->host.base, js::utf8(rt.toStringValue(arg(a, 0))));
-        req.method = arg(a, 1).isUndefined() ? "GET" : upper(js::utf8(rt.toStringValue(arg(a, 1))));
-        if (!arg(a, 2).isNullish()) req.content_type = js::utf8(rt.toStringValue(arg(a, 2)));
-        if (arg(a, 3).isString()) req.body = js::utf8(arg(a, 3).asString());
-        else if (!arg(a, 3).isNullish() && !rt.bufferBytes(arg(a, 3), req.body)) req.body = js::utf8(rt.toStringValue(arg(a, 3)));
-        if (!self->host.fetch) {
-            rt.rejectPromise(promise, Value::object(rt.newError("TypeError", "Failed to fetch: no network here")));
-            return Value::object(promise);
-        }
-        self->pending_fetches.push_back(promise);
-        std::weak_ptr<bool> alive = self->alive;
-        self->host.fetch(req, [self, alive, promise](PageScript::Host::Response r) {
-            if (alive.expired()) return;
-            auto& pend = self->pending_fetches;
-            pend.erase(std::remove(pend.begin(), pend.end(), promise), pend.end());
-            self->rt.setStepBudget(kTaskBudget);
-            self->task([&] {
-                Runtime& rt = self->rt;
-                if (!r.ok) {
-                    rt.rejectPromise(promise, Value::object(rt.newError("TypeError", "Failed to fetch" + (r.error.empty() ? std::string() : ": " + r.error))));
-                    return;
-                }
-                Object* parts = rt.newArray({Value::number(r.status), str(r.url), str(r.content_type), Value::object(rt.newArrayBuffer(r.body))});
-                rt.resolvePromise(promise, Value::object(parts));
-            });
-            self->drainMicrotasks();
-            self->dirty = true;
-        });
-        return Value::object(promise);
-    });
+    // The browser's side of fetch() and XMLHttpRequest (script_fetch.cc), which the
+    // prelude builds them on.
+    method(g, u"__xwebFetch", 6, [self](Runtime&, const Value&, Args a) { return self->browserFetch(a); });
     method(g, u"queueMicrotask", 1, [self](Runtime& rt, const Value&, Args a) {
         if (!rt.isCallable(arg(a, 0))) rt.throwError("TypeError", "queueMicrotask needs a function");
         rt.enqueueMicrotask(arg(a, 0));

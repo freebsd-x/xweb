@@ -713,6 +713,8 @@ struct PageScript::Impl {
     void queueMutation(const char16_t* type, Node* target, const std::vector<Node*>& added, const std::vector<Node*>& removed,
                        Node* prev, Node* next, const std::string* attr_name, const std::string* old_value);
 
+    Value browserFetch(Args a);   // script_fetch.cc
+
     void install();
     void installNode();
     void installElement();

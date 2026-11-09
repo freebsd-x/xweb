@@ -9,6 +9,8 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include "xweb/dom.h"
 #include "xweb/forms.h"
@@ -46,6 +48,8 @@ public:
             std::string method = "GET";
             std::string content_type;
             std::string body;
+            std::vector<std::pair<std::string, std::string>> headers;   // what the page may send, and Origin/Referer
+            bool cookies = false;       // send and keep cookies (decided by the fetch algorithm)
         };
         struct Response {
             bool ok = false;            // a response came back (any status)
@@ -53,6 +57,7 @@ public:
             std::string url;            // after redirects
             std::string content_type;
             std::string body;
+            std::vector<std::pair<std::string, std::string>> headers;   // lower-case names; never Set-Cookie
             std::string error;          // when not ok: why
         };
         std::function<void(const Request&, std::function<void(Response)> done)> fetch;

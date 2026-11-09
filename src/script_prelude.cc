@@ -595,12 +595,13 @@ const char* const kScriptPrelude = R"JS(
     let req;
     try { req = new Request(input, init); } catch (e) { return Promise.reject(e); }
     if (req.signal && req.signal.aborted) return Promise.reject(abortError(req.signal));
-    const done = native(req.url, req.method, req.headers.get('content-type'), req._source).then(([status, url, type, buf]) => {
+    const done = native(req.url, req.method, [...req.headers], req._source, req.mode, req.credentials).then(([status, url, type, buf, headers, kind]) => {
       if (req.signal && req.signal.aborted) throw abortError(req.signal);
-      const res = new Response(null, { status: status >= 200 && status <= 599 ? status : 200, statusText: statusTexts[status] || '', headers: type ? { 'content-type': type } : {} });
+      const res = new Response(null, { status: 200, headers });
       res.status = status;
+      res.statusText = statusTexts[status] || '';
       res[bodyData] = new Uint8Array(buf);
-      res.url = url; res.redirected = url !== req.url.split('#')[0]; res.type = 'basic';
+      res.url = url; res.redirected = kind !== 'opaque' && url !== req.url.split('#')[0]; res.type = kind;
       return res;
     });
     if (!req.signal) return done;
@@ -630,16 +631,18 @@ const char* const kScriptPrelude = R"JS(
       this._state(1);
     }
     setRequestHeader(k, v) { if (this.readyState !== 1) throw new Error('InvalidStateError'); this._headers.append(k, v); }
-    getResponseHeader(k) { return String(k).toLowerCase() === 'content-type' && this._type ? this._type : null; }
-    getAllResponseHeaders() { return this._type ? 'content-type: ' + this._type + '\r\n' : ''; }
+    getResponseHeader(k) { return this._responseHeaders ? this._responseHeaders.get(k) : null; }
+    getAllResponseHeaders() { return this._responseHeaders ? [...this._responseHeaders].map(([k, v]) => k + ': ' + v + '\r\n').join('') : ''; }
     overrideMimeType(t) { this._override = t; }
     send(body) {
       if (this.readyState !== 1) throw new Error('InvalidStateError');
       const [b, type] = extractBody(this._method === 'GET' || this._method === 'HEAD' ? null : body);
       this._fire('loadstart');
-      native(this._url, this._method, this._headers.get('content-type') || type, b).then(([status, url, ctype, buf]) => {
+      if (type && !this._headers.has('content-type')) this._headers.set('content-type', type);
+      native(this._url, this._method, [...this._headers], b, 'cors', this.withCredentials ? 'include' : 'same-origin').then(([status, url, ctype, buf, headers]) => {
         if (this._aborted) return;
         this.status = status; this.statusText = statusTexts[status] || ''; this.responseURL = url; this._type = ctype;
+        this._responseHeaders = new Headers(headers);
         this._bytes = new Uint8Array(buf);
         this._state(2); this._state(3); this._state(4);
         this._fire('load'); this._fire('loadend');

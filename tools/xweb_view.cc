@@ -1276,8 +1276,6 @@ private:
             const bool same_origin = target.scheme == origin.scheme && target.authority == origin.authority;
             if (target.scheme != "http" && target.scheme != "https") {
                 refused.error = "only http and https can be fetched";
-            } else if (req.method != "GET" && req.method != "POST" && req.method != "HEAD") {
-                refused.error = "the method " + req.method + " isn't supported yet";
             } else if (!same_origin && local(target.authority) && !local(origin.authority)) {
                 refused.error = "a page on the web can't reach this machine or the local network";
             }
@@ -1287,24 +1285,22 @@ private:
                 });
                 return;
             }
-            std::thread([this, weak, req, same_origin, done = std::move(done)] {
-                Resource got;
-                if (req.method == "POST") {
-                    web::FormSubmission sub;
-                    sub.url = req.url;
-                    sub.content_type = req.content_type.empty() ? "text/plain;charset=UTF-8" : req.content_type;
-                    sub.body = req.body;
-                    got = loadPost(sub, same_origin);
-                } else {
-                    got = load(req.url, same_origin);
-                }
+            (void)same_origin;
+            std::thread([this, weak, req, done = std::move(done)] {
+                // The fetch algorithm (script_fetch.cc) chose the headers and the cookies;
+                // this only carries the request, method, headers and all.
+                auto got = scriptWebBlocking(req.method, req.url, req.headers, req.body, req.cookies);
                 web::PageScript::Host::Response r;
-                r.ok = got.ok;
-                r.status = got.http_status ? static_cast<int>(got.http_status) : (got.ok ? 200 : 0);
-                r.url = got.final_url;
-                r.content_type = got.content_type;
+                r.ok = got.ok();
+                r.status = static_cast<int>(got.http_status);
+                r.url = got.final_url.empty() ? req.url : got.final_url;
+                r.content_type = lowerCase(got.content_type);
                 r.body = std::move(got.body);
-                r.error = got.error;
+                r.headers = std::move(got.headers);
+                if (!r.ok) r.error = got.status == fbx::shared::FetchStatus::Denied ? "this address isn't allowed"
+                                     : got.status == fbx::shared::FetchStatus::TooLarge ? "the response is too large"
+                                     : got.status == fbx::shared::FetchStatus::Unavailable ? "the connection service isn't running"
+                                     : "the site can't be reached";
                 XApplication::post([this, weak, done, r = std::move(r)] {
                     std::shared_ptr<Page> p = weak.lock();
                     if (!p || !p->script) return;

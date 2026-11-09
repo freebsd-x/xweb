@@ -44,11 +44,27 @@ struct Page {
         host.submit = [this](const Node* n) { submitted.push_back(n); };
         // A network that answers at once, from a table; what was asked is kept.
         host.fetch = [this](const PageScript::Host::Request& r, std::function<void(PageScript::Host::Response)> done) {
-            fetched.push_back(r.method + " " + r.url + " " + r.content_type + " " + r.body);
+            std::string hs;
+            for (const auto& [k, v] : r.headers) hs += k + "=" + v + ";";
+            fetched.push_back(r.method + " " + r.url + " " + r.content_type + " " + r.body + " [" + hs + "] cookies=" + (r.cookies ? "yes" : "no"));
             PageScript::Host::Response res;
-            if (r.url == "https://example.org/dir/data.json") res = {true, 200, r.url, "application/json", R"({"items":[1,2,3],"name":"x"})", ""};
-            else if (r.url == "https://example.org/api") res = {true, 201, r.url, "text/plain", "made " + r.body, ""};
-            else if (r.url == "https://example.org/missing") res = {true, 404, r.url, "text/html", "nope", ""};
+            const auto answer = [&](int status, std::string type, std::string body, std::vector<std::pair<std::string, std::string>> headers = {}) {
+                res.ok = true;
+                res.status = status;
+                res.url = r.url;
+                res.content_type = type;
+                res.body = std::move(body);
+                headers.emplace_back("content-type", res.content_type);
+                res.headers = std::move(headers);
+            };
+            if (r.url == "https://example.org/dir/data.json") answer(200, "application/json", R"({"items":[1,2,3],"name":"x"})", {{"x-secret", "s"}});
+            else if (r.url == "https://example.org/api") answer(201, "text/plain", "made " + r.body);
+            else if (r.url == "https://example.org/missing") answer(404, "text/html", "nope");
+            else if (r.url == "https://api.other.test/open") answer(200, "text/plain", "open data", {{"access-control-allow-origin", "*"}, {"x-shown", "1"}, {"x-hidden", "2"}, {"access-control-expose-headers", "x-shown"}});
+            else if (r.url == "https://api.other.test/closed") answer(200, "text/plain", "private");
+            else if (r.url == "https://api.other.test/rw" && r.method == "OPTIONS")
+                answer(204, "", "", {{"access-control-allow-origin", "https://example.org"}, {"access-control-allow-methods", "PUT"}, {"access-control-allow-headers", "x-token"}});
+            else if (r.url == "https://api.other.test/rw") answer(200, "text/plain", "put ok", {{"access-control-allow-origin", "https://example.org"}});
             else res.error = "unreachable";
             pending.push_back([done, res] { done(res); });
         };
@@ -255,7 +271,7 @@ TEST(Script, FetchAndXMLHttpRequest) {
                              "log:failed TypeError Failed to fetch: unreachable\n", "log:aborted AbortError\n", "log:xhr 200 x 4\n",
                              "log:response 9\n", "log:blob abc\n"})
         EXPECT_NE(p.console.find(want), std::string::npos) << want << "\n" << p.console;
-    EXPECT_NE(std::find(p.fetched.begin(), p.fetched.end(), "POST https://example.org/api application/json {\"a\":1}"), p.fetched.end());
+    EXPECT_NE(std::find_if(p.fetched.begin(), p.fetched.end(), [](const std::string& f) { return f.starts_with("POST https://example.org/api application/json {\"a\":1} [content-type=application/json;Origin=https://example.org;Referer=https://example.org/dir/page.html;] cookies=yes"); }), p.fetched.end()) << p.fetched[1];
 }
 
 TEST(Script, CustomElementsShadowRootsAndObservers) {
@@ -356,4 +372,29 @@ TEST(Script, CryptoAndIntl) {
     for (const char* want : {"log:random true true\n", "log:1,234,567.891 -$3.50 12.5K 26%\n",
                              "log:11/8/2026 | Nov 8, 2026 | November 8, 2026, 3:04 PM\n", "log:yesterday | in 3 hours | 2 months ago | a, b, and c | two abC\n"})
         EXPECT_NE(p.console.find(want), std::string::npos) << want << "\n" << p.console;
+}
+
+TEST(Script, CrossOriginRequestsFollowCors) {
+    Page p(R"(<body><script>
+        const log = (...a) => console.log(...a);
+        fetch('https://api.other.test/open').then(async r => log('open', r.type, await r.text(), r.headers.get('x-shown'), r.headers.get('x-hidden')));
+        fetch('https://api.other.test/closed').then(r => log('closed read!'), e => log('closed', e.name));
+        fetch('https://api.other.test/rw', {method: 'PUT', headers: {'X-Token': 't'}, body: 'b'}).then(async r => log('rw', await r.text()));
+        fetch('https://api.other.test/open', {credentials: 'include'}).then(r => log('star with credentials read!'), e => log('star with credentials', e.name));
+        fetch('https://api.other.test/closed', {mode: 'no-cors'}).then(async r => log('opaque', r.type, r.status, (await r.text()).length));
+        fetch('data.json').then(r => log('same', r.type, r.headers.get('x-secret')));
+        fetch('https://api.other.test/closed', {mode: 'same-origin'}).catch(e => log('same-origin mode', e.name));
+        </script>)");
+    p.deliver();
+    p.deliver();
+    for (const char* want : {"log:open cors open data 1 null\n", "log:closed TypeError\n", "log:rw put ok\n", "log:star with credentials TypeError\n",
+                             "log:opaque opaque 0 0\n", "log:same basic s\n", "log:same-origin mode TypeError\n"})
+        EXPECT_NE(p.console.find(want), std::string::npos) << want << "\n" << p.console;
+    const auto sent = [&](const std::string& prefix) {
+        return std::find_if(p.fetched.begin(), p.fetched.end(), [&](const std::string& f) { return f.starts_with(prefix); }) != p.fetched.end();
+    };
+    EXPECT_TRUE(sent("OPTIONS https://api.other.test/rw   [Origin=https://example.org;Access-Control-Request-Method=PUT;Access-Control-Request-Headers=x-token;] cookies=no"));
+    EXPECT_TRUE(sent("GET https://api.other.test/open   [Origin=https://example.org;Referer=https://example.org/;] cookies=no"));
+    EXPECT_TRUE(sent("GET https://api.other.test/open   [Origin=https://example.org;Referer=https://example.org/;] cookies=yes"));   // credentials: include
+    EXPECT_TRUE(sent("GET https://example.org/dir/data.json   [Referer=https://example.org/dir/page.html;] cookies=yes"));
 }
