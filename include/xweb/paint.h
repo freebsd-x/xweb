@@ -83,6 +83,9 @@ public:
     void fillRect(float x, float y, float w, float h, Color color, float radius = 0);
     // Stretched over the rectangle, bilinear; `tint` (if any) replaces its colour, keeping alpha.
     void drawRaster(const Raster& image, float x, float y, float w, float h, float opacity = 1, const Color* tint = nullptr);
+    // Through a matrix from the image's pixels (0..width, 0..height) to the canvas: rotated,
+    // scaled or skewed. Bilinear, with antialiased edges.
+    void drawRaster(const Raster& image, const Matrix& to_canvas, float opacity = 1, const Color* tint = nullptr);
     // Another canvas the same size on top of this, faded, and through a coverage mask (if any).
     void composite(const Canvas& layer, float opacity, const Canvas* mask = nullptr);
     // Coverage of these polygons, as a canvas whose alpha is it: for clip paths.
@@ -118,6 +121,8 @@ struct StrokeStyle {
 [[nodiscard]] std::vector<std::pair<std::vector<Point>, bool>> parsePathData(const std::string& d, float scale);
 // A transform attribute's value.
 [[nodiscard]] Matrix parseTransform(const std::string& text);
+// Every point through the matrix.
+[[nodiscard]] Contours transformed(const Contours& contours, const Matrix& m);
 
 // What layout can't hand over as plain rectangles: a background with uneven corners,
 // borders that are rounded, patterned, shaded or split diagonally, and shadows.

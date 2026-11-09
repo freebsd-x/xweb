@@ -473,7 +473,7 @@ TEST(Paint, TranslateMovesTheBoxAsPainted) {
     const auto r = layout(
         "<style>body{margin:0}</style>"
         "<div id=a style='width:100px;height:40px;transform:translate(10px,-50%)'></div>"
-        "<div id=b style='width:50px;height:20px;transform:translateY(calc(5px + 10%)) rotate(3deg) translateX(-100%)'></div>"
+        "<div id=b style='width:50px;height:20px;transform:translateY(calc(5px + 10%)) translateX(-100%)'></div>"
         "<div id=c style='width:50px;height:20px;translate:4px 6px'></div>"
         "<div style='position:relative'><span id=d style='position:absolute;left:0;top:0;width:8px;height:8px;"
         "transform:matrix(1,0,0,1,3,7)'></span></div>");
@@ -518,4 +518,36 @@ TEST(ShadowDom, PartRulesReachExposedElements) {
     EXPECT_FLOAT_EQ(r.box("label").h, 0);
     EXPECT_FLOAT_EQ(r.box("icon").h, 9);
     EXPECT_FLOAT_EQ(r.box("plain").h, 4);
+}
+
+TEST(Paint, RotationsAndScalesWrapWhatTheyPaint) {
+    const auto r = layout("<style>body{margin:0}</style><div style='width:40px;height:20px;background:red;transform:rotate(90deg) scale(2)'></div>"
+                          "<div style='width:10px;height:10px;background:blue;transform-origin:0 0;scale:3'></div><div style='transform:none'></div>");
+    std::vector<PaintKind> kinds;
+    const PaintOp* first = nullptr;
+    const PaintOp* second = nullptr;
+    for (const PaintOp& op : r.page.ops) {
+        if (op.kind == PaintKind::TransformBegin) (first ? second : first) = &op;
+        if (op.kind == PaintKind::TransformBegin || op.kind == PaintKind::TransformEnd || op.kind == PaintKind::Rect) kinds.push_back(op.kind);
+    }
+    EXPECT_EQ(kinds, (std::vector<PaintKind>{PaintKind::TransformBegin, PaintKind::Rect, PaintKind::TransformEnd,
+                                             PaintKind::TransformBegin, PaintKind::Rect, PaintKind::TransformEnd}));
+    ASSERT_TRUE(first && second);
+    // About the centre (20, 10): the box's right middle (40, 10) goes 40 below it.
+    const Point p = first->transform.apply({40, 10});
+    EXPECT_NEAR(p.x, 20, 1e-3);
+    EXPECT_NEAR(p.y, 50, 1e-3);
+    // About the top left (0, 20): three times as far from it.
+    const Point q = second->transform.apply({10, 30});
+    EXPECT_NEAR(q.x, 30, 1e-3);
+    EXPECT_NEAR(q.y, 50, 1e-3);
+}
+
+TEST(Flex, MinWidthZeroLetsAnItemShrinkBelowItsContent) {
+    const auto r = layout(
+        "<style>body{margin:0}.row{display:flex;width:100px}</style>"
+        "<div class=row><div id=z style='min-width:0;display:flex'><span style='white-space:nowrap;overflow:hidden'>aaaa bbbb cccc dddd eeee</span></div></div>"
+        "<div class=row><div id=a style='display:flex'><span style='white-space:nowrap'>aaaa bbbb cccc dddd eeee</span></div></div>");
+    EXPECT_FLOAT_EQ(r.box("z").w, 100);
+    EXPECT_GT(r.box("a").w, 100);   // auto: no smaller than its content
 }

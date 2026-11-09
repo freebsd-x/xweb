@@ -85,7 +85,10 @@ int main(int argc, char** argv) {
         todo.pop_back();
         const auto it = by_node.find(n);
         if (it != by_node.end()) {
-            std::printf("%s %.2f %.2f %.2f %.2f", n->name.c_str(), it->second->x, it->second->y, it->second->w, it->second->h);
+            // XWEB_LAYOUT_IDS=1 names elements with ids as tag#id, for finding them.
+            const std::string* id = std::getenv("XWEB_LAYOUT_IDS") ? n->attr("id") : nullptr;
+            std::printf("%s%s%s %.2f %.2f %.2f %.2f", n->name.c_str(), id ? "#" : "", id ? id->c_str() : "", it->second->x, it->second->y,
+                        it->second->w, it->second->h);
             if (const ComputedStyle* s = fonts ? styles.styleOf(n) : nullptr) {
                 FontSpec f;
                 f.size = s->font_size;

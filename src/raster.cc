@@ -337,6 +337,68 @@ void Canvas::drawRaster(const Raster& image, float x, float y, float w, float h,
     }
 }
 
+void Canvas::drawRaster(const Raster& image, const Matrix& to_canvas, float opacity, const Color* tint) {
+    if (image.empty()) return;
+    const auto inv = to_canvas.inverse();
+    if (!inv) return;
+    const float iw = static_cast<float>(image.width), ih = static_cast<float>(image.height);
+    float minx = INFINITY, miny = INFINITY, maxx = -INFINITY, maxy = -INFINITY;
+    for (const Point p : {Point{0, 0}, Point{iw, 0}, Point{0, ih}, Point{iw, ih}}) {
+        const Point q = to_canvas.apply(p);
+        if (!std::isfinite(q.x) || !std::isfinite(q.y)) return;
+        minx = std::min(minx, q.x);
+        miny = std::min(miny, q.y);
+        maxx = std::max(maxx, q.x);
+        maxy = std::max(maxy, q.y);
+    }
+    const int x0 = std::max(clip_x0_, toInt(std::floor(minx))), x1 = std::min(clip_x1_, toInt(std::ceil(maxx)));
+    const int y0 = std::max(clip_y0_, toInt(std::floor(miny))), y1 = std::min(clip_y1_, toInt(std::ceil(maxy)));
+    // How many image pixels one canvas pixel spans along each image axis: for the edges.
+    // (u = a x + c y + e: its gradient is (a, c).)
+    const float su = std::hypot(inv->a, inv->c), sv = std::hypot(inv->b, inv->d);
+    const auto texel = [&](int tx, int ty) {
+        tx = std::clamp(tx, 0, static_cast<int>(image.width) - 1);
+        ty = std::clamp(ty, 0, static_cast<int>(image.height) - 1);
+        const uint8_t* p = image.rgba.data() + (static_cast<size_t>(ty) * image.width + static_cast<size_t>(tx)) * 4;
+        const float a = p[3] / 255.0f;
+        if (tint) return Premul{tint->r / 255.0f * a, tint->g / 255.0f * a, tint->b / 255.0f * a, a};
+        return Premul{p[0] / 255.0f * a, p[1] / 255.0f * a, p[2] / 255.0f * a, a};
+    };
+    const float tint_alpha = tint ? tint->a / 255.0f : 1.0f;
+    for (int py = y0; py < y1; ++py) {
+        float* row = px_.data() + static_cast<size_t>(py) * width_ * 4;
+        for (int px = x0; px < x1; ++px) {
+            const Point uv = inv->apply({static_cast<float>(px) + 0.5f, static_cast<float>(py) + 0.5f});
+            // Coverage of this pixel by the image's quad, from its distance to the edges.
+            const float cu = std::clamp(std::min(uv.x, iw - uv.x) / std::max(su, 1e-6f) + 0.5f, 0.0f, 1.0f);
+            const float cv = std::clamp(std::min(uv.y, ih - uv.y) / std::max(sv, 1e-6f) + 0.5f, 0.0f, 1.0f);
+            if (cu <= 0 || cv <= 0) continue;
+            const float u = uv.x - 0.5f, v = uv.y - 0.5f;
+            const int tx = toInt(std::floor(u)), ty = toInt(std::floor(v));
+            const float fx = u - static_cast<float>(tx), fy = v - static_cast<float>(ty);
+            const Premul a = texel(tx, ty), b = texel(tx + 1, ty), c = texel(tx, ty + 1), d = texel(tx + 1, ty + 1);
+            const auto mix = [&](float pa, float pb, float pc, float pd) {
+                return (pa * (1 - fx) + pb * fx) * (1 - fy) + (pc * (1 - fx) + pd * fx) * fy;
+            };
+            const float k = cu * cv * opacity * tint_alpha;
+            const float sr = mix(a.r, b.r, c.r, d.r) * k, sg = mix(a.g, b.g, c.g, d.g) * k, sb = mix(a.b, b.b, c.b, d.b) * k,
+                        sa = mix(a.a, b.a, c.a, d.a) * k;
+            float* o = row + static_cast<size_t>(px) * 4;
+            o[0] = sr + o[0] * (1 - sa);
+            o[1] = sg + o[1] * (1 - sa);
+            o[2] = sb + o[2] * (1 - sa);
+            o[3] = sa + o[3] * (1 - sa);
+        }
+    }
+}
+
+Contours transformed(const Contours& contours, const Matrix& m) {
+    Contours out = contours;
+    for (auto& c : out)
+        for (Point& p : c) p = m.apply(p);
+    return out;
+}
+
 void Canvas::composite(const Canvas& layer, float opacity, const Canvas* mask) {
     if (layer.width_ != width_ || layer.height_ != height_) return;
     if (mask && (mask->width_ != width_ || mask->height_ != height_)) return;

@@ -509,6 +509,12 @@ public:
                 applyClip();
                 continue;
             }
+            if (op.kind == web::PaintKind::TransformBegin) {
+                // Drawn as one image, unless it holds text: then as if untransformed.
+                const size_t end = transformEnd(i);
+                if (drawTransformed(dl, i, end, at)) i = end;
+                continue;
+            }
             const float y = op.y + at.y_;
             if (y > kMaxWindowHeight + kOffscreenMargin || y + op.h < -kOffscreenMargin) continue;
             switch (op.kind) {
@@ -788,6 +794,7 @@ private:
             if (on_fonts_) on_fonts_(page_, web::wantedWebFonts(*page.doc, styles));
         }
         layout_ = web::layoutPage(*page.doc, styles, measurer_, &images_, width, height, &page_->forms);
+        ++layout_gen_;
         std::vector<std::string> wanted;
         for (const std::string& src : layout_.images_wanted) {
             std::string url = web::resolveUrl(page.base, src);
@@ -892,7 +899,11 @@ private:
         return kept.raster.empty() ? nullptr : &kept;
     }
 
-    static void drawRaster(fbx::xrender::DisplayList& dl, const CachedRaster& r, float x, float y, float w, float h) {
+    void drawRaster(fbx::xrender::DisplayList& dl, const CachedRaster& r, float x, float y, float w, float h) {
+        if (group_) {
+            groupRaster(r.raster, x, y, w, h);
+            return;
+        }
         fbx::shared::ImageData d{};
         d.x_ = x;
         d.y_ = y;
@@ -1002,6 +1013,14 @@ private:
             if (r) drawRaster(dl, *r, x, y, op.w, op.h);
             return;
         }
+        if (group_) {
+            web::Raster r;
+            r.width = loaded->width;
+            r.height = loaded->height;
+            r.rgba = loaded->pixels;
+            groupRaster(r, x, y, op.w, op.h);
+            return;
+        }
         fbx::shared::ImageData d{};
         d.x_ = x;
         d.y_ = y;
@@ -1017,6 +1036,97 @@ private:
         d.uv_y1_ = 1;
         dl.addCommand(fbx::shared::CommandType::DrawImage, {reinterpret_cast<const uint8_t*>(&d), sizeof(d)});
     }
+
+    // ── Transforms ──
+    // The compositor draws rectangles, text and images upright. What a rotation, scale or
+    // skew holds, when it's no text, is drawn here on the CPU through the matrix, once,
+    // and handed over as one image; with text in it, it's drawn untransformed.
+
+    // Into the group being drawn: a raster shown at (x, y, w, h) on screen.
+    void groupRaster(const web::Raster& r, float x, float y, float w, float h) {
+        if (r.empty()) return;
+        const web::Matrix place = web::Matrix::translate(x, y).after(web::Matrix::scaling(w / static_cast<float>(r.width), h / static_cast<float>(r.height)));
+        group_->drawRaster(r, group_m_.after(place));
+    }
+
+    // The TransformEnd that closes the TransformBegin at `begin` (the list's end if none).
+    [[nodiscard]] size_t transformEnd(size_t begin) const {
+        int depth = 0;
+        for (size_t k = begin; k < layout_.ops.size(); ++k) {
+            if (layout_.ops[k].kind == web::PaintKind::TransformBegin) ++depth;
+            else if (layout_.ops[k].kind == web::PaintKind::TransformEnd && --depth == 0) return k;
+        }
+        return layout_.ops.size();
+    }
+
+    // Each drawing op from `begin` to `end` with the matrix in force (page coordinates).
+    template <typename F>
+    void eachTransformed(size_t begin, size_t end, F&& f) const {
+        std::vector<web::Matrix> stack;
+        for (size_t k = begin; k < end && k < layout_.ops.size(); ++k) {
+            const web::PaintOp& op = layout_.ops[k];
+            if (op.kind == web::PaintKind::TransformBegin) stack.push_back(stack.empty() ? op.transform : stack.back().after(op.transform));
+            else if (op.kind == web::PaintKind::TransformEnd) { if (!stack.empty()) stack.pop_back(); }
+            else if (op.kind != web::PaintKind::ClipBegin && op.kind != web::PaintKind::ClipEnd && !stack.empty()) f(op, stack.back());
+        }
+    }
+
+    // Draws the group from `begin` to `end`; false if it holds text (then it isn't drawn).
+    bool drawTransformed(fbx::xrender::DisplayList& dl, size_t begin, size_t end, Offset at) {
+        bool text = false;
+        float l = INFINITY, t = INFINITY, r = -INFINITY, b = -INFINITY;
+        eachTransformed(begin, end, [&](const web::PaintOp& op, const web::Matrix& m) {
+            if (op.kind == web::PaintKind::Text) text = true;
+            for (const web::Point p : {web::Point{op.x, op.y}, web::Point{op.x + op.w, op.y}, web::Point{op.x, op.y + op.h}, web::Point{op.x + op.w, op.y + op.h}}) {
+                const web::Point q = m.apply(p);
+                l = std::min(l, q.x);
+                t = std::min(t, q.y);
+                r = std::max(r, q.x);
+                b = std::max(b, q.y);
+            }
+        });
+        if (text) return false;
+        if (!(r > l && b > t) || !std::isfinite(l) || !std::isfinite(t) || !std::isfinite(r) || !std::isfinite(b)) return true;
+        l = std::floor(l);
+        t = std::floor(t);
+        r = std::ceil(r);
+        b = std::ceil(b);
+        const float y = t + at.y_;
+        if (y > kMaxWindowHeight + kOffscreenMargin || y + (b - t) < -kOffscreenMargin) return true;
+        const auto [pw, ph] = rasterSize(r - l, b - t);
+        const std::string key = "t:" + std::to_string(layout_gen_) + ":" + std::to_string(begin) + ":" +
+                                std::to_string(page_ ? page_->images.size() : 0) + ":" + std::to_string(pw) + "x" + std::to_string(ph);
+        const web::Matrix to_canvas = web::Matrix::scaling(static_cast<float>(pw) / (r - l), static_cast<float>(ph) / (b - t)).after(web::Matrix::translate(-l, -t));
+        const CachedRaster* drawn = cached(key, [&, pw = pw, ph = ph] {
+            web::Canvas canvas(pw, ph);
+            group_ = &canvas;
+            eachTransformed(begin, end, [&](const web::PaintOp& op, const web::Matrix& m) {
+                const web::Matrix page_to_canvas = to_canvas.after(m);
+                if (op.kind == web::PaintKind::Rect) {
+                    canvas.fill(web::transformed(web::roundedRect(op.x, op.y, op.w, op.h, op.radius, op.radius), page_to_canvas), false, web::Paint{op.color, nullptr, 1});
+                    return;
+                }
+                // The helpers place things on screen: back to the page, then through.
+                group_m_ = page_to_canvas.after(web::Matrix::translate(-at.x_, -at.y_));
+                const float x = op.x + at.x_, oy = op.y + at.y_;
+                switch (op.kind) {
+                    case web::PaintKind::Image: image(dl, op, x, oy); break;
+                    case web::PaintKind::Gradient: gradient(dl, op, x, oy); break;
+                    case web::PaintKind::Svg: inlineSvg(dl, op, x, oy); break;
+                    case web::PaintKind::Box: boxPaint(dl, op, x, oy); break;
+                    default: break;
+                }
+            });
+            group_ = nullptr;
+            return canvas.toRaster();
+        });
+        if (drawn) drawRaster(dl, *drawn, l + at.x_, t + at.y_, r - l, b - t);
+        return true;
+    }
+
+    web::Canvas* group_ = nullptr;   // a transformed group being drawn into
+    web::Matrix group_m_;            // screen coordinates to its canvas
+    uint64_t layout_gen_ = 0;
 
     std::shared_ptr<Page> page_;
     std::function<void(const std::shared_ptr<Page>&, std::vector<web::WebFontFace>)> on_fonts_;

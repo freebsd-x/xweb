@@ -87,7 +87,7 @@ int main(int argc, char** argv) {
 
     // XWEB_PAINT_OPS=1 lists what's painted besides text, for finding what drew what.
     if (std::getenv("XWEB_PAINT_OPS")) {
-        static const char* kNames[] = {"rect", "text", "image", "clip", "unclip", "gradient", "svg", "box"};
+        static const char* kNames[] = {"rect", "text", "image", "clip", "unclip", "gradient", "svg", "box", "transform", "untransform"};
         for (const PaintOp& op : page.ops)
             if (op.kind != PaintKind::Text)
                 std::fprintf(stderr, "%s %.1f %.1f %.1f %.1f %s%s\n", kNames[static_cast<int>(op.kind)], op.x, op.y, op.w, op.h, op.text.substr(0, 60).c_str(), op.tint ? " (tint)" : "");
@@ -98,6 +98,7 @@ int main(int argc, char** argv) {
     const auto applyClip = [&] {
         float l = 0, t = 0, r = static_cast<float>(w), b = static_cast<float>(h);
         for (const PaintOp& c : clips) {
+            if (c.w < 0) continue;   // begun inside a transform: a rectangle can't follow it
             l = std::max(l, c.x);
             t = std::max(t, c.y);
             r = std::min(r, c.x + c.w);
@@ -105,7 +106,25 @@ int main(int argc, char** argv) {
         }
         canvas.setClip(l, t, std::max(0.0f, r - l), std::max(0.0f, b - t));
     };
+    // Transforms in force: what's drawn goes through the innermost.
+    std::vector<Matrix> transforms;
+    const auto draw = [&](const Raster& r, float x, float y, float rw, float rh, float opacity = 1, const Color* tint = nullptr) {
+        if (transforms.empty()) {
+            canvas.drawRaster(r, x, y, rw, rh, opacity, tint);
+            return;
+        }
+        const Matrix place = Matrix::translate(x, y).after(Matrix::scaling(rw / static_cast<float>(std::max(1u, r.width)), rh / static_cast<float>(std::max(1u, r.height))));
+        canvas.drawRaster(r, transforms.back().after(place), opacity, tint);
+    };
     for (const PaintOp& raw : page.ops) {
+        if (raw.kind == PaintKind::TransformBegin) {
+            transforms.push_back(transforms.empty() ? raw.transform : transforms.back().after(raw.transform));
+            continue;
+        }
+        if (raw.kind == PaintKind::TransformEnd) {
+            if (!transforms.empty()) transforms.pop_back();
+            continue;
+        }
         // The compositor fills a quad's pixels whose centres are inside it, so square
         // edges land on whole pixels; as Chromium snaps them too.
         PaintOp op = raw;
@@ -118,16 +137,24 @@ int main(int argc, char** argv) {
             if (op.w <= 0 || op.h <= 0) continue;
         }
         switch (op.kind) {
-            case PaintKind::ClipBegin: clips.push_back(op); applyClip(); break;
+            case PaintKind::ClipBegin:
+                clips.push_back(op);
+                if (!transforms.empty()) clips.back().w = -1;
+                applyClip();
+                break;
             case PaintKind::ClipEnd: if (!clips.empty()) clips.pop_back(); applyClip(); break;
-            case PaintKind::Rect: canvas.fillRect(op.x, op.y, op.w, op.h, op.color, op.radius); break;
+            case PaintKind::Rect:
+                if (transforms.empty()) canvas.fillRect(op.x, op.y, op.w, op.h, op.color, op.radius);
+                else canvas.fill(transformed(roundedRect(op.x, op.y, op.w, op.h, op.radius, op.radius), transforms.back()), false, Paint{op.color, nullptr, 1});
+                break;
             case PaintKind::Text: break;
+            case PaintKind::TransformBegin: case PaintKind::TransformEnd: break;
             case PaintKind::Gradient: {
                 if (!op.gradient) break;
                 const auto pw = static_cast<uint32_t>(std::clamp(std::ceil(op.w), 1.0f, 2048.0f));
                 const auto ph = static_cast<uint32_t>(std::clamp(std::ceil(op.h), 1.0f, 2048.0f));
                 const Raster r = renderGradient(*op.gradient, op.w, op.h, pw, ph);
-                canvas.drawRaster(r, op.x, op.y, op.w, op.h, op.color.a / 255.0f);
+                draw(r, op.x, op.y, op.w, op.h, op.color.a / 255.0f);
                 break;
             }
             case PaintKind::Box: {
@@ -141,7 +168,7 @@ int main(int argc, char** argv) {
                 const auto pw = static_cast<uint32_t>(std::clamp(std::ceil(raw.w + raw.x - x0), 1.0f, 4096.0f));
                 const auto ph = static_cast<uint32_t>(std::clamp(std::ceil(raw.h + raw.y - y0), 1.0f, 4096.0f));
                 const Raster r = renderBoxPaint(box, static_cast<float>(pw), static_cast<float>(ph), pw, ph);
-                canvas.drawRaster(r, x0, y0, static_cast<float>(pw), static_cast<float>(ph));
+                draw(r, x0, y0, static_cast<float>(pw), static_cast<float>(ph));
                 break;
             }
             case PaintKind::Svg: {
@@ -149,7 +176,7 @@ int main(int argc, char** argv) {
                 const auto pw = static_cast<uint32_t>(std::clamp(std::lround(op.w), 1L, 4096L));
                 const auto ph = static_cast<uint32_t>(std::clamp(std::lround(op.h), 1L, 4096L));
                 const Raster r = renderSvg(*op.node, pw, ph, &styles, op.color);
-                canvas.drawRaster(r, op.x, op.y, op.w, op.h);
+                draw(r, op.x, op.y, op.w, op.h);
                 break;
             }
             case PaintKind::Image: {
@@ -163,7 +190,7 @@ int main(int argc, char** argv) {
                     svg_raster = l->svg->render(pw, ph);
                     r = &svg_raster;
                 }
-                canvas.drawRaster(*r, op.x, op.y, op.w, op.h, op.tint ? 1.0f : op.color.a / 255.0f, op.tint ? &op.color : nullptr);
+                draw(*r, op.x, op.y, op.w, op.h, op.tint ? 1.0f : op.color.a / 255.0f, op.tint ? &op.color : nullptr);
                 break;
             }
         }

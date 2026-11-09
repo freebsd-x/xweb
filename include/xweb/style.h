@@ -221,13 +221,24 @@ struct ComputedStyle {
     Color border_color[4];
     enum class WidthKeyword { None, MinContent, MaxContent, FitContent } width_keyword = WidthKeyword::None;   // width is auto then
     Length width = Length::autoLength(), height = Length::autoLength();
-    Length min_width, min_height;
+    // auto (the initial value) resolves to 0, but a flex item's is its content.
+    Length min_width = Length::autoLength(), min_height = Length::autoLength();
     Length max_width = Length::autoLength(), max_height = Length::autoLength();
     int z_index = 0;
     // How far transform's translate functions, and the translate property, move it as
-    // painted; percentages are of its own border box. Other transform functions aren't drawn.
+    // painted; percentages are of its own border box.
     Length transform_shift[2];
     Length translate_shift[2];
+    // The rest of transform (rotate, scale, skew, matrix) as a 2x2 matrix a b c d, as SVG
+    // orders them; and the rotate and scale properties. About transform-origin.
+    float transform_linear[4] = {1, 0, 0, 1};
+    float rotate_deg = 0;
+    float scale_prop[2] = {1, 1};
+    Length transform_origin[2] = {Length{false, 0, 50}, Length{false, 0, 50}};
+    [[nodiscard]] bool linearlyTransformed() const noexcept {
+        return transform_linear[0] != 1 || transform_linear[1] != 0 || transform_linear[2] != 0 || transform_linear[3] != 1 ||
+               rotate_deg != 0 || scale_prop[0] != 1 || scale_prop[1] != 1;
+    }
     bool ua_margin_top = true, ua_margin_bottom = true;   // not set by the page
     bool native_look = true;   // a form control the page hasn't given a border, background or appearance: drawn as Chromium's
     Float float_side = Float::None;

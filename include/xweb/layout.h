@@ -48,6 +48,9 @@ enum class PaintKind {
     Gradient,   // `gradient` filling the rectangle
     Svg,        // the inline <svg> `node`, drawn into the rectangle; currentColor is `color`
     Box,        // `box` (uneven corners, fancy borders, a shadow) drawn into the rectangle
+    // What's painted until the matching TransformEnd goes through `transform` (page
+    // coordinates to page coordinates): rotated, scaled or skewed.
+    TransformBegin, TransformEnd,
 };
 
 struct PaintOp {
@@ -61,6 +64,7 @@ struct PaintOp {
     std::shared_ptr<const Gradient> gradient;
     const Node* node = nullptr;
     std::shared_ptr<const BoxPaint> box;
+    Matrix transform;      // TransformBegin
 };
 
 struct LinkArea {

@@ -1586,8 +1586,8 @@ private:
                 it.base = k.height;
             }
             it.base = std::max(0.0f, it.base);
-            // Automatic minimum: an item doesn't shrink below its content.
-            if (min_size.px > 0 || min_size.hasPercent()) {
+            // Automatic minimum: an item doesn't shrink below its content, unless it says how far.
+            if (!min_size.is_auto) {
                 it.min_main = std::max(0.0f, min_size.resolve(base_for_percent) - box_extra);
             } else if (row && !ks.overflow_clip) {
                 it.min_main = minContentWidth(k);
@@ -3753,13 +3753,15 @@ private:
             if (f.atomic) {
                 float ax = cx + f.atomic->x, ay = cy + f.atomic->y;
                 shift(*f.atomic, ax, ay);
+                // (A picture in a wrapper of its own was transformed with the wrapper.)
+                const bool transformed = f.atomic->node != b.node && beginTransform(*f.atomic, ax, ay);
                 if (f.atomic->node != b.node) {
                     record(*f.atomic, ax, ay);
                 } else if (b.node && b.node->isElement()) {
                     // A picture standing in a block of its own: the block holds its padding
                     // and borders, the picture its size.
-                    out_->boxes.push_back({b.node, ax - b.padding[Left] - b.border[Left], ay - b.padding[Top] - b.border[Top],
-                                           f.atomic->outerWidth() + b.frameWidth(), f.atomic->outerHeight() + b.frameHeight()});
+                    recordRect(b.node, ax - b.padding[Left] - b.border[Left], ay - b.padding[Top] - b.border[Top],
+                               f.atomic->outerWidth() + b.frameWidth(), f.atomic->outerHeight() + b.frameHeight());
                 }
                 if (f.link) out_->links.push_back({ax, ay, f.atomic->outerWidth(), f.atomic->outerHeight(), *f.link});
                 if (f.atomic->kind == BoxKind::Replaced) {
@@ -3767,6 +3769,7 @@ private:
                 } else {
                     paintContents(*f.atomic, ax, ay, cb, opacity);
                 }
+                if (transformed) endTransform();
                 continue;
             }
             const ComputedStyle& s = *f.style;
@@ -3793,7 +3796,25 @@ private:
     }
 
     void record(const Box& b, float x, float y) {
-        if (b.node && b.node->isElement()) out_->boxes.push_back({b.node, x, y, b.outerWidth(), b.outerHeight()});
+        if (b.node && b.node->isElement()) recordRect(b.node, x, y, b.outerWidth(), b.outerHeight());
+    }
+
+    // As getBoundingClientRect has it: through the transforms it's inside, the box around that.
+    void recordRect(const Node* node, float x, float y, float w, float h) {
+        if (transforms_.empty()) {
+            out_->boxes.push_back({node, x, y, w, h});
+            return;
+        }
+        const Matrix& m = transforms_.back();
+        float l = INFINITY, t = INFINITY, r = -INFINITY, bt = -INFINITY;
+        for (const Point p : {Point{x, y}, Point{x + w, y}, Point{x, y + h}, Point{x + w, y + h}}) {
+            const Point q = m.apply(p);
+            l = std::min(l, q.x);
+            t = std::min(t, q.y);
+            r = std::max(r, q.x);
+            bt = std::max(bt, q.y);
+        }
+        out_->boxes.push_back({node, l, t, r - l, bt - t});
     }
 
     void paintMarker(const Box& b, float cx, float cy, float opacity) {
@@ -3912,8 +3933,40 @@ private:
             else if (!s.offset[Bottom].is_auto) y -= s.offset[Bottom].resolve(cb.h);
         }
         shift(b, x, y);
+        const bool transformed = beginTransform(b, x, y);
         record(b, x, y);
         paintContents(b, x, y, cb, opacity);
+        if (transformed) endTransform();
+    }
+
+    // rotate, scale, then transform's own rotations, scales and skews, about the origin.
+    bool beginTransform(const Box& b, float x, float y) {
+        const ComputedStyle& s = *b.style;
+        if (!s.linearlyTransformed()) return false;
+        const float w = b.outerWidth(), h = b.outerHeight();
+        const float ox = x + s.transform_origin[0].resolve(w), oy = y + s.transform_origin[1].resolve(h);
+        const double r = s.rotate_deg * M_PI / 180.0;
+        const Matrix rotate{static_cast<float>(std::cos(r)), static_cast<float>(std::sin(r)), static_cast<float>(-std::sin(r)), static_cast<float>(std::cos(r)), 0, 0};
+        const Matrix scale = Matrix::scaling(s.scale_prop[0], s.scale_prop[1]);
+        const Matrix own{s.transform_linear[0], s.transform_linear[1], s.transform_linear[2], s.transform_linear[3], 0, 0};
+        const Matrix m = Matrix::translate(ox, oy).after(rotate.after(scale.after(own))).after(Matrix::translate(-ox, -oy));
+        PaintOp op;
+        op.kind = PaintKind::TransformBegin;
+        op.x = x;
+        op.y = y;
+        op.w = w;
+        op.h = h;
+        op.transform = m;
+        out_->ops.push_back(std::move(op));
+        transforms_.push_back(transforms_.empty() ? m : transforms_.back().after(m));
+        return true;
+    }
+
+    void endTransform() {
+        if (!transforms_.empty()) transforms_.pop_back();
+        PaintOp op;
+        op.kind = PaintKind::TransformEnd;
+        out_->ops.push_back(std::move(op));
     }
 
     void flushPositioned() {
@@ -3936,6 +3989,7 @@ private:
                 if (!s.offset[Top].is_auto) y = cb.y + s.offset[Top].resolve(cb.h) + k.margin[Top];
                 else if (!s.offset[Bottom].is_auto) y = cb.y + cb.h - s.offset[Bottom].resolve(cb.h) - k.outerHeight() - k.margin[Bottom];
                 shift(k, x, y);
+                const bool transformed = beginTransform(k, x, y);
                 record(k, x, y);
                 // Inside the clips it was inside, as far as its containing block.
                 for (const Rect& c : p.clips) {
@@ -3959,6 +4013,7 @@ private:
                     op.kind = PaintKind::ClipEnd;
                     out_->ops.push_back(std::move(op));
                 }
+                if (transformed) endTransform();
             }
         }
     }
@@ -3993,6 +4048,7 @@ private:
     float max_bottom_ = 0;
     std::vector<Positioned> positioned_;
     std::vector<Rect> clip_stack_;   // overflow clips around what's being painted
+    std::vector<Matrix> transforms_; // the transforms around what's being painted, composed
     size_t cb_clip_depth_ = 0;       // how many of them are outside the containing block
 
     // An absolutely positioned box is clipped by overflow inside its containing block, not

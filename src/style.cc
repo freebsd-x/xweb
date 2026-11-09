@@ -422,11 +422,31 @@ void skipWs(const Tokens& v, size_t& i) {
 
 // A transform's translations, summed: translate(), translateX/Y/3d() and an identity-scaled
 // matrix(); anything else in the list is left undrawn. False if the value isn't a list of functions.
-bool transformShift(const Tokens& v, size_t i, const LengthContext& c, Length out[2]) {
+// An angle in degrees: deg, rad, grad, turn, or a bare 0.
+bool angleDegrees(const Token& t, float& out) {
+    if (t.type == TokenType::Number && t.number == 0) { out = 0; return true; }
+    if (t.type != TokenType::Dimension) return false;
+    const std::string u = lower(t.text);
+    const double n = t.number;
+    if (u == "deg") out = static_cast<float>(n);
+    else if (u == "rad") out = static_cast<float>(n * 180.0 / M_PI);
+    else if (u == "grad") out = static_cast<float>(n * 0.9);
+    else if (u == "turn") out = static_cast<float>(n * 360.0);
+    else return false;
+    return std::isfinite(out);
+}
+
+bool transformShift(const Tokens& v, size_t i, const LengthContext& c, Length out[2], float linear[4]) {
     Length x, y;
+    float m[4] = {1, 0, 0, 1};
     bool any = false;
     skipWs(v, i);
-    if (i < v.size() && v[i].type == TokenType::Ident && lower(v[i].text) == "none") { out[0] = out[1] = Length{}; return true; }
+    if (i < v.size() && v[i].type == TokenType::Ident && lower(v[i].text) == "none") {
+        out[0] = out[1] = Length{};
+        linear[0] = linear[3] = 1;
+        linear[1] = linear[2] = 0;
+        return true;
+    }
     while (i < v.size()) {
         if (v[i].type == TokenType::Whitespace) { ++i; continue; }
         if (v[i].type != TokenType::Function) return false;
@@ -434,9 +454,12 @@ bool transformShift(const Tokens& v, size_t i, const LengthContext& c, Length ou
         ++i;
         std::vector<Length> args;
         std::vector<double> numbers;
+        std::vector<float> angles;
         while (i < v.size() && v[i].type != TokenType::RightParen) {
             if (v[i].type == TokenType::Whitespace || v[i].type == TokenType::Comma) { ++i; continue; }
             if (v[i].type == TokenType::Number) numbers.push_back(v[i].number);
+            if (v[i].type == TokenType::Percentage) numbers.push_back(v[i].number / 100);   // scale(150%)
+            if (float deg = 0; angleDegrees(v[i], deg)) angles.push_back(deg);
             Length l;
             const size_t before = i;
             if (lengthAt(v, i, c, l, false)) { args.push_back(l); continue; }
@@ -460,14 +483,42 @@ bool transformShift(const Tokens& v, size_t i, const LengthContext& c, Length ou
             if (!args.empty()) add(x, args[0]);
         } else if (name == "translatey") {
             if (!args.empty()) add(y, args[0]);
-        } else if (name == "matrix" && numbers.size() == 6 && numbers[0] == 1 && numbers[1] == 0 && numbers[2] == 0 && numbers[3] == 1) {
-            x.px += static_cast<float>(numbers[4]);
-            y.px += static_cast<float>(numbers[5]);
+        } else {
+            // The linear part, applied after what came before it in the list.
+            float f[4] = {1, 0, 0, 1};
+            const auto num = [&](size_t k, double fallback) { return static_cast<float>(k < numbers.size() ? numbers[k] : fallback); };
+            if ((name == "rotate" || name == "rotatez") && !angles.empty()) {
+                const double r = angles[0] * M_PI / 180.0;
+                f[0] = static_cast<float>(std::cos(r));
+                f[1] = static_cast<float>(std::sin(r));
+                f[2] = -f[1];
+                f[3] = f[0];
+            } else if (name == "scale" || name == "scale3d") {
+                f[0] = num(0, 1);
+                f[3] = num(1, f[0]);
+            } else if (name == "scalex") {
+                f[0] = num(0, 1);
+            } else if (name == "scaley") {
+                f[3] = num(0, 1);
+            } else if ((name == "skew" || name == "skewx") && !angles.empty()) {
+                f[2] = static_cast<float>(std::tan(angles[0] * M_PI / 180.0));
+                if (name == "skew" && angles.size() > 1) f[1] = static_cast<float>(std::tan(angles[1] * M_PI / 180.0));
+            } else if (name == "skewy" && !angles.empty()) {
+                f[1] = static_cast<float>(std::tan(angles[0] * M_PI / 180.0));
+            } else if (name == "matrix" && numbers.size() == 6) {
+                for (int k = 0; k < 4; ++k) f[k] = static_cast<float>(numbers[static_cast<size_t>(k)]);
+                x.px += static_cast<float>(numbers[4]);
+                y.px += static_cast<float>(numbers[5]);
+            }
+            if (!std::all_of(std::begin(f), std::end(f), [](float k) { return std::isfinite(k); })) return false;
+            const float r[4] = {m[0] * f[0] + m[2] * f[1], m[1] * f[0] + m[3] * f[1], m[0] * f[2] + m[2] * f[3], m[1] * f[2] + m[3] * f[3]};
+            std::copy(std::begin(r), std::end(r), m);
         }
     }
     if (!any) return false;
     out[0] = x;
     out[1] = y;
+    std::copy(std::begin(m), std::end(m), linear);
     return true;
 }
 
@@ -2744,7 +2795,14 @@ private:
         else if (p == "box-sizing") to.border_box = from.border_box;
         else if (p == "box-shadow") to.box_shadow = from.box_shadow;
         else if (p == "z-index") to.z_index = from.z_index;
-        else if (p == "transform") { to.transform_shift[0] = from.transform_shift[0]; to.transform_shift[1] = from.transform_shift[1]; }
+        else if (p == "transform") {
+            to.transform_shift[0] = from.transform_shift[0];
+            to.transform_shift[1] = from.transform_shift[1];
+            std::copy(std::begin(from.transform_linear), std::end(from.transform_linear), to.transform_linear);
+        }
+        else if (p == "rotate") to.rotate_deg = from.rotate_deg;
+        else if (p == "scale") { to.scale_prop[0] = from.scale_prop[0]; to.scale_prop[1] = from.scale_prop[1]; }
+        else if (p == "transform-origin") { to.transform_origin[0] = from.transform_origin[0]; to.transform_origin[1] = from.transform_origin[1]; }
         else if (p == "translate") { to.translate_shift[0] = from.translate_shift[0]; to.translate_shift[1] = from.translate_shift[1]; }
         else if (p.ends_with("radius")) {
             for (int i = 0; i < 4; ++i)
@@ -3035,7 +3093,58 @@ private:
         if (p == "right") { oneLength(s.offset[Right], true); return; }
         if (p == "bottom") { oneLength(s.offset[Bottom], true); return; }
         if (p == "left") { oneLength(s.offset[Left], true); return; }
-        if (p == "transform") { (void)transformShift(v, i, c, s.transform_shift); return; }
+        if (p == "transform") { (void)transformShift(v, i, c, s.transform_shift, s.transform_linear); return; }
+        if (p == "rotate") {
+            size_t k = i;
+            skipWs(v, k);
+            float deg = 0;
+            if (k < v.size() && v[k].type == TokenType::Ident && lower(v[k].text) == "none") s.rotate_deg = 0;
+            else if (k < v.size() && angleDegrees(v[k], deg)) s.rotate_deg = deg;
+            return;
+        }
+        if (p == "scale") {
+            size_t k = i;
+            skipWs(v, k);
+            if (k < v.size() && v[k].type == TokenType::Ident && lower(v[k].text) == "none") { s.scale_prop[0] = s.scale_prop[1] = 1; return; }
+            float got[2];
+            int n = 0;
+            for (; k < v.size() && n < 2; ++k) {
+                if (v[k].type == TokenType::Number) got[n++] = static_cast<float>(v[k].number);
+                else if (v[k].type == TokenType::Percentage) got[n++] = static_cast<float>(v[k].number / 100);
+                else if (v[k].type != TokenType::Whitespace) return;
+            }
+            if (n == 0) return;
+            s.scale_prop[0] = got[0];
+            s.scale_prop[1] = n > 1 ? got[1] : got[0];
+            return;
+        }
+        if (p == "transform-origin") {
+            // One or two of: a length, a percentage, or a keyword.
+            Length o[2] = {Length{false, 0, 50}, Length{false, 0, 50}};
+            int axis = 0;
+            for (size_t start : valueStarts(v)) {
+                if (axis > 1) break;
+                const Token& t = v[start];
+                if (t.type == TokenType::Ident) {
+                    const std::string k = lower(t.text);
+                    if (k == "left") o[0] = Length{false, 0, 0};
+                    else if (k == "right") o[0] = Length{false, 0, 100};
+                    else if (k == "top") o[1] = Length{false, 0, 0};
+                    else if (k == "bottom") o[1] = Length{false, 0, 100};
+                    else if (k != "center") return;
+                    if (k == "top" || k == "bottom") axis = 2;
+                    else ++axis;
+                    continue;
+                }
+                size_t k = start;
+                Length l;
+                if (!lengthAt(v, k, c, l, false)) return;
+                o[axis++] = l;
+            }
+            s.transform_origin[0] = o[0];
+            s.transform_origin[1] = o[1];
+            return;
+        }
         if (p == "translate") {
             size_t k = i;
             skipWs(v, k);
@@ -3134,8 +3243,8 @@ private:
             return;
         }
         if (p == "height") { oneLength(s.height, true); noNegative(s.height); return; }
-        if (p == "min-width") { oneLength(s.min_width, true); if (s.min_width.is_auto) s.min_width = Length{}; noNegative(s.min_width); return; }
-        if (p == "min-height") { oneLength(s.min_height, true); if (s.min_height.is_auto) s.min_height = Length{}; noNegative(s.min_height); return; }
+        if (p == "min-width") { oneLength(s.min_width, true); noNegative(s.min_width); return; }
+        if (p == "min-height") { oneLength(s.min_height, true); noNegative(s.min_height); return; }
         if (p == "max-width") { if (kw == "none") s.max_width = Length::autoLength(); else { oneLength(s.max_width, false); noNegative(s.max_width); } return; }
         if (p == "max-height") { if (kw == "none") s.max_height = Length::autoLength(); else { oneLength(s.max_height, false); noNegative(s.max_height); } return; }
         if (p == "border") { setBorder(s, v, {Top, Right, Bottom, Left}); return; }

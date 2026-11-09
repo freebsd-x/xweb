@@ -517,3 +517,24 @@ TEST(Fuzz, HostileBoxes) {
     run("<div style='width:20px;height:20px;" + many + "0 0 red'></div>");
     run("<div style='width:20px;height:20px;border-style:groove ridge inset outset;border-width:1e-9px 7px 3px nanpx;border-radius:-5px'></div>");
 }
+
+TEST(Raster, DrawsAnImageThroughAMatrix) {
+    // A 4x2 image, left half red and right half blue, turned a quarter about its corner.
+    Raster img;
+    img.width = 4;
+    img.height = 2;
+    for (uint32_t y = 0; y < 2; ++y)
+        for (uint32_t x = 0; x < 4; ++x) {
+            const bool left = x < 2;
+            img.rgba.insert(img.rgba.end(), {static_cast<uint8_t>(left ? 255 : 0), 0, static_cast<uint8_t>(left ? 0 : 255), 255});
+        }
+    Canvas c(10, 10);
+    const Matrix quarter{0, 1, -1, 0, 0, 0};   // (x, y) -> (-y, x)
+    c.drawRaster(img, Matrix::translate(5, 2).after(quarter), 1);
+    const Raster r = c.toRaster();
+    // The image now runs down from (3..5, 2) to (3..5, 6): red on top, blue below.
+    EXPECT_GT(at(r, 4, 2).r, 200);
+    EXPECT_GT(at(r, 4, 5).b, 200);
+    EXPECT_EQ(at(r, 6, 3).a, 0);
+    EXPECT_EQ(at(r, 4, 7).a, 0);
+}
