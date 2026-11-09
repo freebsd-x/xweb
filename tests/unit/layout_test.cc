@@ -468,3 +468,54 @@ TEST(Forms, ButtonsAreBorderBox) {
     EXPECT_FLOAT_EQ(r.box("b").h, 30);
     EXPECT_FLOAT_EQ(r.box("i").w, 80);
 }
+
+TEST(Paint, TranslateMovesTheBoxAsPainted) {
+    const auto r = layout(
+        "<style>body{margin:0}</style>"
+        "<div id=a style='width:100px;height:40px;transform:translate(10px,-50%)'></div>"
+        "<div id=b style='width:50px;height:20px;transform:translateY(calc(5px + 10%)) rotate(3deg) translateX(-100%)'></div>"
+        "<div id=c style='width:50px;height:20px;translate:4px 6px'></div>"
+        "<div style='position:relative'><span id=d style='position:absolute;left:0;top:0;width:8px;height:8px;"
+        "transform:matrix(1,0,0,1,3,7)'></span></div>");
+    EXPECT_FLOAT_EQ(r.box("a").x, 10);
+    EXPECT_FLOAT_EQ(r.box("a").y, -20);
+    EXPECT_FLOAT_EQ(r.box("b").x, -50);
+    EXPECT_FLOAT_EQ(r.box("b").y, 40 + 7);
+    EXPECT_FLOAT_EQ(r.box("c").x, 4);
+    EXPECT_FLOAT_EQ(r.box("c").y, 60 + 6);
+    EXPECT_FLOAT_EQ(r.box("d").x, 3);
+    EXPECT_FLOAT_EQ(r.box("d").y, 80 + 7);
+}
+
+TEST(Forms, BorderBoxInputsInFlexAndGridKeepTheirWidth) {
+    const auto r = layout(
+        "<style>*{box-sizing:border-box}body{margin:0;width:216px}input{width:100%;padding:5px 20px;border:1px solid}</style>"
+        "<div style='display:grid;grid-template-columns:20px 1fr'><input id=g style='grid-column:1/-1'></div>"
+        "<div style='display:flex'><input id=f></div>");
+    EXPECT_FLOAT_EQ(r.box("g").x, 0);
+    EXPECT_FLOAT_EQ(r.box("g").w, 216);
+    EXPECT_FLOAT_EQ(r.box("f").w, 216);
+}
+
+TEST(Inline, DetailsShowsOnlyItsSummaryUntilOpen) {
+    const auto closed = layout("<details><summary>Sum</summary><p>Body</p></details>");
+    EXPECT_EQ(closed.texts(), (std::vector<std::string>{"\xE2\x96\xB8 Sum"}));
+    const auto open = layout("<details open><summary>Sum</summary><p>Body</p></details>");
+    EXPECT_EQ(open.texts(), (std::vector<std::string>{"\xE2\x96\xBE Sum", "Body"}));
+    // A summary laid out as something else has no marker.
+    const auto flex = layout("<details><summary style=display:flex>Sum</summary>x</details>");
+    EXPECT_EQ(flex.texts(), (std::vector<std::string>{"Sum"}));
+}
+
+TEST(ShadowDom, PartRulesReachExposedElements) {
+    const auto r = layout(R"(<style>x-b { display: block } .login::part(label) { width: 0; height: 0; overflow: hidden }
+                                 x-b::part(icon box) { height: 9px } x-b::part(nope) { height: 50px }</style>
+        <x-b id=host class=login><template shadowrootmode=open>
+          <style>div { width: 40px; height: 4px }</style>
+          <div id=label part=label>Log in</div><div id=icon part="box icon"></div><div id=plain></div></template></x-b>)");
+    // The outer tree's ::part() rule beats the shadow tree's own.
+    EXPECT_FLOAT_EQ(r.box("label").w, 0);
+    EXPECT_FLOAT_EQ(r.box("label").h, 0);
+    EXPECT_FLOAT_EQ(r.box("icon").h, 9);
+    EXPECT_FLOAT_EQ(r.box("plain").h, 4);
+}

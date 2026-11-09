@@ -44,6 +44,22 @@ const Node* Node::containingShadowRoot() const noexcept {
     return n->type == NodeType::Fragment && n->shadow_host ? n : nullptr;
 }
 
+Node* detailsToggledBy(Node* target) noexcept {
+    for (Node* n = target; n; n = n->parent ? n->parent : n->shadow_host) {
+        if (n->type != NodeType::Element) continue;
+        if ((n->isHtml("a") && n->attr("href")) || n->isHtml("button") || n->isHtml("input") || n->isHtml("select") ||
+            n->isHtml("textarea") || n->isHtml("label"))
+            return nullptr;
+        if (!n->isHtml("summary")) continue;
+        Node* details = n->parent;
+        if (!details || !details->isHtml("details")) return nullptr;
+        for (Node* c : details->children)
+            if (c->isHtml("summary")) return c == n ? details : nullptr;
+        return nullptr;
+    }
+    return nullptr;
+}
+
 namespace {
 
 std::string slotName(const Node* n) {

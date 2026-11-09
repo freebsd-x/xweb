@@ -398,3 +398,15 @@ TEST(Script, CrossOriginRequestsFollowCors) {
     EXPECT_TRUE(sent("GET https://api.other.test/open   [Origin=https://example.org;Referer=https://example.org/;] cookies=yes"));   // credentials: include
     EXPECT_TRUE(sent("GET https://example.org/dir/data.json   [Referer=https://example.org/dir/page.html;] cookies=yes"));
 }
+
+TEST(Script, DetailsToggleTellsThePage) {
+    Page p(R"(<body><details id=d><summary>s</summary>x</details><script>
+        const d = document.getElementById('d');
+        d.addEventListener('toggle', () => console.log('toggle', d.open));
+        </script>)");
+    p.script->toggle(p.byId("d"));
+    EXPECT_TRUE(p.byId("d")->attr("open"));
+    p.script->toggle(p.byId("d"));
+    EXPECT_FALSE(p.byId("d")->attr("open"));
+    EXPECT_EQ(p.console, "log:toggle true\nlog:toggle false\n");
+}

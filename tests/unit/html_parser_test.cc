@@ -43,3 +43,22 @@ TEST(HtmlParser, EndOfInputInsideATagDropsIt) {
     const auto doc = parseHtml("<p>x<div class=");
     EXPECT_EQ(serializeChildren(*doc->body()), "<p>x</p>");
 }
+
+TEST(HtmlParser, SummaryClicksToggleTheirDetails) {
+    auto doc = parseHtml("<details id=d><summary id=s><b id=b>x</b><a id=a href=#>l</a></summary><summary id=t>2</summary><p id=p>y</p></details>");
+    const auto find = [&](const char* id) {
+        std::vector<Node*> stack{doc->root()};
+        while (!stack.empty()) {
+            Node* n = stack.back();
+            stack.pop_back();
+            if (const std::string* v = n->attr("id"); v && *v == id) return n;
+            for (Node* c : n->children) stack.push_back(c);
+        }
+        return static_cast<Node*>(nullptr);
+    };
+    EXPECT_EQ(detailsToggledBy(find("b")), find("d"));
+    EXPECT_EQ(detailsToggledBy(find("s")), find("d"));
+    EXPECT_EQ(detailsToggledBy(find("a")), nullptr);   // the link takes it
+    EXPECT_EQ(detailsToggledBy(find("t")), nullptr);   // not the first summary
+    EXPECT_EQ(detailsToggledBy(find("p")), nullptr);
+}

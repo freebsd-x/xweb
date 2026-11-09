@@ -1038,6 +1038,8 @@ private:
 // ── The browser ───────────────────────────────────────────────────────────────
 
 class Browser {
+    friend class WebPageElement;   // a click on a summary
+
 public:
     explicit Browser(std::shared_ptr<RenderWebPage> node) : node_(std::move(node)) {
         node_->onFontsWanted([this](const std::shared_ptr<Page>& page, std::vector<web::WebFontFace> faces) { loadFonts(page, std::move(faces)); });
@@ -1320,9 +1322,27 @@ private:
 
     // A click's default action, for element.click() and the like: follow a link, tick a
     // box, send a form.
+    // A click on a <details>'s summary opens or closes it.
+    bool toggleDetails(web::Node* target) {
+        Page* page = node_->page();
+        web::Node* details = page ? web::detailsToggledBy(target) : nullptr;
+        if (!details) return false;
+        if (page->script) {
+            page->script->toggle(details);
+            (void)page->script->takeDirty();
+        } else if (details->attr("open")) {
+            std::erase_if(details->attrs, [](const web::Attribute& a) { return a.name == "open"; });
+        } else {
+            details->attrs.push_back({"open", ""});
+        }
+        node_->invalidate();
+        return true;
+    }
+
     void activateNode(const web::Node* n) {
         Page* page = node_->page();
         if (!page) return;
+        if (toggleDetails(const_cast<web::Node*>(n))) return;
         for (const web::Node* a = n; a; a = a->parent)
             if (a->isHtml("a"))
                 if (const std::string* href = a->attr("href")) {
@@ -1499,6 +1519,10 @@ public:
                 return true;
             }
             pressed_control_ = nullptr;
+            if (!down && browser_ && browser_->toggleDetails(node_->nodeAt(x, y))) {
+                changed();
+                return true;
+            }
             return handleLinkClick(down, x, y);
         }
         if (!page) return false;

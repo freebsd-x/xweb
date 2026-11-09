@@ -1404,6 +1404,14 @@ void PageScript::resized(float w, float h) {
     impl_->fire(nullptr, u"resize", false, false);
 }
 
+void PageScript::toggle(Node* details) {
+    Impl& s = *impl_;
+    if (!details) return;
+    if (details->attr("open")) s.removeAttr(details, "open");
+    else s.setAttr(details, "open", "");
+    s.fire(details, u"toggle", false, false);
+}
+
 void PageScript::scrolled() { impl_->fire(nullptr, u"scroll", false, false); }
 
 void PageScript::tick() {

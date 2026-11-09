@@ -19,6 +19,8 @@ head, link, meta, script, style, title, template, area, base, basefont, datalist
 source, track, option, dialog:not([open]), [hidden] { display: none; }
 slot { display: contents; }
 li { display: list-item; }
+details > summary:first-of-type { display: list-item; list-style-type: disclosure-closed; }
+details[open] > summary:first-of-type { list-style-type: disclosure-open; }
 html { color: black; }
 body { margin: 8px; }
 address, cite, dfn, em, i, var { font-style: italic; }

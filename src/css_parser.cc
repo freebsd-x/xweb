@@ -674,6 +674,15 @@ private:
                 }
             }
             if (!parseNth(text, ss.a, ss.b)) return false;
+        } else if (ss.name == "part" && ss.kind == SimpleKind::PseudoElement) {
+            // ::part(name ...): the names, space separated.
+            for (size_t i = arg_begin; i < arg_end && i < tokens.size(); ++i) {
+                if (tokens[i].type == TokenType::Whitespace) continue;
+                if (tokens[i].type != TokenType::Ident) return false;
+                if (!ss.value.empty()) ss.value += ' ';
+                ss.value += tokens[i].text;
+            }
+            if (ss.value.empty()) return false;
         } else if (ss.name == "lang" || ss.name == "dir") {
             if (arg_begin < arg_end && arg_begin < tokens.size()) ss.value = tokens[arg_begin].text;
         } else {

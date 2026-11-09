@@ -420,6 +420,57 @@ void skipWs(const Tokens& v, size_t& i) {
     while (i < v.size() && v[i].type == TokenType::Whitespace) ++i;
 }
 
+// A transform's translations, summed: translate(), translateX/Y/3d() and an identity-scaled
+// matrix(); anything else in the list is left undrawn. False if the value isn't a list of functions.
+bool transformShift(const Tokens& v, size_t i, const LengthContext& c, Length out[2]) {
+    Length x, y;
+    bool any = false;
+    skipWs(v, i);
+    if (i < v.size() && v[i].type == TokenType::Ident && lower(v[i].text) == "none") { out[0] = out[1] = Length{}; return true; }
+    while (i < v.size()) {
+        if (v[i].type == TokenType::Whitespace) { ++i; continue; }
+        if (v[i].type != TokenType::Function) return false;
+        const std::string name = lower(v[i].text);
+        ++i;
+        std::vector<Length> args;
+        std::vector<double> numbers;
+        while (i < v.size() && v[i].type != TokenType::RightParen) {
+            if (v[i].type == TokenType::Whitespace || v[i].type == TokenType::Comma) { ++i; continue; }
+            if (v[i].type == TokenType::Number) numbers.push_back(v[i].number);
+            Length l;
+            const size_t before = i;
+            if (lengthAt(v, i, c, l, false)) { args.push_back(l); continue; }
+            i = before;
+            // Skip whatever this is (angles, nested functions).
+            int depth = 0;
+            do {
+                if (v[i].type == TokenType::Function || v[i].type == TokenType::LeftParen) ++depth;
+                else if (v[i].type == TokenType::RightParen) --depth;
+                ++i;
+            } while (i < v.size() && depth > 0);
+        }
+        if (i >= v.size()) return false;
+        ++i;   // the )
+        any = true;
+        const auto add = [](Length& into, const Length& l) { into.px += l.px; into.percent += l.percent; };
+        if (name == "translate" || name == "translate3d") {
+            if (!args.empty()) add(x, args[0]);
+            if (args.size() > 1) add(y, args[1]);
+        } else if (name == "translatex") {
+            if (!args.empty()) add(x, args[0]);
+        } else if (name == "translatey") {
+            if (!args.empty()) add(y, args[0]);
+        } else if (name == "matrix" && numbers.size() == 6 && numbers[0] == 1 && numbers[1] == 0 && numbers[2] == 0 && numbers[3] == 1) {
+            x.px += static_cast<float>(numbers[4]);
+            y.px += static_cast<float>(numbers[5]);
+        }
+    }
+    if (!any) return false;
+    out[0] = x;
+    out[1] = y;
+    return true;
+}
+
 // ── Grid values ───────────────────────────────────────────────────────────────
 
 constexpr size_t kMaxGridListTracks = 1000;   // what one template may spell out
@@ -1429,7 +1480,8 @@ bool parseColor(const Tokens& value, const Color& current, Color& out) {
 
 // ── The resolver ──────────────────────────────────────────────────────────────
 
-enum class Origin { UserAgent, Hint, Author, Inline };
+// Part: an outer tree's ::part() rules, over the shadow tree's own.
+enum class Origin { UserAgent, Hint, Author, Part, Inline };
 
 struct MatchedDecl {
     const Declaration* decl;
@@ -1462,12 +1514,23 @@ struct SlottedRule {
     size_t order;
 };
 
+// ::part(names) rule: what the host must match (the selector without ::part), and the
+// names an element in its shadow tree must all have in its part attribute.
+struct PartRule {
+    ComplexSelector host_side;
+    std::vector<std::string> names;
+    const css::Rule* rule;
+    Origin origin;
+    size_t order;
+};
+
 // The rules of one tree: the user agent's, the document's, or a shadow root's. A shadow
 // tree's rules only reach into it, and to its host through :host.
 struct Scope {
     Buckets normal, before, after;
     std::vector<IndexedSelector> host;      // rules whose subject is :host(...)
     std::deque<SlottedRule> slotted;
+    std::deque<PartRule> parts;             // aimed at shadow trees of this tree's elements
     const Node* host_el = nullptr;          // a shadow scope's host
 };
 
@@ -1543,6 +1606,20 @@ private:
                 target_->slotted.back().slotted = nullptr;
                 for (const SimpleSelector& x : last.simple)
                     if (x.kind == SimpleKind::PseudoElement && x.name == "slotted") target_->slotted.back().slotted = &x;
+                return;
+            } else if (s.name == "part") {
+                PartRule r{sel, {}, &rule, origin, ++order_};
+                std::string_view names = s.value;
+                while (!names.empty()) {
+                    const size_t sp = names.find(' ');
+                    r.names.emplace_back(names.substr(0, sp));
+                    names = sp == std::string_view::npos ? std::string_view{} : names.substr(sp + 1);
+                }
+                auto& simple = r.host_side.parts.back().simple;
+                simple.erase(std::remove_if(simple.begin(), simple.end(), [](const SimpleSelector& x) {
+                    return x.kind == SimpleKind::PseudoElement;
+                }), simple.end());
+                target_->parts.push_back(std::move(r));
                 return;
             } else {
                 return;   // ::marker, ::placeholder and so on: nothing to style yet
@@ -1951,7 +2028,13 @@ private:
     // ── Values ────────────────────────────────────────────────────────────────
 
     // Replaces var() in a value. False: the declaration is invalid at computed time.
-    bool substitute(const Tokens& in, const ComputedStyle& s, Tokens& out, int depth, size_t& budget) {
+    // Each variable's expansion within one value, null if invalid: worked out once, so
+    // fallbacks after failures can't multiply the work.
+    using VarMemo = std::unordered_map<std::string, std::optional<Tokens>>;
+
+    bool substitute(const Tokens& in, const ComputedStyle& s, Tokens& out, int depth, size_t& budget, VarMemo* memo = nullptr) {
+        VarMemo own;
+        if (!memo) memo = &own;
         if (depth > kMaxVarDepth) return false;
         for (size_t i = 0; i < in.size(); ++i) {
             if (in[i].type != TokenType::Function || in[i].text != "var") {
@@ -1977,15 +2060,29 @@ private:
             if (s.custom) {
                 const auto it = s.custom->find(name);
                 if (it != s.custom->end()) {
-                    if (!substitute(it->second, s, out, depth + 1, budget)) return false;
-                    done = true;
+                    // A variable whose own references fail is invalid: the fallback applies.
+                    // (Too deep, or a cycle, is invalid too.)
+                    auto known = memo->find(name);
+                    if (known == memo->end()) {
+                        Tokens value;
+                        const bool ok = substitute(it->second, s, value, depth + 1, budget, memo);
+                        known = memo->emplace(name, ok ? std::optional<Tokens>(std::move(value)) : std::nullopt).first;
+                    } else if (known->second) {
+                        // Used again: its tokens count again.
+                        if (known->second->size() > budget) return false;
+                        budget -= known->second->size();
+                    }
+                    if (known->second) {
+                        out.insert(out.end(), known->second->begin(), known->second->end());
+                        done = true;
+                    }
                 }
             }
             if (!done) {
                 if (comma + 1 >= j) return false;
                 const Tokens fallback(in.begin() + static_cast<std::ptrdiff_t>(comma + 1),
                                       in.begin() + static_cast<std::ptrdiff_t>(j - 1));
-                if (!substitute(fallback, s, out, depth + 1, budget)) return false;
+                if (!substitute(fallback, s, out, depth + 1, budget, memo)) return false;
             }
             i = j - 1;
         }
@@ -2647,6 +2744,8 @@ private:
         else if (p == "box-sizing") to.border_box = from.border_box;
         else if (p == "box-shadow") to.box_shadow = from.box_shadow;
         else if (p == "z-index") to.z_index = from.z_index;
+        else if (p == "transform") { to.transform_shift[0] = from.transform_shift[0]; to.transform_shift[1] = from.transform_shift[1]; }
+        else if (p == "translate") { to.translate_shift[0] = from.translate_shift[0]; to.translate_shift[1] = from.translate_shift[1]; }
         else if (p.ends_with("radius")) {
             for (int i = 0; i < 4; ++i)
                 for (int j = 0; j < 2; ++j) to.radius[i][j] = from.radius[i][j];
@@ -2936,6 +3035,19 @@ private:
         if (p == "right") { oneLength(s.offset[Right], true); return; }
         if (p == "bottom") { oneLength(s.offset[Bottom], true); return; }
         if (p == "left") { oneLength(s.offset[Left], true); return; }
+        if (p == "transform") { (void)transformShift(v, i, c, s.transform_shift); return; }
+        if (p == "translate") {
+            size_t k = i;
+            skipWs(v, k);
+            if (k < v.size() && v[k].type == TokenType::Ident && lower(v[k].text) == "none") { s.translate_shift[0] = s.translate_shift[1] = Length{}; return; }
+            Length tx, ty;
+            if (!lengthAt(v, k, c, tx, false)) return;
+            skipWs(v, k);
+            if (k < v.size()) (void)lengthAt(v, k, c, ty, false);
+            s.translate_shift[0] = tx;
+            s.translate_shift[1] = ty;
+            return;
+        }
         if (p == "z-index") {
             if (i < v.size() && v[i].type == TokenType::Number)
                 s.z_index = static_cast<int>(std::clamp(v[i].number, -1e6, 1e6));
@@ -3156,6 +3268,8 @@ private:
                 else if (k == "upper-alpha" || k == "upper-latin") s.list_style = ListStyle::UpperAlpha;
                 else if (k == "lower-roman") s.list_style = ListStyle::LowerRoman;
                 else if (k == "upper-roman") s.list_style = ListStyle::UpperRoman;
+                else if (k == "disclosure-closed") s.list_style = ListStyle::DisclosureClosed;
+                else if (k == "disclosure-open") s.list_style = ListStyle::DisclosureOpen;
             }
             return;
         }
@@ -3228,6 +3342,20 @@ private:
                 if (!matchComplex(slot, r.slot_side)) continue;
                 for (const Declaration& d : r.rule->declarations)
                     matched.push_back({&d, d.important, d.important ? r.origin : Origin::Hint, r.slot_side.specificity.key(), r.order});
+            }
+        }
+        // ::part() rules of the tree the host is in, for an element its shadow tree exposes.
+        if (scope->host_el) {
+            if (const std::string* part = el->attr("part")) {
+                const Scope* outer = scopeFor(scope->host_el);
+                for (const PartRule& r : outer->parts) {
+                    if (!std::all_of(r.names.begin(), r.names.end(), [&](const std::string& n) { return hasWord(*part, n); })) continue;
+                    host_context_ = outer->host_el;
+                    fuel_ = kSelectorFuel;
+                    if (!matchComplex(scope->host_el, r.host_side)) continue;
+                    for (const Declaration& d : r.rule->declarations)
+                        matched.push_back({&d, d.important, d.important ? r.origin : Origin::Part, r.host_side.specificity.key(), r.order});
+                }
             }
         }
         host_context_ = scope->host_el;
@@ -3313,7 +3441,18 @@ private:
                     if (s.custom) custom = *s.custom;
                     has_custom = true;
                 }
-                custom[m.decl->name] = m.decl->value;
+                // initial is the guaranteed-invalid value, as if never set; inherit and
+                // unset take the parent's.
+                const std::string kw = keyword(m.decl->value);
+                if (kw == "initial") {
+                    custom.erase(m.decl->name);
+                } else if (kw == "inherit" || kw == "unset") {
+                    const auto it = parent.custom ? parent.custom->find(m.decl->name) : decltype(parent.custom->end()){};
+                    if (parent.custom && it != parent.custom->end()) custom[m.decl->name] = it->second;
+                    else custom.erase(m.decl->name);
+                } else {
+                    custom[m.decl->name] = m.decl->value;
+                }
             }
         }
         if (has_custom) s.custom = std::make_shared<const std::map<std::string, Tokens>>(std::move(custom));

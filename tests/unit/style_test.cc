@@ -166,6 +166,27 @@ TEST(CustomProperties, CyclesAndExpansionBombsAreHarmless) {
     EXPECT_FLOAT_EQ(s.of("a").margin[Top].px, 1);
 }
 
+TEST(CustomProperties, InvalidVariablesTakeTheFallback) {
+    // initial unsets a variable; one referring to a missing variable is invalid itself;
+    // an empty one is valid (the space toggle light-dark() polyfills use).
+    const auto s = style("<style>:root{--off:initial;--on: ;--t1:var(--off) blue;--t2:var(--on) blue;--t3:var(--nope) 1px}"
+                         "#a{color:var(--t1,red);background-color:var(--t2,red);width:var(--t3,7px)}"
+                         "#b{--on:inherit;--t2:var(--on) blue;color:var(--t2,red)}</style><div id=a></div><div id=b></div>");
+    EXPECT_EQ(s.of("a").color, kRed);
+    EXPECT_EQ(s.of("a").background, kBlue);
+    EXPECT_FLOAT_EQ(s.of("a").width.px, 7);
+    EXPECT_EQ(s.of("b").color, kBlue);
+}
+
+TEST(CustomProperties, FailedFallbacksDontMultiply) {
+    std::string css = "<style>:root{--v0:var(--missing)";
+    for (int i = 1; i < 40; ++i)
+        css += ";--v" + std::to_string(i) + ":var(--v" + std::to_string(i - 1) + ",var(--v" + std::to_string(i - 1) + "))";
+    css += "}#a{width:var(--v39,3px)}</style><div id=a></div>";
+    const auto s = style(css);
+    EXPECT_FLOAT_EQ(s.of("a").width.px, 3);
+}
+
 TEST(Selectors, HostileSelectorsStopEarly) {
     std::string css = "<style>";
     for (int i = 0; i < 40; ++i) css += "div ";

@@ -80,6 +80,8 @@ public:
     bool key(Node* target, bool down, const std::string& key, int key_code, uint32_t modifiers);
     void resized(float w, float h);
     void scrolled();
+    // Opens or closes a <details>, as clicking its summary does, and says so with "toggle".
+    void toggle(Node* details);
 
     // The event loop: due timers, then animation frames, then microtasks.
     void tick();

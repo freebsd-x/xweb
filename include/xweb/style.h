@@ -50,7 +50,7 @@ enum class Position { Static, Relative, Absolute, Fixed };
 enum class TextAlign { Left, Right, Center };
 enum class WhiteSpace { Normal, Pre, NoWrap, PreWrap, PreLine };
 enum class TextTransform { None, Uppercase, Lowercase, Capitalize };
-enum class ListStyle { None, Disc, Circle, Square, Decimal, LowerAlpha, UpperAlpha, LowerRoman, UpperRoman };
+enum class ListStyle { None, Disc, Circle, Square, Decimal, LowerAlpha, UpperAlpha, LowerRoman, UpperRoman, DisclosureClosed, DisclosureOpen };
 enum Side { Top = 0, Right = 1, Bottom = 2, Left = 3 };
 
 // Grid tracks, as specified: both ends of a track's minmax().
@@ -224,6 +224,10 @@ struct ComputedStyle {
     Length min_width, min_height;
     Length max_width = Length::autoLength(), max_height = Length::autoLength();
     int z_index = 0;
+    // How far transform's translate functions, and the translate property, move it as
+    // painted; percentages are of its own border box. Other transform functions aren't drawn.
+    Length transform_shift[2];
+    Length translate_shift[2];
     bool ua_margin_top = true, ua_margin_bottom = true;   // not set by the page
     bool native_look = true;   // a form control the page hasn't given a border, background or appearance: drawn as Chromium's
     Float float_side = Float::None;

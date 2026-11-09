@@ -50,6 +50,7 @@ struct Box {
     float pref_width = -1;         // max-content width, once computed
     float min_content = -1;        // min-content width, once computed
     int list_number = 0;
+    const Box* deco_parent = nullptr;   // an inline with a background or border: the next such out
     float last_baseline = -1;      // of the last line box, from the content box's top
     float percent_min_h = 0, percent_max_h = -1;
 
@@ -61,6 +62,9 @@ struct Box {
         Box* atomic = nullptr;
         Color background{0, 0, 0, 0};
         const std::string* link = nullptr;
+        const Box* deco = nullptr;      // the innermost inline with a background or border it's in
+        float baseline = 0;             // its line's
+        uint32_t line = 0;              // which line of the block
     };
     std::vector<Fragment> fragments;
 
@@ -193,9 +197,13 @@ std::string romanNumeral(int n) {
     return out;
 }
 
+bool isDisclosure(ListStyle style) { return style == ListStyle::DisclosureClosed || style == ListStyle::DisclosureOpen; }
+
 std::string markerText(ListStyle style, int number) {
     switch (style) {
         case ListStyle::None: return {};
+        case ListStyle::DisclosureClosed: return "\xE2\x96\xB8";   // ▸
+        case ListStyle::DisclosureOpen: return "\xE2\x96\xBE";     // ▾
         case ListStyle::Disc: return "\xE2\x80\xA2";     // •
         case ListStyle::Circle: return "\xE2\x97\xA6";   // ◦
         case ListStyle::Square: return "\xE2\x96\xAA";   // ▪
@@ -396,10 +404,24 @@ private:
 
     // An element's content as boxes in `box`, which is its own unless it has none.
     void addChildren(const Node* el, const ComputedStyle& style, Box& box, int depth, int& counter) {
+        // A disclosure marker sits inside, on the line, as text would, before ::before.
+        if (style.display == Display::ListItem && isDisclosure(style.list_style)) {
+            auto t = std::make_unique<Box>();
+            t->kind = BoxKind::Text;
+            t->style = &style;
+            t->text = markerText(style.list_style, 0) + " ";
+            box.kids.push_back(std::move(t));
+        }
         if (const ComputedStyle* before = styles_.beforeOf(el)) box.kids.push_back(pseudoBox(*before));
         // The composed tree: a host's shadow tree, a slot's assigned nodes.
         std::vector<const Node*> kids;
         composedChildren(el, kids);
+        // A closed <details> shows only its summary.
+        if (el->isHtml("details") && !el->attr("open")) {
+            const auto summary = std::find_if(kids.begin(), kids.end(), [](const Node* c) { return c->isHtml("summary"); });
+            if (summary == kids.end()) kids.clear();
+            else kids = {*summary};
+        }
         for (const Node* c : kids) {
             if (c->type == NodeType::Text) {
                 if (c->data.empty()) continue;
@@ -1079,7 +1101,9 @@ private:
         layoutContents(b, own, Flow{});
     }
 
-    void layoutReplaced(Box& b, float cb_width) {
+    // `fill`: the content width it must be, when a block wrapping it already sized itself
+    // from the same style.
+    void layoutReplaced(Box& b, float cb_width, const float* fill = nullptr) {
         const ComputedStyle& s = *b.style;
         resolveSpacing(b, cb_width);
         const Node* n = b.node;
@@ -1189,10 +1213,12 @@ private:
             natural_w = 160;
             natural_h = 16;
         }
-        const bool has_w = !widthIsAuto(s, cb_width);
+        const bool has_w = fill || !widthIsAuto(s, cb_width);
         const bool has_h = !s.height.is_auto && !s.height.hasPercent();
         float w = natural_w, h = natural_h;
-        if (has_w) {
+        if (fill) {
+            w = *fill;
+        } else if (has_w) {
             w = s.width.resolve(cb_width);
             if (s.border_box) w -= b.frameWidth();
         }
@@ -1206,7 +1232,7 @@ private:
         if (has_w && !has_h && ratio > 0) h = w / ratio;
         if (has_h && !has_w && ratio > 0) w = h * ratio;
         const float auto_w = w;
-        w = clampWidth(b, std::max(0.0f, w), cb_width);
+        w = fill ? std::max(0.0f, w) : clampWidth(b, std::max(0.0f, w), cb_width);
         // max-width: 100% on an image keeps its shape.
         if (w != auto_w && !has_h && ratio > 0) h = w / ratio;
         b.width = w;
@@ -2584,11 +2610,13 @@ private:
         Box* atomic = nullptr;
         Color background{0, 0, 0, 0};
         const std::string* link = nullptr;
+        const Box* deco = nullptr;
     };
 
     struct InlineContext {
         Color background{0, 0, 0, 0};
         const std::string* link = nullptr;
+        const Box* deco = nullptr;
     };
 
     void collectInline(Box& box, InlineContext ctx, std::vector<InlineItem>& items, float cb_width) {
@@ -2602,6 +2630,7 @@ private:
                     it.text = k.text;
                     it.background = ctx.background;
                     it.link = ctx.link;
+                    it.deco = ctx.deco;
                     items.push_back(std::move(it));
                     break;
                 }
@@ -2615,10 +2644,15 @@ private:
                 case BoxKind::Inline: {
                     InlineContext inner = ctx;
                     const ComputedStyle& s = *k.style;
-                    if (s.background.visible()) inner.background = s.background;
                     if (k.node && k.node->isHtml("a"))
                         if (const std::string* href = k.node->attr("href")) inner.link = href;
                     resolveSpacing(k, cb_width);
+                    // Its background and borders are painted around its fragments, line by line.
+                    const bool bordered = std::any_of(std::begin(k.border), std::end(k.border), [](float w) { return w > 0; });
+                    if (s.background.visible() || (s.background_layers && !s.masked) || bordered || s.box_shadow) {
+                        k.deco_parent = ctx.deco;
+                        inner.deco = &k;
+                    }
                     const float open = k.margin[Left] + k.padding[Left] + k.border[Left];
                     const float close = k.margin[Right] + k.padding[Right] + k.border[Right];
                     if (open != 0) {
@@ -2648,6 +2682,7 @@ private:
                     it.style = k.style;
                     it.atomic = &k;
                     it.link = ctx.link;
+                    it.deco = ctx.deco;
                     if (k.node && k.node->isHtml("a"))
                         if (const std::string* href = k.node->attr("href")) it.link = href;
                     items.push_back(std::move(it));
@@ -2749,7 +2784,9 @@ private:
         if (b.kids.size() == 1 && b.kids[0]->kind == BoxKind::Replaced && b.kind == BoxKind::Block && b.kids[0]->node == b.node) {
             // A display:block replaced element is exactly its one box.
             Box& r = *b.kids[0];
-            layoutReplaced(r, b.width);
+            // A width the wrapper resolved (it has the same style) is the picture's too.
+            const bool fills = !widthIsAuto(*b.style, b.width);
+            layoutReplaced(r, b.width, fills ? &b.width : nullptr);
             r.x = r.y = 0;
             for (int i = 0; i < 4; ++i) r.margin[i] = r.padding[i] = r.border[i] = 0;
             Box::Fragment f;
@@ -2781,12 +2818,12 @@ private:
             switch (it.kind) {
                 case InlineItem::Text: addText(it); break;
                 case InlineItem::Spacer:
-                    pushChunk(Chunk{Chunk::Space, {}, it.width, it.style, {0, 0, 0, 0}, nullptr, nullptr});
+                    pushChunk(Chunk{Chunk::Space, {}, it.width, it.style, {0, 0, 0, 0}, nullptr, nullptr, nullptr});
                     break;
                 case InlineItem::Atomic:
                     flushRun();
                     addSpaceIfPending();
-                    pushChunk(Chunk{Chunk::Atomic, {}, marginBoxWidth(*it.atomic), it.style, {0, 0, 0, 0}, it.link, it.atomic});
+                    pushChunk(Chunk{Chunk::Atomic, {}, marginBoxWidth(*it.atomic), it.style, {0, 0, 0, 0}, it.link, it.atomic, it.deco});
                     flushRun();
                     after_space_ = false;
                     line_has_content_ = true;
@@ -2834,6 +2871,7 @@ private:
             Color background{0, 0, 0, 0};
             const std::string* link = nullptr;
             Box* atomic = nullptr;
+            const Box* deco = nullptr;
         };
 
         // The free span for a line starting at y_, floats taken out.
@@ -2912,6 +2950,7 @@ private:
             c.style = space_style_;
             c.background = space_background_;
             c.link = space_link_;
+            c.deco = space_deco_;
             c.width = l_.text_.width(" ", fontOf(*space_style_));
             line_space_ = c;
             has_line_space_ = true;
@@ -2954,6 +2993,7 @@ private:
             f.style = c.style;
             f.background = c.background;
             f.link = c.link;
+            f.deco = c.deco;
             if (c.kind == Chunk::Atomic) {
                 f.atomic = c.atomic;
                 line_has_content_ = true;
@@ -2961,7 +3001,7 @@ private:
             } else if (!c.text.empty()) {
                 // Next to text in the same style: extend it, so it's drawn as one run.
                 if (!line_.empty() && !line_.back().atomic && line_.back().style == c.style &&
-                    line_.back().background == c.background && line_.back().link == c.link &&
+                    line_.back().background == c.background && line_.back().link == c.link && line_.back().deco == c.deco &&
                     std::abs(line_.back().x + line_.back().w - x_) < 0.01f) {
                     line_.back().text += c.text;
                     line_.back().w += c.width;
@@ -2984,6 +3024,7 @@ private:
             c.style = it.style;
             c.background = it.background;
             c.link = it.link;
+            c.deco = it.deco;
             pushChunk(std::move(c));
             after_space_ = false;
         }
@@ -3045,6 +3086,7 @@ private:
                             space_style_ = it.style;
                             space_background_ = it.background;
                             space_link_ = it.link;
+                            space_deco_ = it.deco;
                         }
                         after_space_ = true;
                         while (i < text.size() && isSpaceChar(text[i]) && !(keepsNewlines(ws) && text[i] == '\n')) ++i;
@@ -3059,6 +3101,7 @@ private:
                     sp.style = it.style;
                     sp.background = it.background;
                     sp.link = it.link;
+                    sp.deco = it.deco;
                     pushChunk(std::move(sp));
                     flushRun();
                     ++i;
@@ -3125,6 +3168,8 @@ private:
             b_.last_baseline = baseline;
             for (auto& f : line_) {
                 f.x += shift;
+                f.baseline = baseline;
+                f.line = line_index_;
                 if (f.atomic) {
                     Box* a = f.atomic;
                     a->x = f.x + a->margin[Left];
@@ -3141,6 +3186,7 @@ private:
                 b_.fragments.push_back(std::move(f));
             }
             line_.clear();
+            ++line_index_;
             y_ = clampCoord(y_ + above + below);
             line_has_content_ = false;
             after_space_ = true;
@@ -3166,6 +3212,8 @@ private:
         bool prev_was_word_ = false;
         const ComputedStyle* space_style_ = nullptr;
         Color space_background_{0, 0, 0, 0};
+        const Box* space_deco_ = nullptr;
+        uint32_t line_index_ = 0;
         const std::string* space_link_ = nullptr;
     };
 
@@ -3646,12 +3694,73 @@ private:
         if (!shown.empty()) addText(cx, cy, shown.substr(0, shown.find('\n')), s, opacity);
     }
 
+    // Inline boxes' backgrounds and borders: on each line, one box around its fragments,
+    // as tall as its font plus its padding and borders; the start and end sides only
+    // where the box starts and ends. Outer ones first.
+    void paintInlineDecorations(const Box& b, float cx, float cy, float opacity) {
+        struct Span {
+            const Box* box;
+            uint32_t line;
+            int depth;
+            float x0, x1, top, bottom;
+            bool first = false, last = false;
+        };
+        std::vector<Span> spans;
+        std::vector<std::pair<const Box*, size_t>> last_span;   // each box's latest span
+        for (const auto& f : b.fragments) {
+            int depth = 0;
+            for (const Box* d = f.deco; d; d = d->deco_parent) ++depth;
+            for (const Box* d = f.deco; d && spans.size() < 10000; d = d->deco_parent, --depth) {
+                const auto seen = std::find_if(last_span.begin(), last_span.end(), [&](const auto& e) { return e.first == d; });
+                const FontSpec font = fontOf(*d->style);
+                const float top = f.baseline - text_.ascent(font), bottom = f.baseline + text_.descent(font);
+                if (seen != last_span.end() && spans[seen->second].line == f.line) {
+                    Span& sp = spans[seen->second];
+                    sp.x0 = std::min(sp.x0, f.x);
+                    sp.x1 = std::max(sp.x1, f.x + f.w);
+                    continue;
+                }
+                spans.push_back({d, f.line, depth, f.x, f.x + f.w, top, bottom, seen == last_span.end()});
+                if (seen == last_span.end()) last_span.emplace_back(d, spans.size() - 1);
+                else seen->second = spans.size() - 1;
+            }
+        }
+        if (spans.empty()) return;
+        for (const auto& [box, i] : last_span) spans[i].last = true;
+        std::stable_sort(spans.begin(), spans.end(), [](const Span& a, const Span& c) { return a.depth < c.depth; });
+        for (const Span& sp : spans) {
+            const Box& d = *sp.box;
+            Box frame;
+            frame.kind = BoxKind::Inline;
+            frame.node = d.node;
+            frame.style = d.style;
+            for (int i = 0; i < 4; ++i) {
+                frame.padding[i] = d.padding[i];
+                frame.border[i] = d.border[i];
+            }
+            if (!sp.first) frame.padding[Left] = frame.border[Left] = 0;
+            if (!sp.last) frame.padding[Right] = frame.border[Right] = 0;
+            frame.width = std::max(0.0f, sp.x1 - sp.x0);
+            frame.height = std::max(0.0f, sp.bottom - sp.top);
+            paintFrame(frame, cx + sp.x0 - frame.padding[Left] - frame.border[Left], cy + sp.top - frame.padding[Top] - frame.border[Top], opacity);
+        }
+    }
+
     void paintFragments(const Box& b, float cx, float cy, const Rect& cb, float opacity) {
+        paintInlineDecorations(b, cx, cy, opacity);
         for (const auto& f : b.fragments) {
             const float fx = cx + f.x;
             if (f.atomic) {
-                const float ax = cx + f.atomic->x, ay = cy + f.atomic->y;
-                record(*f.atomic, ax, ay);
+                float ax = cx + f.atomic->x, ay = cy + f.atomic->y;
+                shift(*f.atomic, ax, ay);
+                if (f.atomic->node != b.node) {
+                    record(*f.atomic, ax, ay);
+                } else if (b.node && b.node->isElement()) {
+                    // A picture standing in a block of its own: the block holds its padding
+                    // and borders, the picture its size.
+                    out_->boxes.push_back({b.node, ax - b.padding[Left] - b.border[Left], ay - b.padding[Top] - b.border[Top],
+                                           f.atomic->outerWidth() + b.frameWidth(), f.atomic->outerHeight() + b.frameHeight()});
+                }
                 if (f.link) out_->links.push_back({ax, ay, f.atomic->outerWidth(), f.atomic->outerHeight(), *f.link});
                 if (f.atomic->kind == BoxKind::Replaced) {
                     paintReplaced(*f.atomic, ax, ay, opacity);
@@ -3675,6 +3784,14 @@ private:
         }
     }
 
+    // Where translate and transform move a box as painted.
+    static void shift(const Box& b, float& x, float& y) {
+        const ComputedStyle& s = *b.style;
+        const float w = b.outerWidth(), h = b.outerHeight();
+        x += s.transform_shift[0].resolve(w) + s.translate_shift[0].resolve(w);
+        y += s.transform_shift[1].resolve(h) + s.translate_shift[1].resolve(h);
+    }
+
     void record(const Box& b, float x, float y) {
         if (b.node && b.node->isElement()) out_->boxes.push_back({b.node, x, y, b.outerWidth(), b.outerHeight()});
     }
@@ -3682,6 +3799,7 @@ private:
     void paintMarker(const Box& b, float cx, float cy, float opacity) {
         const ComputedStyle& s = *b.style;
         if (s.display != Display::ListItem || s.hidden) return;
+        if (isDisclosure(s.list_style)) return;   // inside, as text
         const std::string marker = markerText(s.list_style, b.list_number);
         if (marker.empty()) return;
         const FontSpec font = fontOf(s);
@@ -3793,6 +3911,7 @@ private:
             if (!s.offset[Top].is_auto) y += s.offset[Top].resolve(cb.h);
             else if (!s.offset[Bottom].is_auto) y -= s.offset[Bottom].resolve(cb.h);
         }
+        shift(b, x, y);
         record(b, x, y);
         paintContents(b, x, y, cb, opacity);
     }
@@ -3816,6 +3935,7 @@ private:
                 else if (!s.offset[Right].is_auto) x = cb.x + cb.w - s.offset[Right].resolve(cb.w) - k.outerWidth() - k.margin[Right];
                 if (!s.offset[Top].is_auto) y = cb.y + s.offset[Top].resolve(cb.h) + k.margin[Top];
                 else if (!s.offset[Bottom].is_auto) y = cb.y + cb.h - s.offset[Bottom].resolve(cb.h) - k.outerHeight() - k.margin[Bottom];
+                shift(k, x, y);
                 record(k, x, y);
                 // Inside the clips it was inside, as far as its containing block.
                 for (const Rect& c : p.clips) {

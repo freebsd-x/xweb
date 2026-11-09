@@ -63,6 +63,9 @@ void composedChildren(const Node* n, std::vector<const Node*>& out);
 // What a <slot> in a shadow tree has assigned: its host's children that name it (text
 // and unnamed elements go to the unnamed slot), each to the first such slot.
 void assignedNodes(const Node* slot, std::vector<const Node*>& out);
+// The <details> a click on `target` opens or closes: the one whose summary it's in,
+// unless a link or control nearer it takes the click. Null if none.
+[[nodiscard]] Node* detailsToggledBy(Node* target) noexcept;
 // <template shadowrootmode=open|closed> in a parsed document: its content becomes its
 // parent's shadow root, as declarative shadow DOM has it.
 void attachDeclarativeShadowRoots(class Document& doc);
