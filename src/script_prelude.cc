@@ -1024,6 +1024,17 @@ const char* const kScriptPrelude = R"JS(
     }
   }
 
+  // DOMTokenList (classList): iterable, as a list of its tokens.
+  {
+    const proto = Object.getPrototypeOf(document.createElement('div').classList);
+    const tokens = list => Array.prototype.slice.call(list, 0, list.length);
+    Object.defineProperty(proto, Symbol.iterator, { value() { return tokens(this)[Symbol.iterator](); }, writable: true, configurable: true });
+    proto.values = function () { return tokens(this).values(); };
+    proto.keys = function () { return tokens(this).keys(); };
+    proto.entries = function () { return tokens(this).entries(); };
+    proto.forEach = function (cb, thisArg) { tokens(this).forEach((v, i) => cb.call(thisArg, v, i, this)); };
+  }
+
   // <select> and <option>, over the element's attributes and selectedIndex (which goes
   // through the page's form state).
   if (typeof HTMLSelectElement === 'function' && typeof HTMLOptionElement === 'function') {

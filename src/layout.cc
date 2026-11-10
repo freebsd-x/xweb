@@ -52,6 +52,8 @@ struct Box {
     int list_number = 0;
     const Box* deco_parent = nullptr;   // an inline with a background or border: the next such out
     float inline_extent = 0;       // how far its widest line reaches, closing padding included
+    float cb_height_hint = -1;     // its containing block's definite content height, if known: for a
+                                   // picture's percentage height (an SVG at height: 100% of a 26px box)
     float last_baseline = -1;      // of the last line box, from the content box's top
     float percent_min_h = 0, percent_max_h = -1;
 
@@ -732,6 +734,8 @@ private:
 
     void layoutContents(Box& b, std::optional<float> own_height, Flow flow) {
         const ComputedStyle& s = *b.style;
+        // Before anything measures them: what a percentage height of theirs is of.
+        for (auto& k : b.kids) k->cb_height_hint = own_height ? *own_height : -1;
         const bool isolated = establishesBfc(b);
         b.collapses_through = false;
         if (b.isTable()) {
@@ -1119,6 +1123,7 @@ private:
         resolveSpacing(b, cb_width);
         const Node* n = b.node;
         float natural_w = 300, natural_h = 150;
+        float shape = 0;   // an SVG's width over height from its viewBox, whatever its size
         bool have_natural = true;
         if (n->isHtml("img")) {
             have_natural = false;
@@ -1168,6 +1173,7 @@ private:
                 }
                 if (ok && vb[2] > 0 && vb[3] > 0) ratio = vb[2] / vb[3];
             }
+            shape = ratio;
             if (attr_w && attr_h) {
                 natural_w = *attr_w;
                 natural_h = *attr_h;
@@ -1225,7 +1231,7 @@ private:
             natural_h = 16;
         }
         const bool has_w = fill || !widthIsAuto(s, cb_width);
-        const bool has_h = !s.height.is_auto && !s.height.hasPercent();
+        const bool has_h = !s.height.is_auto && (!s.height.hasPercent() || b.cb_height_hint >= 0);
         float w = natural_w, h = natural_h;
         if (fill) {
             w = *fill;
@@ -1234,12 +1240,13 @@ private:
             if (s.border_box) w -= b.frameWidth();
         }
         if (has_h) {
-            h = s.height.px;
+            h = s.height.resolve(std::max(0.0f, b.cb_height_hint));
             if (s.border_box) h -= b.frameHeight();
         }
         // Only pictures keep their shape: a text field made wider doesn't get taller.
         const bool has_ratio = !(n->isHtml("input") || n->isHtml("textarea") || n->isHtml("select") || n->isHtml("progress") || n->isHtml("meter"));
-        const float ratio = (has_ratio && natural_w > 0 && natural_h > 0) ? natural_w / natural_h : 0;
+        const float ratio = !has_ratio ? 0 : shape > 0 && !(n->attr("width") && n->attr("height")) ? shape
+                                            : (natural_w > 0 && natural_h > 0) ? natural_w / natural_h : 0;
         if (has_w && !has_h && ratio > 0) h = w / ratio;
         if (has_h && !has_w && ratio > 0) w = h * ratio;
         const float auto_w = w;
@@ -2836,6 +2843,7 @@ private:
         if (b.kids.size() == 1 && b.kids[0]->kind == BoxKind::Replaced && b.kind == BoxKind::Block && b.kids[0]->node == b.node) {
             // A display:block replaced element is exactly its one box.
             Box& r = *b.kids[0];
+            r.cb_height_hint = b.cb_height_hint;   // the wrapper is the picture: same containing block
             // A width the wrapper resolved (it has the same style) is the picture's too.
             const bool fills = !widthIsAuto(*b.style, b.width);
             layoutReplaced(r, b.width, fills ? &b.width : nullptr);

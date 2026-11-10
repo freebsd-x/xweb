@@ -74,7 +74,8 @@ private:
             case Tok::Number: case Tok::String: case Tok::Regex: case Tok::Identifier: case Tok::PrivateName: return false;
             case Tok::Template: return !t.template_tail;
             case Tok::Keyword: return !(t.value == u"this" || t.value == u"super" || t.value == u"null" || t.value == u"true" || t.value == u"false");
-            case Tok::Punct: return !(t.value == u")" || t.value == u"]" || t.value == u"}");
+            // (After x++ or x--, a / divides: d++/2. A regex can't follow ++ or -- anyway.)
+            case Tok::Punct: return !(t.value == u")" || t.value == u"]" || t.value == u"}" || t.value == u"++" || t.value == u"--");
             default: return true;
         }
     }
@@ -85,6 +86,7 @@ private:
         prev_end_ = cur_.end;
         prev_line_ = cur_.line;
         cur_ = lex_.next(regex);
+        p_.make_offset = cur_.begin;
         if (cur_.type == Tok::Eof && !lex_.error.empty()) fail(lex_.error);
     }
 
@@ -146,7 +148,7 @@ private:
     // A name used as an identifier where it may not be one.
     void checkName(const std::u16string& name, bool binding) {
         if (name == u"yield" && (strict_ || fn_->is_generator)) fail("yield can't be a name here");
-        if (name == u"await" && (p_.module || fn_->is_async)) fail("await can't be a name here");
+        if (name == u"await" && (p_.module || fn_->is_async || static_await_)) fail("await can't be a name here");
         if (strict_ && strictReserved(name)) fail("'" + utf8(name) + "' is reserved in strict code");
         if (binding && strict_ && (name == u"eval" || name == u"arguments")) fail("can't bind eval or arguments in strict code");
     }
@@ -536,7 +538,7 @@ private:
                 return n;
             }
             if (k == u"return") {
-                if (fn_ == p_.top) fail("return outside a function");
+                if (fn_ == p_.top || fn_ == static_block_fn_) fail("return outside a function");
                 advance();
                 Node* n = p_.make(N::Return, line);
                 if (!is(u";") && !is(u"}") && cur_.type != Tok::Eof && !cur_.newline_before) n->a = expression();
@@ -874,6 +876,8 @@ private:
         const bool derived_ctor = derived_ctor_next_;
         derived_ctor_next_ = false;
         FunctionContext context(*this, false, method, derived_ctor);
+        const bool outer_block = static_block_, outer_await = static_await_;
+        static_block_ = static_await_ = false;   // a function inside a static block is its own
         fn_ = fn;
         fn->strict = strict_;
         auto params_scope = std::make_shared<std::vector<std::u16string>>();
@@ -887,6 +891,8 @@ private:
         expect(u")");
         functionBody(fn);
         popScope();
+        static_block_ = outer_block;
+        static_await_ = outer_await;
         base_lexical_depth_ = outer_base;
         fn_ = outer;
         strict_ = outer_strict;
@@ -1019,6 +1025,37 @@ private:
         return n;
     }
 
+    // A class's static { ... }, as a method with no parameters whose body it is.
+    FunctionInfo* staticBlock(uint32_t begin) {
+        FunctionInfo* fn = newFunction();
+        fn->is_method = true;
+        FunctionInfo* outer = fn_;
+        const bool outer_strict = strict_;
+        const size_t outer_base = base_lexical_depth_;
+        FunctionContext context(*this, false, true, false);
+        fn_ = fn;
+        fn->strict = true;
+        // Inside: no await as a name, no arguments, no return (arrows in it included).
+        const bool outer_block = static_block_, outer_await = static_await_;
+        FunctionInfo* const outer_block_fn = static_block_fn_;
+        static_block_ = static_await_ = true;
+        static_block_fn_ = fn;
+        auto params_scope = std::make_shared<std::vector<std::u16string>>();
+        pushScope(params_scope.get());
+        base_lexical_depth_ = lexical_.size();
+        InAllowed in(*this);
+        functionBody(fn);
+        popScope();
+        static_block_ = outer_block;
+        static_await_ = outer_await;
+        static_block_fn_ = outer_block_fn;
+        base_lexical_depth_ = outer_base;
+        fn_ = outer;
+        strict_ = outer_strict;
+        fn->source = std::u16string(src_.substr(begin, prev_end_ - begin));
+        return fn;
+    }
+
     // `extends` and the body; n->a is the superclass, n->kids the methods and fields,
     // n->fn the constructor.
     void classTail(Node* n, uint32_t begin) {
@@ -1039,7 +1076,13 @@ private:
                 if (!(t.type == Tok::Punct && (t.value == u"(" || t.value == u"="))) {
                     advance();
                     m->flags |= kStatic;
-                    if (is(u"{")) fail("static blocks aren't supported yet");
+                    if (is(u"{")) {
+                        // static { ... }: run once, with the class as this, its own var scope.
+                        m->flags |= kField | kStaticBlock;
+                        m->fn = staticBlock(mbegin);
+                        n->kids.push_back(m);
+                        continue;
+                    }
                 }
             }
             bool is_async = false, generator = false;
@@ -1083,6 +1126,8 @@ private:
                 init->arrow = false;
                 init->strict = true;
                 FunctionInfo* outer = fn_;
+                // Like a method's body: super.x is allowed (super() isn't), arguments isn't.
+                FunctionContext context(*this, false, true, false);
                 fn_ = init;
                 m->b = assignment();
                 fn_ = outer;
@@ -1195,6 +1240,7 @@ private:
                     prop->b = bindingElement();
                 } else {
                     if (!plain_name) fail("expected : in a destructuring pattern");
+                    checkName(prop->str, true);
                     Node* id = p_.make(N::Identifier, prop->line);
                     id->str = prop->str;
                     prop->b = id;
@@ -1371,6 +1417,15 @@ private:
         FunctionInfo* outer = fn_;
         const bool outer_strict = strict_;
         const size_t outer_base = base_lexical_depth_;
+        // A static block's "no await as a name" reaches an arrow's parameters, not its body.
+        const bool outer_await = static_await_;
+        if (outer_await)
+            for (Node* p : fn->params) {
+                std::vector<std::u16string> names;
+                boundNames(p, names);
+                for (const auto& name : names) checkName(name, true);
+            }
+        static_await_ = false;
         fn_ = fn;
         auto params_scope = std::make_shared<std::vector<std::u16string>>();
         pushScope(params_scope.get());
@@ -1384,6 +1439,7 @@ private:
             no_in_ = saved_in;
             checkParams(fn);
         }
+        static_await_ = outer_await;
         popScope();
         base_lexical_depth_ = outer_base;
         fn_ = outer;
@@ -1865,6 +1921,10 @@ private:
                     Node* n = p_.make(N::ClassExpr, line);
                     if (cur_.type == Tok::Identifier) {
                         n->str = cur_.value;
+                        const bool saved = strict_;
+                        strict_ = true;   // a class's name is in its strict code
+                        checkName(n->str, true);
+                        strict_ = saved;
                         advance();
                     }
                     classTail(n, begin);
@@ -1902,6 +1962,7 @@ private:
     }
 
     void markArguments() {
+        if (static_block_) fail("arguments isn't allowed in a class static block");
         // The nearest function that isn't an arrow owns `arguments`.
         fn_->uses_arguments = true;
     }
@@ -2007,6 +2068,7 @@ private:
             } else if (plain_name && !(prop->flags & kComputed)) {
                 // Shorthand `{a}`, or `{a = 1}` that only a pattern may have.
                 prop->flags |= kShorthand;
+                checkName(prop->str, false);
                 Node* id = p_.make(N::Identifier, prop->line);
                 id->str = prop->str;
                 if (id->str == u"arguments") markArguments();
@@ -2048,6 +2110,9 @@ private:
     // Early errors' bookkeeping.
     bool top_item_ = false;            // the statement now is a module's top-level item
     bool loop_body_next_ = false;      // the statement now is a loop's body
+    bool static_block_ = false;        // in a class static block, arrows in it too: no arguments
+    bool static_await_ = false;        // ...and not in an arrow's body: no await as a name
+    FunctionInfo* static_block_fn_ = nullptr;   // that block's own function: return isn't allowed in it
     bool in_params_ = false;           // in a function's parameters (no yield or await expressions)
     int loop_depth_ = 0;
     int breakable_depth_ = 0;
@@ -2068,6 +2133,10 @@ std::unique_ptr<Program> parse(std::u16string_view source, std::string& error, b
     Parser parser(source, *prog, strict);
     if (module) parser.setModule();
     if (eval) parser.setEvalContext(*eval);
+    // Where each line starts, for the columns errors report.
+    prog->line_starts.push_back(0);
+    for (size_t i = 0; i < source.size() && prog->line_starts.size() < (1u << 24); ++i)
+        if (source[i] == u'\n') prog->line_starts.push_back(static_cast<uint32_t>(i + 1));
     try {
         prog->root = parser.program();
     } catch (const ParseError& e) {

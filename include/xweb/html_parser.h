@@ -14,7 +14,7 @@ namespace fbx::xweb {
 inline constexpr size_t kMaxOpenElements = 512;
 
 struct ParseOptions {
-    // With scripting on, <noscript> is raw text. We don't run scripts yet.
+    // With scripting on (the page's scripts run), <noscript> is raw text, and hidden.
     bool scripting = false;
 };
 

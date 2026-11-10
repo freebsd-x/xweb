@@ -34,7 +34,8 @@ public:
     Node* shadow_root = nullptr;
     Node* shadow_host = nullptr;
     bool shadow_open = true;            // a shadow root's mode
-    std::vector<std::string> adopted_css;   // a shadow root's adoptedStyleSheets, as text
+    std::vector<std::string> adopted_css;   // a shadow root's adoptedStyleSheets, as text; a <style>'s or
+                                            // <link>'s rules added through its sheet (insertRule)
     // A custom element's state: 0 none (or not yet looked at), 1 undefined (a custom
     // element name waiting for its definition), 2 custom (upgraded), 3 failed.
     uint8_t custom_state = 0;
@@ -79,6 +80,7 @@ public:
     [[nodiscard]] Node* body() const noexcept;
     [[nodiscard]] Node* head() const noexcept;
     bool quirks = false;
+    bool scripting = false;   // parsed for a page whose scripts run: <noscript> isn't shown
 
 private:
     std::vector<std::unique_ptr<Node>> nodes_;

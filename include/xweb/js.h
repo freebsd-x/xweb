@@ -284,6 +284,7 @@ public:
         bool ok = false;
         Value value;          // the last statement's, as eval would give
         std::string error;    // for a failure: what was thrown, as text
+        std::string where;    // and where, " (url:line)", if it was an error that knows
     };
     // Runs a script in the global scope.
     Result evaluate(std::string_view source, std::string_view name = "script");
@@ -326,6 +327,9 @@ public:
     // Where errors nothing caught go when no script is on the stack to throw to: a
     // failing microtask, a promise rejected with no handler. The console by default.
     void setErrorReporter(std::function<void(const std::string& message)> sink) { error_reporter_ = std::move(sink); }
+    // A promise rejected with nobody handling it, first offered here (a page's
+    // "unhandledrejection"); true: it was dealt with, nothing to report.
+    std::function<bool(const Value& promise, const Value& reason)> unhandled_rejection;
     void reportError(const std::string& message) {
         if (error_reporter_) error_reporter_(message);
         else emitConsole("error", message);
@@ -570,5 +574,10 @@ private:
 
 // What was thrown, as a line of text: "TypeError: x is not a function".
 std::string describe(Runtime& rt, const Value& thrown);
+// What was thrown, for a line after "Uncaught ": an error's name and message, an
+// object's message or a glimpse of its properties, a value as a string.
+std::string describeValue(Runtime& rt, const Value& thrown);
+// Where an error was made, " (url:line)" from its stack, or "".
+std::string describeWhere(Runtime& rt, const Value& thrown);
 
 }  // namespace fbx::xweb::js

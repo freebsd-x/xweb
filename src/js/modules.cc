@@ -904,7 +904,7 @@ void Runtime::evaluateModule(std::string_view source, const std::string& url, st
         Result r;
         r.ok = false;
         try {
-            r.error = describe(*this, error);
+            r.error = error.isObject() && error.asObject()->cls == ObjectClass::Error ? describe(*this, error) : "Uncaught " + describeValue(*this, error);
         } catch (const Thrown&) {
             r.error = "Uncaught exception";
         }

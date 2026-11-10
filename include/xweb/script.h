@@ -32,6 +32,14 @@ public:
         std::function<void(std::string_view level, const std::string& text)> console;
         std::function<void(const std::string& url)> navigate;
         std::function<std::optional<ElementRect>(const Node*)> rect;
+        // The element shown at a point of the page (not the window); null if none.
+        std::function<Node*(float page_x, float page_y)> element_at;
+        // An image's state by its absolute URL: still coming, or here (with its size), or failed.
+        struct ImageState {
+            bool done = false, ok = false;
+            uint32_t width = 0, height = 0;
+        };
+        std::function<ImageState(const std::string& url)> image_state;
         std::function<std::unordered_map<std::string, std::string>(const Node*)> computed_style;
         std::function<void(const Node*)> activate;     // a click's default action (a link, a checkbox, a submit button)
         std::function<void(const Node*)> submit;       // form.submit(): no event, straight off
@@ -82,6 +90,8 @@ public:
     void scrolled();
     // Opens or closes a <details>, as clicking its summary does, and says so with "toggle".
     void toggle(Node* details);
+    // An image has come (or failed): "load" (or "error") at each <img> showing it.
+    void imageLoaded(const std::string& url, bool ok);
 
     // The event loop: due timers, then animation frames, then microtasks.
     void tick();

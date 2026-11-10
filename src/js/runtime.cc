@@ -558,11 +558,22 @@ void Runtime::method(Object* o, const char16_t* name, int length, NativeFunction
     put(o, name, Value::object(newFunction(name, length, std::move(fn))));
 }
 
+std::u16string stackLine() {
+    const ThrowSite& site = throwSite();
+    if (!site.url || site.line == 0) return {};
+    uint32_t col = 1;
+    if (site.line_starts && site.line - 1 < site.line_starts->size() && site.offset >= (*site.line_starts)[site.line - 1])
+        col = site.offset - (*site.line_starts)[site.line - 1] + 1;
+    // As V8 writes a frame, which pages' own error handling knows how to read.
+    return u"\n    at " + utf16(site.url->empty() ? std::string("<anonymous>") : *site.url) + u":" + utf16(std::to_string(site.line)) + u":" +
+           utf16(std::to_string(col));
+}
+
 Object* Runtime::newError(const char* kind, const std::string& message) {
     const auto it = error_prototypes.find(kind);
     Object* e = allocate<Object>(it != error_prototypes.end() ? it->second : error_prototype, ObjectClass::Error);
     put(e, u"message", Value::string(utf16(message)));
-    const std::u16string stack = utf16(std::string(kind) + ": " + message);
+    const std::u16string stack = utf16(std::string(kind) + ": " + message) + stackLine();
     put(e, u"stack", Value::string(stack));
     return e;
 }
@@ -1511,7 +1522,10 @@ Runtime::Result Runtime::evaluate(std::string_view source, std::string_view name
         result.ok = true;
     } catch (const Thrown& t) {
         try {
-            result.error = describe(*this, t.value);
+            // An error as itself; anything else as what's in it.
+            result.error = t.value.isObject() && t.value.asObject()->cls == ObjectClass::Error ? describe(*this, t.value)
+                                                                                                : "Uncaught " + describeValue(*this, t.value);
+            result.where = describeWhere(*this, t.value);
         } catch (...) {
             result.error = "Uncaught exception";
         }
@@ -1537,6 +1551,52 @@ std::string describe(Runtime& rt, const Value& thrown) {
     }
     if (thrown.isSymbol()) return "Uncaught symbol";
     return "Uncaught " + utf8(*rt.toString(thrown));
+}
+
+std::string describeWhere(Runtime& rt, const Value& thrown) {
+    if (!thrown.isObject() || thrown.asObject()->cls != ObjectClass::Error) return {};
+    const Property* p = thrown.asObject()->own(PropertyKey(u"stack"));
+    if (!p || (p->flags & kAccessor) || !p->value.isString()) return {};
+    const std::u16string& stack = p->value.asString();
+    const size_t at = stack.find(u"\n    at ");
+    if (at == std::u16string::npos) return {};
+    const size_t from = at + 8, to = stack.find(u'\n', from);
+    std::string where = utf8(stack.substr(from, to == std::u16string::npos ? std::u16string::npos : to - from));
+    if (where.size() > 2 && where.ends_with(":1")) where.resize(where.size() - 2);   // no column known
+    return " (" + where + ")";
+}
+
+std::string describeValue(Runtime& rt, const Value& thrown) {
+    if (thrown.isObject() && thrown.asObject()->cls == ObjectClass::Error) return describe(rt, thrown);
+    if (thrown.isSymbol()) return "Symbol()";
+    if (!thrown.isObject()) return utf8(*rt.toString(thrown));
+    Object* o = thrown.asObject();
+    if (o->code || o->cls == ObjectClass::Proxy) return utf8(*rt.toString(thrown));
+    // One that says what it is (its own toString): that.
+    const std::string as_string = utf8(*rt.toString(thrown));
+    if (as_string != "[object Object]") return as_string;
+    // An error-like object (DOMException, a library's own): its name and message.
+    const Value msg = rt.get(thrown, u"message");
+    if (msg.isString()) {
+        const Value name = rt.get(thrown, u"name");
+        return (name.isString() && !name.asString().empty() ? utf8(name.asString()) : std::string("Error")) + ": " + utf8(msg.asString());
+    }
+    // A plain object: a few of its own properties.
+    std::string out = "{";
+    int shown = 0;
+    for (const PropertyKey& key : rt.ownPropertyKeys(o)) {
+        if (key.isSymbol()) continue;
+        if (shown == 4) { out += ", …"; break; }
+        const Value v = rt.get(thrown, key);
+        std::string text;
+        if (v.isString()) text = "\"" + utf8(v.asString()).substr(0, 60) + "\"";
+        else if (v.isObject()) text = v.asObject()->code ? "ƒ" : (v.asObject()->cls == ObjectClass::Array ? "[…]" : "{…}");
+        else if (v.isSymbol()) text = "Symbol()";
+        else text = utf8(*rt.toString(v));
+        out += (shown ? ", " : "") + utf8(key.name) + ": " + text;
+        ++shown;
+    }
+    return out + "}";
 }
 
 // ── The interpreter proper ────────────────────────────────────────────────────
@@ -2116,6 +2176,11 @@ void Interpreter::declare(Node* decl, Env* env, bool strict) {
 
 Completion Interpreter::exec(Node* n, Env* env, bool strict) {
     rt_.step();
+    ThrowSite& site = throwSite();
+    site.url = &prog_->url;
+    site.line_starts = &prog_->line_starts;
+    site.line = n->line;
+    site.offset = n->offset;
     EvalDepth depth(rt_);
     switch (n->kind) {
         case N::ExprStmt: return {CT::Normal, eval(n->a, env, strict)};
@@ -2447,18 +2512,18 @@ Object* Interpreter::classDefinition(Node* n, Env* env) {
     ctor->define(u"prototype", {Value::object(proto), nullptr, nullptr, 0});
     ctor->define(u"name", {Value::string(name), nullptr, nullptr, kConfigurable});
     proto->define(u"constructor", {Value::object(ctor), nullptr, nullptr, kWritable | kConfigurable});
+    // Static fields and blocks run after the methods are made and the class's name is
+    // bound, in order: `static x = Foo.make()` and static { ... } see all of it.
+    std::vector<std::pair<Node*, PropertyKey>> statics;
     for (Node* m : n->kids) {
         Object* target = (m->flags & kStatic) ? ctor : proto;
+        if (m->flags & kStaticBlock) {
+            statics.emplace_back(m, PropertyKey(std::u16string()));
+            continue;
+        }
         const PropertyKey key = (m->flags & kComputed) ? rt_.toPropertyKey(eval(m->a, class_env, true)) : PropertyKey(m->str);
         if (m->flags & kField) {
-            if (m->flags & kStatic) {
-                Env* fenv = newEnv(class_env);
-                fenv->is_function = true;
-                fenv->this_value = Value::object(ctor);
-                fenv->home = ctor;
-                const Value v = m->b ? eval(m->b, fenv, true) : Value::undefined();
-                ctor->define(key, {v});
-            }
+            if (m->flags & kStatic) statics.emplace_back(m, key);
             continue;
         }
         Object* fn = makeFunction(m->fn, class_env, target);
@@ -2475,6 +2540,21 @@ Object* Interpreter::classDefinition(Node* n, Env* env) {
     if (!n->str.empty()) {
         class_env->vars[n->str].value = Value::object(ctor);
         class_env->vars[n->str].initialized = true;
+    }
+    std::vector<Value> held{Value::object(ctor), Value::object(proto)};
+    TempRoots keep(rt_, held);
+    for (const auto& [m, key] : statics) {
+        if (m->flags & kStaticBlock) {
+            Object* block = makeFunction(m->fn, class_env, ctor);
+            (void)rt_.call(Value::object(block), Value::object(ctor), {});
+            continue;
+        }
+        Env* fenv = newEnv(class_env);
+        fenv->is_function = true;
+        fenv->this_value = Value::object(ctor);
+        fenv->home = ctor;
+        const Value v = m->b ? eval(m->b, fenv, true) : Value::undefined();
+        ctor->define(key, {v});
     }
     return ctor;
 }
@@ -2579,6 +2659,8 @@ Value Interpreter::eval(Node* n, Env* env, bool strict) {
         case N::Member: {
             if (n->a->kind == N::Super) return rt_.get(superObject(env), memberKey(n, env, strict), thisValue(env));
             const Value base = eval(n->a, env, strict);
+            throwSite().line = n->line;   // reading from it is what may fail here
+            throwSite().offset = n->offset;
             if ((n->flags & kOptional) && base.isNullish()) throw ShortCircuit{};
             return rt_.get(base, memberKey(n, env, strict));
         }
@@ -2589,8 +2671,14 @@ Value Interpreter::eval(Node* n, Env* env, bool strict) {
                 return Value::undefined();
             }
         }
-        case N::Call: return evalCall(n, env, strict);
-        case N::New: return evalNew(n, env, strict);
+        case N::Call:
+            throwSite().line = n->line;
+            throwSite().offset = n->offset;
+            return evalCall(n, env, strict);
+        case N::New:
+            throwSite().line = n->line;
+            throwSite().offset = n->offset;
+            return evalNew(n, env, strict);
         case N::NewTarget: {
             Env* f = functionEnv(env);
             return f && f->new_target ? Value::object(f->new_target) : Value::undefined();

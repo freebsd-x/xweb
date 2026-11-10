@@ -375,3 +375,48 @@ TEST(Sheets, ImportsKeepToTheirConditions) {
     EXPECT_EQ(s.of("b").color, (Color{0, 0, 0, 255}));
     EXPECT_EQ(s.of("c").color, kRed);
 }
+
+TEST(Display, NoscriptHidesOnlyWhereScriptsRun) {
+    const auto with = parseHtml("<p><noscript id=n><b>no js</b></noscript></p>", ParseOptions{.scripting = true});
+    const StyledDocument styled(*with, css::MediaContext{800, 600});
+    const Node* n = nullptr;
+    std::vector<const Node*> todo{with->root()};
+    while (!todo.empty()) {
+        const Node* c = todo.back();
+        todo.pop_back();
+        if (const std::string* id = c->attr("id"); id && *id == "n") n = c;
+        for (const Node* k : c->children) todo.push_back(k);
+    }
+    ASSERT_TRUE(n);
+    ASSERT_TRUE(styled.styleOf(n));
+    EXPECT_EQ(styled.styleOf(n)->display, Display::None);
+    const auto s = style("<p><noscript id=n><b>no js</b></noscript></p>");   // no scripting: shown
+    EXPECT_NE(s.of("n").display, Display::None);
+}
+
+TEST(Sheets, RulesInsertedIntoAStyleElementApply) {
+    auto doc = parseHtml("<style id=s>#a{color:red}</style><div id=a></div><div id=b></div>");
+    Node* st = nullptr;
+    std::vector<Node*> todo{doc->root()};
+    while (!todo.empty()) {
+        Node* n = todo.back();
+        todo.pop_back();
+        if (const std::string* id = n->attr("id"); id && *id == "s") st = n;
+        for (Node* c : n->children) todo.push_back(c);
+    }
+    ASSERT_TRUE(st);
+    st->adopted_css = {"#b{color:blue}", "#a{color:blue}"};
+    const StyledDocument styled(*doc, css::MediaContext{800, 600});
+    const auto colorOf = [&](const char* id) {
+        std::vector<const Node*> t{doc->root()};
+        while (!t.empty()) {
+            const Node* n = t.back();
+            t.pop_back();
+            if (const std::string* v = n->attr("id"); v && *v == id) return styled.styleOf(n)->color;
+            for (const Node* c : n->children) t.push_back(c);
+        }
+        return Color{};
+    };
+    EXPECT_EQ(colorOf("b"), kBlue);
+    EXPECT_EQ(colorOf("a"), kBlue);   // after the element's own text
+}

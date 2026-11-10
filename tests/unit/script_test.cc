@@ -68,6 +68,12 @@ struct Page {
             else res.error = "unreachable";
             pending.push_back([done, res] { done(res); });
         };
+        // Scripts not fetched ahead, as a page's own fetch would bring them, a task later.
+        host.fetch_script = [this](const std::string& url, std::function<void(std::optional<std::string>)> done) {
+            std::optional<std::string> body;
+            if (url == "https://example.org/dir/chunk.js") body = "console.log('chunk ran', typeof window.chunkFlag); window.chunkLoaded = true;";
+            pending.push_back([done, body] { done(body); });
+        };
         script = std::make_unique<PageScript>(*doc, host);
         script->run([external](const std::string& url) -> std::optional<std::string> {
             if (url == "https://example.org/dir/lib.js") return external;
@@ -426,4 +432,86 @@ TEST(Script, SelectsAndOptionsAsPagesBuildThem) {
         log(s.length, s.item(0).text, new Image(3, 4).getAttribute('width'), o instanceof HTMLOptionElement);
         </script>)");
     EXPECT_EQ(p.console, "log:3 Zero v2 Two 2 2 true\nlog:false true v0\nlog:2 a 3 true\n");
+}
+
+TEST(Script, DocumentsOfAScriptsOwn) {
+    Page p(R"(<body><p id=x>page</p><script>
+        const log = (...a) => console.log(...a);
+        const d = document.implementation.createHTMLDocument('');
+        d.body.innerHTML = '<form></form><form></form>';   // what jQuery checks
+        log(d.body.childNodes.length, d.title === '', d.documentElement.localName, d.head !== document.head);
+        log(document.body.querySelectorAll('form').length, document.getElementById('x').textContent);
+        const t = document.implementation.createHTMLDocument('T');
+        t.body.innerHTML = '<span id=x>theirs</span>';
+        log(t.title, t.getElementById('x').textContent, document.getElementById('x').textContent);
+        log(typeof document.implementation.hasFeature, t instanceof Document);
+        </script>)");
+    EXPECT_EQ(p.console, "log:2 true html true\nlog:0 page\nlog:T theirs page\nlog:function true\n");
+}
+
+TEST(Script, StyleSheetsOfElements) {
+    // What styled-components does: an empty <style>, its sheet found through
+    // document.styleSheets, rules inserted.
+    Page p(R"(<head><style id=s></style></head><body><script>
+        const log = (...a) => console.log(...a);
+        const el = document.getElementById('s');
+        const sheet = el.sheet;
+        log(sheet === el.sheet, document.styleSheets.length, document.styleSheets[0] === sheet, sheet.ownerNode === el);
+        log(sheet.insertRule('.a{color:red}', 0), sheet.insertRule('.b{color:blue}', 1), sheet.cssRules.length, sheet.cssRules[1].cssText);
+        sheet.deleteRule(0);
+        log(sheet.cssRules.length, sheet.cssRules[0].cssText);
+        try { sheet.insertRule('.c{}', 5); } catch (e) { log(e.message); }
+        </script>)");
+    EXPECT_EQ(p.console, "log:true 1 true true\nlog:0 1 2 .b{color:blue}\nlog:1 .b{color:blue}\nlog:IndexSizeError: no such rule index\n");
+    ASSERT_EQ(p.byId("s")->adopted_css.size(), 1u);
+}
+
+TEST(Script, InsertedScriptsAreFetchedAndRun) {
+    // What bundlers do to load a chunk: a <script src> added later, waited on by load.
+    Page p(R"(<body><script>
+        const log = (...a) => console.log(...a);
+        window.chunkFlag = 1;
+        const s = document.createElement('script');
+        s.src = 'chunk.js';
+        s.onload = () => log('load', window.chunkLoaded);
+        document.head.appendChild(s);
+        const bad = document.createElement('script');
+        bad.src = 'missing.js';
+        bad.onerror = () => log('error event');
+        document.head.appendChild(bad);
+        log('inserted');
+        </script>)");
+    EXPECT_EQ(p.console, "log:inserted\n");
+    p.deliver();
+    EXPECT_EQ(p.console, "log:inserted\nlog:chunk ran number\nlog:load true\nlog:error event\n");
+}
+
+TEST(Script, NodesCompareByWhatTheyAre) {
+    Page p(R"(<body><div id=a class=x title=t><b>hi</b></div><div title=t class=x><b>hi</b></div><div class=x><b>ho</b></div><script>
+        const [a, b, c] = document.querySelectorAll('body > div');
+        console.log(a.isEqualNode(b), a.isEqualNode(c), a.isEqualNode(null), a.isSameNode(a), a.isSameNode(b), a.cloneNode(true).isEqualNode(a));
+        </script>)");
+    EXPECT_EQ(p.console, "log:false false false true false true\n");
+}
+
+TEST(Script, UnhandledRejectionsReachThePage) {
+    Page p(R"(<body><script>
+        console.log(typeof PromiseRejectionEvent, new PromiseRejectionEvent('x', {reason: 1}).reason);
+        addEventListener('unhandledrejection', e => { console.log('saw', e.reason, e.promise instanceof Promise); if (e.reason === 'quiet') e.preventDefault(); });
+        Promise.reject('quiet');
+        Promise.reject('loud');
+        </script>)");
+    EXPECT_NE(p.console.find("log:function 1\n"), std::string::npos) << p.console;
+    EXPECT_NE(p.console.find("log:saw quiet true\n"), std::string::npos) << p.console;
+    EXPECT_NE(p.console.find("log:saw loud true\n"), std::string::npos) << p.console;
+    EXPECT_EQ(p.console.find("Uncaught (in promise) quiet"), std::string::npos) << p.console;
+    EXPECT_NE(p.console.find("Uncaught (in promise) loud"), std::string::npos) << p.console;
+}
+
+TEST(Script, ClassListIsAList) {
+    Page p(R"(<body class="a b  c"><script>
+        const cl = document.body.classList;
+        console.log(cl.length, cl[0], cl[2], cl.item(1), Array.from(cl).join('+'), [...cl].length, cl.value);
+        </script>)");
+    EXPECT_EQ(p.console, "log:3 a c b a+b+c 3 a b  c\n");
 }

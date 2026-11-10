@@ -1022,7 +1022,7 @@ void Runtime::installBuiltins() {
             if (!arg(a, 0).isUndefined()) rt.put(e, u"message", Value::string(rt.toString(arg(a, 0))));
             const Value opts = arg(a, 1);
             if (opts.isObject() && rt.has(opts.asObject(), u"cause")) rt.put(e, u"cause", rt.get(opts, u"cause"));
-            rt.put(e, u"stack", Value::string(utf16(k) + (arg(a, 0).isUndefined() ? u"" : u": " + *rt.toString(arg(a, 0)))));
+            rt.put(e, u"stack", Value::string(utf16(k) + (arg(a, 0).isUndefined() ? u"" : u": " + *rt.toString(arg(a, 0))) + stackLine()));
             return Value::object(e);
         }, proto);
         if (parent_ctor) c->prototype = parent_ctor;
@@ -2338,7 +2338,7 @@ void Runtime::installBuiltins() {
                 if (v.isString()) line += utf8(v.asString());
                 else if (v.isSymbol()) line += "Symbol(" + utf8(v.asSymbol()->description) + ")";
                 else if (v.isBigInt()) line += utf8(*rt.toString(v)) + "n";
-                else if (v.isObject() && v.asObject()->cls == ObjectClass::Error) line += describe(rt, v);
+                else if (v.isObject() && v.asObject()->cls == ObjectClass::Error) line += describe(rt, v) + describeWhere(rt, v);
                 else if (v.isObject() && v.asObject()->cls == ObjectClass::RegExp) line += utf8(*rt.toString(v));
                 else if (v.isObject() && !rt.isCallable(v)) {
                     // As JSON where it can be; [object …] where it can't.

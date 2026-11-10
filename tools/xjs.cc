@@ -160,7 +160,7 @@ int main(int argc, char** argv) {
         try {
             rt.call(t.fn, Value::undefined(), t.args);
         } catch (const Thrown& e) {
-            std::cerr << "Uncaught " << describe(rt, e.value) << "\n";
+            std::cerr << "Uncaught " << describeValue(rt, e.value) << "\n";
             status = 1;
         } catch (const Terminated& e) {
             std::cerr << "Stopped: " << e.why << "\n";

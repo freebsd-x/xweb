@@ -28,6 +28,7 @@ using Args = std::span<const Value>;
 namespace script_detail {
 
 inline constexpr uint8_t kNodeWrapper = 1, kStyleWrapper = 2, kClassListWrapper = 3;
+inline constexpr uint8_t kOwnedSheet = 4;   // a <style>'s or <link>'s CSSStyleSheet: host is the element
 inline constexpr uint64_t kTaskBudget = 50'000'000;   // steps one script, event or timer may take
 inline constexpr size_t kMaxTimers = 10'000;
 inline constexpr int kMaxCloneDepth = 512;
@@ -238,7 +239,7 @@ struct PageScript::Impl {
             f();
         } catch (const js::Thrown& t) {
             try {
-                report("Uncaught " + js::describe(rt, t.value));
+                report("Uncaught " + js::describeValue(rt, t.value) + js::describeWhere(rt, t.value));
             } catch (...) {
                 report("Uncaught exception");
             }
@@ -284,6 +285,24 @@ struct PageScript::Impl {
         Node* n = node(t);
         if (!n) rt.throwError("TypeError", "not a node");
         return n;
+    }
+
+    // The document a document method was called on: a script's own, or the page's.
+    Node* docNode(const Value& t) {
+        Node* n = node(t);
+        return n && n->type == NodeType::Document ? n : doc.root();
+    }
+    static Node* documentElementOf(Node* d) {
+        if (d)
+            for (Node* c : d->children)
+                if (c->isElement()) return c;
+        return nullptr;
+    }
+    static Node* childElementNamed(Node* parent, std::string_view tag) {
+        if (parent)
+            for (Node* c : parent->children)
+                if (c->isHtml(tag)) return c;
+        return nullptr;
     }
 
     Node* thisElement(const Value& t) {
@@ -622,20 +641,40 @@ struct PageScript::Impl {
     void runScript(Node* s) {
         if (std::find(ran.begin(), ran.end(), s) != ran.end() || !runnable(s)) return;
         ran.push_back(s);
-        std::string code;
-        std::string name = "inline script";
         if (const std::string* src = s->attr("src")) {
             const std::string url = resolveUrl(host.base, *src);
-            name = url;
             std::optional<std::string> got = source ? source(url) : std::nullopt;
-            if (!got) {
-                fire(s, u"error", false, false);
+            if (got) {
+                runScriptCode(s, std::move(*got), url);
                 return;
             }
-            code = std::move(*got);
-        } else {
-            code = s->textContent();
+            // Not fetched ahead (a script added later, as bundlers load their chunks):
+            // fetched now, and run when it comes, as browsers run inserted scripts.
+            if (host.fetch_script && pending_script_fetches < kMaxPendingScriptFetches) {
+                ++pending_script_fetches;
+                host.fetch_script(url, [this, s, url](std::optional<std::string> body) {
+                    --pending_script_fetches;
+                    rt.setStepBudget(kTaskBudget);
+                    if (!body) {
+                        task([&] { fire(s, u"error", false, false); });
+                    } else {
+                        runScriptCode(s, std::move(*body), url);
+                    }
+                    drainMicrotasks();
+                    dirty = true;
+                });
+                return;
+            }
+            fire(s, u"error", false, false);
+            return;
         }
+        runScriptCode(s, s->textContent(), "inline script");
+    }
+
+    static constexpr int kMaxPendingScriptFetches = 64;
+    int pending_script_fetches = 0;
+
+    void runScriptCode(Node* s, std::string code, const std::string& name) {
         Node* saved = current_script;
         rt.setStepBudget(kTaskBudget);
         if (isModule(s)) {
@@ -645,7 +684,7 @@ struct PageScript::Impl {
             const bool has_src = s->attr("src") != nullptr;
             current_script = nullptr;
             rt.evaluateModule(code, url, [this, name](Runtime::Result r) {
-                if (!r.ok) report(r.error + " (" + name + ")");
+                if (!r.ok) report(r.error + (r.where.empty() ? " (" + name + ")" : r.where));
             });
             current_script = saved;
             drainMicrotasks();
@@ -654,7 +693,7 @@ struct PageScript::Impl {
         }
         current_script = s;
         const Runtime::Result r = rt.evaluate(code, name);
-        if (!r.ok) report(r.error + " (" + name + ")");
+        if (!r.ok) report(r.error + (r.where.empty() ? " (" + name + ")" : r.where));
         current_script = saved;
         drainMicrotasks();
         if (s->attr("src")) fire(s, u"load", false, false);
@@ -662,7 +701,8 @@ struct PageScript::Impl {
 
     // Scripts that just came into the document (appendChild, innerHTML) run now.
     void scriptsInserted(Node* root) {
-        if (running_scripts && ready_state == "loading") return;   // the initial pass will get them
+        // Even during the first pass: its list was made before any script ran, so one a
+        // script adds is never in it. (Each runs once whichever way it's reached.)
         std::vector<Node*> found;
         std::vector<Node*> todo{root};
         while (!todo.empty()) {

@@ -136,7 +136,7 @@ void PageScript::Impl::callReaction(Node* el, const Value& callback, std::vector
         // A reaction's error is reported, not thrown at whoever changed the tree.
         std::string message = "Uncaught exception";
         try {
-            message = "Uncaught " + js::describe(rt, t.value);
+            message = "Uncaught " + js::describeValue(rt, t.value) + js::describeWhere(rt, t.value);
         } catch (const js::Thrown&) {
         }
         report(message);
@@ -153,7 +153,7 @@ void PageScript::Impl::upgrade(Node* el, const CustomDefinition& def) {
         made = rt.construct(Value::object(def.ctor), {});
     } catch (const js::Thrown& t) {
         try {
-            failure = "Uncaught " + js::describe(rt, t.value);
+            failure = "Uncaught " + js::describeValue(rt, t.value) + js::describeWhere(rt, t.value);
         } catch (const js::Thrown&) {
             failure = "Uncaught exception";
         }
@@ -278,7 +278,7 @@ void PageScript::Impl::queueMutation(const char16_t* type, Node* target, const s
             } catch (const js::Thrown& t) {
                 std::string message = "Uncaught exception";
                 try {
-                    message = "Uncaught " + js::describe(rt, t.value);
+                    message = "Uncaught " + js::describeValue(rt, t.value) + js::describeWhere(rt, t.value);
                 } catch (const js::Thrown&) {
                 }
                 self->report(message);
@@ -539,9 +539,15 @@ void PageScript::Impl::installDom() {
         method(canvas, u"getContext", 1, [](Runtime&, const Value&, Args) { return Value::null(); });
         method(canvas, u"toDataURL", 0, [](Runtime&, const Value&, Args) { return str("data:,"); });
         Object* img = interface_protos["HTMLImageElement"];
-        accessor(img, u"complete", [](Runtime&, const Value&, Args) { return Value::boolean(true); });
-        accessor(img, u"naturalWidth", [](Runtime&, const Value&, Args) { return Value::number(0); });
-        accessor(img, u"naturalHeight", [](Runtime&, const Value&, Args) { return Value::number(0); });
+        // What the page's loader says of the image, by the URL it's showing.
+        const auto state = [self](const Value& t) {
+            const std::string* v = self->thisElement(t)->attr("src");
+            if (!v || v->empty() || !self->host.image_state) return PageScript::Host::ImageState{true, false, 0, 0};
+            return self->host.image_state(resolveUrl(self->host.base, *v));
+        };
+        accessor(img, u"complete", [state](Runtime&, const Value& t, Args) { return Value::boolean(state(t).done); });
+        accessor(img, u"naturalWidth", [state](Runtime&, const Value& t, Args) { return Value::number(state(t).width); });
+        accessor(img, u"naturalHeight", [state](Runtime&, const Value& t, Args) { return Value::number(state(t).height); });
         accessor(img, u"currentSrc", [self](Runtime&, const Value& t, Args) {
             const std::string* v = self->thisElement(t)->attr("src");
             return str(v ? resolveUrl(self->host.base, *v) : std::string{});
@@ -872,15 +878,87 @@ void PageScript::Impl::installDom() {
         rt.resolvePromise(p, t);
         return Value::object(p);
     });
-    method(sheet_proto, u"insertRule", 1, [resync](Runtime& rt, const Value& t, Args a) {
+    // An element's sheet keeps the rules added to it on the element, where styling reads them.
+    const auto owner = [](const Value& t) -> Node* {
+        return t.isObject() && t.asObject()->host_kind == kOwnedSheet ? static_cast<Node*>(t.asObject()->host) : nullptr;
+    };
+    method(sheet_proto, u"insertRule", 1, [self, resync, owner](Runtime& rt, const Value& t, Args a) {
         if (!t.isObject()) rt.throwError("TypeError", "not a CSSStyleSheet");
+        const std::string rule = js::utf8(rt.toStringValue(arg(a, 0)));
+        if (Node* n = owner(t)) {
+            const double at = arg(a, 1).isUndefined() ? 0 : rt.toIntegerOrInfinity(arg(a, 1));
+            if (at < 0 || at > static_cast<double>(n->adopted_css.size())) rt.throwError("Error", "IndexSizeError: no such rule index");
+            if (n->adopted_css.size() >= 100000) rt.throwError("Error", "QuotaExceededError: too many rules");
+            n->adopted_css.insert(n->adopted_css.begin() + static_cast<ptrdiff_t>(at), rule);
+            self->dirty = true;
+            return Value::number(at);
+        }
         Object* s = t.asObject();
         const std::u16string old = s->primitive.isString() ? s->primitive.asString() : u"";
-        s->primitive = Value::string(old + u"\n" + *rt.toString(arg(a, 0)));
+        s->primitive = Value::string(old + u"\n" + js::utf16(rule));
         resync();
         return Value::number(0);
     });
-    accessor(sheet_proto, u"cssRules", [](Runtime& rt, const Value&, Args) { return Value::object(rt.newArray()); });
+    method(sheet_proto, u"deleteRule", 1, [self, owner](Runtime& rt, const Value& t, Args a) {
+        Node* n = owner(t);
+        if (!n) return Value::undefined();
+        const double at = rt.toIntegerOrInfinity(arg(a, 0));
+        if (at < 0 || at >= static_cast<double>(n->adopted_css.size())) rt.throwError("Error", "IndexSizeError: no such rule index");
+        n->adopted_css.erase(n->adopted_css.begin() + static_cast<ptrdiff_t>(at));
+        self->dirty = true;
+        return Value::undefined();
+    });
+    accessor(sheet_proto, u"cssRules", [owner](Runtime& rt, const Value& t, Args) {
+        std::vector<Value> rules;
+        if (Node* n = owner(t))
+            for (const std::string& css : n->adopted_css) {
+                Object* r = rt.newObject();
+                rt.put(r, u"cssText", Value::string(js::utf16(css)), js::kEnumerable);
+                rules.push_back(Value::object(r));
+            }
+        return Value::object(rt.newArray(std::move(rules)));
+    });
+    accessor(sheet_proto, u"ownerNode", [self, owner](Runtime&, const Value& t, Args) { return self->wrap(owner(t)); });
+    // <style>.sheet and <link rel=stylesheet>.sheet, one each, kept on the element's wrapper.
+    const auto sheetOf = [self, sheet_proto](Runtime& rt, Node* n) -> Value {
+        if (!n) return Value::null();
+        if (n->isHtml("link")) {
+            const std::string* rel = n->attr("rel");
+            if (!rel || lower(*rel).find("stylesheet") == std::string::npos) return Value::null();
+        } else if (!n->isHtml("style")) {
+            return Value::null();
+        }
+        const Value w = self->wrap(n);
+        const PropertyKey key(u"\u0000sheet");
+        if (const js::Property* p = w.asObject()->own(key)) return p->value;
+        Object* s = rt.newObject(sheet_proto);
+        s->host = n;
+        s->host_kind = kOwnedSheet;
+        rt.put(w.asObject(), key, Value::object(s), 0);
+        return Value::object(s);
+    };
+    for (const char* iface : {"HTMLStyleElement", "HTMLLinkElement"})
+        if (Object* proto = interface_protos[iface])
+            accessor(proto, u"sheet", [self, sheetOf](Runtime& rt, const Value& t, Args) { return sheetOf(rt, self->thisElement(t)); });
+    accessor(proto_document, u"styleSheets", [self, sheetOf](Runtime& rt, const Value&, Args) {
+        std::vector<Value> sheets;
+        std::vector<Node*> todo{self->doc.root()};
+        while (!todo.empty() && sheets.size() < 10000) {
+            Node* n = todo.back();
+            todo.pop_back();
+            if (n->isHtml("style") || n->isHtml("link")) {
+                const Value s = sheetOf(rt, n);
+                if (s.isObject()) sheets.push_back(s);
+            }
+            todo.insert(todo.end(), n->children.rbegin(), n->children.rend());
+        }
+        Object* list = rt.newArray(std::move(sheets));
+        rt.method(list, u"item", 1, [](Runtime& r, const Value& t, Args a) {
+            const Value v = r.get(t, PropertyKey(js::utf16(std::to_string(static_cast<long long>(r.toIntegerOrInfinity(arg(a, 0)))))));
+            return v.isUndefined() ? Value::null() : v;
+        });
+        return Value::object(list);
+    });
     const auto adoptedAccessor = [self, resync](Object* o, bool document) {
         self->accessor(o, u"adoptedStyleSheets", [self, document](Runtime& rt, const Value& t, Args) {
             Node* n = document ? self->doc.root() : self->thisNode(t);

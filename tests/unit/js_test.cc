@@ -180,7 +180,7 @@ TEST(Js, Console) {
     std::string got;
     rt.setConsole([&](std::string_view level, const std::string& text) { got += std::string(level) + ":" + text + ";"; });
     ASSERT_TRUE(rt.evaluate("console.log('a', 1, {x: [2]}); console.error(new TypeError('t'))").ok);
-    EXPECT_EQ(got, "log:a 1 {\"x\":[2]};error:TypeError: t;");
+    EXPECT_EQ(got, "log:a 1 {\"x\":[2]};error:TypeError: t (script:1:59);");
 }
 
 TEST(Js, Fuzz) {
@@ -365,7 +365,7 @@ TEST(Js, AsyncFunctionsAndPromises) {
     EXPECT_EQ(runAsync("const thenable = { then(r) { r('from thenable'); } }; (async () => console.log(await thenable))();"),
               "from thenable\n");
     EXPECT_EQ(runAsync("new Promise((_, reject) => reject(new Error('nobody listens')));"),
-              "! Uncaught (in promise) Error: nobody listens\n");
+              "! Uncaught (in promise) Error: nobody listens (script:1:44)\n");
     EXPECT_EQ(runAsync("async function* g() { yield 1; await null; yield 2; } (async () => { const o = []; for await (const v of g()) o.push(v);"
                        "for await (const v of [Promise.resolve('p'), 'q']) o.push(v); console.log(o.join()); })()"),
               "1,2,p,q\n");
@@ -709,4 +709,8 @@ TEST(Js, CollectsWhileAScriptRuns) {
     EXPECT_GT(rt.mid_script_collections, 50u);
     // What the loop made and dropped is gone already, not waiting for the script's end.
     EXPECT_LT(rt.heapSize(), 50'000u);
+}
+
+TEST(Js, DivisionAfterPostfixIncrement) {
+    EXPECT_EQ(run("var d = 10, k = [1, 2, 3, 4]; var y = d++ / 2; var z = k[d-- / 5 >> 1]; y + ',' + z + ',' + d"), "5,2,10");
 }

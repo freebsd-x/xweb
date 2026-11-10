@@ -1594,6 +1594,8 @@ public:
         target_ = &ua_;
         addSheet(css::parseStylesheet(detail::kUserAgentStyle), Origin::UserAgent, 0);
         if (doc.quirks) addSheet(css::parseStylesheet(detail::kQuirksStyle), Origin::UserAgent, 0);
+        // What's for browsers without scripts isn't shown where they run.
+        if (doc.scripting) addSheet(css::parseStylesheet("noscript { display: none }"), Origin::UserAgent, 0);
         target_ = &doc_scope_;
         collectSheets(doc_.root());
         for (const std::string& css : doc_.root()->adopted_css) addSheet(css::parseStylesheet(css), Origin::Author, 0);   // document.adoptedStyleSheets
@@ -1707,15 +1709,20 @@ private:
             todo.pop_back();
             if (n->isHtml("style") || (n->ns == Namespace::Svg && n->name == "style")) {
                 const std::string* media = n->attr("media");
-                if (!media || css::mediaMatches(css::tokenize(*media), out_.media_))
+                if (!media || css::mediaMatches(css::tokenize(*media), out_.media_)) {
                     addSheet(css::parseStylesheet(n->textContent()), Origin::Author, 0);
+                    // Rules a script put in its sheet (CSS-in-JS libraries do it this way).
+                    for (const std::string& css : n->adopted_css) addSheet(css::parseStylesheet(css), Origin::Author, 0);
+                }
             } else if (n->isHtml("link") && loader_) {
                 const std::string* rel = n->attr("rel");
                 const std::string* href = n->attr("href");
                 if (rel && href && hasWord(lower(*rel), "stylesheet") && !hasWord(lower(*rel), "alternate")) {
                     const std::string* media = n->attr("media");
-                    if (!media || css::mediaMatches(css::tokenize(*media), out_.media_))
+                    if (!media || css::mediaMatches(css::tokenize(*media), out_.media_)) {
                         addSheet(css::parseStylesheet(loader_(*href)), Origin::Author, 0, *href);
+                        for (const std::string& css : n->adopted_css) addSheet(css::parseStylesheet(css), Origin::Author, 0, *href);
+                    }
                 }
             }
             todo.insert(todo.end(), n->children.rbegin(), n->children.rend());

@@ -126,6 +126,30 @@ void PageScript::Impl::installNode() {
         return arg(a, 1);
     });
     method(p, u"cloneNode", 1, [self](Runtime& rt, const Value& t, Args a) { return self->wrap(self->clone(self->thisNode(t), rt.toBoolean(arg(a, 0)))); });
+    // The same kind, name, attributes (in any order), text, and children, all the way down.
+    method(p, u"isEqualNode", 1, [self](Runtime&, const Value& t, Args a) {
+        const Node* x = self->thisNode(t);
+        const Node* y = self->node(arg(a, 0));
+        if (!y) return Value::boolean(false);
+        std::vector<std::pair<const Node*, const Node*>> todo{{x, y}};
+        size_t seen = 0;
+        while (!todo.empty()) {
+            if (++seen > 1'000'000) return Value::boolean(false);
+            const auto [m, n] = todo.back();
+            todo.pop_back();
+            if (m->type != n->type || m->ns != n->ns || m->name != n->name || m->data != n->data) return Value::boolean(false);
+            if (m->attrs.size() != n->attrs.size() || m->children.size() != n->children.size()) return Value::boolean(false);
+            for (const Attribute& at : m->attrs) {
+                const std::string* other = n->attr(at.name);
+                if (!other || *other != at.value) return Value::boolean(false);
+            }
+            for (size_t i = 0; i < m->children.size(); ++i) todo.emplace_back(m->children[i], n->children[i]);
+        }
+        return Value::boolean(true);
+    });
+    method(p, u"isSameNode", 1, [self](Runtime&, const Value& t, Args a) {
+        return Value::boolean(self->node(arg(a, 0)) == self->thisNode(t));
+    });
     method(p, u"contains", 1, [self](Runtime&, const Value& t, Args a) {
         const Node* n = self->thisNode(t);
         for (const Node* c = self->node(arg(a, 0)); c; c = c->parent)
@@ -559,8 +583,16 @@ void PageScript::Impl::installElement() {
     });
     accessor(p, u"classList", [self](Runtime& rt, const Value& t, Args) {
         Object* c = rt.allocate<Object>(self->proto_classlist);
-        c->host = self->thisElement(t);
+        Node* el = self->thisElement(t);
+        c->host = el;
         c->host_kind = kClassListWrapper;
+        // Its tokens by index, as they are now (it's made afresh each time it's asked for).
+        std::istringstream words(self->attr(el, "class"));
+        std::string word;
+        std::vector<std::string> seen;
+        while (words >> word && seen.size() < 10000)
+            if (std::find(seen.begin(), seen.end(), word) == seen.end()) seen.push_back(word);
+        for (size_t i = 0; i < seen.size(); ++i) rt.put(c, PropertyKey(js::utf16(std::to_string(i))), str(seen[i]), js::kEnumerable);
         return Value::object(c);
     });
     accessor(p, u"isContentEditable", [](Runtime&, const Value&, Args) { return Value::boolean(false); });
@@ -701,11 +733,13 @@ void PageScript::Impl::installElement() {
 void PageScript::Impl::installDocument() {
     Impl* self = this;
     Object* p = proto_document;
-    accessor(p, u"documentElement", [self](Runtime&, const Value&, Args) { return self->wrap(self->doc.documentElement()); });
-    accessor(p, u"head", [self](Runtime&, const Value&, Args) { return self->wrap(self->doc.head()); });
-    accessor(p, u"body", [self](Runtime&, const Value&, Args) { return self->wrap(self->doc.body()); });
-    accessor(p, u"title", [self](Runtime&, const Value&, Args) {
-        std::vector<Node*> todo{self->doc.root()};
+    // Each answers for the document it's asked of: the page's, or one a script made
+    // (document.implementation.createHTMLDocument).
+    accessor(p, u"documentElement", [self](Runtime&, const Value& t, Args) { return self->wrap(documentElementOf(self->docNode(t))); });
+    accessor(p, u"head", [self](Runtime&, const Value& t, Args) { return self->wrap(childElementNamed(documentElementOf(self->docNode(t)), "head")); });
+    accessor(p, u"body", [self](Runtime&, const Value& t, Args) { return self->wrap(childElementNamed(documentElementOf(self->docNode(t)), "body")); });
+    accessor(p, u"title", [self](Runtime&, const Value& self_doc, Args) {
+        std::vector<Node*> todo{self->docNode(self_doc)};
         while (!todo.empty()) {
             Node* n = todo.back();
             todo.pop_back();
@@ -725,9 +759,9 @@ void PageScript::Impl::installDocument() {
             todo.insert(todo.end(), n->children.rbegin(), n->children.rend());
         }
         return str("");
-    }, [self](Runtime& rt, const Value&, Args a) {
+    }, [self](Runtime& rt, const Value& self_doc, Args a) {
         const std::string text = js::utf8(rt.toStringValue(arg(a, 0)));
-        std::vector<Node*> todo{self->doc.root()};
+        std::vector<Node*> todo{self->docNode(self_doc)};
         while (!todo.empty()) {
             Node* n = todo.back();
             todo.pop_back();
@@ -737,7 +771,7 @@ void PageScript::Impl::installDocument() {
             }
             todo.insert(todo.end(), n->children.rbegin(), n->children.rend());
         }
-        if (Node* head = self->doc.head()) {
+        if (Node* head = childElementNamed(documentElementOf(self->docNode(self_doc)), "head")) {
             Node* t = self->doc.make(NodeType::Element);
             t->name = "title";
             head->append(t);
@@ -745,9 +779,58 @@ void PageScript::Impl::installDocument() {
         }
         return Value::undefined();
     });
-    method(p, u"getElementById", 1, [self](Runtime& rt, const Value&, Args a) {
+    // document.implementation: documents of a script's own, apart from the page (jQuery
+    // parses HTML in one). Nothing in them is shown or run.
+    {
+        Object* impl = rt.newObject();
+        rt.method(impl, u"createHTMLDocument", 0, [self](Runtime& r, const Value&, Args a) {
+            Node* d = self->doc.make(NodeType::Document);
+            const auto element = [&](const char* tag, Node* parent) {
+                Node* e = self->doc.make(NodeType::Element);
+                e->ns = Namespace::Html;
+                e->name = tag;
+                parent->append(e);
+                return e;
+            };
+            Node* dt = self->doc.make(NodeType::Doctype);
+            dt->name = "html";
+            d->append(dt);
+            Node* html = element("html", d);
+            Node* head = element("head", html);
+            if (!arg(a, 0).isUndefined()) {
+                Node* title = element("title", head);
+                Node* text = self->doc.make(NodeType::Text);
+                text->data = js::utf8(r.toStringValue(arg(a, 0)));
+                title->append(text);
+            }
+            element("body", html);
+            return self->wrap(d);
+        });
+        rt.method(impl, u"createDocument", 0, [self](Runtime&, const Value&, Args) {
+            return self->wrap(self->doc.make(NodeType::Document));
+        });
+        rt.method(impl, u"hasFeature", 0, [](Runtime&, const Value&, Args) { return Value::boolean(true); });
+        rt.put(p, u"implementation", Value::object(impl), js::kConfigurable);
+    }
+    // At a point of the window: the page's hit test, offset by how far it's scrolled.
+    const auto at_point = [self](Runtime& rt, Args a) -> Node* {
+        if (!self->host.element_at) return nullptr;
+        const double x = rt.toNumber(arg(a, 0)), y = rt.toNumber(arg(a, 1));
+        if (!std::isfinite(x) || !std::isfinite(y) || x < 0 || y < 0) return nullptr;
+        if (x > self->host.viewport_w || y > self->host.viewport_h) return nullptr;
+        const float sy = self->host.scroll_y ? self->host.scroll_y() : 0;
+        return self->host.element_at(static_cast<float>(x), static_cast<float>(y) + sy);
+    };
+    method(p, u"elementFromPoint", 2, [self, at_point](Runtime& rt, const Value&, Args a) { return self->wrap(at_point(rt, a)); });
+    method(p, u"elementsFromPoint", 2, [self, at_point](Runtime& rt, const Value&, Args a) {
+        std::vector<Node*> out;
+        for (Node* n = at_point(rt, a); n; n = n->parent)
+            if (n->isElement()) out.push_back(n);
+        return self->list(out);
+    });
+    method(p, u"getElementById", 1, [self](Runtime& rt, const Value& self_doc, Args a) {
         const std::string id = js::utf8(rt.toStringValue(arg(a, 0)));
-        std::vector<Node*> todo{self->doc.root()};
+        std::vector<Node*> todo{self->docNode(self_doc)};
         while (!todo.empty()) {
             Node* n = todo.back();
             todo.pop_back();
@@ -757,10 +840,10 @@ void PageScript::Impl::installDocument() {
         }
         return Value::null();
     });
-    method(p, u"getElementsByName", 1, [self](Runtime& rt, const Value&, Args a) {
+    method(p, u"getElementsByName", 1, [self](Runtime& rt, const Value& self_doc, Args a) {
         const std::string want = js::utf8(rt.toStringValue(arg(a, 0)));
         std::vector<Node*> out;
-        std::vector<Node*> todo{self->doc.root()};
+        std::vector<Node*> todo{self->docNode(self_doc)};
         while (!todo.empty()) {
             Node* n = todo.back();
             todo.pop_back();
@@ -1223,7 +1306,9 @@ void PageScript::Impl::installWindow() {
         return Value::undefined();
     });
     method(proto_event, u"composedPath", 0, [](Runtime& rt, const Value&, Args) { return Value::object(rt.newArray()); });
-    for (const char16_t* name : {u"Event", u"CustomEvent", u"MouseEvent", u"KeyboardEvent", u"FocusEvent", u"InputEvent", u"UIEvent", u"PointerEvent"}) {
+    for (const char16_t* name : {u"Event", u"CustomEvent", u"MouseEvent", u"KeyboardEvent", u"FocusEvent", u"InputEvent", u"UIEvent", u"PointerEvent",
+                                 u"PromiseRejectionEvent", u"ErrorEvent", u"MessageEvent", u"ProgressEvent", u"PopStateEvent", u"HashChangeEvent",
+                                 u"StorageEvent", u"TransitionEvent", u"AnimationEvent", u"WheelEvent", u"TouchEvent", u"SubmitEvent"}) {
         Object* c = rt.newFunction(name, 1, [self](Runtime& rt, const Value&, Args a) {
             Object* e = self->makeEvent(rt.toStringValue(arg(a, 0)), false, false);
             rt.put(e, u"isTrusted", Value::boolean(false), js::kEnumerable);
@@ -1284,6 +1369,13 @@ void PageScript::Impl::install() {
         if (host.console) host.console(level, text);
     });
     rt.setErrorReporter([this](const std::string& message) { report(message); });
+    // "unhandledrejection" at the window; preventDefault() means it's been seen to.
+    rt.unhandled_rejection = [this](const Value& promise, const Value& reason) {
+        return !fire(nullptr, u"unhandledrejection", false, true, [&](Object* e) {
+            rt.put(e, u"promise", promise, js::kEnumerable);
+            rt.put(e, u"reason", reason, js::kEnumerable);
+        });
+    };
     rt.base_url = host.base;
     rt.setModuleLoader([this](const std::string& url, std::function<void(js::ModuleSource)> done) {
         if (std::optional<std::string> got = source ? source(url) : std::nullopt) {
@@ -1355,6 +1447,20 @@ void PageScript::run(const std::function<std::optional<std::string>(const std::s
     s.ready_state = "complete";
     s.fire(s.doc.root(), u"readystatechange", false, false);
     s.fire(nullptr, u"load", false, false);
+    // XWEB_PROBE=<expression>: for finding what a page is up to, its value 15 seconds on,
+    // as a console line.
+    if (const char* probe = std::getenv("XWEB_PROBE")) {
+        std::string quoted = "\"";
+        for (const char c : std::string(probe)) {
+            if (c == '"' || c == '\\') quoted += '\\';
+            if (c == '\n') { quoted += "\\n"; continue; }
+            quoted += c;
+        }
+        quoted += "\"";
+        (void)s.rt.evaluate("setTimeout(function () { try { console.log('probe: ' + String((0, eval)(" + quoted +
+                                "))); } catch (e) { console.log('probe threw: ' + e); } }, 15000);",
+                            "probe");
+    }
     s.collect();
 }
 
@@ -1402,6 +1508,21 @@ void PageScript::resized(float w, float h) {
     impl_->host.viewport_w = w;
     impl_->host.viewport_h = h;
     impl_->fire(nullptr, u"resize", false, false);
+}
+
+void PageScript::imageLoaded(const std::string& url, bool ok) {
+    Impl& s = *impl_;
+    std::vector<Node*> imgs, todo{s.doc.root()};
+    while (!todo.empty()) {
+        Node* n = todo.back();
+        todo.pop_back();
+        if (n->isHtml("img"))
+            if (const std::string* src = n->attr("src"); src && resolveUrl(s.host.base, *src) == url) imgs.push_back(n);
+        todo.insert(todo.end(), n->children.rbegin(), n->children.rend());
+        if (n->shadow_root) todo.push_back(n->shadow_root);
+    }
+    for (Node* n : imgs) s.fire(n, ok ? u"load" : u"error", false, false);
+    s.drainMicrotasks();
 }
 
 void PageScript::toggle(Node* details) {

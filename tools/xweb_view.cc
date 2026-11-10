@@ -234,6 +234,7 @@ struct Page {
     std::map<std::string, std::string> sheets;   // by absolute URL
     std::map<std::string, std::shared_ptr<LoadedImage>> images;   // by absolute URL, UI thread only
     std::set<std::string> requested;   // images asked for, loaded or not; UI thread only
+    std::set<std::string> failed_images;   // asked for and not had; UI thread only
     uint64_t pixels = 0;
     bool fonts_known = false;   // its @font-face rules are in force, and what they need asked for
     web::FormState forms;       // what its controls hold; UI thread only
@@ -1347,6 +1348,29 @@ private:
         host.computed_style = [this](const web::Node* n) { return node_->computedStyleOf(n); };
         Page* raw = page.get();
         host.activate = [this](const web::Node* n) { activateNode(n); };
+        host.element_at = [this](float x, float y) -> web::Node* {
+            web::Node* n = node_->nodeAt(x, y);
+            while (n && !n->isElement()) n = n->parent;
+            return n;
+        };
+        host.image_state = [page = page.get()](const std::string& url) {
+            web::PageScript::Host::ImageState st;
+            if (const auto it = page->images.find(url); it != page->images.end()) {
+                st.done = st.ok = true;
+                if (it->second->svg) {
+                    const web::SvgSize& z = it->second->svg->size();
+                    st.width = static_cast<uint32_t>(z.width.value_or(300));
+                    st.height = static_cast<uint32_t>(z.height.value_or(150));
+                } else {
+                    st.width = it->second->width;
+                    st.height = it->second->height;
+                }
+            } else if (page->failed_images.count(url)) {
+                st.done = true;
+            }
+            if (std::getenv("XWEB_DEBUG_IMAGES")) std::fprintf(stderr, "[image] asked of %s: %s\n", url.c_str(), st.done ? (st.ok ? "here" : "failed") : "coming");
+            return st;
+        };
         host.submit = [this, raw](const web::Node* form) {
             if (auto sub = web::submitForm(form, nullptr, raw->forms, raw->base)) XApplication::post([this, sub = std::move(*sub)] { submit(sub); });
         };
@@ -1366,6 +1390,9 @@ private:
                 Resource got = load(url, web::sameSite(page_url, url));
                 std::optional<std::string> body;
                 if (got.ok && got.http_status < 400 && got.body.size() <= (8u << 20)) body = web::decodeToUtf8(got.body, got.content_type);
+                // XWEB_DEBUG_SCRIPTS=1: what each script fetch came to.
+                if (std::getenv("XWEB_DEBUG_SCRIPTS"))
+                    std::fprintf(stderr, "[script] %s: %s status %d, %zu bytes\n", url.c_str(), body ? "ok" : "FAILED", got.http_status, got.body.size());
                 XApplication::post([this, weak, url, done, body = std::move(body)] {
                     std::shared_ptr<Page> p = weak.lock();
                     if (!p || !p->script) return;   // the page is gone
@@ -1505,17 +1532,48 @@ private:
                         work->queue.pop_front();
                     }
                     Resource got = load(url, web::sameSite(page->url, url));
-                    if (!got.ok || got.http_status >= 400) continue;
+                    // XWEB_DEBUG_IMAGES=1: what each image came to, for finding why one's missing.
+                    static const bool debug = std::getenv("XWEB_DEBUG_IMAGES") != nullptr;
+                    // Said to the page's scripts, as an "error" at its <img>s.
+                    const auto failed = [this, page, url, mine] {
+                        XApplication::post([this, page, url, mine] {
+                            if (generation_.load() != mine) return;
+                            page->failed_images.insert(url);
+                            if (page->script) {
+                                page->script->imageLoaded(url, false);
+                                if (page->script->takeDirty()) relayout_wanted_ = true;
+                            }
+                        });
+                    };
+                    if (!got.ok || got.http_status >= 400) {
+                        if (debug) std::fprintf(stderr, "[image] %s: not loaded (status %d)\n", url.c_str(), got.http_status);
+                        failed();
+                        continue;
+                    }
                     auto decoded = decodeImage(url, got.body, got.content_type);
-                    if (!decoded) continue;
+                    if (debug)
+                        std::fprintf(stderr, "[image] %s: %zu bytes %s, %s\n", url.c_str(), got.body.size(), got.content_type.c_str(),
+                                     decoded ? (std::to_string(decoded->width) + "x" + std::to_string(decoded->height)).c_str() : "not decoded");
+                    if (!decoded) {
+                        failed();
+                        continue;
+                    }
                     auto image = std::make_shared<LoadedImage>(std::move(*decoded));
                     XApplication::post([this, page, url, image, mine] {
                         if (generation_.load() != mine) return;
                         const uint64_t pixels = static_cast<uint64_t>(image->width) * image->height;
-                        if (page->pixels + pixels > kMaxPagePixels) return;
+                        if (page->pixels + pixels > kMaxPagePixels) {
+                            if (std::getenv("XWEB_DEBUG_IMAGES")) std::fprintf(stderr, "[image] %s: over the page's pixel budget\n", url.c_str());
+                            return;
+                        }
                         page->pixels += pixels;
                         page->images[url] = image;
                         relayout_wanted_ = true;
+                        // "load" at its <img>s: pages hide placeholders, start fades, measure.
+                        if (page->script) {
+                            page->script->imageLoaded(url, true);
+                            (void)page->script->takeDirty();
+                        }
                     });
                 }
             }).detach();

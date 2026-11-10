@@ -641,7 +641,7 @@ void Runtime::runJobs() {
         if (failed.threw) {
             std::string message = "Uncaught exception";
             try {
-                message = "Uncaught " + describe(*this, failed.value);
+                message = "Uncaught " + describeValue(*this, failed.value);
             } catch (const Thrown&) {
             }
             reportError(message);
@@ -653,9 +653,17 @@ void Runtime::runJobs() {
     NoGc no_gc(*this);   // describe() may run script; these promises are only in this list
     for (Object* p : rejected) {
         if (p->promise_handled) continue;
+        if (unhandled_rejection) {
+            bool dealt = false;
+            try {
+                dealt = unhandled_rejection(Value::object(p), p->primitive);
+            } catch (const Thrown&) {
+            }
+            if (dealt) continue;
+        }
         std::string message = "Uncaught (in promise)";
         try {
-            message = "Uncaught (in promise) " + describe(*this, p->primitive);
+            message = "Uncaught (in promise) " + describeValue(*this, p->primitive) + describeWhere(*this, p->primitive);
         } catch (const Thrown&) {
         }
         reportError(message);

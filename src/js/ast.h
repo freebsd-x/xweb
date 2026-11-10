@@ -66,6 +66,7 @@ struct Node {
     Op op = Op::None;
     uint32_t line = 0;
     uint32_t flags = 0;
+    uint32_t offset = 0;          // where in its source it starts (a column, with Program::line_starts)
     double number = 0;
     std::u16string str;           // a name, a string's value
     std::u16string str2;          // a template's raw text, a regex's flags
@@ -91,6 +92,7 @@ enum : uint32_t {
     kDefault = 32768,                         // export default
     kNamespace = 65536,                       // import * as ns, export * as ns
     kHoisted = 131072,                        // export default function () {}: made at link time
+    kStaticBlock = 262144,                    // a class's static { ... } (with kStatic | kField)
 };
 
 struct FunctionInfo {
@@ -118,8 +120,32 @@ struct FunctionInfo {
     std::u16string source;                   // its text, for toString
 };
 
+// Where the statement running now is: its script's URL and line, for an error's stack.
+// (One runtime runs at a time on a thread; a Program forgets itself here as it goes.)
+struct ThrowSite {
+    const std::string* url = nullptr;
+    const std::vector<uint32_t>* line_starts = nullptr;
+    uint32_t line = 0;
+    uint32_t offset = 0;
+};
+inline thread_local ThrowSite t_throw_site;
+inline ThrowSite& throwSite() noexcept { return t_throw_site; }
+// "\n    at url:line:1" for where that is, or nothing: what an error's stack ends with.
+std::u16string stackLine();
+
 struct Program {
+    Program() = default;
+    Program(const Program&) = delete;
+    Program& operator=(const Program&) = delete;
+    ~Program() {
+        if (throwSite().url == &url) {
+            throwSite().url = nullptr;
+            throwSite().line_starts = nullptr;
+        }
+    }
     std::string url;                 // a module's (or a script's) URL, for import() and import.meta
+    std::vector<uint32_t> line_starts;   // the offset each line starts at, for columns
+    uint32_t make_offset = 0;        // set by the parser: where the token being read starts
     bool module = false;
     std::deque<Node> nodes;
     std::deque<FunctionInfo> functions;
@@ -128,6 +154,7 @@ struct Program {
     Node* make(N kind, uint32_t line) {
         nodes.push_back(Node{kind});
         nodes.back().line = line;
+        nodes.back().offset = make_offset;
         return &nodes.back();
     }
 };

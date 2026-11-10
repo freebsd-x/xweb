@@ -1783,6 +1783,7 @@ private:
 
 std::unique_ptr<Document> parseHtml(std::string_view html, ParseOptions options) {
     std::unique_ptr<Document> doc = TreeBuilder(html, options).run();
+    doc->scripting = options.scripting;
     attachDeclarativeShadowRoots(*doc);
     return doc;
 }
