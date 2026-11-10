@@ -2700,6 +2700,7 @@ private:
     void setContent(ComputedStyle& s, const Tokens& v) {
         const std::string kw = keyword(v);
         s.content.clear();
+        s.content_image.clear();
         s.has_content = kw != "none" && kw != "normal" && !v.empty();
         if (!s.has_content) return;
         for (size_t i = 0; i < v.size(); ++i) {
@@ -2709,6 +2710,11 @@ private:
             if (t.type == TokenType::Delim && t.text == "/") break;
             if (t.type == TokenType::String) {
                 s.content += t.text;
+            } else if (t.type == TokenType::Url) {
+                if (s.content_image.empty()) s.content_image = t.text;   // an icon, usually
+            } else if (t.type == TokenType::Function && lower(t.text) == "url") {
+                for (++i; i < v.size() && v[i].type != TokenType::RightParen; ++i)
+                    if (v[i].type == TokenType::String && s.content_image.empty()) s.content_image = v[i].text;
             } else if (t.type == TokenType::Ident) {
                 const std::string k = lower(t.text);
                 if (k == "open-quote") s.content += "\xE2\x80\x9C";

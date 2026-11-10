@@ -52,6 +52,7 @@ struct Box {
     int list_number = 0;
     const Box* deco_parent = nullptr;   // an inline with a background or border: the next such out
     float inline_extent = 0;       // how far its widest line reaches, closing padding included
+    bool synthetic = false;        // a pseudo-element's image: its node is the layout's own, not the page's
     float cb_height_hint = -1;     // its containing block's definite content height, if known: for a
                                    // picture's percentage height (an SVG at height: 100% of a 26px box)
     float last_baseline = -1;      // of the last line box, from the content box's top
@@ -398,6 +399,20 @@ private:
         auto box = std::make_unique<Box>();
         box->style = &style;
         box->kind = kindFor(style.display);
+        // content: url(icon.svg): a picture, as an <img> of its own would be.
+        if (!style.content_image.empty() && synthetic_nodes_.size() < 10000) {
+            Node& img = synthetic_nodes_.emplace_back();
+            img.type = NodeType::Element;
+            img.ns = Namespace::Html;
+            img.name = "img";
+            img.attrs.push_back({"src", style.content_image});
+            auto pic = std::make_unique<Box>();
+            pic->kind = BoxKind::Replaced;
+            pic->node = &img;
+            pic->style = anonymousStyle(style, Display::Inline);
+            pic->synthetic = true;
+            box->kids.push_back(std::move(pic));
+        }
         if (!style.content.empty()) {
             auto t = std::make_unique<Box>();
             t->kind = BoxKind::Text;
@@ -3881,7 +3896,7 @@ private:
     }
 
     void record(const Box& b, float x, float y) {
-        if (b.node && b.node->isElement()) recordRect(b.node, x, y, b.outerWidth(), b.outerHeight());
+        if (b.node && b.node->isElement() && !b.synthetic) recordRect(b.node, x, y, b.outerWidth(), b.outerHeight());
     }
 
     // As getBoundingClientRect has it: through the transforms it's inside, the box around that.
@@ -4127,6 +4142,7 @@ private:
     [[nodiscard]] const FormState& forms() const { return forms_ ? *forms_ : no_forms_; }
     float vw_, vh_;
     std::deque<ComputedStyle> anon_styles_;
+    std::deque<Node> synthetic_nodes_;   // pseudo-elements' pictures, for this layout only
     PageLayout* out_ = nullptr;
     const Box* skip_background_ = nullptr;
     const Box* root_ = nullptr;

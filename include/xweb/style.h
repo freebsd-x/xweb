@@ -275,6 +275,7 @@ struct ComputedStyle {
     // ::before and ::after
     bool has_content = false;
     std::string content;
+    std::string content_image;   // content: url(...): the image a ::before or ::after shows
     bool underline = false, line_through = false;   // includes those of ancestors
 
     [[nodiscard]] float usedLineHeight() const noexcept {
