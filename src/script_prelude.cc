@@ -458,6 +458,18 @@ const char* const kScriptPrelude = R"JS(
     constructor(parts, name, options = {}) { super(parts, options); this.name = String(name); this.lastModified = options.lastModified ?? Date.now(); }
     get [Symbol.toStringTag]() { return 'File'; }
   }
+  // blob: URLs for Blobs, which fetch() answers from here until they're revoked.
+  const blobUrls = new Map();
+  URL.createObjectURL = function createObjectURL(obj) {
+    if (!(obj instanceof Blob)) throw new TypeError("createObjectURL takes a Blob");
+    let id = '';
+    for (let i = 0; i < 32; i++) id += '0123456789abcdef'[Math.floor(Math.random() * 16)];
+    const url = 'blob:' + (typeof location === 'object' && location.origin ? location.origin : 'null') + '/' +
+      id.slice(0, 8) + '-' + id.slice(8, 12) + '-' + id.slice(12, 16) + '-' + id.slice(16, 20) + '-' + id.slice(20);
+    if (blobUrls.size < 10000) blobUrls.set(url, obj);
+    return url;
+  };
+  URL.revokeObjectURL = function revokeObjectURL(url) { blobUrls.delete(String(url)); };
   class FormData {
     constructor(form) {
       this._entries = [];
@@ -595,6 +607,14 @@ const char* const kScriptPrelude = R"JS(
     let req;
     try { req = new Request(input, init); } catch (e) { return Promise.reject(e); }
     if (req.signal && req.signal.aborted) return Promise.reject(abortError(req.signal));
+    if (req.url.startsWith('blob:')) {
+      const blob = blobUrls.get(req.url.split('#')[0]);
+      if (!blob || req.method !== 'GET') return Promise.reject(new TypeError('Failed to fetch'));
+      const res = new Response(null, { status: 200, headers: blob.type ? { 'content-type': blob.type } : {} });
+      res[bodyData] = blob[bytes].slice();
+      res.url = req.url;
+      return Promise.resolve(res);
+    }
     const done = native(req.url, req.method, [...req.headers], req._source, req.mode, req.credentials).then(([status, url, type, buf, headers, kind]) => {
       if (req.signal && req.signal.aborted) throw abortError(req.signal);
       const res = new Response(null, { status: 200, headers });
@@ -723,34 +743,62 @@ const char* const kScriptPrelude = R"JS(
     const r = el.getBoundingClientRect();
     return { x: r.x, y: r.y, width: r.width, height: r.height, top: r.top, left: r.left, right: r.right, bottom: r.bottom };
   }
+  // IntersectionObserver: each target's crossing in or out of the viewport, said when
+  // it's first observed and again whenever it changes (scrolling, or the page moving).
+  const liveObservers = new Set();
+  let observerTimer = 0, observerTicks = 0;
+  const checkObservers = () => { for (const o of Array.from(liveObservers)) o._check(false); };
+  // Polled a while after something's observed, for pages that move as they settle; then
+  // only scrolling and resizing look again, so an idle page stays idle.
+  const keepChecking = (restart) => {
+    if (restart) observerTicks = 0;
+    if (observerTimer || !liveObservers.size || observerTicks >= 40) return;
+    observerTimer = setTimeout(function tick() {
+      observerTimer = 0;
+      ++observerTicks;
+      checkObservers();
+      keepChecking(false);
+    }, 250);
+  };
+  global.addEventListener('scroll', checkObservers);
+  global.addEventListener('resize', checkObservers);
   class IntersectionObserver {
     constructor(callback, options = {}) {
       if (typeof callback !== 'function') throw new TypeError('IntersectionObserver needs a callback');
-      this._cb = callback; this._targets = new Set(); this._queued = [];
+      this._cb = callback; this._targets = new Set(); this._state = new Map(); this._fresh = new Set();
       this.root = options.root || null; this.rootMargin = options.rootMargin || '0px';
       this.thresholds = [].concat(options.threshold ?? 0);
+      const m = /^\s*(-?[\d.]+)px/.exec(this.rootMargin);
+      this._margin = m ? Number(m[1]) : 0;
     }
     observe(el) {
       if (this._targets.has(el)) return;
       this._targets.add(el);
-      this._queued.push(el);
-      if (this._queued.length === 1) setTimeout(() => this._flush(), 0);
+      this._fresh.add(el);
+      liveObservers.add(this);
+      setTimeout(() => this._check(true), 0);
+      keepChecking(true);
     }
-    _flush() {
-      const els = this._queued.filter(e => this._targets.has(e)); this._queued = [];
-      if (!els.length) return;
-      const vh = global.innerHeight, vw = global.innerWidth;
-      const entries = els.map(target => {
+    _check(firstOnly) {
+      if (!this._targets.size) return;
+      const vh = global.innerHeight, vw = global.innerWidth, m = this._margin;
+      const entries = [];
+      for (const target of this._targets) {
+        const fresh = this._fresh.has(target);
+        if (firstOnly && !fresh) continue;
         const r = entryRect(target);
-        const visible = r.bottom > 0 && r.top < vh && r.right > 0 && r.left < vw;
-        return { target, isIntersecting: visible, intersectionRatio: visible ? 1 : 0, boundingClientRect: r,
-                 intersectionRect: visible ? r : { x: 0, y: 0, width: 0, height: 0, top: 0, left: 0, right: 0, bottom: 0 },
-                 rootBounds: { x: 0, y: 0, width: vw, height: vh, top: 0, left: 0, right: vw, bottom: vh }, time: performance.now() };
-      });
-      this._cb(entries, this);
+        const visible = (r.width > 0 || r.height > 0) && r.bottom > -m && r.top < vh + m && r.right > -m && r.left < vw + m;
+        if (!fresh && this._state.get(target) === visible) continue;
+        this._fresh.delete(target);
+        this._state.set(target, visible);
+        entries.push({ target, isIntersecting: visible, intersectionRatio: visible ? 1 : 0, boundingClientRect: r,
+                       intersectionRect: visible ? r : { x: 0, y: 0, width: 0, height: 0, top: 0, left: 0, right: 0, bottom: 0 },
+                       rootBounds: { x: 0, y: 0, width: vw, height: vh, top: 0, left: 0, right: vw, bottom: vh }, time: performance.now() });
+      }
+      if (entries.length) this._cb(entries, this);
     }
-    unobserve(el) { this._targets.delete(el); }
-    disconnect() { this._targets.clear(); this._queued = []; }
+    unobserve(el) { this._targets.delete(el); this._state.delete(el); this._fresh.delete(el); if (!this._targets.size) liveObservers.delete(this); }
+    disconnect() { this._targets.clear(); this._state.clear(); this._fresh.clear(); liveObservers.delete(this); }
     takeRecords() { return []; }
   }
   class ResizeObserver {
@@ -1023,6 +1071,48 @@ const char* const kScriptPrelude = R"JS(
         configurable: true, enumerable: true });
     }
   }
+
+  // Range: positions in the tree, and the HTML-to-nodes use pages mostly want of it.
+  class Range {
+    constructor() {
+      this.startContainer = document; this.startOffset = 0;
+      this.endContainer = document; this.endOffset = 0;
+    }
+    get collapsed() { return this.startContainer === this.endContainer && this.startOffset === this.endOffset; }
+    get commonAncestorContainer() {
+      for (let a = this.startContainer; a; a = a.parentNode) if (a === this.endContainer || a.contains(this.endContainer)) return a;
+      return document;
+    }
+    setStart(node, offset) { this.startContainer = node; this.startOffset = offset >>> 0; }
+    setEnd(node, offset) { this.endContainer = node; this.endOffset = offset >>> 0; }
+    setStartBefore(node) { this.setStart(node.parentNode, Array.prototype.indexOf.call(node.parentNode.childNodes, node)); }
+    setStartAfter(node) { this.setStart(node.parentNode, Array.prototype.indexOf.call(node.parentNode.childNodes, node) + 1); }
+    setEndBefore(node) { this.setEnd(node.parentNode, Array.prototype.indexOf.call(node.parentNode.childNodes, node)); }
+    setEndAfter(node) { this.setEnd(node.parentNode, Array.prototype.indexOf.call(node.parentNode.childNodes, node) + 1); }
+    selectNode(node) { this.setStartBefore(node); this.setEndAfter(node); }
+    selectNodeContents(node) { this.setStart(node, 0); this.setEnd(node, node.childNodes ? node.childNodes.length : 0); }
+    collapse(toStart) { if (toStart) this.setEnd(this.startContainer, this.startOffset); else this.setStart(this.endContainer, this.endOffset); }
+    cloneRange() { const r = new Range(); r.setStart(this.startContainer, this.startOffset); r.setEnd(this.endContainer, this.endOffset); return r; }
+    createContextualFragment(html) {
+      const t = document.createElement('template');
+      t.innerHTML = String(html);
+      const f = document.createDocumentFragment();
+      while (t.content.firstChild) f.appendChild(t.content.firstChild);
+      return f;
+    }
+    getBoundingClientRect() {
+      const n = this.startContainer;
+      return n && n.getBoundingClientRect ? n.getBoundingClientRect() : { x: 0, y: 0, width: 0, height: 0, top: 0, left: 0, right: 0, bottom: 0 };
+    }
+    getClientRects() { return []; }
+    deleteContents() {}
+    detach() {}
+    toString() { return ''; }
+  }
+  global.Range = Range;
+  if (typeof Document === 'function') Document.prototype.createRange = function createRange() { return new Range(); };
+  if (typeof Element === 'function' && !Element.prototype.webkitMatchesSelector)
+    Element.prototype.webkitMatchesSelector = Element.prototype.matches;
 
   // DOMTokenList (classList): iterable, as a list of its tokens.
   {

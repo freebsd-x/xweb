@@ -305,7 +305,9 @@ public:
     // fonts, so someone has to say; without an answer it's taken as half an em.
     using ChMeasure = std::function<float(const ComputedStyle&)>;
 
-    StyledDocument(const Document& doc, css::MediaContext media, const SheetLoader& loader = {}, const ChMeasure& measure_ch = {});
+    // `forms`: what the page's controls hold now, for :checked (null: what the page said).
+    StyledDocument(const Document& doc, css::MediaContext media, const SheetLoader& loader = {}, const ChMeasure& measure_ch = {},
+                   const class FormState* forms = nullptr);
 
     // Nullptr for anything that has no box-generating style (or is too deep).
     [[nodiscard]] const ComputedStyle* styleOf(const Node* element) const;
@@ -320,6 +322,7 @@ public:
 private:
     css::MediaContext media_;
     ChMeasure measure_ch_;
+    const class FormState* forms_ = nullptr;
     std::unordered_map<const Node*, const ComputedStyle*> styles_;
     std::unordered_map<const Node*, const ComputedStyle*> before_, after_;
     std::deque<ComputedStyle> storage_;

@@ -580,13 +580,22 @@ public:
     }
 
     // A few computed values, for getComputedStyle.
+    // Laid out again now, at the size it was: a script reading styles or boxes after
+    // changing the page sees the change, as browsers recompute when asked.
+    void refresh() {
+        if (laid_out_width_ > 0) relayout(laid_out_width_, laid_out_height_);
+    }
+
     [[nodiscard]] std::unordered_map<std::string, std::string> computedStyleOf(const web::Node* n) const {
         std::unordered_map<std::string, std::string> out;
         const web::ComputedStyle* s = styles_ ? styles_->styleOf(n) : nullptr;
-        if (!s) {
-            out["display"] = "none";
-            return out;
-        }
+        // Not rendered (display: none, or inside one): every property still has a value.
+        static const web::ComputedStyle kUnrendered = [] {
+            web::ComputedStyle u;
+            u.display = web::Display::None;
+            return u;
+        }();
+        if (!s) s = &kUnrendered;
         static const char* kDisplay[] = {"none", "inline", "block", "inline-block", "list-item", "flow-root", "table", "inline-table",
                                          "table-caption", "table-row-group", "table-row", "table-cell", "table-column", "flex",
                                          "inline-flex", "grid", "inline-grid", "contents"};
@@ -613,9 +622,45 @@ public:
         out["font-family"] = s->font_family;
         out["opacity"] = std::to_string(s->opacity).substr(0, 4);
         out["z-index"] = std::to_string(s->z_index);
+        // Lengths as specified: px, or the percentage when that's what was said.
+        const auto len = [&px](const web::Length& l) {
+            if (l.is_auto) return std::string("auto");
+            if (l.hasPercent() && l.px == 0) {
+                char b[32];
+                std::snprintf(b, sizeof b, "%g%%", l.percent);
+                return std::string(b);
+            }
+            return px(l.px);
+        };
+        static const char* kSide[] = {"top", "right", "bottom", "left"};
+        static const char* kBorderStyle[] = {"none", "hidden", "solid", "dashed", "dotted", "double", "groove", "ridge", "inset", "outset"};
+        for (int i = 0; i < 4; ++i) {
+            out[std::string("margin-") + kSide[i]] = s->margin[i].is_auto ? std::string("0px") : len(s->margin[i]);
+            out[std::string("padding-") + kSide[i]] = len(s->padding[i]);
+            out[std::string("border-") + kSide[i] + "-width"] = px(s->border_width[i]);
+            out[std::string("border-") + kSide[i] + "-style"] = kBorderStyle[static_cast<size_t>(s->border_style[i])];
+            out[std::string("border-") + kSide[i] + "-color"] = rgb(s->border_color[i]);
+            out[kSide[i]] = len(s->offset[i]);
+        }
+        out["box-sizing"] = s->border_box ? "border-box" : "content-box";
+        out["float"] = s->float_side == web::Float::Left ? "left" : s->float_side == web::Float::Right ? "right" : "none";
+        out["overflow"] = s->overflow_clip ? "hidden" : "visible";
+        out["line-height"] = s->line_height > 0 ? px(s->line_height) : std::string("normal");
+        out["min-width"] = len(s->min_width);
+        out["min-height"] = len(s->min_height);
+        out["max-width"] = s->max_width.is_auto ? std::string("none") : len(s->max_width);
+        out["max-height"] = s->max_height.is_auto ? std::string("none") : len(s->max_height);
         if (const web::ElementBox* b = boxOf(n)) {
-            out["width"] = px(b->w);
-            out["height"] = px(b->h);
+            // The used size: its content box, unless it sizes its border box.
+            float w = b->w, h = b->h;
+            if (!s->border_box) {
+                for (int i : {1, 3}) w -= s->border_width[i] + (s->padding[i].hasPercent() ? 0 : s->padding[i].px);
+                for (int i : {0, 2}) h -= s->border_width[i] + (s->padding[i].hasPercent() ? 0 : s->padding[i].px);
+            }
+            out["width"] = px(std::max(0.0f, w));
+            out["height"] = px(std::max(0.0f, h));
+        } else {
+            out["width"] = out["height"] = "auto";
         }
         return out;
     }
@@ -783,7 +828,7 @@ private:
                 const auto it = page.sheets.find(web::resolveUrl(page.base, href));
                 return it == page.sheets.end() ? std::string{} : it->second;
             },
-            [this](const web::ComputedStyle& s) { return web::chWidth(measurer_, s); });
+            [this](const web::ComputedStyle& s) { return web::chWidth(measurer_, s); }, &page_->forms);
         const web::StyledDocument& styles = *styles_;
         if (!page.fonts_known) {
             page_->fonts_known = true;
@@ -1341,11 +1386,15 @@ private:
         host.forms = &page->forms;
         host.console = [](std::string_view level, const std::string& text) { std::cerr << "[page " << level << "] " << text << "\n"; };
         host.navigate = [this](const std::string& url) { XApplication::post([this, url] { navigate(url, Mode::New); }); };
-        host.rect = [this](const web::Node* n) -> std::optional<web::ElementRect> {
+        host.rect = [this, raw = page.get()](const web::Node* n) -> std::optional<web::ElementRect> {
+            if (raw->script && raw->script->dirty()) node_->refresh();
             if (const web::ElementBox* b = node_->boxOf(n)) return web::ElementRect{b->x, b->y, b->w, b->h};
             return std::nullopt;
         };
-        host.computed_style = [this](const web::Node* n) { return node_->computedStyleOf(n); };
+        host.computed_style = [this, raw = page.get()](const web::Node* n) {
+            if (raw->script && raw->script->dirty()) node_->refresh();
+            return node_->computedStyleOf(n);
+        };
         Page* raw = page.get();
         host.activate = [this](const web::Node* n) { activateNode(n); };
         host.element_at = [this](float x, float y) -> web::Node* {

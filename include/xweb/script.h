@@ -98,6 +98,8 @@ public:
     [[nodiscard]] bool busy() const;   // timers or frames waiting
     // Whether the tree or a control changed since last asked: time to lay out again.
     bool takeDirty();
+    // The same, without forgetting it (a script asking where something is now).
+    [[nodiscard]] bool dirty() const;
 
 private:
     struct Impl;

@@ -8,6 +8,7 @@
 #include <unordered_set>
 
 #include "ua_stylesheet.h"
+#include "xweb/forms.h"
 #include "xweb/url.h"
 
 namespace fbx::xweb {
@@ -1893,7 +1894,23 @@ private:
         }
         if (n == "link" || n == "any-link" || n == "-webkit-any-link")
             return (el->isHtml("a") || el->isHtml("area")) && el->attr("href");
-        if (n == "checked") return el->attr("checked") != nullptr || el->attr("selected") != nullptr;
+        if (n == "checked") {
+            // As the controls are now: what the user ticked or a script set.
+            if (const FormState* f = out_.forms_) {
+                const ControlKind k = controlKind(el);
+                if (k == ControlKind::Checkbox || k == ControlKind::Radio) return f->checked(el);
+                if (el->isHtml("option")) {
+                    const Node* sel = el->parent;
+                    if (sel && sel->isHtml("optgroup")) sel = sel->parent;
+                    if (sel && sel->isHtml("select")) {
+                        const auto opts = optionsOf(sel);
+                        const int at = f->selected(sel);
+                        return at >= 0 && static_cast<size_t>(at) < opts.size() && opts[static_cast<size_t>(at)] == el;
+                    }
+                }
+            }
+            return el->attr("checked") != nullptr || el->attr("selected") != nullptr;
+        }
         if (n == "disabled") return el->attr("disabled") != nullptr;
         if (n == "enabled") return (el->isHtml("input") || el->isHtml("button") || el->isHtml("select") || el->isHtml("textarea")) && !el->attr("disabled");
         if (n == "lang") {
@@ -3833,8 +3850,9 @@ private:
     bool border_none_[4] = {true, true, true, true};
 };
 
-StyledDocument::StyledDocument(const Document& doc, css::MediaContext media, const SheetLoader& loader, const ChMeasure& measure_ch)
-    : media_(media), measure_ch_(measure_ch) {
+StyledDocument::StyledDocument(const Document& doc, css::MediaContext media, const SheetLoader& loader, const ChMeasure& measure_ch,
+                               const FormState* forms)
+    : media_(media), measure_ch_(measure_ch), forms_(forms) {
     StyleResolver resolver(doc, *this, loader);
     resolver.run();
 }

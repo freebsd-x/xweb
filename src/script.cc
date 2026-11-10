@@ -1567,6 +1567,8 @@ void PageScript::tick() {
 
 bool PageScript::busy() const { return !impl_->timers.empty() || !impl_->frames.empty(); }
 
+bool PageScript::dirty() const { return impl_->dirty; }
+
 bool PageScript::takeDirty() {
     const bool d = impl_->dirty;
     impl_->dirty = false;

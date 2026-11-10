@@ -48,6 +48,7 @@ inline std::string upper(std::string s) {
 
 // "background-color" from "backgroundColor", and back.
 inline std::string cssName(const std::string& camel) {
+    if (camel == "cssFloat") return "float";   // float was a reserved word once
     std::string out;
     for (char c : camel) {
         if (c >= 'A' && c <= 'Z') {
@@ -139,7 +140,11 @@ inline std::string escapeAttr(const std::string& v) {
 }
 
 inline const char* kStyleProperties[] = {
-    "display", "position", "top", "right", "bottom", "left", "width", "height", "minWidth", "minHeight", "maxWidth",
+    "cssFloat", "float", "transformOrigin", "transitionDuration", "transitionProperty", "transitionTimingFunction", "transitionDelay",
+    "animationName", "animationDuration", "flexFlow", "gridTemplateAreas", "gridColumnStart", "gridColumnEnd", "gridRowStart",
+    "gridRowEnd", "gridAutoFlow", "borderTopLeftRadius", "borderTopRightRadius", "borderBottomLeftRadius", "borderBottomRightRadius",
+    "objectPosition", "overflowWrap", "translate", "rotate", "scale", "borderTopColor", "borderBottomColor", "borderLeftColor",
+    "borderRightColor", "webkitTransform", "webkitTransition", "display", "position", "top", "right", "bottom", "left", "width", "height", "minWidth", "minHeight", "maxWidth",
     "maxHeight", "margin", "marginTop", "marginRight", "marginBottom", "marginLeft", "padding", "paddingTop",
     "paddingRight", "paddingBottom", "paddingLeft", "border", "borderTop", "borderRight", "borderBottom", "borderLeft",
     "borderWidth", "borderStyle", "borderColor", "borderRadius", "color", "background", "backgroundColor",
@@ -576,6 +581,8 @@ struct PageScript::Impl {
         const std::u16string type = rt.toStringValue(rt.get(Value::object(event), u"type"));
         const bool bubbles = rt.toBoolean(rt.get(Value::object(event), u"bubbles"));
         rt.put(event, u"target", Value::object(target_obj), js::kEnumerable | js::kWritable);
+        // The window's load says the document is its target (the legacy target override).
+        if (target_obj == rt.global() && type == u"load") rt.put(event, u"target", wrap(doc.root()), js::kEnumerable | js::kWritable);
         event->remove(PropertyKey(stop_flag));
         event->remove(PropertyKey(stop_now_flag));
         std::vector<Object*> path;   // from the target outward

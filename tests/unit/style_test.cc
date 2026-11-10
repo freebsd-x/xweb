@@ -3,6 +3,7 @@
 #include <string>
 
 #include "xweb/html_parser.h"
+#include "xweb/forms.h"
 #include "xweb/style.h"
 
 using namespace fbx::xweb;
@@ -419,4 +420,28 @@ TEST(Sheets, RulesInsertedIntoAStyleElementApply) {
     };
     EXPECT_EQ(colorOf("b"), kBlue);
     EXPECT_EQ(colorOf("a"), kBlue);   // after the element's own text
+}
+
+TEST(Selectors, CheckedFollowsTheControlsState) {
+    auto doc = parseHtml("<style>:checked + b{color:red} option:checked{color:blue}</style>"
+                         "<input type=radio name=g id=r1 checked><b id=a></b><input type=radio name=g id=r2><b id=b></b>"
+                         "<select id=s><option id=o1 selected>1<option id=o2>2</select>");
+    const auto find = [&](const char* id) {
+        std::vector<Node*> todo{doc->root()};
+        while (!todo.empty()) {
+            Node* n = todo.back();
+            todo.pop_back();
+            if (const std::string* v = n->attr("id"); v && *v == id) return n;
+            for (Node* c : n->children) todo.push_back(c);
+        }
+        return static_cast<Node*>(nullptr);
+    };
+    FormState forms;
+    forms.setChecked(find("r2"), true);   // as a click or a script would
+    forms.select(find("s"), 1);
+    const StyledDocument styled(*doc, css::MediaContext{800, 600}, {}, {}, &forms);
+    EXPECT_NE(styled.styleOf(find("a"))->color, kRed);
+    EXPECT_EQ(styled.styleOf(find("b"))->color, kRed);
+    EXPECT_EQ(styled.styleOf(find("o2"))->color, kBlue);
+    EXPECT_NE(styled.styleOf(find("o1"))->color, kBlue);
 }

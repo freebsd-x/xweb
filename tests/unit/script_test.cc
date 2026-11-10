@@ -515,3 +515,58 @@ TEST(Script, ClassListIsAList) {
         </script>)");
     EXPECT_EQ(p.console, "log:3 a c b a+b+c 3 a b  c\n");
 }
+
+TEST(Script, StylePropertiesTakeWhatPagesAssign) {
+    Page p(R"(<body><div id=d></div><script>
+        const s = document.getElementById('d').style;
+        s.opacity = 0; s.zIndex = 1; s.cssFloat = 'left'; s.marginRight = '-100%'; s.display = 'block';
+        s['width'] = '100%'; s.setProperty('position', 'relative');
+        console.log(document.getElementById('d').getAttribute('style'));
+        console.log(s.opacity, s.zIndex, s.cssFloat, s.float, s.marginRight);
+        </script>)");
+    EXPECT_EQ(p.console, "log:opacity: 0; z-index: 1; float: left; margin-right: -100%; display: block; width: 100%; position: relative;\n"
+                         "log:0 1 left left -100%\n");
+}
+
+TEST(Script, BlobUrls) {
+    Page p(R"(<body><script>
+        const u = URL.createObjectURL(new Blob(['hello'], {type: 'text/plain'}));
+        console.log(u.startsWith('blob:https://example.org/'), u.length > 40);
+        fetch(u).then(r => r.text().then(t => console.log('got', t, r.headers.get('content-type'))));
+        URL.revokeObjectURL(u);
+        fetch(u).catch(e => console.log('revoked', e.name));
+        </script>)");
+    p.deliver();
+    EXPECT_NE(p.console.find("log:true true\n"), std::string::npos) << p.console;
+    EXPECT_NE(p.console.find("log:revoked TypeError\n"), std::string::npos) << p.console;
+}
+
+TEST(Script, MatchesOnEveryKindOfElement) {
+    Page p(R"(<body><svg id=s><circle id=c /></svg><template id=t><p>x</p></template><script>
+        const log = (...a) => console.log(...a);
+        log(typeof document.body.matches, typeof document.getElementById('c').matches, typeof document.createElementNS('http://www.w3.org/2000/svg', 'g').matches);
+        log(typeof document.getElementById('t').content, document.getElementById('t').content && document.getElementById('t').content.childNodes.length);
+        log(typeof document.createElement('div').closest, typeof Element.prototype.webkitMatchesSelector, typeof Element.prototype.msMatchesSelector);
+        const f = document.createRange().createContextualFragment('<b>1</b><i>2</i>');
+        log(f.childNodes.length, f.firstChild.localName, document.createRange().collapsed);
+        </script>)");
+    EXPECT_EQ(p.console, "log:function function function\nlog:object 1\nlog:function function undefined\nlog:2 b true\n") << p.console;
+}
+
+TEST(Script, WindowLoadDoesntPassThroughTheDocument) {
+    Page p(R"(<body><script>
+        document.addEventListener('load', e => console.log('document saw load', e.target === document), true);
+        window.addEventListener('load', e => console.log('window load', e.target === document));
+        </script>)");
+    EXPECT_EQ(p.console, "log:window load true\n") << p.console;
+}
+
+TEST(Script, IntersectionObserversSayWhatsInView) {
+    // The fixture puts every element at (10, 20) 300x40, in an 1000x800 view.
+    Page p(R"(<body><div id=a></div><script>
+        const io = new IntersectionObserver(es => es.forEach(e => console.log('seen', e.target.id, e.isIntersecting)));
+        io.observe(document.getElementById('a'));
+        </script>)");
+    for (int i = 0; i < 3; ++i) p.script->tick();
+    EXPECT_NE(p.console.find("log:seen a true\n"), std::string::npos) << p.console;
+}
