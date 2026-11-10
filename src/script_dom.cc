@@ -371,6 +371,9 @@ void PageScript::Impl::installDom() {
                  self->setText(self->thisNode(t), js::utf8(rt.toStringValue(arg(a, 0))));
                  return Value::undefined();
              });
+    // Nodes our HTML parser never makes, but polyfills patch their prototypes.
+    illegal(u"CDATASection", rt.newObject(proto_text), nullptr);
+    illegal(u"ProcessingInstruction", rt.newObject(proto_text->prototype ? proto_text->prototype : proto_node), nullptr);
     proto_doctype = rt.newObject(proto_node);
     illegal(u"DocumentType", proto_doctype, nullptr);
     accessor(proto_doctype, u"name", [self](Runtime&, const Value& t, Args) { return str(self->thisNode(t)->name); });
@@ -509,6 +512,34 @@ void PageScript::Impl::installDom() {
             self->fire(el, u"close", false, false);
             return Value::undefined();
         });
+    }
+    // Form controls' members belong to the controls, not to every element: on Element
+    // they'd be in the way of a custom element's own (Lit's `options`, a `type`, a `form`).
+    {
+        const std::pair<const char16_t*, std::vector<const char*>> owners[] = {
+            {u"value", {"HTMLInputElement", "HTMLSelectElement", "HTMLTextAreaElement", "HTMLOptionElement", "HTMLButtonElement",
+                        "HTMLDataElement", "HTMLOutputElement", "HTMLParamElement", "HTMLMeterElement", "HTMLProgressElement"}},
+            {u"checked", {"HTMLInputElement"}},
+            {u"selectedIndex", {"HTMLSelectElement"}},
+            {u"options", {"HTMLSelectElement", "HTMLDataListElement"}},
+            {u"type", {"HTMLInputElement", "HTMLButtonElement", "HTMLSelectElement", "HTMLTextAreaElement", "HTMLScriptElement",
+                       "HTMLLinkElement", "HTMLStyleElement", "HTMLOListElement", "HTMLSourceElement", "HTMLEmbedElement",
+                       "HTMLObjectElement", "HTMLOutputElement", "HTMLAnchorElement"}},
+            {u"form", {"HTMLInputElement", "HTMLSelectElement", "HTMLTextAreaElement", "HTMLButtonElement", "HTMLFieldSetElement",
+                       "HTMLOutputElement", "HTMLObjectElement", "HTMLLabelElement", "HTMLLegendElement", "HTMLOptionElement"}},
+            {u"elements", {"HTMLFormElement", "HTMLFieldSetElement"}},
+            {u"submit", {"HTMLFormElement"}},
+            {u"requestSubmit", {"HTMLFormElement"}},
+            {u"reset", {"HTMLFormElement"}},
+        };
+        for (const auto& [name, ifaces] : owners) {
+            const js::Property* own = proto_element->own(PropertyKey(name));
+            if (!own) continue;
+            const js::Property kept = *own;
+            for (const char* iface : ifaces)
+                if (Object* proto = interface_protos[iface]; proto && !proto->own(PropertyKey(name))) proto->define(PropertyKey(name), kept);
+            proto_element->remove(PropertyKey(name));
+        }
     }
     // <details>'s open.
     accessor(interface_protos["HTMLDetailsElement"], u"open", [self](Runtime&, const Value& t, Args) { return Value::boolean(self->thisElement(t)->attr("open") != nullptr); },

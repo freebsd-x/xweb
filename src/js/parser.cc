@@ -81,13 +81,22 @@ private:
     }
 
     void advance() {
-        const bool regex = started_ ? regexAfter(cur_) : true;
+        const bool regex = regex_next_ || (started_ ? regexAfter(cur_) : true);
+        regex_next_ = false;
         started_ = true;
         prev_end_ = cur_.end;
         prev_line_ = cur_.line;
         cur_ = lex_.next(regex);
         p_.make_offset = cur_.begin;
         if (cur_.type == Tok::Eof && !lex_.error.empty()) fail(lex_.error);
+    }
+
+    // The ) closing an if, while or for head: what follows is a statement, so a / there
+    // starts a regex (for (…) /re/.test(x) …), not a division.
+    void expectHeadClose() {
+        if (!is(u")")) expect(u")");
+        regex_next_ = true;
+        advance();
     }
 
     Token peek() {
@@ -521,7 +530,7 @@ private:
                 Node* n = p_.make(N::While, line);
                 expect(u"(");
                 n->a = expression();
-                expect(u")");
+                expectHeadClose();
                 n->b = loopBody();
                 return n;
             }
@@ -694,7 +703,7 @@ private:
         advance();
         expect(u"(");
         n->a = expression();
-        expect(u")");
+        expectHeadClose();
         n->b = isKw(u"function") ? functionDeclaration() : statement();
         if (isKw(u"else")) {
             advance();
@@ -742,7 +751,7 @@ private:
             }
             advance();
             n->b = of ? assignment() : expression();
-            expect(u")");
+            expectHeadClose();
             n->c = loopBody();
         } else {
             n = p_.make(N::For, line);
@@ -755,7 +764,7 @@ private:
             if (!is(u";")) n->b = expression();
             expect(u";");
             if (!is(u")")) n->c = expression();
-            expect(u")");
+            expectHeadClose();
             n->d = loopBody();
         }
         popScope();
@@ -2110,6 +2119,7 @@ private:
     // Early errors' bookkeeping.
     bool top_item_ = false;            // the statement now is a module's top-level item
     bool loop_body_next_ = false;      // the statement now is a loop's body
+    bool regex_next_ = false;          // the next token is lexed as if after an operator
     bool static_block_ = false;        // in a class static block, arrows in it too: no arguments
     bool static_await_ = false;        // ...and not in an arrow's body: no await as a name
     FunctionInfo* static_block_fn_ = nullptr;   // that block's own function: return isn't allowed in it

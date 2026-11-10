@@ -783,6 +783,16 @@ void PageScript::Impl::installDocument() {
     // parses HTML in one). Nothing in them is shown or run.
     {
         Object* impl = rt.newObject();
+        // DOMParser's work: a whole document from text, apart from the page (its scripts
+        // don't run). XML types are read as HTML, which serves the SVG and markup pages pass.
+        rt.method(impl, u"__parseDocument", 1, [self](Runtime& r, const Value&, Args a) {
+            const std::string text = js::utf8(r.toStringValue(arg(a, 0)));
+            if (text.size() > (32u << 20)) r.throwError("RangeError", "too much text to parse");
+            const auto parsed = parseHtml(text);
+            Node* d = self->doc.make(NodeType::Document);
+            for (const Node* c : parsed->root()->children) d->append(self->clone(c, true));
+            return self->wrap(d);
+        });
         rt.method(impl, u"createHTMLDocument", 0, [self](Runtime& r, const Value&, Args a) {
             Node* d = self->doc.make(NodeType::Document);
             const auto element = [&](const char* tag, Node* parent) {
@@ -1341,6 +1351,11 @@ void PageScript::Impl::installWindow() {
         rt.put(proto_target, u"constructor", Value::object(c));
         rt.put(g, u"EventTarget", Value::object(c));
     }
+    // NodeList and HTMLCollection: our lists are arrays, so their prototype inherits
+    // Array's; pages test instanceof and add forEach to it.
+    proto_nodelist = rt.newObject(rt.array_prototype);
+    iface(u"NodeList", proto_nodelist);
+    iface(u"HTMLCollection", proto_nodelist);
     iface(u"Node", proto_node);
     iface(u"Element", proto_element);
     iface(u"Document", proto_document);

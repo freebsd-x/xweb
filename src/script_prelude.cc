@@ -1072,6 +1072,45 @@ const char* const kScriptPrelude = R"JS(
     }
   }
 
+  // insertAdjacentElement and insertAdjacentText, beside insertAdjacentHTML.
+  {
+    const place = (el, where, node) => {
+      switch (String(where).toLowerCase()) {
+        case 'beforebegin': if (!el.parentNode) return null; el.parentNode.insertBefore(node, el); return node;
+        case 'afterbegin': el.insertBefore(node, el.firstChild); return node;
+        case 'beforeend': el.appendChild(node); return node;
+        case 'afterend': if (!el.parentNode) return null; el.parentNode.insertBefore(node, el.nextSibling); return node;
+        default: throw new SyntaxError("insertAdjacent: '" + where + "' isn't a position");
+      }
+    };
+    Element.prototype.insertAdjacentElement = function (where, el) { return place(this, where, el); };
+    Element.prototype.insertAdjacentText = function (where, text) { place(this, where, document.createTextNode(String(text))); };
+  }
+
+  // DOMParser and XMLSerializer.
+  {
+    const impl = document.implementation;
+    const parse = impl.__parseDocument;
+    delete impl.__parseDocument;
+    class DOMParser {
+      parseFromString(text, type) {
+        const t = String(type);
+        if (!['text/html', 'text/xml', 'application/xml', 'application/xhtml+xml', 'image/svg+xml'].includes(t))
+          throw new TypeError("DOMParser can't parse " + t);
+        return parse.call(impl, String(text));
+      }
+    }
+    class XMLSerializer {
+      serializeToString(node) {
+        if (node && node.nodeType === 9) return (node.documentElement ? node.documentElement.outerHTML : '');
+        if (node && node.nodeType === 1) return node.outerHTML;
+        return node && node.textContent != null ? String(node.textContent) : '';
+      }
+    }
+    global.DOMParser = DOMParser;
+    global.XMLSerializer = XMLSerializer;
+  }
+
   // Range: positions in the tree, and the HTML-to-nodes use pages mostly want of it.
   class Range {
     constructor() {

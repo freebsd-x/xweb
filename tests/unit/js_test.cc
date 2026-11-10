@@ -714,3 +714,12 @@ TEST(Js, CollectsWhileAScriptRuns) {
 TEST(Js, DivisionAfterPostfixIncrement) {
     EXPECT_EQ(run("var d = 10, k = [1, 2, 3, 4]; var y = d++ / 2; var z = k[d-- / 5 >> 1]; y + ',' + z + ',' + d"), "5,2,10");
 }
+
+TEST(Js, RegexAfterAStatementHead) {
+    EXPECT_EQ(run("var a = [], s = ['and[1]', 'x', 'not[2]'];"
+                  "for (let t of s) /and\\[\\d+\\]/.test(t) ? a.push('a') : /not\\[\\d+\\]/.test(t) && a.push('n');"
+                  "if (true) /x/.test('x') && a.push('i');"
+                  "var i = 0; while (i++ < 1) /y/.test('y') && a.push('w');"
+                  "var b = (4) / 2;"
+                  "a.join('') + b"), "aniw2");
+}

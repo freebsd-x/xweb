@@ -570,3 +570,48 @@ TEST(Script, IntersectionObserversSayWhatsInView) {
     for (int i = 0; i < 3; ++i) p.script->tick();
     EXPECT_NE(p.console.find("log:seen a true\n"), std::string::npos) << p.console;
 }
+
+TEST(Script, DOMParserMakesDocumentsOfItsOwn) {
+    Page p(R"(<body><p id=x>page</p><script>
+        const d = new DOMParser().parseFromString('<title>T</title><p id=x>parsed<script>console.log("ran!")<\/script>', 'text/html');
+        console.log(d.title, d.getElementById('x').textContent, document.getElementById('x').textContent, d instanceof Document);
+        const svg = new DOMParser().parseFromString('<svg xmlns="http://www.w3.org/2000/svg"><circle r="1"/></svg>', 'image/svg+xml');
+        console.log(svg.querySelector('circle') !== null, new XMLSerializer().serializeToString(document.getElementById('x')));
+        </script>)");
+    EXPECT_EQ(p.console, "log:T parsedconsole.log(\"ran!\") page true\nlog:true <p id=\"x\">page</p>\n") << p.console;   // its script is text, not run
+}
+
+TEST(Script, FormMembersStayWithTheControls) {
+    Page p(R"(<body><div id=d></div><form id=f><input id=i value=v><select id=s><option>a</select></form><script>
+        const log = (...a) => console.log(...a);
+        class XPicker extends HTMLElement { constructor() { super(); this.options = [1, 2]; this.type = 'fancy'; this.form = 'mine'; } }
+        customElements.define('x-picker', XPicker);
+        const x = document.createElement('x-picker');
+        log(x.options.length, x.type, x.form, 'value' in document.getElementById('d'));
+        log(document.getElementById('i').value, document.getElementById('i').form.id, document.getElementById('s').options.length, typeof document.getElementById('f').submit);
+        const d = document.getElementById('d');
+        d.insertAdjacentElement('beforeend', document.createElement('span'));
+        d.insertAdjacentText('afterbegin', 'hi');
+        log(d.innerHTML);
+        </script>)");
+    EXPECT_EQ(p.console, "log:2 fancy mine false\nlog:v f 1 function\nlog:hi<span></span>\n") << p.console;
+}
+
+TEST(Script, ListsAreNodeLists) {
+    Page p(R"(<body><b></b><b></b><script>
+        const l = document.querySelectorAll('b');
+        if (!NodeList.prototype.myEach) NodeList.prototype.myEach = function (f) { for (let i = 0; i < this.length; i++) f(this[i]); };
+        let n = 0; l.myEach(() => n++);
+        console.log(l instanceof NodeList, document.body.children instanceof HTMLCollection, Array.isArray(l), n, l.item(1) === l[1]);
+        </script>)");
+    EXPECT_EQ(p.console, "log:true true true 2 true\n") << p.console;
+}
+
+TEST(Script, EveryCharacterDataInterfaceIsThere) {
+    // The webcomponents polyfill patches all four without checking they exist.
+    Page p(R"(<body><script>
+        const r = ["Text", "Comment", "CDATASection", "ProcessingInstruction"].map(n => typeof window[n].prototype.__proto__);
+        console.log(r.join(), Object.getPrototypeOf(CDATASection.prototype) === Text.prototype);
+        </script>)");
+    EXPECT_EQ(p.console, "log:object,object,object,object true\n") << p.console;
+}

@@ -178,7 +178,7 @@ struct PageScript::Impl {
         for (auto& [id, fn] : frames) roots.push_back(fn);
         for (auto& [id, fn] : running_frames) roots.push_back(fn);
         for (Object* p : pending_fetches) roots.push_back(Value::object(p));
-        for (Object* p : {proto_target, proto_node, proto_element, proto_document, proto_text, proto_event, proto_style, proto_classlist,
+        for (Object* p : {proto_target, proto_node, proto_element, proto_document, proto_nodelist, proto_text, proto_event, proto_style, proto_classlist,
                           proto_html_element, proto_svg_element, proto_unknown, proto_fragment, proto_shadow_root})
             if (p) roots.push_back(Value::object(p));
         for (auto& [name, p] : interface_protos) roots.push_back(Value::object(p));
@@ -193,6 +193,7 @@ struct PageScript::Impl {
     Object* proto_node = nullptr;
     Object* proto_element = nullptr;
     Object* proto_document = nullptr;
+    Object* proto_nodelist = nullptr;   // NodeList.prototype (and HTMLCollection's): an Array.prototype below
     Object* proto_text = nullptr;
     Object* proto_event = nullptr;
     Object* proto_style = nullptr;
@@ -321,6 +322,7 @@ struct PageScript::Impl {
         items.reserve(nodes.size());
         for (Node* n : nodes) items.push_back(wrap(n));
         Object* a = rt.newArray(std::move(items));
+        if (proto_nodelist) a->prototype = proto_nodelist;   // instanceof NodeList; still an array
         rt.method(a, u"item", 1, [this](Runtime& r, const Value& t, Args args) {
             const Value v = r.get(t, PropertyKey(Runtime::numberToString(r.toIntegerOrInfinity(arg(args, 0)))));
             return v.isUndefined() ? Value::null() : v;
