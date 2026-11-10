@@ -828,12 +828,46 @@ private:
                                       tokens_.begin() + static_cast<std::ptrdiff_t>(e));
         };
         if (name == "import" && !has_block) {
-            for (const Token& t : preludeTokens()) {
-                if (t.type == TokenType::String || t.type == TokenType::Url) {
-                    out.imports.push_back(t.text);
-                    break;
-                }
+            // url, then perhaps layer(...), supports(...), then a media query list.
+            const std::vector<Token> prelude = preludeTokens();
+            size_t i = 0;
+            while (i < prelude.size() && prelude[i].type == TokenType::Whitespace) ++i;
+            std::string url;
+            if (i < prelude.size() && (prelude[i].type == TokenType::String || prelude[i].type == TokenType::Url)) {
+                url = prelude[i++].text;
+            } else if (i < prelude.size() && prelude[i].type == TokenType::Function && lower(prelude[i].text) == "url") {
+                // url("...") with a quoted string comes as a function.
+                for (++i; i < prelude.size() && prelude[i].type != TokenType::RightParen; ++i)
+                    if (prelude[i].type == TokenType::String) url = prelude[i].text;
+                if (i < prelude.size()) ++i;
             }
+            if (url.empty()) return;
+            const auto skipArgs = [&](size_t& k) {   // past a function's matching )
+                int depth = 0;
+                for (; k < prelude.size(); ++k) {
+                    if (prelude[k].type == TokenType::Function || prelude[k].type == TokenType::LeftParen) ++depth;
+                    else if (prelude[k].type == TokenType::RightParen && --depth == 0) { ++k; return; }
+                }
+            };
+            std::vector<Token> media;
+            while (i < prelude.size()) {
+                const Token& t = prelude[i];
+                if (t.type == TokenType::Function && lower(t.text) == "layer") { skipArgs(i); continue; }
+                if (t.type == TokenType::Ident && lower(t.text) == "layer" && media.empty()) { ++i; continue; }
+                if (t.type == TokenType::Function && lower(t.text) == "supports") {
+                    const size_t from = i + 1;
+                    skipArgs(i);
+                    const std::vector<Token> cond(prelude.begin() + static_cast<std::ptrdiff_t>(from), prelude.begin() + static_cast<std::ptrdiff_t>(i - 1));
+                    if (!supportsMatches(cond)) return;   // not for this browser
+                    continue;
+                }
+                media.push_back(t);
+                ++i;
+            }
+            while (!media.empty() && media.back().type == TokenType::Whitespace) media.pop_back();
+            while (!media.empty() && media.front().type == TokenType::Whitespace) media.erase(media.begin());
+            out.imports.push_back(url);
+            out.import_media.push_back(std::move(media));
             return;
         }
         if (!has_block || depth >= kMaxBlockDepth) return;

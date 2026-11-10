@@ -106,6 +106,11 @@ private:
     int clip_x0_, clip_y0_, clip_x1_, clip_y1_;
 };
 
+// Rounded corners cut out of an image's alpha (radii in its pixels), antialiased.
+void roundCorners(Raster& image, float rx, float ry);
+// The image redrawn at this many pixels (bilinear).
+[[nodiscard]] Raster resampled(const Raster& image, uint32_t width, uint32_t height);
+
 // Shapes, as polygons.
 [[nodiscard]] Contours roundedRect(float x, float y, float w, float h, float rx, float ry);
 [[nodiscard]] Contours ellipse(float cx, float cy, float rx, float ry, float scale);

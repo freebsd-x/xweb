@@ -538,3 +538,17 @@ TEST(Raster, DrawsAnImageThroughAMatrix) {
     EXPECT_EQ(at(r, 6, 3).a, 0);
     EXPECT_EQ(at(r, 4, 7).a, 0);
 }
+
+TEST(Raster, RoundedCornersCutTheAlpha) {
+    Raster img;
+    img.width = img.height = 20;
+    img.rgba.assign(20 * 20 * 4, 255);
+    roundCorners(img, 10, 10);   // a circle
+    EXPECT_EQ(at(img, 0, 0).a, 0);
+    EXPECT_EQ(at(img, 19, 19).a, 0);
+    EXPECT_EQ(at(img, 10, 10).a, 255);
+    EXPECT_GT(at(img, 10, 0).a, 240);   // the top middle, all but touching the edge
+    const int edge = at(img, 3, 3).a;   // (3.5, 3.5) is about 9.2 from the centre: inside
+    EXPECT_GT(edge, 200);
+    EXPECT_EQ(at(img, 1, 1).a, 0);
+}

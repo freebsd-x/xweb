@@ -190,6 +190,15 @@ int main(int argc, char** argv) {
                     svg_raster = l->svg->render(pw, ph);
                     r = &svg_raster;
                 }
+                Raster rounded;
+                if (raw.radius > 0 && raw.w > 0 && raw.h > 0) {
+                    // At the size it's shown, so the edge is crisp.
+                    const auto pw = static_cast<uint32_t>(std::clamp(std::ceil(raw.w), 1.0f, 4096.0f));
+                    const auto ph = static_cast<uint32_t>(std::clamp(std::ceil(raw.h), 1.0f, 4096.0f));
+                    rounded = resampled(*r, pw, ph);
+                    roundCorners(rounded, raw.radius * static_cast<float>(pw) / raw.w, raw.radius_y * static_cast<float>(ph) / raw.h);
+                    r = &rounded;
+                }
                 draw(*r, op.x, op.y, op.w, op.h, op.tint ? 1.0f : op.color.a / 255.0f, op.tint ? &op.color : nullptr);
                 break;
             }

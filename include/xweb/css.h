@@ -94,6 +94,7 @@ struct Stylesheet {
     std::vector<Rule> rules;
     std::vector<FontFaceRule> font_faces;
     std::vector<std::string> imports;   // @import URLs, in order
+    std::vector<std::vector<Token>> import_media;   // each one's media query list (empty: always)
 };
 
 [[nodiscard]] Stylesheet parseStylesheet(std::string_view css);

@@ -1613,7 +1613,10 @@ private:
     // `url` is where the sheet came from: its @imports are relative to that.
     void addSheet(css::Stylesheet sheet, Origin origin, int depth, const std::string& url = {}) {
         if (loader_ && depth < kMaxImportDepth) {
-            for (const std::string& ref : sheet.imports) {
+            for (size_t n = 0; n < sheet.imports.size(); ++n) {
+                const std::string& ref = sheet.imports[n];
+                // Only those whose media query list matches.
+                if (n < sheet.import_media.size() && !sheet.import_media[n].empty() && !css::mediaMatches(sheet.import_media[n], out_.media_)) continue;
                 if (++import_count_ > kMaxImports) break;
                 const std::string target = resolveUrl(url, ref);
                 addSheet(css::parseStylesheet(loader_(target)), origin, depth + 1, target);

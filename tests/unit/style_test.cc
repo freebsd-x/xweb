@@ -357,3 +357,21 @@ TEST(Values, LogicalPropertiesAreTheirPhysicalOnes) {
     EXPECT_FLOAT_EQ(s.of("a").offset[Bottom].px, 2);
     EXPECT_FLOAT_EQ(s.of("b").offset[Right].px, 5);
 }
+
+TEST(Sheets, ImportsKeepToTheirConditions) {
+    const auto loader = [](const std::string& href) -> std::string {
+        if (href == "all.css") return "@import url(light.css); @import url('dark.css') (prefers-color-scheme: dark);"
+                                      "@import \"print.css\" print; @import 'layered.css' layer(base) screen;"
+                                      "@import 'nosupport.css' supports(display: nonsense-value);";
+        if (href == "light.css") return "#a{color:red}";
+        if (href == "dark.css") return "#a{color:blue}";
+        if (href == "print.css") return "#b{color:blue}";
+        if (href == "layered.css") return "#c{color:red}";
+        if (href == "nosupport.css") return "#c{color:blue}";
+        return {};
+    };
+    const auto s = style("<link rel=stylesheet href=all.css><div id=a></div><div id=b></div><div id=c></div>", loader);
+    EXPECT_EQ(s.of("a").color, kRed);
+    EXPECT_EQ(s.of("b").color, (Color{0, 0, 0, 255}));
+    EXPECT_EQ(s.of("c").color, kRed);
+}

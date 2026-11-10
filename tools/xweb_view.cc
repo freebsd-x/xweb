@@ -984,13 +984,16 @@ private:
     void image(fbx::xrender::DisplayList& dl, const web::PaintOp& op, float x, float y) {
         const LoadedImage* loaded = images_.find(op.text);
         if (!loaded) return;
-        if (loaded->svg || op.tint) {
+        if (loaded->svg || op.tint || op.radius > 0) {
             // Drawn for this size (an SVG), or only its alpha in a colour (a mask).
-            const auto [pw, ph] = loaded->svg ? rasterSize(op.w, op.h) : std::pair<uint32_t, uint32_t>{loaded->width, loaded->height};
+            // An SVG, or rounded corners, at the size shown; a mask at the image's own.
+            const auto [pw, ph] = loaded->svg || op.radius > 0 ? rasterSize(op.w, op.h) : std::pair<uint32_t, uint32_t>{loaded->width, loaded->height};
             char ptr[32];
             std::snprintf(ptr, sizeof ptr, "%p", static_cast<const void*>(loaded));
-            const std::string key = std::string("i:") + ptr + ":" + std::to_string(pw) + "x" + std::to_string(ph) + (op.tint ? ":" + colorKey(op.color) : "");
+            const std::string key = std::string("i:") + ptr + ":" + std::to_string(pw) + "x" + std::to_string(ph) + (op.tint ? ":" + colorKey(op.color) : "") +
+                                    (op.radius > 0 ? ":r" + std::to_string(op.radius) + "," + std::to_string(op.radius_y) + "@" + std::to_string(op.w) + "x" + std::to_string(op.h) : "");
             const bool tint = op.tint;
+            const float rx = op.radius, ry = op.radius_y, shown_w = op.w, shown_h = op.h;
             const web::Color color = op.color;
             const CachedRaster* r = cached(key, [&, pw = pw, ph = ph] {
                 web::Raster out;
@@ -1000,7 +1003,10 @@ private:
                     out.width = loaded->width;
                     out.height = loaded->height;
                     out.rgba = loaded->pixels;
+                    if (out.width != pw || out.height != ph) out = web::resampled(out, pw, ph);
                 }
+                if (rx > 0 && shown_w > 0 && shown_h > 0)
+                    web::roundCorners(out, rx * static_cast<float>(out.width) / shown_w, ry * static_cast<float>(out.height) / shown_h);
                 if (tint)
                     for (size_t i = 0; i + 3 < out.rgba.size(); i += 4) {
                         out.rgba[i] = color.r;

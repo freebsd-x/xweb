@@ -57,7 +57,8 @@ struct PaintOp {
     PaintKind kind = PaintKind::Rect;
     float x = 0, y = 0, w = 0, h = 0;
     Color color;
-    float radius = 0;      // Rect: rounded corners
+    float radius = 0;      // Rect: rounded corners. Image: its corners' horizontal radius
+    float radius_y = 0;    // Image: their vertical radius
     std::string text;      // Text: the run. Image: its source.
     FontSpec font;
     bool tint = false;     // Image: only its alpha, in `color` (a mask over a background colour)

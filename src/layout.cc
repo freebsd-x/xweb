@@ -51,6 +51,7 @@ struct Box {
     float min_content = -1;        // min-content width, once computed
     int list_number = 0;
     const Box* deco_parent = nullptr;   // an inline with a background or border: the next such out
+    float inline_extent = 0;       // how far its widest line reaches, closing padding included
     float last_baseline = -1;      // of the last line box, from the content box's top
     float percent_min_h = 0, percent_max_h = -1;
 
@@ -68,10 +69,14 @@ struct Box {
     };
     std::vector<Fragment> fragments;
 
+    // (Text and line breaks share their element's style: its float or position isn't theirs.)
     [[nodiscard]] bool outOfFlow() const noexcept {
-        return style && (style->position == Position::Absolute || style->position == Position::Fixed);
+        return style && kind != BoxKind::Text && kind != BoxKind::LineBreak &&
+               (style->position == Position::Absolute || style->position == Position::Fixed);
     }
-    [[nodiscard]] bool floating() const noexcept { return style && style->float_side != Float::None; }
+    [[nodiscard]] bool floating() const noexcept {
+        return style && kind != BoxKind::Text && kind != BoxKind::LineBreak && style->float_side != Float::None;
+    }
     [[nodiscard]] bool blockLevel() const noexcept { return kind == BoxKind::Block; }
     [[nodiscard]] bool inFlowBlock() const noexcept { return blockLevel() && !outOfFlow() && !floating(); }
     [[nodiscard]] Display display() const noexcept { return style ? style->display : Display::Block; }
@@ -1059,6 +1064,7 @@ private:
             (void)layoutInline(b, Flow{&scratch, 0, 0});
             for (const auto& f : b.fragments)
                 if (f.x + f.w < kUnbounded / 2) result = std::max(result, f.x + f.w);
+            if (b.inline_extent < kUnbounded / 2) result = std::max(result, b.inline_extent);
             float floats = 0;
             for (const FloatArea& f : scratch.floats) {
                 if (max_content) floats += f.w;
@@ -1617,8 +1623,15 @@ private:
                 it.min_main = minContentWidth(k);
                 if (!main_size.is_auto && !main_size.hasPercent()) it.min_main = std::min(it.min_main, std::max(0.0f, main_size.px - box_extra));
             } else if (!row && !ks.overflow_clip) {
-                it.min_main = std::min(it.base, it.base);   // content height, already measured above
-                if (!ks.flex_basis.is_auto || !main_size.is_auto) it.min_main = 0;
+                // Its content height, whatever its basis (flex: 1 on a page's <main> mustn't
+                // squash it to nothing); no more than a height it gives itself.
+                float content = it.base;   // measured above when the basis came from content
+                if (!ks.flex_basis.is_auto || !main_size.is_auto) {
+                    layoutItem(k, columnItemWidth(c, it), std::nullopt);
+                    content = k.height;
+                }
+                it.min_main = content;
+                if (!main_size.is_auto && !main_size.hasPercent()) it.min_main = std::min(it.min_main, std::max(0.0f, main_size.px - box_extra));
             }
             if (!max_size.is_auto) it.max_main = std::max(0.0f, max_size.resolve(base_for_percent) - box_extra);
             if (it.max_main < it.min_main) it.max_main = it.min_main;
@@ -2814,6 +2827,7 @@ private:
     // Returns the height of the lines; fills b.fragments.
     float layoutInline(Box& b, Flow flow) {
         b.fragments.clear();
+        b.inline_extent = 0;
         b.last_baseline = -1;
         // An inline-block counts its own <a> for what it contains.
         InlineContext ctx;
@@ -3050,6 +3064,10 @@ private:
                 line_has_content_ = true;
             }
             x_ = clampCoord(x_ + c.width);
+            // An inline's closing padding, border and margin: no fragment, but the line
+            // reaches past it.
+            if (c.kind == Chunk::Space && c.text.empty()) tail_spacer_ = x_;
+            else if (c.kind == Chunk::Atomic || !c.text.empty()) tail_spacer_ = -1;
         }
 
         void addWord(std::string_view word, const InlineItem& it) {
@@ -3161,10 +3179,15 @@ private:
             float above = strut_a + strut_half, below = strut_d + strut_half;
             if (line_.empty() && !forced) above = below = 0;
 
-            const auto textShift = [](const ComputedStyle& s) {
+            const auto textShift = [&](const ComputedStyle& s) {
                 // Measured from the parent's size; "smaller" is what usually got us here.
                 if (s.vertical_align == VerticalAlign::Sub) return s.font_size * 1.2f / 5 + 1;
                 if (s.vertical_align == VerticalAlign::Super) return -(s.font_size * 1.2f / 3 + 1);
+                if (s.vertical_align == VerticalAlign::Middle && &s != &container) {
+                    // Its middle at the baseline plus half the x-height (as for an atomic).
+                    const FontSpec f = fontOf(s);
+                    return (l_.text_.ascent(f) - l_.text_.descent(f)) / 2 - container.font_size * 0.25f;
+                }
                 return 0.0f;
             };
 
@@ -3194,6 +3217,10 @@ private:
                     line_w = last.x + last.w;
                 }
             }
+
+            if (!line_.empty() && tail_spacer_ > line_w) line_w = tail_spacer_;
+            tail_spacer_ = -1;
+            if (!line_.empty()) b_.inline_extent = std::max(b_.inline_extent, line_w);
 
             float shift = 0;
             if (b_.width < kUnbounded) {
@@ -3251,6 +3278,7 @@ private:
         const ComputedStyle* space_style_ = nullptr;
         Color space_background_{0, 0, 0, 0};
         const Box* space_deco_ = nullptr;
+        float tail_spacer_ = -1;   // where a closing spacer after the line's last fragment ends
         uint32_t line_index_ = 0;
         const std::string* space_link_ = nullptr;
     };
@@ -3580,6 +3608,17 @@ private:
                     op.h = b.height;
                     op.text = *src;
                     op.color = faded(Color{255, 255, 255, 255}, opacity);
+                    // border-radius rounds the picture too: inside its border and padding.
+                    float radii[4][2];
+                    const float bw = b.outerWidth(), bh = b.outerHeight();
+                    for (int i = 0; i < 4; ++i) {
+                        radii[i][0] = std::max(0.0f, s.radius[i][0].resolve(bw));
+                        radii[i][1] = std::max(0.0f, s.radius[i][1].resolve(bh));
+                    }
+                    fitRadii(radii, bw, bh);
+                    op.radius = std::max(0.0f, radii[0][0] - b.border[Left] - b.padding[Left]);
+                    op.radius_y = std::max(0.0f, radii[0][1] - b.border[Top] - b.padding[Top]);
+                    if (op.radius <= 0 || op.radius_y <= 0) op.radius = op.radius_y = 0;
                     out_->ops.push_back(std::move(op));
                     return;
                 }

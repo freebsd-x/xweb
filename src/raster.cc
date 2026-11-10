@@ -392,6 +392,38 @@ void Canvas::drawRaster(const Raster& image, const Matrix& to_canvas, float opac
     }
 }
 
+Raster resampled(const Raster& image, uint32_t width, uint32_t height) {
+    if (image.width == width && image.height == height) return image;
+    Canvas c(width, height);
+    c.drawRaster(image, 0, 0, static_cast<float>(width), static_cast<float>(height));
+    return c.toRaster();
+}
+
+void roundCorners(Raster& image, float rx, float ry) {
+    const float w = static_cast<float>(image.width), h = static_cast<float>(image.height);
+    rx = std::min(rx, w / 2);
+    ry = std::min(ry, h / 2);
+    if (rx <= 0 || ry <= 0 || image.empty()) return;
+    for (uint32_t y = 0; y < image.height; ++y) {
+        const float py = static_cast<float>(y) + 0.5f;
+        const float dy = py < ry ? ry - py : py > h - ry ? py - (h - ry) : 0;
+        if (dy == 0) continue;
+        for (uint32_t x = 0; x < image.width; ++x) {
+            const float px = static_cast<float>(x) + 0.5f;
+            const float dx = px < rx ? rx - px : px > w - rx ? px - (w - rx) : 0;
+            if (dx == 0) continue;
+            // Distance outside the corner's ellipse, about in pixels.
+            const float nx = dx / rx, ny = dy / ry;
+            const float len = std::sqrt(nx * nx + ny * ny);
+            const float grad = std::sqrt(nx * nx / (rx * rx) + ny * ny / (ry * ry)) / std::max(len, 1e-6f);
+            const float outside = (len - 1) / std::max(grad, 1e-6f);
+            const float cover = std::clamp(0.5f - outside, 0.0f, 1.0f);
+            uint8_t& a = image.rgba[(static_cast<size_t>(y) * image.width + x) * 4 + 3];
+            a = static_cast<uint8_t>(std::lround(a * cover));
+        }
+    }
+}
+
 Contours transformed(const Contours& contours, const Matrix& m) {
     Contours out = contours;
     for (auto& c : out)

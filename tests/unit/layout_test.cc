@@ -551,3 +551,22 @@ TEST(Flex, MinWidthZeroLetsAnItemShrinkBelowItsContent) {
     EXPECT_FLOAT_EQ(r.box("z").w, 100);
     EXPECT_GT(r.box("a").w, 100);   // auto: no smaller than its content
 }
+
+TEST(Floats, WhitespaceInsideAFloatIsntAFloat) {
+    // Text shares its element's style; the float's float: left isn't the text's. Counted
+    // as floats, the blank runs around the <p> each painted the float's background again.
+    for (const char* pos : {"float:left", "position:absolute"}) {
+        const auto r = layout(std::string("<div><div style='") + pos + ";width:190px;height:40px;background:red'> <p></p> </div></div>");
+        int reds = 0;
+        for (const PaintOp& op : r.page.ops)
+            if (op.kind == PaintKind::Rect && op.color.r == 255 && op.color.g == 0) ++reds;
+        EXPECT_EQ(reds, 1) << pos;
+    }
+}
+
+TEST(Flex, ColumnItemsKeepTheirContentHeightWhateverTheirBasis) {
+    const auto r = layout("<style>body{margin:0}</style><div style='display:flex;flex-direction:column;min-height:100px'>"
+                          "<main id=m style='flex:1'><div style='height:250px'></div></main><footer id=f style='height:20px'></footer></div>");
+    EXPECT_FLOAT_EQ(r.box("m").h, 250);
+    EXPECT_FLOAT_EQ(r.box("f").y, 250);
+}
