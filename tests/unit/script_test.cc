@@ -41,6 +41,19 @@ struct Page {
         host.navigate = [this](const std::string& url) { navigated = url; };
         host.rect = [](const Node*) { return std::optional<ElementRect>(ElementRect{10, 20, 300, 40}); };
         host.activate = [this](const Node* n) { activated.push_back(n); };
+        // Canvas text in a pretend font: 5px a character, 8 above the baseline, 2 below, solid.
+        host.canvas_text = [](const std::string& text, const std::string&, float scale, bool render) {
+            PageScript::Host::CanvasText t;
+            t.advance = 5.0f * static_cast<float>(text.size());
+            t.ascent = 8;
+            t.descent = 2;
+            if (render) {
+                t.mask.width = static_cast<uint32_t>(t.advance * scale);
+                t.mask.height = static_cast<uint32_t>(10 * scale);
+                t.mask.rgba.assign(static_cast<size_t>(t.mask.width) * t.mask.height * 4, 255);
+            }
+            return std::optional<PageScript::Host::CanvasText>(t);
+        };
         host.submit = [this](const Node* n) { submitted.push_back(n); };
         // A network that answers at once, from a table; what was asked is kept.
         host.fetch = [this](const PageScript::Host::Request& r, std::function<void(PageScript::Host::Response)> done) {
@@ -807,4 +820,16 @@ TEST(Script, Canvas2dDrawsPixels) {
                     c.getContext('2d') === x, c.getContext('webgl'), x.measureText('ab').width > 0, c.width, c.height);
         </script>)");
     EXPECT_EQ(p.console, "log:255,0,0,255 0,0,255,255 0,0,0,0 1,2,3,255 data:image/png;base64, true false true null true 20 10\n") << p.console;
+}
+
+TEST(Script, CanvasTextIsPlacedByAlignAndBaseline) {
+    Page p(R"(<body><canvas id=c width=40 height=30></canvas><script>
+        const x = document.getElementById('c').getContext('2d');
+        x.fillStyle = '#00ff00';
+        x.textAlign = 'right'; x.textBaseline = 'top';
+        x.fillText('ab', 30, 5);   // 10 wide, 10 tall: x 20..30, y 5..15
+        const a = (X, Y) => x.getImageData(X, Y, 1, 1).data[3];
+        console.log(x.measureText('abcd').width, a(25, 10), a(15, 10), a(25, 3), a(25, 17));
+        </script>)");
+    EXPECT_EQ(p.console, "log:20 255 0 0 0\n") << p.console;
 }

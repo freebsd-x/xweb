@@ -1986,8 +1986,16 @@ const char* const kScriptPrelude = R"JS(
       }
       // Pictures: other canvases (images aren't drawn yet).
       drawImage(src, ...a) {
-        if (!(src instanceof HTMLCanvasElement)) return;
-        const [sw0, sh0] = N.size(src);
+        const isImage = typeof HTMLImageElement === 'function' && src instanceof HTMLImageElement;
+        const isBitmap = src && src._xwebBitmapOf instanceof HTMLCanvasElement;
+        if (isBitmap) src = src._xwebBitmapOf;
+        if (!(src instanceof HTMLCanvasElement) && !isImage) {
+          if (src && (src instanceof SVGElement || (typeof HTMLVideoElement === 'function' && src instanceof HTMLVideoElement))) return;
+          throw new TypeError('drawImage needs an image or a canvas');
+        }
+        const url = isImage ? (src.currentSrc || src.src) : null;
+        const [sw0, sh0] = isImage ? N.imageSize(url) : N.size(src);
+        if (isImage && (!sw0 || !sh0)) return;   // not loaded (yet): nothing to draw
         let sx = 0, sy = 0, sw = sw0, sh = sh0, dx, dy, dw, dh;
         if (a.length <= 2) [dx, dy] = a, dw = sw, dh = sh;
         else if (a.length <= 4) [dx, dy, dw, dh] = a;
@@ -1995,7 +2003,19 @@ const char* const kScriptPrelude = R"JS(
         if (!finite(sx, sy, sw, sh, dx, dy, dw, dh) || !sw || !sh) return;
         // Source pixels onto the destination rectangle, then the current transform.
         const fit = [dw / sw, 0, 0, dh / sh, dx - sx * dw / sw, dy - sy * dh / sh];
-        N.drawCanvas(this.canvas, src, new Float32Array(mul(this._s.m, fit)), this._s.alpha);
+        const m = new Float32Array(mul(this._s.m, fit));
+        if (sx || sy || sw !== sw0 || sh !== sh0) {
+          // Only part of the source: clip to where it lands.
+          this.save();
+          const b = new Builder(); b.rect(this._s.m, dx, dy, dw, dh);
+          const { pts, counts } = b.packed();
+          this._s.clips = this._s.clips.concat([{ pts, counts, evenOdd: false }]);
+          N.clip(this.canvas, pts, counts, false);
+          if (isImage) N.drawImage(this.canvas, url, m, this._s.alpha); else N.drawCanvas(this.canvas, src, m, this._s.alpha);
+          this.restore();
+          return;
+        }
+        if (isImage) N.drawImage(this.canvas, url, m, this._s.alpha); else N.drawCanvas(this.canvas, src, m, this._s.alpha);
       }
       // Text: measured roughly; not drawn yet.
       get font() { return this._s.font; }
@@ -2006,14 +2026,30 @@ const char* const kScriptPrelude = R"JS(
       set textBaseline(v) { if (['top', 'hanging', 'middle', 'alphabetic', 'ideographic', 'bottom'].includes(v)) this._s.textBaseline = v; }
       measureText(text) {
         const size = fontSize(this._s.font);
+        const got = N.measure(String(text), this._s.font);
+        if (got) {
+          const [w, asc, desc] = got;
+          const left = this._s.textAlign === 'center' ? w / 2 : (this._s.textAlign === 'right' || this._s.textAlign === 'end') ? w : 0;
+          return { width: w, actualBoundingBoxLeft: left, actualBoundingBoxRight: w - left, actualBoundingBoxAscent: asc, actualBoundingBoxDescent: desc,
+                   fontBoundingBoxAscent: asc, fontBoundingBoxDescent: desc, emHeightAscent: asc, emHeightDescent: desc,
+                   hangingBaseline: asc * 0.8, alphabeticBaseline: 0, ideographicBaseline: -desc };
+        }
         let w = 0;
         for (const ch of String(text)) w += (ch.codePointAt(0) > 0x2e80 ? 1 : /[il.,:;'|!]/.test(ch) ? 0.28 : /[mwMW@]/.test(ch) ? 0.85 : 0.55) * size;
         return { width: w, actualBoundingBoxLeft: 0, actualBoundingBoxRight: w, actualBoundingBoxAscent: size * 0.72, actualBoundingBoxDescent: size * 0.2,
                  fontBoundingBoxAscent: size * 0.9, fontBoundingBoxDescent: size * 0.25, emHeightAscent: size * 0.8, emHeightDescent: size * 0.2,
                  hangingBaseline: size * 0.7, alphabeticBaseline: 0, ideographicBaseline: -size * 0.2 };
       }
-      fillText() {}
-      strokeText() {}
+      _text(text, x, y, maxWidth, style) {
+        if (!finite(x, y)) return;
+        const align = { left: -1, start: -1, center: 0, right: 1, end: 1 }[this._s.textAlign] ?? -1;
+        const shift = { alphabetic: 0, ideographic: -1, bottom: -1, top: 1, hanging: 0.8, middle: 0.5 }[this._s.textBaseline] ?? 0;
+        N.text(this.canvas, String(text).replace(/[\t\n\f\r]/g, ' '), this._s.font, x, y, align, shift, new Float32Array(this._s.m),
+               styleValue(style), this._s.alpha, maxWidth === undefined ? NaN : +maxWidth);
+      }
+      fillText(text, x, y, maxWidth) { this._text(text, x, y, maxWidth, this._s.fill); }
+      // Outlines of glyphs aren't drawn: their filling, in the stroke's colour, stands in.
+      strokeText(text, x, y, maxWidth) { this._text(text, x, y, maxWidth, this._s.stroke); }
       drawFocusIfNeeded() {}
       scrollPathIntoView() {}
     }

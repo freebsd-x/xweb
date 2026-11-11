@@ -202,6 +202,14 @@ void PageScript::Impl::afterRemove(Node* parent, Node* child, Node* prev, Node* 
 
 void PageScript::Impl::afterAttr(Node* n, const std::string& name, const std::string* old) {
     queueMutation(u"attributes", n, {}, {}, nullptr, nullptr, &name, old);
+    // An image a script points somewhere loads whether or not it's in the page (new
+    // Image() for a canvas, preloading): its load event comes when it has.
+    if (name == "src" && n->isHtml("img") && host.load_image)
+        if (const std::string* src = n->attr("src"); src && !src->empty()) {
+            if (std::find(script_images.begin(), script_images.end(), n) == script_images.end() && script_images.size() < 10000)
+                script_images.push_back(n);
+            host.load_image(resolveUrl(host.base, *src));
+        }
     if (n->custom_state != 2) return;
     const CustomDefinition* def = definitionFor(n);
     if (!def || std::find(def->observed.begin(), def->observed.end(), name) == def->observed.end()) return;

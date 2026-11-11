@@ -37,6 +37,7 @@
 #include <vector>
 
 #include "xrender/font_manager.h"
+#include FT_SIZES_H
 #include "xweb/css.h"
 #include "xweb/encoding.h"
 #include "xweb/forms.h"
@@ -345,6 +346,154 @@ void loadScripts(Page& page, const std::atomic<uint64_t>& generation, uint64_t m
             if (!dep.empty() && !seen.count(dep)) modules.emplace_back(dep, std::string{});
         }
     }
+}
+
+// Text for a 2D canvas in a CSS font, through FreeType: glyph by glyph, unshaped, each
+// from the first face that has it, at `scale` times its size. Its own FT_Size, so the
+// faces the page's text is drawn with keep theirs.
+std::optional<web::PageScript::Host::CanvasText> canvasText(const std::string& text, const std::string& font, float scale, bool render) {
+    using fbx::xrender::FontFace;
+    using fbx::xrender::FontManager;
+    using fbx::xrender::FontStyle;
+    using fbx::xrender::FontWeight;
+    // The font shorthand: style and weight words, a size, maybe /line-height, families.
+    float size = 10;
+    FontWeight weight = FontWeight::Regular;
+    FontStyle style = FontStyle::Normal;
+    std::vector<std::string> families;
+    {
+        std::vector<std::string> words;
+        std::string cur;
+        char quote = 0;
+        for (const char c : font) {
+            if (quote) { if (c == quote) quote = 0; else cur += c; continue; }
+            if (c == '"' || c == '\'') { quote = c; continue; }
+            if (c == ' ' || c == ',') { if (!cur.empty()) words.push_back(cur), cur.clear(); if (c == ',') words.push_back(","); continue; }
+            cur += c;
+        }
+        if (!cur.empty()) words.push_back(cur);
+        size_t i = 0;
+        for (; i < words.size(); ++i) {
+            const std::string w = lowerCase(words[i]);
+            if (w == "italic" || w == "oblique") style = w == "italic" ? FontStyle::Italic : FontStyle::Oblique;
+            else if (w == "bold" || w == "bolder") weight = FontWeight::Bold;
+            else if (w == "lighter") weight = FontWeight::Light;
+            else if (w.size() == 3 && std::isdigit(static_cast<unsigned char>(w[0])) && w.substr(1) == "00") weight = static_cast<FontWeight>(std::stoi(w));
+            else if (std::isdigit(static_cast<unsigned char>(w[0])) || w[0] == '.') {
+                char* end = nullptr;
+                const float v = std::strtof(w.c_str(), &end);
+                const std::string unit = std::string(end).substr(0, std::string(end).find('/'));
+                size = unit == "pt" ? v * 4 / 3 : unit == "em" || unit == "rem" ? v * 16 : unit == "%" ? v * 0.16f : v;
+                ++i;
+                break;
+            }
+        }
+        std::string fam;
+        for (; i < words.size(); ++i) {
+            if (words[i] == ",") { if (!fam.empty()) families.push_back(fam), fam.clear(); continue; }
+            if (words[i].starts_with("/")) continue;
+            fam += (fam.empty() ? "" : " ") + words[i];
+        }
+        if (!fam.empty()) families.push_back(fam);
+    }
+    size = std::clamp(size, 1.0f, 512.0f);
+    std::string family;
+    if (!families.empty()) {
+        const std::string f = lowerCase(families.front());
+        family = f == "sans-serif" || f == "system-ui" || f == "-apple-system" || f == "blinkmacsystemfont" ? std::string() : families.front();
+    }
+    FontFace* primary = FontManager::getFace(family, weight, style);
+    if (!primary || !primary->valid()) primary = FontManager::getFace("", weight, style);
+    if (!primary || !primary->valid()) return std::nullopt;
+    FontFace* fallback = FontManager::getLastResortFace();
+    const uint32_t px = static_cast<uint32_t>(std::clamp(std::lround(size * scale), 1L, 1024L));
+
+    struct Sized {
+        FT_Face face = nullptr;
+        FT_Size mine = nullptr, theirs = nullptr;
+        ~Sized() {
+            if (mine) { FT_Activate_Size(theirs); FT_Done_Size(mine); }
+        }
+        bool use(FT_Face f, uint32_t pixels) {
+            face = f;
+            theirs = f->size;
+            if (FT_New_Size(f, &mine) != 0) { mine = nullptr; return false; }
+            FT_Activate_Size(mine);
+            return FT_Set_Pixel_Sizes(f, 0, pixels) == 0;
+        }
+    };
+    Sized a, b;
+    if (!a.use(primary->ft_face_, px)) return std::nullopt;
+    const bool have_fallback = fallback && fallback->valid() && fallback->ft_face_ != primary->ft_face_ && b.use(fallback->ft_face_, px);
+    const float ascent = static_cast<float>(primary->ft_face_->size->metrics.ascender) / 64.0f;
+    const float descent = static_cast<float>(-primary->ft_face_->size->metrics.descender) / 64.0f;
+
+    struct Glyph { std::vector<uint8_t> coverage; int w = 0, h = 0, left = 0, top = 0; float pen = 0; };
+    std::vector<Glyph> glyphs;
+    float pen = 0;
+    FT_UInt previous = 0;
+    FT_Face previous_face = nullptr;
+    // UTF-8 to code points.
+    for (size_t i = 0; i < text.size() && glyphs.size() < 4096;) {
+        const unsigned char c = static_cast<unsigned char>(text[i]);
+        const int n = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : (c >> 3) == 30 ? 4 : 1;
+        uint32_t cp = n == 1 ? c : c & (0x7F >> n);
+        for (int k = 1; k < n && i + k < text.size(); ++k) cp = (cp << 6) | (static_cast<unsigned char>(text[i + k]) & 0x3F);
+        i += static_cast<size_t>(n);
+        FT_Face face = a.face;
+        FT_UInt index = FT_Get_Char_Index(face, cp);
+        if (!index && have_fallback) {
+            const FT_UInt other = FT_Get_Char_Index(b.face, cp);
+            if (other) face = b.face, index = other;
+        }
+        if (previous && face == previous_face && FT_HAS_KERNING(face)) {
+            FT_Vector k;
+            if (FT_Get_Kerning(face, previous, index, FT_KERNING_DEFAULT, &k) == 0) pen += static_cast<float>(k.x) / 64.0f;
+        }
+        if (FT_Load_Glyph(face, index, render ? FT_LOAD_RENDER : FT_LOAD_DEFAULT) != 0) continue;
+        const FT_GlyphSlot slot = face->glyph;
+        if (render && slot->bitmap.pixel_mode == FT_PIXEL_MODE_GRAY && slot->bitmap.width > 0) {
+            Glyph g;
+            g.w = static_cast<int>(slot->bitmap.width);
+            g.h = static_cast<int>(slot->bitmap.rows);
+            g.left = slot->bitmap_left;
+            g.top = slot->bitmap_top;
+            g.pen = pen;
+            g.coverage.resize(static_cast<size_t>(g.w) * g.h);
+            for (int row = 0; row < g.h; ++row)
+                std::memcpy(&g.coverage[static_cast<size_t>(row) * g.w], slot->bitmap.buffer + static_cast<ptrdiff_t>(row) * slot->bitmap.pitch, static_cast<size_t>(g.w));
+            glyphs.push_back(std::move(g));
+        }
+        pen += static_cast<float>(slot->advance.x) / 64.0f;
+        previous = index;
+        previous_face = face;
+    }
+    web::PageScript::Host::CanvasText out;
+    out.advance = pen / scale;
+    out.ascent = ascent / scale;
+    out.descent = descent / scale;
+    if (render) {
+        web::Raster& m = out.mask;
+        m.width = static_cast<uint32_t>(std::clamp(std::ceil(pen) + 2, 1.0f, 8192.0f));
+        m.height = static_cast<uint32_t>(std::clamp(std::ceil(ascent + descent) + 1, 1.0f, 2048.0f));
+        if (static_cast<uint64_t>(m.width) * m.height > web::kMaxRasterPixels) return out;
+        m.rgba.assign(static_cast<size_t>(m.width) * m.height * 4, 0);
+        for (size_t p = 0; p < m.rgba.size(); p += 4) m.rgba[p] = m.rgba[p + 1] = m.rgba[p + 2] = 255;
+        for (const Glyph& g : glyphs) {
+            const int ox = static_cast<int>(std::lround(g.pen)) + g.left, oy = static_cast<int>(std::lround(ascent)) - g.top;
+            for (int row = 0; row < g.h; ++row) {
+                const int y = oy + row;
+                if (y < 0 || y >= static_cast<int>(m.height)) continue;
+                for (int col = 0; col < g.w; ++col) {
+                    const int x = ox + col;
+                    if (x < 0 || x >= static_cast<int>(m.width)) continue;
+                    uint8_t& alpha = m.rgba[(static_cast<size_t>(y) * m.width + x) * 4 + 3];
+                    alpha = std::max(alpha, g.coverage[static_cast<size_t>(row) * g.w + col]);
+                }
+            }
+        }
+    }
+    return out;
 }
 
 std::vector<std::string> imageSources(const Page& page) {
@@ -1450,6 +1599,39 @@ private:
         };
         Page* raw = page.get();
         host.activate = [this](const web::Node* n) { activateNode(n); };
+        host.load_image = [this, page_weak = std::weak_ptr<Page>(page)](const std::string& url) {
+            XApplication::post([this, page_weak, url] {
+                std::shared_ptr<Page> p = page_weak.lock();
+                if (!p || !p->script) return;
+                // Here or given up on already: say so now (the loader won't again).
+                if (p->images.count(url) || p->failed_images.count(url)) {
+                    p->script->imageLoaded(url, p->images.count(url) > 0);
+                    if (p->script->takeDirty()) node_->invalidate();
+                    return;
+                }
+                loadImages(p, {url}, generation_.load());
+            });
+        };
+        host.canvas_text = [](const std::string& text, const std::string& font, float scale, bool render) {
+            return canvasText(text, font, scale, render);
+        };
+        // A loaded image's pixels for a canvas: an SVG drawn at its own size.
+        host.image_pixels = [raw](const std::string& url) -> std::shared_ptr<const web::Raster> {
+            Page* p = raw;   // (the page owns its script: it outlives this)
+            const auto it = p->images.find(web::resolveUrl(p->base, url));
+            if (it == p->images.end() || !it->second) return nullptr;
+            const LoadedImage& img = *it->second;
+            auto r = std::make_shared<web::Raster>();
+            if (img.svg) {
+                const web::SvgSize& z = img.svg->size();
+                *r = img.svg->render(static_cast<uint32_t>(z.width.value_or(300)), static_cast<uint32_t>(z.height.value_or(150)));
+            } else {
+                r->width = img.width;
+                r->height = img.height;
+                r->rgba = img.pixels;
+            }
+            return r;
+        };
         host.element_at = [this](float x, float y) -> web::Node* {
             web::Node* n = node_->nodeAt(x, y);
             while (n && !n->isElement()) n = n->parent;

@@ -341,6 +341,65 @@ void PageScript::Impl::installCanvas() {
         changed(s);
         return Value::undefined();
     });
+    // text(canvas, text, font, x, y, align (-1 left, 0 centre, 1 right), baseline shift
+    // (fraction: 0 alphabetic, 1 top, 0.5 middle, -1 bottom), matrix, style, alpha, maxWidth)
+    rt.method(n, u"text", 11, [self, canvasArg, changed, clipped](Runtime& r, const Value&, Args a) {
+        CanvasSurface& s = self->surfaceOf(canvasArg(r, a));
+        if (!self->host.canvas_text) return Value::undefined();
+        const std::string text = js::utf8(r.toStringValue(arg(a, 1)));
+        const std::string font = js::utf8(r.toStringValue(arg(a, 2)));
+        const Matrix m = matrixOf(r, arg(a, 7));
+        const float scale = std::clamp(m.scale(), 0.05f, 16.0f);
+        const auto got = self->host.canvas_text(text, font, scale, true);
+        if (!got || got->mask.empty()) return Value::undefined();
+        Paint paint;
+        if (!paintOf(r, arg(a, 8), arg(a, 7), static_cast<float>(r.toNumber(arg(a, 9))), paint)) return Value::undefined();
+        // A gradient's text is drawn in its first colour (as a mask takes one colour).
+        Color color = paint.gradient && !paint.gradient->stops.empty() ? paint.gradient->stops.front().color : paint.color;
+        const float x = static_cast<float>(r.toNumber(arg(a, 3))), y = static_cast<float>(r.toNumber(arg(a, 4)));
+        const double align = r.toNumber(arg(a, 5)), shift = r.toNumber(arg(a, 6));
+        float width = got->advance;
+        float squeeze = 1;
+        const double max_width = r.toNumber(arg(a, 10));
+        if (std::isfinite(max_width) && max_width > 0 && width > max_width) squeeze = static_cast<float>(max_width) / width, width = static_cast<float>(max_width);
+        const float left = x - (align < 0 ? 0 : align > 0 ? width : width / 2);
+        // Where the baseline goes below the top of the text.
+        const float drop = shift > 0 ? got->ascent * static_cast<float>(shift) : shift < 0 ? -got->descent : 0;
+        const float top = y + drop - got->ascent;
+        // The mask's pixels are `scale` to a px: back to px, squeezed, placed, transformed.
+        const Matrix place{squeeze / scale, 0, 0, 1 / scale, left, top};
+        const Matrix to_canvas = m.after(place);
+        const float opacity = paint.opacity * color.a / 255.0f;
+        color.a = 255;
+        clipped(s, [&](Canvas& c) { c.drawRaster(got->mask, to_canvas, opacity, &color); });
+        changed(s);
+        return Value::undefined();
+    });
+    // measure(text, font): [advance, ascent, descent], or null without fonts.
+    rt.method(n, u"measure", 2, [self](Runtime& r, const Value&, Args a) {
+        if (!self->host.canvas_text) return Value::null();
+        const auto got = self->host.canvas_text(js::utf8(r.toStringValue(arg(a, 0))), js::utf8(r.toStringValue(arg(a, 1))), 1, false);
+        if (!got) return Value::null();
+        return Value::object(r.newArray({Value::number(got->advance), Value::number(got->ascent), Value::number(got->descent)}));
+    });
+    // drawImage(canvas, url, matrix (image pixels to canvas), alpha): false if it isn't loaded.
+    rt.method(n, u"drawImage", 4, [self, canvasArg, changed, clipped](Runtime& r, const Value&, Args a) {
+        CanvasSurface& s = self->surfaceOf(canvasArg(r, a));
+        if (!self->host.image_pixels) return Value::boolean(false);
+        const std::shared_ptr<const Raster> image = self->host.image_pixels(js::utf8(r.toStringValue(arg(a, 1))));
+        if (!image || image->empty()) return Value::boolean(false);
+        const Matrix m = matrixOf(r, arg(a, 2));
+        const float alpha = static_cast<float>(std::clamp(r.toNumber(arg(a, 3)), 0.0, 1.0));
+        clipped(s, [&](Canvas& c) { c.drawRaster(*image, m, alpha); });
+        changed(s);
+        return Value::boolean(true);
+    });
+    // The size a loaded image's pixels are (0, 0 if it isn't).
+    rt.method(n, u"imageSize", 1, [self](Runtime& r, const Value&, Args a) {
+        std::shared_ptr<const Raster> image;
+        if (self->host.image_pixels) image = self->host.image_pixels(js::utf8(r.toStringValue(arg(a, 0))));
+        return Value::object(r.newArray({Value::number(image ? image->width : 0), Value::number(image ? image->height : 0)}));
+    });
     rt.method(n, u"png", 1, [self, canvasArg](Runtime& r, const Value&, Args a) {
         const std::string png = encodePng(self->surfaceOf(canvasArg(r, a)).pixels->toRaster());
         return Value::object(r.newArrayBuffer(png));

@@ -1689,6 +1689,9 @@ void PageScript::imageLoaded(const std::string& url, bool ok) {
         todo.insert(todo.end(), n->children.rbegin(), n->children.rend());
         if (n->shadow_root) todo.push_back(n->shadow_root);
     }
+    for (Node* n : s.script_images)
+        if (std::find(imgs.begin(), imgs.end(), n) == imgs.end())
+            if (const std::string* src = n->attr("src"); src && resolveUrl(s.host.base, *src) == url) imgs.push_back(n);
     for (Node* n : imgs) s.fire(n, ok ? u"load" : u"error", false, false);
     s.drainMicrotasks();
 }

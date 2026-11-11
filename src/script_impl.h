@@ -806,6 +806,7 @@ struct PageScript::Impl {
         mutable uint64_t shown_version = 0;
     };
     std::unordered_map<const Node*, std::unique_ptr<CanvasSurface>> canvases;
+    std::vector<Node*> script_images;   // <img>s a script gave a src, in the page or not
     CanvasSurface& surfaceOf(Node* canvas);
     void installCanvas();
 

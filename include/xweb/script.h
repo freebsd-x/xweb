@@ -35,6 +35,19 @@ public:
         std::function<std::optional<ElementRect>(const Node*)> rect;
         // The element shown at a point of the page (not the window); null if none.
         std::function<Node*(float page_x, float page_y)> element_at;
+        // For 2D canvases. Text in a CSS font at `scale` times its size: its coverage (in
+        // the alpha of `mask`, left edge at the pen, top `ascent` above the baseline) when
+        // `render`, and its metrics either way, in unscaled px. Null: no fonts here.
+        struct CanvasText {
+            Raster mask;
+            float advance = 0, ascent = 0, descent = 0;
+        };
+        std::function<std::optional<CanvasText>(const std::string& text, const std::string& font, float scale, bool render)> canvas_text;
+        // Load this image (an <img> a script set a src on): imageLoaded() says when, even
+        // when it was here already.
+        std::function<void(const std::string& url)> load_image;
+        // A loaded image's pixels, by its URL (null if it isn't loaded).
+        std::function<std::shared_ptr<const Raster>(const std::string& url)> image_pixels;
         // An image's state by its absolute URL: still coming, or here (with its size), or failed.
         struct ImageState {
             bool done = false, ok = false;
