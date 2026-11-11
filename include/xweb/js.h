@@ -457,6 +457,7 @@ public:
     Symbol* sym_split = nullptr;
     Symbol* sym_species = nullptr;
     Symbol* sym_async_iterator = nullptr;
+    Symbol* sym_unscopables = nullptr;
     std::unordered_map<std::u16string, Symbol*> symbol_registry;
 
     // Heap.

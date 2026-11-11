@@ -405,7 +405,9 @@ std::optional<web::PageScript::Host::CanvasText> canvasText(const std::string& t
     FontFace* primary = FontManager::getFace(family, weight, style);
     if (!primary || !primary->valid()) primary = FontManager::getFace("", weight, style);
     if (!primary || !primary->valid()) return std::nullopt;
-    FontFace* fallback = FontManager::getLastResortFace();
+    // Fallbacks: CJK text first (most pages' fonts lack it), then symbols.
+    FontFace* fallback = FontManager::getCjkFace();
+    FontFace* symbols = FontManager::getLastResortFace();
     const uint32_t px = static_cast<uint32_t>(std::clamp(std::lround(size * scale), 1L, 1024L));
 
     struct Sized {
@@ -422,9 +424,11 @@ std::optional<web::PageScript::Host::CanvasText> canvasText(const std::string& t
             return FT_Set_Pixel_Sizes(f, 0, pixels) == 0;
         }
     };
-    Sized a, b;
+    Sized a, b, sym;
     if (!a.use(primary->ft_face_, px)) return std::nullopt;
     const bool have_fallback = fallback && fallback->valid() && fallback->ft_face_ != primary->ft_face_ && b.use(fallback->ft_face_, px);
+    const bool have_symbols = symbols && symbols->valid() && symbols->ft_face_ != primary->ft_face_ &&
+                              (!have_fallback || symbols->ft_face_ != fallback->ft_face_) && sym.use(symbols->ft_face_, px);
     const float ascent = static_cast<float>(primary->ft_face_->size->metrics.ascender) / 64.0f;
     const float descent = static_cast<float>(-primary->ft_face_->size->metrics.descender) / 64.0f;
 
@@ -445,6 +449,10 @@ std::optional<web::PageScript::Host::CanvasText> canvasText(const std::string& t
         if (!index && have_fallback) {
             const FT_UInt other = FT_Get_Char_Index(b.face, cp);
             if (other) face = b.face, index = other;
+        }
+        if (!index && have_symbols) {
+            const FT_UInt other = FT_Get_Char_Index(sym.face, cp);
+            if (other) face = sym.face, index = other;
         }
         if (previous && face == previous_face && FT_HAS_KERNING(face)) {
             FT_Vector k;

@@ -802,7 +802,7 @@ TEST(Script, MoreReflectedAttributes) {
         l.referrerPolicy = 'no-referrer';
         console.log(alt.hreflang.split('-')[1], l.crossOrigin, l.getAttribute('referrerpolicy'), document.body.crossOrigin, alt.media === '');
         </script>)");
-    EXPECT_EQ(p.console, "log:GB anonymous no-referrer null true\n") << p.console;
+    EXPECT_EQ(p.console, "log:GB anonymous no-referrer undefined true\n") << p.console;   // <body> has no crossOrigin
 }
 
 TEST(Script, Canvas2dDrawsPixels) {
@@ -899,4 +899,17 @@ TEST(Script, PerformanceEntriesHaveTheirInterfaces) {
                     performance.getEntriesByName('m')[0] instanceof PerformanceMark);
         </script>)");
     EXPECT_EQ(p.console, "log:true true true\n") << p.console;
+}
+
+TEST(Script, ACustomElementsOwnPropertiesStayItsOwn) {
+    // Reddit's <zoomable-img> keeps its <img> in this.media: not the <link media> attribute.
+    Page p(R"(<body><zoomable-img><img src="a.png" alt=""></zoomable-img><link id=l media=print><script>
+        class Z extends HTMLElement {
+          connectedCallback() { this.media = this.querySelector('img'); this.sizes = 3; }
+        }
+        customElements.define('zoomable-img', Z);
+        const z = document.querySelector('zoomable-img');
+        console.log(typeof z.media.addEventListener, z.sizes, z.hasAttribute('media'), document.getElementById('l').media);
+        </script>)");
+    EXPECT_EQ(p.console, "log:function 3 false print\n") << p.console;
 }

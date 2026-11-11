@@ -740,3 +740,22 @@ TEST(Js, NativesCalledInsideAConstructorAreCalls) {
                   "const m = new Map([[1, typeof String(3)]]); t + m.get(1)"),
               "stringnumberbooleanstring");
 }
+
+TEST(Js, ArgumentsCallee) {
+    EXPECT_EQ(run("function f() { return arguments.callee; } "
+                  "function g() { 'use strict'; try { return arguments.callee; } catch (e) { return e instanceof TypeError; } } "
+                  "const keys = (function () { return Object.keys(arguments).join(); })(1, 2); "
+                  "[f() === f, g(), keys].join()"),
+              "true,true,0,1");
+}
+
+TEST(Js, WithStatement) {
+    EXPECT_EQ(run("var o = { a: 1, f() { return this === o; } }, a = 'outer', b = 2; var out = [];"
+                  "with (o) { out.push(a, b, f(), typeof a); a = 5; b = 3; }"
+                  "out.push(o.a, b, a);"
+                  "var u = { x: 1, [Symbol.unscopables]: { x: true } }, x = 'mine';"
+                  "with (u) out.push(x);"
+                  "out.join()"),
+              "1,2,true,number,5,3,outer,mine");
+    EXPECT_EQ(run("'use strict'; with ({}) {}"), "throws: SyntaxError: with isn't allowed in strict mode (line 1)");
+}

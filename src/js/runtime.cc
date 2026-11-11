@@ -377,9 +377,18 @@ private:
 
     // The binding a name means here. An import is followed to the exporting module's
     // binding (`imported` says it was one: those can't be assigned).
-    Binding* findBinding(Env* env, const std::u16string& name, Env** where, bool* imported = nullptr) {
+    // `with_hit`: where a with statement's object has the name first (the binding is
+    // then its property, and nothing is returned). Without it, with scopes are passed by.
+    Binding* findBinding(Env* env, const std::u16string& name, Env** where, bool* imported = nullptr, Object** with_hit = nullptr) {
         const size_t h = VarMap::hashOf(name);
         for (Env* e = env; e; e = e->outer) {
+            if (e->with_object) {
+                if (with_hit && withHas(e->with_object, name)) {
+                    *with_hit = e->with_object;
+                    return nullptr;
+                }
+                continue;
+            }
             if (VarMap::Entry* it = e->vars.find(name, h)) {
                 if (where) *where = e;
                 Binding* b = &it->second;
@@ -395,6 +404,15 @@ private:
         return nullptr;
     }
 
+    // Whether a with statement's object supplies this name: it has it, and its
+    // Symbol.unscopables doesn't hide it.
+    bool withHas(Object* o, const std::u16string& name) {
+        const PropertyKey key(name);
+        if (!rt_.has(o, key)) return false;
+        const Value hidden = rt_.get(Value::object(o), PropertyKey(rt_.sym_unscopables));
+        return !(hidden.isObject() && rt_.toBoolean(rt_.get(hidden, key)));
+    }
+
     Object* globalObject(Env* env) {
         for (Env* e = env; e; e = e->outer)
             if (e->global_object) return e->global_object;
@@ -402,10 +420,12 @@ private:
     }
 
     Value lookup(Env* env, const std::u16string& name) {
-        if (Binding* b = findBinding(env, name, nullptr)) {
+        Object* with = nullptr;
+        if (Binding* b = findBinding(env, name, nullptr, nullptr, &with)) {
             if (!b->initialized) rt_.throwError("ReferenceError", "can't use '" + utf8(name) + "' before it's declared");
             return b->value;
         }
+        if (with) return rt_.get(Value::object(with), PropertyKey(name));
         Object* g = globalObject(env);
         if (name == u"undefined") return Value::undefined();
         const PropertyKey key(name);
@@ -419,7 +439,13 @@ private:
 
     void assignName(Env* env, const std::u16string& name, const Value& v, bool strict) {
         bool imported = false;
-        if (Binding* b = findBinding(env, name, nullptr, &imported)) {
+        Object* with = nullptr;
+        Binding* b = findBinding(env, name, nullptr, &imported, &with);
+        if (with) {
+            rt_.set(with, PropertyKey(name), v, Value::object(with));
+            return;
+        }
+        if (b) {
             if (imported) rt_.throwError("TypeError", "assignment to the import '" + utf8(name) + "'");
             if (!b->initialized) rt_.throwError("ReferenceError", "can't use '" + utf8(name) + "' before it's declared");
             if (!b->is_mutable) {
@@ -1421,6 +1447,7 @@ void Runtime::collect(bool mid_script) {
             markCell(e->home);
             markCell(e->new_target);
             markCell(e->global_object);
+            markCell(e->with_object);
             for (auto& en : e->vars) markCell(en.second.import_env);
         } else if (auto* o = dynamic_cast<Object*>(c)) {
             markCell(o->prototype);
@@ -2093,6 +2120,13 @@ Env* Interpreter::prepareCall(Object* f, const Value& this_value, std::span<cons
         for (size_t i = 0; i < args.size(); ++i) a->define(PropertyKey(utf16(std::to_string(i))), {args[i]});
         a->define(u"length", {Value::number(static_cast<double>(args.size())), nullptr, nullptr, kWritable | kConfigurable});
         a->define(PropertyKey(rt_.sym_iterator), {rt_.get(Value::object(rt_.array_prototype), u"values"), nullptr, nullptr, kWritable | kConfigurable});
+        // callee: the function itself, in sloppy code with plain parameters (frameworks'
+        // `o.extend = arguments.callee`); in strict code, %ThrowTypeError% both ways.
+        if (!info->strict && info->simple_params) {
+            a->define(u"callee", {Value::object(f), nullptr, nullptr, kWritable | kConfigurable});
+        } else if (const Property* caller = rt_.function_prototype->own(PropertyKey(u"caller")); caller && caller->getter) {
+            a->define(u"callee", {Value::undefined(), caller->getter, caller->getter, kAccessor});
+        }
         if (!env->vars.count(u"arguments")) env->vars[u"arguments"] = Binding{Value::object(a)};
     }
     if (!info->simple_params) {
@@ -2245,6 +2279,16 @@ Completion Interpreter::exec(Node* n, Env* env, bool strict) {
             return execBlock(n->kids, block, strict);
         }
         case N::Empty: case N::Debugger: return {CT::Normal, Value::empty()};
+        case N::With: {
+            const Value o = eval(n->a, env, strict);
+            if (o.isNullish()) rt_.throwError("TypeError", "with needs an object");
+            Env* scope = newEnv(env);
+            scope->with_object = rt_.toObject(o);
+            EnvScope in(rt_, scope);
+            Completion c = exec(n->b, scope, strict);
+            if (c.value.isEmpty()) c.value = Value::undefined();
+            return c;
+        }
         case N::Throw: throw Thrown{eval(n->a, env, strict)};
         case N::Try: return tryStatement(n, env, strict);
         case N::Break: return {CT::Break, Value::empty(), n->str.empty() ? nullptr : &n->str};
@@ -3077,6 +3121,15 @@ Value Interpreter::evalCall(Node* n, Env* env, bool strict) {
         } catch (const ShortCircuit&) {
             return Value::undefined();
         }
+    } else if (callee->kind == N::Identifier && !(callee->flags & kParenthesized)) {
+        // A name a with statement's object supplies: called as its method.
+        Object* with = nullptr;
+        if (!findBinding(env, callee->str, nullptr, nullptr, &with) && with) {
+            this_value = Value::object(with);
+            fn = rt_.get(this_value, PropertyKey(callee->str));
+        } else {
+            fn = eval(callee, env, strict);
+        }
     } else {
         fn = eval(callee, env, strict);
     }
@@ -3110,7 +3163,9 @@ Value Interpreter::evalUnary(Node* n, Env* env, bool strict) {
         case Op::TypeOf: {
             if (n->a->kind == N::Identifier) {
                 // typeof an undeclared name is "undefined", not an error.
-                if (!findBinding(env, n->a->str, nullptr) && !rt_.has(globalObject(env), n->a->str)) return Value::string(u"undefined");
+                Object* with = nullptr;
+                if (!findBinding(env, n->a->str, nullptr, nullptr, &with) && !with && !rt_.has(globalObject(env), n->a->str))
+                    return Value::string(u"undefined");
             }
             return rt_.typeOf(eval(n->a, env, strict));
         }
@@ -3128,7 +3183,9 @@ Value Interpreter::evalUnary(Node* n, Env* env, bool strict) {
                 return Value::boolean(ok);
             }
             if (t->kind == N::Identifier) {
-                if (findBinding(env, t->str, nullptr)) return Value::boolean(false);
+                Object* with = nullptr;
+                if (findBinding(env, t->str, nullptr, nullptr, &with)) return Value::boolean(false);
+                if (with) return Value::boolean(rt_.deleteProperty(with, t->str));
                 Object* g = globalObject(env);
                 return Value::boolean(rt_.deleteProperty(g, t->str));
             }

@@ -1070,8 +1070,9 @@ void Runtime::installBuiltins() {
     put(symbol_ctor, u"species", Value::symbol(sym_species), 0);
     sym_async_iterator = newSymbol(u"Symbol.asyncIterator");
     put(symbol_ctor, u"asyncIterator", Value::symbol(sym_async_iterator), 0);
-    for (const char16_t* name : {u"unscopables", u"isConcatSpreadable"})
-        put(symbol_ctor, name, Value::symbol(newSymbol(std::u16string(u"Symbol.") + name)), 0);
+    sym_unscopables = newSymbol(u"Symbol.unscopables");
+    put(symbol_ctor, u"unscopables", Value::symbol(sym_unscopables), 0);
+    put(symbol_ctor, u"isConcatSpreadable", Value::symbol(newSymbol(u"Symbol.isConcatSpreadable")), 0);
     method(symbol_ctor, u"for", 1, [](Runtime& rt, const Value&, Args a) {
         const std::u16string key = *rt.toString(arg(a, 0));
         auto& s = rt.symbol_registry[key];

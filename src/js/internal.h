@@ -138,6 +138,8 @@ struct Env : Cell {
     Object* new_target = nullptr;
     // The global scope's: its var names are the global object's properties.
     Object* global_object = nullptr;
+    // A with statement's: its names are this object's properties (it has no vars).
+    Object* with_object = nullptr;
 };
 
 struct FunctionData {

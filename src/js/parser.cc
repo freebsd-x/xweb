@@ -588,7 +588,17 @@ private:
                 // In sloppy code, a function declaration where only a statement may go.
                 return functionDeclaration();
             }
-            if (k == u"with") fail("with isn't supported");
+            if (k == u"with") {
+                // Sloppy code's object scope: names inside are looked up on the object first.
+                if (strict_) fail("with isn't allowed in strict mode");
+                advance();
+                Node* n = p_.make(N::With, line);
+                expect(u"(");
+                n->a = expression();
+                expectHeadClose();
+                n->b = loopBody();   // a statement, not a declaration (as a loop's body)
+                return n;
+            }
             if (k == u"import" || k == u"export") {
                 const Token t = peek();
                 if (!(k == u"import" && t.type == Tok::Punct && (t.value == u"(" || t.value == u"."))) {

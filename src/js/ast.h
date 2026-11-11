@@ -33,7 +33,7 @@ struct Token {
 enum class N : uint8_t {
     // Statements
     Program, VarDecl, Declarator, FunctionDecl, ClassDecl, Return, If, For, ForIn, ForOf, While, DoWhile,
-    Block, ExprStmt, Empty, Break, Continue, Throw, Try, Switch, Case, Labeled, Debugger,
+    Block, ExprStmt, Empty, Break, Continue, Throw, Try, Switch, Case, Labeled, Debugger, With,
     // Expressions
     Number, String, Template, TaggedTemplate, Regex, Identifier, This, Super, Array, Object, Property,
     FunctionExpr, Arrow, ClassExpr, Method, Unary, Update, Binary, Logical, Assign, Conditional, Call, New,
