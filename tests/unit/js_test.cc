@@ -158,7 +158,7 @@ TEST(Js, Limits) {
     EXPECT_EQ(run("for (;;) { try { } catch (e) { } }"), "throws: Stopped: the script ran too long");
     std::string deep(5000, '(');
     deep += "1" + std::string(5000, ')');
-    EXPECT_EQ(run(deep), "throws: SyntaxError: too deeply nested (line 1, column 80)");
+    EXPECT_EQ(run(deep), "throws: SyntaxError: too deeply nested (line 1, column 800)");
     EXPECT_EQ(run("let s = 'x'; while (true) s += s"), "throws: RangeError: string too long");
     EXPECT_EQ(run("new Array(1e9)"), "throws: RangeError: array too long");
     EXPECT_EQ(run("const a = []; a.length = 4294967296"), "throws: RangeError: invalid array length");

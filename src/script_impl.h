@@ -754,7 +754,9 @@ struct PageScript::Impl {
     };
     std::map<std::string, CustomDefinition> custom_definitions;
     std::map<std::string, Object*> when_defined;   // pending customElements.whenDefined promises
-    std::vector<Node*> upgrade_candidates;          // elements being upgraded, innermost last
+    // Elements being upgraded, innermost last, with their definition's constructor: each
+    // definition has its own construction stack (one element's constructor may make others).
+    std::vector<std::pair<Object*, Node*>> upgrade_candidates;
     struct ObserverState {
         Object* object = nullptr;     // the MutationObserver; its callback is slots[0]
         std::vector<Object*> records;

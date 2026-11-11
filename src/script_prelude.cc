@@ -1500,6 +1500,86 @@ const char* const kScriptPrelude = R"JS(
     };
     global.Image.prototype = HTMLImageElement.prototype;
   }
+  if (typeof HTMLAudioElement === 'function' && !global.Audio) {
+    global.Audio = function Audio(src) {
+      if (!new.target) throw new TypeError("Constructor Audio requires 'new'");
+      const a = document.createElement('audio');
+      a.setAttribute('preload', 'auto');
+      if (src !== undefined) a.setAttribute('src', String(src));
+      return a;
+    };
+    global.Audio.prototype = HTMLAudioElement.prototype;
+  }
+
+  // MessageChannel: two ports; what one posts arrives at the other as a task (a
+  // "message" event), once it has started (onmessage starts it).
+  class MessagePort extends EventTarget {
+    constructor(key) {
+      super();
+      if (key !== portKey) throw new TypeError('Illegal constructor');
+      this._other = null; this._started = false; this._closed = false; this._queue = []; this._onmessage = null; this.onmessageerror = null;
+    }
+    get onmessage() { return this._onmessage; }
+    set onmessage(f) { this._onmessage = typeof f === 'function' ? f : null; this.start(); }
+    postMessage(data) {
+      const to = this._other;
+      if (this._closed || !to || to._closed) return;
+      const copy = structuredClone(data);
+      to._queue.push(copy);
+      if (to._started) to._flush();
+    }
+    start() { if (this._started) return; this._started = true; this._flush(); }
+    close() { this._closed = true; this._queue.length = 0; }
+    _flush() {
+      if (this._pending) return;
+      this._pending = true;
+      setTimeout(() => {
+        this._pending = false;
+        while (this._queue.length && !this._closed) {
+          const data = this._queue.shift();
+          const e = new MessageEvent('message', { data, origin: '', ports: [] });
+          this.dispatchEvent(e);
+          if (this._onmessage) try { this._onmessage.call(this, e); } catch (x) { reportError(x); }
+        }
+      }, 0);
+    }
+  }
+  const portKey = {};
+  class MessageChannel {
+    constructor() {
+      this.port1 = new MessagePort(portKey);
+      this.port2 = new MessagePort(portKey);
+      this.port1._other = this.port2;
+      this.port2._other = this.port1;
+    }
+  }
+  // BroadcastChannel: to the other channels of that name in this page.
+  const channels = new Map();
+  class BroadcastChannel extends EventTarget {
+    constructor(name) {
+      super();
+      this.name = String(name); this.onmessage = null; this.onmessageerror = null; this._closed = false;
+      if (!channels.has(this.name)) channels.set(this.name, new Set());
+      channels.get(this.name).add(this);
+    }
+    postMessage(data) {
+      if (this._closed) throw new DOMException('the channel is closed', 'InvalidStateError');
+      for (const other of channels.get(this.name) || []) {
+        if (other === this) continue;
+        const copy = structuredClone(data);
+        setTimeout(() => {
+          if (other._closed) return;
+          const e = new MessageEvent('message', { data: copy, origin: '' });
+          other.dispatchEvent(e);
+          if (typeof other.onmessage === 'function') try { other.onmessage.call(other, e); } catch (x) { reportError(x); }
+        }, 0);
+      }
+    }
+    close() { this._closed = true; channels.get(this.name)?.delete(this); }
+  }
+  const reportError = (x) => setTimeout(() => { throw x; }, 0);
+  for (const [name, value] of [['MessageChannel', MessageChannel], ['MessagePort', MessagePort], ['BroadcastChannel', BroadcastChannel]])
+    if (!global[name]) Object.defineProperty(global, name, { value, writable: true, configurable: true, enumerable: false });
 
   for (const [name, value] of [['Blob', Blob], ['File', File], ['FormData', FormData], ['Headers', Headers], ['Request', Request],
                                ['Response', Response], ['fetch', fetch], ['XMLHttpRequest', XMLHttpRequest],

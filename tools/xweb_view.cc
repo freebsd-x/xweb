@@ -289,7 +289,7 @@ void loadSheets(Page& page, const std::atomic<uint64_t>& generation, uint64_t mi
 void loadScripts(Page& page, const std::atomic<uint64_t>& generation, uint64_t mine) {
     constexpr size_t kMaxScripts = 100;
     constexpr size_t kMaxModules = 400;
-    constexpr size_t kMaxScriptBytes = 8 << 20;
+    constexpr size_t kMaxScriptBytes = 16 << 20;   // YouTube's app is 10.8 MB (parsing takes ~50x its size in memory)
     constexpr size_t kMaxTotalBytes = 64 << 20;
     std::vector<const web::Node*> todo{page.doc->root()};
     std::vector<std::string> urls;
@@ -1471,7 +1471,7 @@ private:
             std::thread([this, weak, page_url, url, done = std::move(done)] {
                 Resource got = load(url, web::sameSite(page_url, url));
                 std::optional<std::string> body;
-                if (got.ok && got.http_status < 400 && got.body.size() <= (8u << 20)) body = web::decodeToUtf8(got.body, got.content_type);
+                if (got.ok && got.http_status < 400 && got.body.size() <= (16u << 20)) body = web::decodeToUtf8(got.body, got.content_type);
                 // XWEB_DEBUG_SCRIPTS=1: what each script fetch came to.
                 if (std::getenv("XWEB_DEBUG_SCRIPTS"))
                     std::fprintf(stderr, "[script] %s: %s status %d, %zu bytes\n", url.c_str(), body ? "ok" : "FAILED", got.http_status, got.body.size());

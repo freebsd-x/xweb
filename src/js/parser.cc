@@ -14,7 +14,7 @@ namespace fbx::xweb::js {
 
 namespace {
 
-constexpr int kMaxNesting = 400;   // deeper than this is an error, not a crash
+constexpr int kMaxNesting = 4000;   // guard levels (one bracket of nesting is ~5); deeper is an error, not a crash
 
 struct ParseError {
     std::string message;

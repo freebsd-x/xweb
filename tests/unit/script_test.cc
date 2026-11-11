@@ -713,3 +713,33 @@ TEST(Script, AttributesByNameAndALiveDataset) {
         </script>)");
     EXPECT_EQ(p.console, "log:t,2,,7 x false fooBar true null\n") << p.console;
 }
+
+TEST(Script, MessageChannelDeliversAsATask) {
+    Page p(R"(<body><script>
+        const c = new MessageChannel();
+        const got = [];
+        c.port2.onmessage = (e) => { got.push(e.data.n); if (got.length === 2) console.log(got.join(), e instanceof MessageEvent); };
+        c.port1.postMessage({ n: 1 });
+        c.port1.postMessage({ n: 2 });
+        console.log('sync', got.length);
+        </script>)");
+    for (int i = 0; i < 40 && p.script->busy(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        p.script->tick();
+    }
+    EXPECT_EQ(p.console, "log:sync 0\nlog:1,2 true\n") << p.console;
+}
+
+TEST(Script, NodeConstantsAndCustomElementsMadeInsideAnUpgrade) {
+    // ShadyDOM reads Node.DOCUMENT_FRAGMENT_NODE; Polymer's constructors make other elements.
+    Page p(R"(<body><x-outer></x-outer><script>
+        class Inner extends HTMLElement {}
+        customElements.define('x-inner', Inner);
+        class Outer extends HTMLElement { constructor() { super(); this.made = new Inner(); } }
+        customElements.define('x-outer', Outer);
+        const o = document.querySelector('x-outer');
+        console.log(Node.DOCUMENT_FRAGMENT_NODE, Node.DOCUMENT_POSITION_CONTAINED_BY, document.body.ATTRIBUTE_NODE,
+                    o instanceof Outer, o.made instanceof Inner);
+        </script>)");
+    EXPECT_EQ(p.console, "log:11 16 2 true true\n") << p.console;
+}

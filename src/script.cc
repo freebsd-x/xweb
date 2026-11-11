@@ -10,6 +10,19 @@ namespace fbx::xweb {
 
 extern const char* const kScriptPrelude;   // script_prelude.cc
 
+namespace {
+
+// Node's constants: node types, and compareDocumentPosition's bits.
+constexpr std::pair<const char16_t*, int> kNodeConstants[] = {
+    {u"ELEMENT_NODE", 1}, {u"ATTRIBUTE_NODE", 2}, {u"TEXT_NODE", 3}, {u"CDATA_SECTION_NODE", 4}, {u"ENTITY_REFERENCE_NODE", 5},
+    {u"ENTITY_NODE", 6}, {u"PROCESSING_INSTRUCTION_NODE", 7}, {u"COMMENT_NODE", 8}, {u"DOCUMENT_NODE", 9}, {u"DOCUMENT_TYPE_NODE", 10},
+    {u"DOCUMENT_FRAGMENT_NODE", 11}, {u"NOTATION_NODE", 12},
+    {u"DOCUMENT_POSITION_DISCONNECTED", 1}, {u"DOCUMENT_POSITION_PRECEDING", 2}, {u"DOCUMENT_POSITION_FOLLOWING", 4},
+    {u"DOCUMENT_POSITION_CONTAINS", 8}, {u"DOCUMENT_POSITION_CONTAINED_BY", 16}, {u"DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC", 32},
+};
+
+}  // namespace
+
 
 
 // ── Node ──────────────────────────────────────────────────────────────────────
@@ -162,9 +175,7 @@ void PageScript::Impl::installNode() {
         return self->wrap(n);
     });
     method(p, u"normalize", 0, [](Runtime&, const Value&, Args) { return Value::undefined(); });
-    for (auto [name, value] : std::initializer_list<std::pair<const char16_t*, int>>{
-             {u"ELEMENT_NODE", 1}, {u"TEXT_NODE", 3}, {u"COMMENT_NODE", 8}, {u"DOCUMENT_NODE", 9}, {u"DOCUMENT_FRAGMENT_NODE", 11}})
-        rt.put(p, name, Value::number(value), 0);
+    for (auto [name, value] : kNodeConstants) rt.put(p, name, Value::number(value), 0);
     // Text and comments: data and length.
     accessor(proto_text, u"data", [self](Runtime&, const Value& t, Args) { return str(self->thisNode(t)->data); },
              [self](Runtime& rt, const Value& t, Args a) {
@@ -1415,8 +1426,9 @@ void PageScript::Impl::installWindow() {
     iface(u"CharacterData", proto_text);
     iface(u"CSSStyleDeclaration", proto_style);
     iface(u"DOMTokenList", proto_classlist);
-    for (auto [name, value] : std::initializer_list<std::pair<const char16_t*, int>>{{u"ELEMENT_NODE", 1}, {u"TEXT_NODE", 3}, {u"COMMENT_NODE", 8}, {u"DOCUMENT_NODE", 9}})
-        rt.put(rt.get(Value::object(g), u"Node").asObject(), name, Value::number(value), 0);
+    // Node's constants on the interface too (ShadyDOM reads Node.DOCUMENT_FRAGMENT_NODE
+    // for its roots' nodeType).
+    for (auto [name, value] : kNodeConstants) rt.put(rt.get(Value::object(g), u"Node").asObject(), name, Value::number(value), 0);
 }
 
 void PageScript::Impl::install() {

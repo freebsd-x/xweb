@@ -146,7 +146,7 @@ void PageScript::Impl::callReaction(Node* el, const Value& callback, std::vector
 void PageScript::Impl::upgrade(Node* el, const CustomDefinition& def) {
     if (el->custom_state == 2 || el->custom_state == 3) return;
     if (upgrade_candidates.size() > 64) return;
-    upgrade_candidates.push_back(el);
+    upgrade_candidates.emplace_back(def.ctor, el);
     Value made;
     std::string failure;
     try {
@@ -317,14 +317,17 @@ void PageScript::Impl::installDom() {
         if (!def) rt.throwError("TypeError", "Illegal constructor: this class isn't a defined custom element");
         const Value pv = rt.get(Value::object(nt), u"prototype");
         Object* proto = pv.isObject() ? pv.asObject() : self->proto_html_element;
-        if (!self->upgrade_candidates.empty() && self->upgrade_candidates.back()) {
-            Node* el = self->upgrade_candidates.back();
-            self->upgrade_candidates.back() = nullptr;   // constructed: a second super() fails
+        // This definition's construction stack: the innermost element it's upgrading.
+        auto mine = std::find_if(self->upgrade_candidates.rbegin(), self->upgrade_candidates.rend(),
+                                 [&](const auto& c) { return c.first == def->ctor; });
+        if (mine != self->upgrade_candidates.rend()) {
+            if (!mine->second) rt.throwError("TypeError", "the custom element was already constructed");
+            Node* el = mine->second;
+            mine->second = nullptr;   // constructed: a second super() fails
             Object* w = self->wrap(el).asObject();
             w->prototype = proto;
             return Value::object(w);
         }
-        if (!self->upgrade_candidates.empty()) rt.throwError("TypeError", "the custom element was already constructed");
         Node* n = self->doc.make(NodeType::Element);
         n->name = def->local_name;
         if (def->local_name != def->name) n->attrs.push_back({"is", def->name});
