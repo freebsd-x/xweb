@@ -759,3 +759,35 @@ TEST(Script, PostMessageToItselfArrivesAsATask) {
     }
     EXPECT_EQ(p.console, "log:sync 0\nlog:v:true:https://example.org onmessage too\n") << p.console;
 }
+
+TEST(Script, InnerTextIsTheTextAsShown) {
+    Page p(R"(<body><div id=d>  Hello
+        <b>big</b>   world<script>var x = 1;</script><style>p{}</style><p>para</p><span hidden>no</span>a<br>b<ul><li>one</li><li>two</li></ul></div>
+        <script>console.log(JSON.stringify(document.getElementById('d').innerText));</script>)");
+    EXPECT_EQ(p.console, "log:\"Hello big world\\n\\npara\\n\\na\\nb\\none\\ntwo\"\n") << p.console;
+}
+
+TEST(Script, DocumentFontsAnswersAtOnce) {
+    Page p(R"(<body><script>
+        document.fonts.load("italic 700 16px 'Source Sans', serif", 'BESbswy').then(fs => {
+          const f = new FontFace('X', 'url(x.woff2)', { weight: '700' });
+          document.fonts.add(f);
+          f.load().then(g => console.log(fs.length, fs[0].family, document.fonts.check('16px X'), document.fonts.size, g === f, g.status));
+        });
+        </script>)");
+    for (int i = 0; i < 40 && p.script->busy(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        p.script->tick();
+    }
+    EXPECT_EQ(p.console, "log:1 Source Sans true 1 true loaded\n") << p.console;
+}
+
+TEST(Script, MoreReflectedAttributes) {
+    Page p(R"(<head><link rel=alternate hreflang=en-GB href=/uk><link id=l rel=stylesheet href=x.css crossorigin></head><body><script>
+        const alt = document.querySelector('[hreflang]');
+        const l = document.getElementById('l');
+        l.referrerPolicy = 'no-referrer';
+        console.log(alt.hreflang.split('-')[1], l.crossOrigin, l.getAttribute('referrerpolicy'), document.body.crossOrigin, alt.media === '');
+        </script>)");
+    EXPECT_EQ(p.console, "log:GB anonymous no-referrer null true\n") << p.console;
+}

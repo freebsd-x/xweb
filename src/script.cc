@@ -6,11 +6,72 @@
 
 #include "script_impl.h"
 
+#include <set>
+
 namespace fbx::xweb {
 
 extern const char* const kScriptPrelude;   // script_prelude.cc
 
 namespace {
+
+// innerText, roughly: the text as shown. What isn't shown (scripts, styles, templates,
+// hidden elements) is left out; white space collapses; blocks and <br> break lines.
+std::string renderedText(const Node* root) {
+    if (!root) return {};
+    static const std::set<std::string> skipped{"script", "style", "template", "noscript", "head", "title", "iframe", "object", "video", "audio", "canvas"};
+    static const std::set<std::string> blocks{"address", "article", "aside", "blockquote", "dd", "details", "dialog", "div", "dl", "dt", "fieldset",
+                                              "figcaption", "figure", "footer", "form", "header", "hgroup", "hr", "li", "main", "nav", "ol", "section",
+                                              "summary", "table", "tr", "ul", "caption", "thead", "tbody", "tfoot", "center", "menu"};
+    static const std::set<std::string> paragraphs{"p", "h1", "h2", "h3", "h4", "h5", "h6", "pre"};
+    std::string out;
+    int want_breaks = 0;   // line breaks owed before the next text
+    const auto breakBefore = [&](int n) { if (!out.empty()) want_breaks = std::max(want_breaks, n); };
+    const auto emit = [&](std::string_view text, bool pre) {
+        for (const char c : text) {
+            const bool space = !pre && (c == ' ' || c == '\n' || c == '\t' || c == '\r' || c == '\f');
+            if (space) {
+                if (!out.empty() && out.back() != ' ' && out.back() != '\n' && want_breaks == 0) out += ' ';
+                continue;
+            }
+            if (want_breaks > 0) {
+                while (!out.empty() && out.back() == ' ') out.pop_back();
+                out.append(static_cast<size_t>(want_breaks), '\n');
+                want_breaks = 0;
+            }
+            out += c;
+        }
+    };
+    struct Item { const Node* n; bool closing; bool pre; };
+    std::vector<Item> todo;
+    for (auto it = root->children.rbegin(); it != root->children.rend(); ++it) todo.push_back({*it, false, root->isHtml("pre")});
+    size_t steps = 0;
+    while (!todo.empty() && ++steps < 2'000'000 && out.size() < (64u << 20)) {
+        const Item item = todo.back();
+        todo.pop_back();
+        const Node* n = item.n;
+        if (n->type == NodeType::Text) { emit(n->data, item.pre); continue; }
+        if (!n->isElement()) continue;
+        const std::string& tag = n->name;
+        if (item.closing) {
+            if (paragraphs.count(tag)) breakBefore(2);
+            else if (blocks.count(tag)) breakBefore(1);
+            else if (tag == "td" || tag == "th") emit("\t", true);
+            continue;
+        }
+        if (n->ns == Namespace::Html && (skipped.count(tag) || n->attr("hidden"))) continue;
+        if (tag == "br") {
+            if (want_breaks == 0) out += '\n';
+            continue;
+        }
+        if (paragraphs.count(tag)) breakBefore(2);
+        else if (blocks.count(tag)) breakBefore(1);
+        const bool pre = item.pre || tag == "pre" || tag == "textarea";
+        todo.push_back({n, true, pre});
+        for (auto it = n->children.rbegin(); it != n->children.rend(); ++it) todo.push_back({*it, false, pre});
+    }
+    while (!out.empty() && (out.back() == ' ' || out.back() == '\t')) out.pop_back();
+    return out;
+}
 
 // Node's constants: node types, and compareDocumentPosition's bits.
 constexpr std::pair<const char16_t*, int> kNodeConstants[] = {
@@ -330,6 +391,30 @@ void PageScript::Impl::installElement() {
                      return Value::undefined();
                  });
     }
+    // More of them, where the property's name isn't the attribute's.
+    for (auto [prop, attr_name] : std::initializer_list<std::pair<const char16_t*, const char*>>{
+             {u"hreflang", "hreflang"}, {u"media", "media"}, {u"download", "download"}, {u"ping", "ping"}, {u"integrity", "integrity"},
+             {u"as", "as"}, {u"sizes", "sizes"}, {u"srcset", "srcset"}, {u"charset", "charset"}, {u"accept", "accept"},
+             {u"autocomplete", "autocomplete"}, {u"pattern", "pattern"}, {u"wrap", "wrap"}, {u"headers", "headers"}, {u"scope", "scope"},
+             {u"abbr", "abbr"}, {u"accessKey", "accesskey"}, {u"enterKeyHint", "enterkeyhint"}, {u"inputMode", "inputmode"},
+             {u"referrerPolicy", "referrerpolicy"}, {u"decoding", "decoding"}, {u"loading", "loading"}, {u"fetchPriority", "fetchpriority"},
+             {u"nonce", "nonce"}}) {
+        const std::string a = attr_name;
+        accessor(p, prop, [self, a](Runtime&, const Value& t, Args) { return str(self->attr(self->thisElement(t), a.c_str())); },
+                 [self, a](Runtime& rt, const Value& t, Args v) {
+                     self->setAttr(self->thisElement(t), a, js::utf8(rt.toStringValue(arg(v, 0))));
+                     return Value::undefined();
+                 });
+    }
+    // crossOrigin: null when the attribute's absent.
+    accessor(p, u"crossOrigin", [self](Runtime&, const Value& t, Args) {
+        const std::string* v = self->thisElement(t)->attr("crossorigin");
+        return v ? str(*v == "use-credentials" ? "use-credentials" : "anonymous") : Value::null();
+    }, [self](Runtime& rt, const Value& t, Args v) {
+        if (arg(v, 0).isNull()) self->removeAttr(self->thisElement(t), "crossorigin");
+        else self->setAttr(self->thisElement(t), "crossorigin", js::utf8(rt.toStringValue(arg(v, 0))));
+        return Value::undefined();
+    });
     accessor(p, u"className", [self](Runtime&, const Value& t, Args) { return str(self->attr(self->thisElement(t), "class")); },
              [self](Runtime& rt, const Value& t, Args v) {
                  self->setAttr(self->thisElement(t), "class", js::utf8(rt.toStringValue(arg(v, 0))));
@@ -427,7 +512,7 @@ void PageScript::Impl::installElement() {
                  return Value::undefined();
              });
     accessor(p, u"outerHTML", [self](Runtime&, const Value& t, Args) { return str(self->outerHtml(self->thisElement(t))); });
-    accessor(p, u"innerText", [self](Runtime&, const Value& t, Args) { return str(self->thisElement(t)->textContent()); },
+    accessor(p, u"innerText", [self](Runtime&, const Value& t, Args) { return str(renderedText(self->thisElement(t))); },
              [self](Runtime& rt, const Value& t, Args a) {
                  self->setText(self->thisElement(t), js::utf8(rt.toStringValue(arg(a, 0))));
                  return Value::undefined();
@@ -1486,6 +1571,11 @@ void PageScript::Impl::install() {
     // What's written in JavaScript itself (URL, URLSearchParams).
     const Runtime::Result prelude = rt.evaluate(kScriptPrelude, "prelude");
     if (!prelude.ok) report("the script prelude failed: " + prelude.error);
+    // XWEB_EARLY=<script>: for finding what a page does, run before any of its own.
+    if (const char* early = std::getenv("XWEB_EARLY")) {
+        const Runtime::Result r = rt.evaluate(early, "early");
+        if (!r.ok) report("XWEB_EARLY failed: " + r.error);
+    }
 }
 
 // ── The public face ───────────────────────────────────────────────────────────

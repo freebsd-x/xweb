@@ -1578,6 +1578,51 @@ const char* const kScriptPrelude = R"JS(
     close() { this._closed = true; channels.get(this.name)?.delete(this); }
   }
   const reportError = (x) => setTimeout(() => { throw x; }, 0);
+  // FontFace and document.fonts. The page's web fonts are loaded by the renderer, not
+  // through here; to scripts every face is loaded, and asking to load one answers with
+  // a face for that family at once (FontFaceObserver and friends wait on this).
+  class FontFace {
+    constructor(family, source, descriptors = {}) {
+      this.family = String(family).replace(/^["']|["']$/g, '');
+      this.style = descriptors.style || 'normal';
+      this.weight = String(descriptors.weight || 'normal');
+      this.stretch = descriptors.stretch || 'normal';
+      this.unicodeRange = descriptors.unicodeRange || 'U+0-10FFFF';
+      this.display = descriptors.display || 'auto';
+      this.featureSettings = descriptors.featureSettings || 'normal';
+      this.status = 'loaded';
+      this.loaded = Promise.resolve(this);
+    }
+    load() { return Promise.resolve(this); }
+  }
+  {
+    const familiesOf = (font) => {
+      // The family list at the end of a font shorthand ("italic 700 16px 'A B', serif").
+      const m = /(?:^|\s)(?:[\d.]+(?:px|pt|em|rem|%)|xx?-small|small|medium|large|xx?-large)(?:\/\S+)?\s+(.+)$/.exec(String(font).trim());
+      const list = m ? m[1] : String(font);
+      return list.split(',').map(f => f.trim().replace(/^["']|["']$/g, '')).filter(Boolean);
+    };
+    const added = new Set();
+    const fonts = new (class FontFaceSet extends EventTarget {
+      constructor() { super(); this.status = 'loaded'; this.onloading = this.onloadingdone = this.onloadingerror = null; }
+      get ready() { return Promise.resolve(this); }
+      get size() { return added.size; }
+      load(font) { const fam = familiesOf(font)[0]; return Promise.resolve(fam ? [new FontFace(fam, '')] : []); }
+      check() { return true; }
+      add(face) { added.add(face); return this; }
+      delete(face) { return added.delete(face); }
+      has(face) { return added.has(face); }
+      clear() { added.clear(); }
+      forEach(cb, thisArg) { for (const f of added) cb.call(thisArg, f, f, this); }
+      values() { return added.values(); }
+      keys() { return added.values(); }
+      entries() { return added.entries(); }
+      [Symbol.iterator]() { return added.values(); }
+    })();
+    Object.defineProperty(document, 'fonts', { value: fonts, configurable: true, enumerable: true });
+    Object.defineProperty(global, 'FontFace', { value: FontFace, writable: true, configurable: true });
+    Object.defineProperty(global, 'FontFaceSet', { value: fonts.constructor, writable: true, configurable: true });
+  }
   // window.postMessage, to this window (the only one a page here has): a "message"
   // event as a task, if the target origin allows. Schedulers use it to yield.
   {
