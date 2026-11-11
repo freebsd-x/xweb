@@ -629,3 +629,52 @@ TEST(Script, ClonedTemplatesKeepTheirContents) {
         </script>)");
     EXPECT_EQ(p.console, "log:1 1 0 i\n") << p.console;
 }
+
+TEST(Script, CollectionsFindItemsByIdOrName) {
+    Page p(R"(<body><form><input name=q><input id=go name=x></form><script>
+        const els = document.forms[0].elements, kids = document.body.children;
+        console.log(els.namedItem('q').name, els.namedItem('go').name, els.namedItem('x').id, els.namedItem('nope'),
+                    kids.namedItem('go'), els.item(5), els.item(0) === els[0]);
+        </script>)");
+    EXPECT_EQ(p.console, "log:q x go null null null true\n") << p.console;
+}
+
+TEST(Script, TextNodesAreNotParents) {
+    // Reddit's observer asks for querySelectorAll, then calls matches().
+    Page p(R"(<body><p>hi</p><script>
+        const t = document.querySelector('p').firstChild, f = document.createDocumentFragment();
+        console.log(typeof t.querySelectorAll, typeof t.children, typeof f.querySelectorAll, typeof f.getElementsByTagName,
+                    typeof document.querySelectorAll, typeof document.body.children, typeof t.remove);
+        </script>)");
+    EXPECT_EQ(p.console, "log:undefined undefined function undefined function object function\n") << p.console;
+}
+
+TEST(Script, AnimateFinishesAtOnceAndTabIndexIsSettable) {
+    Page p(R"(<body><div id=d></div><button id=b></button><script>
+        const d = document.getElementById('d');
+        const a = d.animate([{ opacity: 0 }, { opacity: 0.5 }], { duration: 300, fill: 'forwards' });
+        d.tabIndex = 3;
+        console.log(a instanceof Animation, a.playState, d.style.opacity, d.getAttribute('tabindex'), d.tabIndex,
+                    document.getElementById('b').tabIndex, typeof a.finished.then);
+        </script>)");
+    EXPECT_EQ(p.console, "log:true finished 0.5 3 3 0 function\n") << p.console;
+}
+
+TEST(Script, ConstraintValidation) {
+    Page p(R"(<body><form><input id=a required><input id=e type=email value="x"><input id=n type=number min=2 value=1>
+        <input id=p pattern="[a-z]+" value="abc"></form><script>
+        const $ = (id) => document.getElementById(id);
+        let invalid = 0;
+        $('a').addEventListener('invalid', () => invalid++);
+        const before = [$('a').validity.valueMissing, $('e').validity.typeMismatch, $('n').validity.rangeUnderflow, $('p').validity.valid];
+        const formOk = document.forms[0].checkValidity();
+        $('p').setCustomValidity('nope');
+        class X extends HTMLElement { static formAssociated = true; constructor() { super(); this.i = this.attachInternals(); } }
+        customElements.define('x-field', X);
+        const x = new X();
+        x.i.setValidity({ customError: true }, 'bad');
+        console.log(before.join(), formOk, invalid, $('p').validity.customError, $('p').validationMessage,
+                    $('a').validationMessage, x.i.validity.valid, x.i.validationMessage, typeof x.i.setFormValue);
+        </script>)");
+    EXPECT_EQ(p.console, "log:true,true,true,true false 1 true nope Please fill out this field. false bad function\n") << p.console;
+}

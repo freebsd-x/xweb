@@ -597,8 +597,17 @@ void PageScript::Impl::installElement() {
     });
     accessor(p, u"isContentEditable", [](Runtime&, const Value&, Args) { return Value::boolean(false); });
     accessor(p, u"tabIndex", [self](Runtime&, const Value& t, Args) {
-        const std::string v = self->attr(self->thisElement(t), "tabindex");
-        return Value::number(v.empty() ? -1 : std::atoi(v.c_str()));
+        Node* el = self->thisElement(t);
+        const std::string v = self->attr(el, "tabindex");
+        if (!v.empty()) return Value::number(std::atoi(v.c_str()));
+        // Controls and links are in the tab order without asking.
+        const bool focusable = el->isHtml("button") || el->isHtml("input") || el->isHtml("select") || el->isHtml("textarea") ||
+                               el->isHtml("iframe") || el->isHtml("summary") || ((el->isHtml("a") || el->isHtml("area")) && el->attr("href"));
+        return Value::number(focusable ? 0 : -1);
+    }, [self](Runtime& rt, const Value& t, Args a) {
+        const double n = rt.toNumber(arg(a, 0));
+        self->setAttr(self->thisElement(t), "tabindex", std::to_string(std::isfinite(n) ? static_cast<long long>(n) : 0));
+        return Value::undefined();
     });
 
     // CSSStyleDeclaration.
@@ -1354,6 +1363,26 @@ void PageScript::Impl::installWindow() {
     // NodeList and HTMLCollection: our lists are arrays, so their prototype inherits
     // Array's; pages test instanceof and add forEach to it.
     proto_nodelist = rt.newObject(rt.array_prototype);
+    method(proto_nodelist, u"item", 1, [](Runtime& r, const Value& t, Args a) {
+        const Value v = r.get(t, PropertyKey(Runtime::numberToString(r.toIntegerOrInfinity(arg(a, 0)))));
+        return v.isUndefined() ? Value::null() : v;
+    });
+    // HTMLCollection's lookup by id, then by name (on NodeLists too: they share a prototype).
+    method(proto_nodelist, u"namedItem", 1, [self](Runtime& r, const Value& t, Args a) {
+        const std::string key = js::utf8(r.toStringValue(arg(a, 0)));
+        if (key.empty()) return Value::null();
+        const double n = r.toNumber(r.get(t, u"length"));
+        Value by_name = Value::null();
+        for (double i = 0; i < n && i < 1e7; ++i) {
+            const Value v = r.get(t, PropertyKey(Runtime::numberToString(i)));
+            Node* e = self->node(v);
+            if (!e || !e->isElement()) continue;
+            if (const std::string* id = e->attr("id"); id && *id == key) return v;
+            if (by_name.isNull())
+                if (const std::string* nm = e->attr("name"); nm && *nm == key) by_name = v;
+        }
+        return by_name;
+    });
     iface(u"NodeList", proto_nodelist);
     iface(u"HTMLCollection", proto_nodelist);
     iface(u"Node", proto_node);

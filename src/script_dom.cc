@@ -541,6 +541,19 @@ void PageScript::Impl::installDom() {
             proto_element->remove(PropertyKey(name));
         }
     }
+    // ParentNode's members belong to elements, documents and fragments, not to every
+    // node: pages tell text from elements by asking for querySelectorAll (Reddit does).
+    for (const char16_t* name : {u"children", u"childElementCount", u"firstElementChild", u"lastElementChild", u"append",
+                                 u"prepend", u"replaceChildren", u"querySelector", u"querySelectorAll",
+                                 u"getElementsByTagName", u"getElementsByClassName"}) {
+        const js::Property* own = proto_node->own(PropertyKey(name));
+        if (!own) continue;
+        const js::Property kept = *own;
+        const bool fragments_too = std::u16string_view(name).substr(0, 10) != u"getElement";
+        for (Object* proto : {proto_element, proto_document, fragments_too ? proto_fragment : nullptr})
+            if (proto && !proto->own(PropertyKey(name))) proto->define(PropertyKey(name), kept);
+        proto_node->remove(PropertyKey(name));
+    }
     // <details>'s open.
     accessor(interface_protos["HTMLDetailsElement"], u"open", [self](Runtime&, const Value& t, Args) { return Value::boolean(self->thisElement(t)->attr("open") != nullptr); },
              [self](Runtime& rt, const Value& t, Args a) {

@@ -322,11 +322,7 @@ struct PageScript::Impl {
         items.reserve(nodes.size());
         for (Node* n : nodes) items.push_back(wrap(n));
         Object* a = rt.newArray(std::move(items));
-        if (proto_nodelist) a->prototype = proto_nodelist;   // instanceof NodeList; still an array
-        rt.method(a, u"item", 1, [this](Runtime& r, const Value& t, Args args) {
-            const Value v = r.get(t, PropertyKey(Runtime::numberToString(r.toIntegerOrInfinity(arg(args, 0)))));
-            return v.isUndefined() ? Value::null() : v;
-        });
+        if (proto_nodelist) a->prototype = proto_nodelist;   // instanceof NodeList; still an array (item(), namedItem() there)
         return Value::object(a);
     }
 

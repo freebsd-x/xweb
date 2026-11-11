@@ -1153,6 +1153,170 @@ const char* const kScriptPrelude = R"JS(
   if (typeof Element === 'function' && !Element.prototype.webkitMatchesSelector)
     Element.prototype.webkitMatchesSelector = Element.prototype.matches;
 
+  // Web Animations, without the animating: an animation finishes at once (as if it
+  // had zero duration), keeping its last frame when its fill says so.
+  if (typeof Element === 'function' && !Element.prototype.animate) {
+    class Animation extends EventTarget {
+      constructor(effect) {
+        super();
+        this.effect = effect; this.id = ''; this.playbackRate = 1; this.startTime = null; this.currentTime = null;
+        this.playState = 'finished'; this.pending = false; this.onfinish = null; this.oncancel = null; this.onremove = null;
+        this.finished = Promise.resolve(this);
+        this.ready = Promise.resolve(this);
+      }
+      play() {} pause() {} finish() {} reverse() {} persist() {} commitStyles() {} updatePlaybackRate(r) { this.playbackRate = r; }
+      cancel() { this.playState = 'idle'; }
+    }
+    const lastFrame = (frames) => {
+      if (Array.isArray(frames)) return frames.length ? frames[frames.length - 1] : {};
+      const out = {};
+      if (frames && typeof frames === 'object')
+        for (const k of Object.keys(frames)) { const v = frames[k]; out[k] = Array.isArray(v) ? v[v.length - 1] : v; }
+      return out;
+    };
+    Element.prototype.animate = function animate(frames, options) {
+      const fill = options && typeof options === 'object' ? options.fill : undefined;
+      if ((fill === 'forwards' || fill === 'both') && this.style) {
+        const last = lastFrame(frames);
+        for (const k of Object.keys(last))
+          if (k !== 'offset' && k !== 'easing' && k !== 'composite') try { this.style[k] = last[k]; } catch (e) {}
+      }
+      const a = new Animation({ target: this, getKeyframes: () => [], getTiming: () => (typeof options === 'object' ? options : { duration: options }) });
+      setTimeout(() => {
+        const e = new Event('finish');
+        a.dispatchEvent(e);
+        if (typeof a.onfinish === 'function') a.onfinish.call(a, e);
+      }, 0);
+      return a;
+    };
+    Element.prototype.getAnimations = function getAnimations() { return []; };
+    if (typeof Document === 'function') Document.prototype.getAnimations = function getAnimations() { return []; };
+    global.Animation = Animation;
+  }
+
+  // Constraint validation: validity, setCustomValidity, checkValidity, for the form
+  // controls, and ElementInternals for form-associated custom elements.
+  if (typeof Element === 'function' && typeof HTMLInputElement === 'function' && !HTMLInputElement.prototype.setCustomValidity) {
+    const custom = new WeakMap();
+    const flagNames = ['valueMissing', 'typeMismatch', 'patternMismatch', 'tooLong', 'tooShort', 'rangeUnderflow',
+                       'rangeOverflow', 'stepMismatch', 'badInput', 'customError'];
+    class ValidityState {
+      constructor(flags) { for (const n of flagNames) Object.defineProperty(this, n, { value: !!flags[n], enumerable: true }); }
+      get valid() { return !flagNames.some(n => this[n]); }
+    }
+    global.ValidityState = ValidityState;
+    const barred = (el) => el.disabled || el.hasAttribute('readonly') && el.localName !== 'select' ||
+      (el.localName === 'input' && ['hidden', 'reset', 'button'].includes(el.type)) ||
+      el.localName === 'button' && el.type !== 'submit' || el.localName === 'fieldset' || el.localName === 'output' ||
+      !!el.closest('datalist');
+    const flagsOf = (el) => {
+      const f = { customError: !!custom.get(el) };
+      if (barred(el)) return f;
+      const v = el.localName === 'select' || el.localName === 'textarea' || el.localName === 'input' ? String(el.value ?? '') : '';
+      const type = el.localName === 'input' ? el.type : '';
+      if (el.hasAttribute('required')) {
+        if (type === 'checkbox' || type === 'radio') {
+          if (type === 'checkbox') f.valueMissing = !el.checked;
+          else {
+            const name = el.name, scope = el.form || el.getRootNode();
+            f.valueMissing = !(name ? Array.from(scope.querySelectorAll('input[type=radio]')).some(r => r.name === name && r.checked) : el.checked);
+          }
+        } else if (el.localName !== 'button') {
+          f.valueMissing = v === '';
+        }
+      }
+      if (v !== '') {
+        if (type === 'email') f.typeMismatch = !v.split(el.multiple ? ',' : '\u0000').every(x => /^[^@\s]+@[^@\s]+$/.test(x.trim()));
+        if (type === 'url') { try { new URL(v); } catch (e) { f.typeMismatch = true; } }
+        const pattern = el.getAttribute('pattern');
+        if (pattern !== null && ['text', 'search', 'url', 'tel', 'email', 'password'].includes(type)) {
+          try { f.patternMismatch = !new RegExp('^(?:' + pattern + ')$', 'v').test(v); }
+          catch (e) { try { f.patternMismatch = !new RegExp('^(?:' + pattern + ')$', 'u').test(v); } catch (e2) {} }
+        }
+        const max = el.getAttribute('maxlength'), min = el.getAttribute('minlength');
+        if (max !== null && /^\d+$/.test(max) && v.length > +max) f.tooLong = true;
+        if (min !== null && /^\d+$/.test(min) && v.length < +min) f.tooShort = true;
+        if (type === 'number' || type === 'range') {
+          const n = Number(v), lo = el.getAttribute('min'), hi = el.getAttribute('max');
+          if (Number.isNaN(n)) f.badInput = true;
+          else {
+            if (lo !== null && lo !== '' && n < Number(lo)) f.rangeUnderflow = true;
+            if (hi !== null && hi !== '' && n > Number(hi)) f.rangeOverflow = true;
+          }
+        }
+      }
+      return f;
+    };
+    const message = (el, f) => {
+      if (f.customError) return custom.get(el);
+      if (f.valueMissing) return 'Please fill out this field.';
+      if (f.typeMismatch) return el.type === 'email' ? 'Please enter an email address.' : 'Please enter a URL.';
+      if (f.patternMismatch) return 'Please match the requested format.';
+      if (f.tooLong || f.tooShort) return 'Please use the requested length.';
+      if (f.rangeUnderflow || f.rangeOverflow) return 'Please enter a value in range.';
+      if (f.badInput) return 'Please enter a number.';
+      return '';
+    };
+    const check = (el) => {
+      const ok = new ValidityState(flagsOf(el)).valid;
+      if (!ok) el.dispatchEvent(new Event('invalid', { cancelable: true }));
+      return ok;
+    };
+    const controls = ['HTMLInputElement', 'HTMLSelectElement', 'HTMLTextAreaElement', 'HTMLButtonElement',
+                      'HTMLFieldSetElement', 'HTMLOutputElement', 'HTMLObjectElement'];
+    for (const name of controls) {
+      const C = global[name];
+      if (typeof C !== 'function') continue;
+      const P = C.prototype;
+      P.setCustomValidity = function setCustomValidity(msg) { custom.set(this, String(msg)); };
+      Object.defineProperty(P, 'validity', { get() { return new ValidityState(flagsOf(this)); }, configurable: true, enumerable: true });
+      Object.defineProperty(P, 'validationMessage', { get() { return barred(this) ? '' : message(this, flagsOf(this)); }, configurable: true, enumerable: true });
+      Object.defineProperty(P, 'willValidate', { get() { return !barred(this); }, configurable: true, enumerable: true });
+      P.checkValidity = function checkValidity() { return check(this); };
+      P.reportValidity = function reportValidity() { return check(this); };
+    }
+    if (typeof HTMLFormElement === 'function') {
+      const all = (form) => {
+        let ok = true;
+        for (const el of Array.from(form.elements)) if (typeof el.checkValidity === 'function' && !el.checkValidity()) ok = false;
+        return ok;
+      };
+      HTMLFormElement.prototype.checkValidity = function checkValidity() { return all(this); };
+      HTMLFormElement.prototype.reportValidity = function reportValidity() { return all(this); };
+    }
+    // ElementInternals: what a form-associated custom element tells its form.
+    class ElementInternals {
+      #el; #flags = {}; #message = ''; #value = null;
+      constructor(el) { this.#el = el; this.states = new Set(); }
+      get shadowRoot() { return this.#el.shadowRoot; }
+      get form() { return this.#el.closest('form'); }
+      get labels() { return this.#el.id ? Array.from(document.querySelectorAll('label[for="' + CSS.escape(this.#el.id) + '"]')) : []; }
+      get willValidate() { return true; }
+      get validity() { return new ValidityState(this.#flags); }
+      get validationMessage() { return this.#message; }
+      setFormValue(value) { this.#value = value; }
+      setValidity(flags, message) {
+        this.#flags = Object.assign({}, flags || {});
+        this.#message = message === undefined ? '' : String(message);
+      }
+      checkValidity() {
+        const ok = new ValidityState(this.#flags).valid;
+        if (!ok) this.#el.dispatchEvent(new Event('invalid', { cancelable: true }));
+        return ok;
+      }
+      reportValidity() { return this.checkValidity(); }
+    }
+    global.ElementInternals = ElementInternals;
+    if (typeof HTMLElement === 'function' && !HTMLElement.prototype.attachInternals) {
+      const attached = new WeakSet();
+      HTMLElement.prototype.attachInternals = function attachInternals() {
+        if (attached.has(this)) throw new DOMException('ElementInternals already attached', 'NotSupportedError');
+        attached.add(this);
+        return new ElementInternals(this);
+      };
+    }
+  }
+
   // DOMTokenList (classList): iterable, as a list of its tokens.
   {
     const proto = Object.getPrototypeOf(document.createElement('div').classList);
