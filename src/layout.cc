@@ -3471,6 +3471,12 @@ private:
                     if (image.gradient) {
                         op.kind = PaintKind::Gradient;
                         op.gradient = image.gradient;
+                        if (opacity < 1) {
+                            // Its colours faded: what draws it goes by the stops alone.
+                            auto copy = std::make_shared<Gradient>(*image.gradient);
+                            for (GradientStop& st : copy->stops) st.color = faded(st.color, opacity);
+                            op.gradient = std::move(copy);
+                        }
                         op.color = faded(Color{255, 255, 255, 255}, opacity);
                     } else {
                         op.kind = PaintKind::Image;

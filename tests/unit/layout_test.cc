@@ -655,3 +655,13 @@ TEST(Positioned, NegativeZIndexGoesUnderTheContent) {
     ASSERT_TRUE(last->node->attr("id"));
     EXPECT_EQ(*last->node->attr("id"), "c");
 }
+
+TEST(Paint, AGradientFadesWithItsBox) {
+    const auto r = layout("<div style='opacity:0.5'><div style='width:10px;height:10px;background:linear-gradient(#f00,#00f)'></div></div>");
+    const PaintOp* g = nullptr;
+    for (const auto& op : r.page.ops)
+        if (op.kind == PaintKind::Gradient) g = &op;
+    ASSERT_NE(g, nullptr);
+    ASSERT_FALSE(g->gradient->stops.empty());
+    EXPECT_NEAR(g->gradient->stops.front().color.a, 128, 1);
+}
