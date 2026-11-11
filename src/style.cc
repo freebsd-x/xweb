@@ -1579,7 +1579,7 @@ struct PartRule {
 // The rules of one tree: the user agent's, the document's, or a shadow root's. A shadow
 // tree's rules only reach into it, and to its host through :host.
 struct Scope {
-    Buckets normal, before, after;
+    Buckets normal, before, after, placeholder;
     std::vector<IndexedSelector> host;      // rules whose subject is :host(...)
     std::deque<SlottedRule> slotted;
     std::deque<PartRule> parts;             // aimed at shadow trees of this tree's elements
@@ -1597,6 +1597,7 @@ public:
         if (doc.quirks) addSheet(css::parseStylesheet(detail::kQuirksStyle), Origin::UserAgent, 0);
         // What's for browsers without scripts isn't shown where they run.
         if (doc.scripting) addSheet(css::parseStylesheet("noscript { display: none }"), Origin::UserAgent, 0);
+        addSheet(css::parseStylesheet("::placeholder { color: #757575 }"), Origin::UserAgent, 0);
         target_ = &doc_scope_;
         collectSheets(doc_.root());
         for (const std::string& css : doc_.root()->adopted_css) addSheet(css::parseStylesheet(css), Origin::Author, 0);   // document.adoptedStyleSheets
@@ -1653,6 +1654,7 @@ private:
             if (s.kind != SimpleKind::PseudoElement) continue;
             if (s.name == "before") buckets = &target_->before;
             else if (s.name == "after") buckets = &target_->after;
+            else if (s.name == "placeholder") buckets = &target_->placeholder;
             else if (s.name == "slotted" && target_->host_el) {
                 SlottedRule r{sel, &s, &rule, origin, ++order_};
                 auto& simple = r.slot_side.parts.back().simple;
@@ -3781,7 +3783,7 @@ private:
     }
 
     void resolvePseudo(const Node* el, const ComputedStyle& s, const Buckets& ua, const Buckets& buckets, const Node* host,
-                       std::unordered_map<const Node*, const ComputedStyle*>& into) {
+                       std::unordered_map<const Node*, const ComputedStyle*>& into, bool needs_content = true) {
         if (ua.empty() && buckets.empty()) return;
         std::vector<MatchedDecl> matched;
         host_context_ = nullptr;
@@ -3794,7 +3796,7 @@ private:
         resolving_pseudo_ = true;
         applyMatched(el, s, pseudo, matched);
         resolving_pseudo_ = false;
-        if (!pseudo.has_content || pseudo.display == Display::None) return;
+        if (needs_content && (!pseudo.has_content || pseudo.display == Display::None)) return;
         out_.storage_.push_back(std::move(pseudo));
         into[el] = &out_.storage_.back();
     }
@@ -3811,6 +3813,8 @@ private:
         if (s.display == Display::None && el->ns != Namespace::Svg) return;
         resolvePseudo(el, s, ua_.before, scope->before, scope->host_el, out_.before_);
         resolvePseudo(el, s, ua_.after, scope->after, scope->host_el, out_.after_);
+        if ((el->isHtml("input") || el->isHtml("textarea")) && el->attr("placeholder"))
+            resolvePseudo(el, s, ua_.placeholder, scope->placeholder, scope->host_el, out_.placeholder_, false);
         if (el->shadow_root) {
             const auto it = shadow_scopes_.find(el->shadow_root);
             const Scope* inner = it == shadow_scopes_.end() ? scope : it->second.get();
@@ -3860,6 +3864,11 @@ StyledDocument::StyledDocument(const Document& doc, css::MediaContext media, con
 const ComputedStyle* StyledDocument::beforeOf(const Node* element) const {
     const auto it = before_.find(element);
     return it == before_.end() ? nullptr : it->second;
+}
+
+const ComputedStyle* StyledDocument::placeholderOf(const Node* element) const {
+    const auto it = placeholder_.find(element);
+    return it == placeholder_.end() ? nullptr : it->second;
 }
 
 const ComputedStyle* StyledDocument::afterOf(const Node* element) const {

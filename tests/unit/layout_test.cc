@@ -570,3 +570,14 @@ TEST(Flex, ColumnItemsKeepTheirContentHeightWhateverTheirBasis) {
     EXPECT_FLOAT_EQ(r.box("m").h, 250);
     EXPECT_FLOAT_EQ(r.box("f").y, 250);
 }
+
+TEST(Positioned, APictureKeepsItsSizeBetweenItsOffsets) {
+    // CSS 2.1 10.3.8 / 10.6.5: the right and bottom offsets give way (Reddit's blurred backdrops).
+    const auto r = layout("<div style='position:relative;overflow:hidden;width:100px;height:50px'>"
+                          "<img id=i src=wide.png style='position:absolute;top:0;bottom:0;left:0;right:0'>"
+                          "<div id=d style='position:absolute;top:0;bottom:0;left:0;right:0'></div></div>");
+    EXPECT_FLOAT_EQ(r.box("i").w, 200);
+    EXPECT_FLOAT_EQ(r.box("i").h, 100);
+    EXPECT_FLOAT_EQ(r.box("d").w, 100);
+    EXPECT_FLOAT_EQ(r.box("d").h, 50);
+}

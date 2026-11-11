@@ -949,12 +949,42 @@ void PageScript::Impl::installDom() {
     });
     accessor(sheet_proto, u"cssRules", [owner](Runtime& rt, const Value& t, Args) {
         std::vector<Value> rules;
-        if (Node* n = owner(t))
-            for (const std::string& css : n->adopted_css) {
-                Object* r = rt.newObject();
-                rt.put(r, u"cssText", Value::string(js::utf16(css)), js::kEnumerable);
-                rules.push_back(Value::object(r));
+        const auto add = [&](std::u16string_view text) {
+            while (!text.empty() && (text.front() == u' ' || text.front() == u'\n' || text.front() == u'\t' || text.front() == u'\r')) text.remove_prefix(1);
+            if (text.empty() || rules.size() >= 100000) return;
+            Object* r = rt.newObject();
+            rt.put(r, u"cssText", Value::string(std::u16string(text)), js::kEnumerable);
+            rules.push_back(Value::object(r));
+        };
+        if (Node* n = owner(t)) {
+            for (const std::string& css : n->adopted_css) add(js::utf16(css));
+        } else if (t.isObject() && t.asObject()->primitive.isString()) {
+            // A constructed sheet's text, rule by rule: split where a top-level block or
+            // statement ends (strings and comments don't count).
+            const std::u16string& css = t.asObject()->primitive.asString();
+            size_t start = 0;
+            int depth = 0;
+            char16_t quote = 0;
+            for (size_t i = 0; i < css.size(); ++i) {
+                const char16_t c = css[i];
+                if (quote) {
+                    if (c == u'\\') ++i;
+                    else if (c == quote) quote = 0;
+                    continue;
+                }
+                if (c == u'/' && i + 1 < css.size() && css[i + 1] == u'*') {
+                    const size_t end = css.find(u"*/", i + 2);
+                    if (end == std::u16string::npos) break;
+                    if (depth == 0 && start == i) start = end + 2;
+                    i = end + 1;
+                    continue;
+                }
+                if (c == u'"' || c == u'\'') quote = c;
+                else if (c == u'{') ++depth;
+                else if (c == u'}' && depth > 0 && --depth == 0) { add(std::u16string_view(css).substr(start, i + 1 - start)); start = i + 1; }
+                else if (c == u';' && depth == 0) { add(std::u16string_view(css).substr(start, i + 1 - start)); start = i + 1; }
             }
+        }
         return Value::object(rt.newArray(std::move(rules)));
     });
     accessor(sheet_proto, u"ownerNode", [self, owner](Runtime&, const Value& t, Args) { return self->wrap(owner(t)); });

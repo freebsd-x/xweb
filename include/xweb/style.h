@@ -314,6 +314,8 @@ public:
     // The element's ::before or ::after, if it has one with content.
     [[nodiscard]] const ComputedStyle* beforeOf(const Node* element) const;
     [[nodiscard]] const ComputedStyle* afterOf(const Node* element) const;
+    // An <input> or <textarea>'s ::placeholder, if a rule styles it.
+    [[nodiscard]] const ComputedStyle* placeholderOf(const Node* element) const;
     [[nodiscard]] const css::MediaContext& media() const noexcept { return media_; }
     // The page's @font-face rules, those applying. Sources are as absolute as the sheet's
     // address was: those in a <style> are still relative to the page.
@@ -324,7 +326,7 @@ private:
     ChMeasure measure_ch_;
     const class FormState* forms_ = nullptr;
     std::unordered_map<const Node*, const ComputedStyle*> styles_;
-    std::unordered_map<const Node*, const ComputedStyle*> before_, after_;
+    std::unordered_map<const Node*, const ComputedStyle*> before_, after_, placeholder_;
     std::deque<ComputedStyle> storage_;
     std::vector<WebFontFace> font_faces_;
     friend class StyleResolver;

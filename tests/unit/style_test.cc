@@ -445,3 +445,25 @@ TEST(Selectors, CheckedFollowsTheControlsState) {
     EXPECT_EQ(styled.styleOf(find("o2"))->color, kBlue);
     EXPECT_NE(styled.styleOf(find("o1"))->color, kBlue);
 }
+
+TEST(Pseudo, PlaceholderHasItsOwnStyle) {
+    auto doc = parseHtml("<style>.t::placeholder{color:transparent} .o::placeholder{opacity:0} .f::placeholder{font-style:italic}</style>"
+                         "<input id=a placeholder=x class=t><textarea id=b placeholder=y class=o></textarea><input id=c placeholder=z class=f><input id=d>");
+    StyledDocument styles(*doc, css::MediaContext{800, 600});
+    const auto byId = [&](const char* id) {
+        const Node* found = nullptr;
+        std::vector<const Node*> todo{doc->root()};
+        while (!todo.empty() && !found) {
+            const Node* n = todo.back();
+            todo.pop_back();
+            if (const std::string* v = n->attr("id"); v && *v == id) found = n;
+            for (const Node* k : n->children) todo.push_back(k);
+        }
+        return found;
+    };
+    ASSERT_NE(styles.placeholderOf(byId("a")), nullptr);
+    EXPECT_EQ(styles.placeholderOf(byId("a"))->color.a, 0);
+    EXPECT_FLOAT_EQ(styles.placeholderOf(byId("b"))->opacity, 0);
+    EXPECT_EQ(styles.placeholderOf(byId("c"))->color.r, 0x75);   // the UA's grey stays
+    EXPECT_EQ(styles.placeholderOf(byId("d")), nullptr);          // no placeholder, no style
+}

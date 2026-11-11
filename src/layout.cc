@@ -914,12 +914,17 @@ private:
         const float base_h = s.position == Position::Fixed ? vh_ : cb_height.value_or(vh_);
         resolveSpacing(k, base);
         const float frame = k.frameWidth();
+        // A positioned picture keeps its own size between its offsets (CSS 2.1 10.3.8,
+        // 10.6.5): the far offsets give way, not the picture.
+        const bool replaced = k.kids.size() == 1 && k.kids[0]->kind == BoxKind::Replaced && k.kids[0]->node == k.node;
         float width;
         if (!widthIsAuto(s, base)) {
             width = s.width.resolve(base);
             if (s.border_box) width -= frame;
-        } else if (!s.offset[Left].is_auto && !s.offset[Right].is_auto) {
+        } else if (!replaced && !s.offset[Left].is_auto && !s.offset[Right].is_auto) {
             width = base - s.offset[Left].resolve(base) - s.offset[Right].resolve(base) - frame - k.margin[Left] - k.margin[Right];
+        } else if (replaced) {
+            width = shrinkToFit(k, kUnbounded);   // its natural width, however little room
         } else {
             width = shrinkToFit(k, base - frame);
         }
@@ -933,7 +938,7 @@ private:
             float h = s.height.resolve(base_h);
             if (s.border_box) h -= k.frameHeight();
             own = std::max(0.0f, h);
-        } else if (cb_height && !s.offset[Top].is_auto && !s.offset[Bottom].is_auto) {
+        } else if (cb_height && !replaced && !s.offset[Top].is_auto && !s.offset[Bottom].is_auto) {
             // Both edges given: as tall as they leave.
             own = std::max(0.0f, base_h - s.offset[Top].resolve(base_h) - s.offset[Bottom].resolve(base_h) - k.frameHeight() - k.margin[Top] - k.margin[Bottom]);
         }
@@ -3613,6 +3618,13 @@ private:
         out_->ops.push_back(std::move(op));
     }
 
+    // A control's placeholder: its ::placeholder's colour (and opacity), or the usual grey.
+    Color placeholderColor(const Node* n) const {
+        const ComputedStyle* ph = styles_.placeholderOf(n);
+        if (!ph) return Color{0x75, 0x75, 0x75, 255};
+        return faded(ph->color, std::clamp(ph->opacity, 0.0f, 1.0f));
+    }
+
     void paintReplaced(const Box& b, float x, float y, float opacity) {
         const ComputedStyle& s = *b.style;
         paintFrame(b, x, y, opacity);
@@ -3737,7 +3749,7 @@ private:
             const float scroll = focused ? std::max(0.0f, caret_x - b.width + 1) : 0;
             clipped([&] {
                 if (shown.empty()) {
-                    if (const std::string* ph = n->attr("placeholder"); ph && !ph->empty()) text(cx, ty, *ph, Color{0x75, 0x75, 0x75, 255});
+                    if (const std::string* ph = n->attr("placeholder"); ph && !ph->empty()) text(cx, ty, *ph, placeholderColor(n));
                 } else {
                     text(cx - scroll, ty, shown, s.color);
                 }
@@ -3750,7 +3762,7 @@ private:
             const size_t caret = std::min(st.caret, value.size());
             clipped([&] {
                 if (value.empty()) {
-                    if (const std::string* ph = n->attr("placeholder"); ph && !ph->empty()) text(cx, cy, *ph, Color{0x75, 0x75, 0x75, 255});
+                    if (const std::string* ph = n->attr("placeholder"); ph && !ph->empty()) text(cx, cy, *ph, placeholderColor(n));
                 }
                 size_t start = 0;
                 float ly = cy;

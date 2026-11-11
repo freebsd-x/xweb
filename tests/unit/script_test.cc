@@ -678,3 +678,12 @@ TEST(Script, ConstraintValidation) {
         </script>)");
     EXPECT_EQ(p.console, "log:true,true,true,true false 1 true nope Please fill out this field. false bad function\n") << p.console;
 }
+
+TEST(Script, ConstructedSheetsListTheirRules) {
+    Page p(R"(<body><script>
+        const s = new CSSStyleSheet();
+        s.replaceSync('/* c */ a { color: red } @media (min-width: 1px) { b { x: "}" } } @import url(x.css);');
+        console.log(s.cssRules.length, s.cssRules[0].cssText, s.cssRules[2].cssText);
+        </script>)");
+    EXPECT_EQ(p.console, "log:3 a { color: red } @import url(x.css);\n") << p.console;
+}
