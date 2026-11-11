@@ -1597,12 +1597,22 @@ private:
         host.console = [](std::string_view level, const std::string& text) { std::cerr << "[page " << level << "] " << text << "\n"; };
         host.navigate = [this](const std::string& url) { XApplication::post([this, url] { navigate(url, Mode::New); }); };
         host.rect = [this, raw = page.get()](const web::Node* n) -> std::optional<web::ElementRect> {
-            if (raw->script && raw->script->dirty()) node_->refresh();
+            // Laid out again once per change, not per question: a script asking for many
+            // boxes or styles in one turn mustn't redo the whole page each time.
+            if (raw->script && raw->script->takeDirty()) {
+                node_->refresh();
+                node_->invalidate();
+            }
             if (const web::ElementBox* b = node_->boxOf(n)) return web::ElementRect{b->x, b->y, b->w, b->h};
             return std::nullopt;
         };
         host.computed_style = [this, raw = page.get()](const web::Node* n) {
-            if (raw->script && raw->script->dirty()) node_->refresh();
+            // Laid out again once per change, not per question: a script asking for many
+            // boxes or styles in one turn mustn't redo the whole page each time.
+            if (raw->script && raw->script->takeDirty()) {
+                node_->refresh();
+                node_->invalidate();
+            }
             return node_->computedStyleOf(n);
         };
         Page* raw = page.get();
