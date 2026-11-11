@@ -1286,6 +1286,55 @@ void Runtime::installBuiltins() {
     method(global_, u"encodeURI", 1, [](Runtime& rt, const Value&, Args a) { return Value::string(uriEncode(rt, *rt.toString(arg(a, 0)), "-_.!~*'();/?:@&=+$,#")); });
     method(global_, u"decodeURIComponent", 1, [](Runtime& rt, const Value&, Args a) { return Value::string(uriDecode(rt, *rt.toString(arg(a, 0)), "")); });
     method(global_, u"decodeURI", 1, [](Runtime& rt, const Value&, Args a) { return Value::string(uriDecode(rt, *rt.toString(arg(a, 0)), ";/?:@&=+$,#")); });
+    // Annex B's escape and unescape: %XX for the first 256 code units, %uXXXX beyond.
+    method(global_, u"escape", 1, [](Runtime& rt, const Value&, Args a) {
+        const std::u16string& in = *rt.toString(arg(a, 0));
+        static const char16_t* const hex = u"0123456789ABCDEF";
+        std::u16string out;
+        for (const char16_t c : in) {
+            if ((c >= u'A' && c <= u'Z') || (c >= u'a' && c <= u'z') || (c >= u'0' && c <= u'9') || c == u'@' || c == u'*' || c == u'_' ||
+                c == u'+' || c == u'-' || c == u'.' || c == u'/') {
+                out += c;
+            } else if (c < 256) {
+                out += u'%'; out += hex[c >> 4]; out += hex[c & 15];
+            } else {
+                out += u"%u"; out += hex[c >> 12]; out += hex[(c >> 8) & 15]; out += hex[(c >> 4) & 15]; out += hex[c & 15];
+            }
+        }
+        return Value::string(std::move(out));
+    });
+    method(global_, u"unescape", 1, [](Runtime& rt, const Value&, Args a) {
+        const std::u16string& in = *rt.toString(arg(a, 0));
+        const auto digit = [](char16_t c) -> int {
+            if (c >= u'0' && c <= u'9') return c - u'0';
+            if (c >= u'a' && c <= u'f') return c - u'a' + 10;
+            if (c >= u'A' && c <= u'F') return c - u'A' + 10;
+            return -1;
+        };
+        std::u16string out;
+        for (size_t i = 0; i < in.size(); ++i) {
+            if (in[i] == u'%') {
+                if (i + 5 < in.size() && in[i + 1] == u'u') {
+                    const int d[4] = {digit(in[i + 2]), digit(in[i + 3]), digit(in[i + 4]), digit(in[i + 5])};
+                    if (d[0] >= 0 && d[1] >= 0 && d[2] >= 0 && d[3] >= 0) {
+                        out += static_cast<char16_t>((d[0] << 12) | (d[1] << 8) | (d[2] << 4) | d[3]);
+                        i += 5;
+                        continue;
+                    }
+                }
+                if (i + 2 < in.size()) {
+                    const int h = digit(in[i + 1]), l = digit(in[i + 2]);
+                    if (h >= 0 && l >= 0) {
+                        out += static_cast<char16_t>((h << 4) | l);
+                        i += 2;
+                        continue;
+                    }
+                }
+            }
+            out += in[i];
+        }
+        return Value::string(std::move(out));
+    });
 
     // ── Math ──
     Object* math = newObject();

@@ -530,6 +530,21 @@ struct PageScript::Impl {
 
     // Calls the listeners on one target for this phase; false once propagation stops.
     void invoke(Object* target, Object* event, const std::u16string& type, int phase) {
+        // window.event: the one being dispatched, while its listeners run.
+        struct CurrentEvent {
+            Runtime& rt;
+            std::vector<Value> before;   // (a list the collector sees)
+            CurrentEvent(Runtime& r, Object* e) : rt(r), before{r.get(Value::object(r.global()), u"event")} {
+                rt.temp_lists.push_back(&before);
+                rt.put(rt.global(), u"event", Value::object(e), js::kWritable | js::kConfigurable);
+            }
+            ~CurrentEvent() {
+                rt.put(rt.global(), u"event", before[0], js::kWritable | js::kConfigurable);
+                rt.temp_lists.pop_back();
+            }
+            CurrentEvent(const CurrentEvent&) = delete;
+            CurrentEvent& operator=(const CurrentEvent&) = delete;
+        } current(rt, event);
         rt.put(event, u"currentTarget", Value::object(target), js::kEnumerable | js::kWritable);
         rt.put(event, u"eventPhase", Value::number(phase), js::kEnumerable | js::kWritable);
         if (Object* l = listenerList(target, false)) {

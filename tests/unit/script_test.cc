@@ -687,3 +687,29 @@ TEST(Script, ConstructedSheetsListTheirRules) {
         </script>)");
     EXPECT_EQ(p.console, "log:3 a { color: red } @import url(x.css);\n") << p.console;
 }
+
+TEST(Script, OldPageApisYouTubeAndNasaUse) {
+    Page p(R"(<body><button id=b>x</button><script>
+        const e = document.createEvent('CustomEvent');
+        e.initCustomEvent('hi', true, false, { n: 1 });
+        let seen = '';
+        document.body.addEventListener('hi', (ev) => { seen = ev.type + ev.detail.n + (window.event === ev); });
+        document.body.dispatchEvent(e);
+        const nav = performance.getEntriesByType('navigation')[0];
+        console.log(seen, window.event === undefined, typeof nav.responseStart, performance.timing.navigationStart > 0,
+                    window instanceof Window, window instanceof EventTarget, escape('a bé中'), unescape('%u4E2D%41'));
+        </script>)");
+    EXPECT_EQ(p.console, "log:hi1true true number true true true a%20b%E9%u4E2D 中A\n") << p.console;
+}
+
+TEST(Script, AttributesByNameAndALiveDataset) {
+    Page p(R"(<body><div id=d data-user-id=7 title=t></div><script>
+        const d = document.getElementById('d');
+        const before = [d.attributes.title.value, d.attributes.getNamedItem('id').nodeType, d.attributes.item(9), d.dataset.userId];
+        d.dataset.fooBar = 'x';
+        delete d.dataset.userId;
+        console.log(before.join(), d.getAttribute('data-foo-bar'), d.hasAttribute('data-user-id'), Object.keys(d.dataset).join(),
+                    'onsubmit' in window, window.onsubmit);
+        </script>)");
+    EXPECT_EQ(p.console, "log:t,2,,7 x false fooBar true null\n") << p.console;
+}

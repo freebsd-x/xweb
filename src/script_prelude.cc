@@ -850,6 +850,109 @@ const char* const kScriptPrelude = R"JS(
     if (!perf.clearMarks) perf.clearMarks = n => { for (let i = marks.length; i--;) if (marks[i].entryType === 'mark' && (n === undefined || marks[i].name === n)) marks.splice(i, 1); };
     if (!perf.clearMeasures) perf.clearMeasures = n => { for (let i = marks.length; i--;) if (marks[i].entryType === 'measure' && (n === undefined || marks[i].name === n)) marks.splice(i, 1); };
     if (!perf.timeOrigin) perf.timeOrigin = Date.now() - perf.now();
+    // The page's own load, as a navigation entry and the older timing object. We don't
+    // measure the network phases, so they all happen at the start.
+    const origin = perf.timeOrigin;
+    const nav = {
+      name: String(location.href), entryType: 'navigation', initiatorType: 'navigation', startTime: 0, duration: 0, type: 'navigate',
+      redirectCount: 0, nextHopProtocol: 'http/1.1', workerStart: 0, redirectStart: 0, redirectEnd: 0, fetchStart: 0, domainLookupStart: 0,
+      domainLookupEnd: 0, connectStart: 0, secureConnectionStart: 0, connectEnd: 0, requestStart: 0, responseStart: 0, responseEnd: 0,
+      transferSize: 0, encodedBodySize: 0, decodedBodySize: 0, serverTiming: [],
+      domInteractive: 0, domContentLoadedEventStart: 0, domContentLoadedEventEnd: 0, domComplete: 0, loadEventStart: 0, loadEventEnd: 0,
+      toJSON() { return Object.assign({}, this); },
+    };
+    document.addEventListener('DOMContentLoaded', () => { const t = perf.now(); nav.domInteractive = nav.domContentLoadedEventStart = nav.domContentLoadedEventEnd = t; });
+    global.addEventListener('load', () => { const t = perf.now(); nav.domComplete = nav.loadEventStart = t; setTimeout(() => { nav.loadEventEnd = nav.duration = perf.now(); }, 0); });
+    const all = () => [nav].concat(marks);
+    perf.getEntries = () => all();
+    perf.getEntriesByType = t => all().filter(m => m.entryType === t);
+    perf.getEntriesByName = (n, t) => all().filter(m => m.name === n && (!t || m.entryType === t));
+    if (!perf.timing) {
+      const timing = {};
+      for (const k of ['navigationStart', 'unloadEventStart', 'unloadEventEnd', 'redirectStart', 'redirectEnd', 'fetchStart', 'domainLookupStart',
+                       'domainLookupEnd', 'connectStart', 'connectEnd', 'secureConnectionStart', 'requestStart', 'responseStart', 'responseEnd',
+                       'domLoading', 'domInteractive', 'domContentLoadedEventStart', 'domContentLoadedEventEnd', 'domComplete',
+                       'loadEventStart', 'loadEventEnd'])
+        Object.defineProperty(timing, k, { enumerable: true, get() {
+          if (/^(unload|redirect)/.test(k)) return 0;                       // none happened
+          if (/^(domInteractive|domContentLoaded|domComplete|loadEvent)/.test(k)) return nav[k] ? Math.round(origin + nav[k]) : 0;   // not yet: 0
+          return Math.round(origin);                                        // the network phases, and domLoading
+        } });
+      timing.toJSON = function () { const o = {}; for (const k in this) if (k !== 'toJSON') o[k] = this[k]; return o; };
+      perf.timing = timing;
+    }
+    if (!perf.navigation) perf.navigation = { type: 0, redirectCount: 0, TYPE_NAVIGATE: 0, TYPE_RELOAD: 1, TYPE_BACK_FORWARD: 2, TYPE_RESERVED: 255 };
+  }
+
+  // The legacy event initialisers, for events made by document.createEvent.
+  if (typeof Event === 'function') {
+    const init = (e, type, bubbles, cancelable) => {
+      if (typeof e.initEvent === 'function') e.initEvent(type, bubbles, cancelable);
+    };
+    const set = (e, k, v) => { try { Object.defineProperty(e, k, { value: v, enumerable: true, configurable: true, writable: true }); } catch (x) {} };
+    Event.prototype.initCustomEvent = function initCustomEvent(type, bubbles, cancelable, detail) {
+      init(this, type, bubbles, cancelable); set(this, 'detail', detail === undefined ? null : detail);
+    };
+    Event.prototype.initUIEvent = function initUIEvent(type, bubbles, cancelable, view, detail) {
+      init(this, type, bubbles, cancelable); set(this, 'view', view ?? null); set(this, 'detail', detail | 0);
+    };
+    Event.prototype.initMouseEvent = function initMouseEvent(type, bubbles, cancelable, view, detail, sx, sy, cx, cy, ctrl, alt, shift, meta, button, related) {
+      init(this, type, bubbles, cancelable);
+      const v = { view: view ?? null, detail: detail | 0, screenX: sx | 0, screenY: sy | 0, clientX: cx | 0, clientY: cy | 0, ctrlKey: !!ctrl,
+                  altKey: !!alt, shiftKey: !!shift, metaKey: !!meta, button: button | 0, relatedTarget: related ?? null };
+      for (const k in v) set(this, k, v[k]);
+    };
+    Event.prototype.initKeyboardEvent = function initKeyboardEvent(type, bubbles, cancelable, view, key, location, ctrl, alt, shift, meta) {
+      init(this, type, bubbles, cancelable);
+      const v = { view: view ?? null, key: key ?? '', location: location | 0, ctrlKey: !!ctrl, altKey: !!alt, shiftKey: !!shift, metaKey: !!meta };
+      for (const k in v) set(this, k, v[k]);
+    };
+  }
+
+  // element.dataset: live, a data-* attribute per camel-cased name.
+  if (typeof HTMLElement === 'function' && typeof Proxy === 'function') {
+    const sets = new WeakMap();
+    const attrOf = (k) => 'data-' + String(k).replace(/[A-Z]/g, c => '-' + c.toLowerCase());
+    const keyOf = (a) => a.slice(5).replace(/-([a-z])/g, (m, c) => c.toUpperCase());
+    const datasetOf = function () {
+      const el = this;
+      let d = sets.get(el);
+      if (d) return d;
+      d = new Proxy({}, {
+        get(_, k) { if (typeof k !== 'string') return undefined; const v = el.getAttribute(attrOf(k)); return v === null ? undefined : v; },
+        set(_, k, v) { if (typeof k === 'string') el.setAttribute(attrOf(k), String(v)); return true; },
+        has(_, k) { return typeof k === 'string' && el.hasAttribute(attrOf(k)); },
+        deleteProperty(_, k) { if (typeof k === 'string') el.removeAttribute(attrOf(k)); return true; },
+        ownKeys() { return Array.from(el.attributes).map(a => a.name).filter(n => n.startsWith('data-')).map(keyOf); },
+        getOwnPropertyDescriptor(_, k) {
+          if (typeof k !== 'string') return undefined;
+          const v = el.getAttribute(attrOf(k));
+          return v === null ? undefined : { value: v, writable: true, enumerable: true, configurable: true };
+        },
+      });
+      sets.set(el, d);
+      return d;
+    };
+    Object.defineProperty(Element.prototype, 'dataset', { get: datasetOf, configurable: true, enumerable: true });
+  }
+
+  // The global's event handler properties, as null until set ('onsubmit' in window).
+  for (const t of ['abort', 'blur', 'cancel', 'change', 'click', 'close', 'contextmenu', 'dblclick', 'drag', 'dragend', 'dragenter', 'dragleave',
+                   'dragover', 'dragstart', 'drop', 'error', 'focus', 'input', 'invalid', 'keydown', 'keypress', 'keyup', 'load', 'mousedown',
+                   'mouseenter', 'mouseleave', 'mousemove', 'mouseout', 'mouseover', 'mouseup', 'pointerdown', 'pointermove', 'pointerup',
+                   'reset', 'resize', 'scroll', 'select', 'submit', 'toggle', 'wheel', 'beforeunload', 'hashchange', 'message', 'offline',
+                   'online', 'pagehide', 'pageshow', 'popstate', 'storage', 'unload', 'unhandledrejection', 'animationend', 'transitionend'])
+    if (!(('on' + t) in global)) global['on' + t] = null;
+
+  // Window: the global object's interface (window instanceof Window, Window.prototype).
+  if (typeof global.Window !== 'function' && typeof EventTarget === 'function') {
+    const proto = Object.create(EventTarget.prototype);
+    function Window() { throw new TypeError('Illegal constructor'); }
+    Object.defineProperty(Window, 'prototype', { value: proto, writable: false });
+    Object.defineProperty(proto, 'constructor', { value: Window, writable: true, configurable: true });
+    Object.defineProperty(proto, Symbol.toStringTag, { value: 'Window', configurable: true });
+    try { if (Object.getPrototypeOf(global) === Object.prototype) Object.setPrototypeOf(global, proto); } catch (e) {}
+    Object.defineProperty(global, 'Window', { value: Window, writable: true, configurable: true });
   }
 
   // Intl, in English (US) whatever locale is asked for: the formats pages show dates,

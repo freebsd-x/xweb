@@ -372,14 +372,36 @@ void PageScript::Impl::installElement() {
         return Value::object(rt.newArray(std::move(out)));
     });
     accessor(p, u"attributes", [self](Runtime& rt, const Value& t, Args) {
+        // A NamedNodeMap's worth: Attr-like objects by index and by name.
+        Node* el = self->thisElement(t);
         std::vector<Value> out;
-        for (const auto& at : self->thisElement(t)->attrs) {
+        for (const auto& at : el->attrs) {
             Object* o = rt.newObject();
             rt.put(o, u"name", str(at.name), js::kEnumerable);
-            rt.put(o, u"value", str(at.value), js::kEnumerable);
+            rt.put(o, u"localName", str(at.name), js::kEnumerable);
+            rt.put(o, u"nodeName", str(at.name), js::kEnumerable);
+            rt.put(o, u"value", str(at.value), js::kEnumerable | js::kWritable);
+            rt.put(o, u"nodeValue", str(at.value), js::kEnumerable);
+            rt.put(o, u"nodeType", Value::number(2), js::kEnumerable);
+            rt.put(o, u"specified", Value::boolean(true), js::kEnumerable);
+            rt.put(o, u"namespaceURI", Value::null(), js::kEnumerable);
+            rt.put(o, u"ownerElement", t, js::kEnumerable);
             out.push_back(Value::object(o));
         }
-        return Value::object(rt.newArray(std::move(out)));
+        Object* map = rt.newArray(std::vector<Value>(out));
+        for (size_t i = 0; i < el->attrs.size(); ++i) {
+            const std::u16string name = js::utf16(el->attrs[i].name);
+            if (!map->own(PropertyKey(name))) rt.put(map, name, out[i], js::kConfigurable);
+        }
+        rt.method(map, u"getNamedItem", 1, [](Runtime& r, const Value& m, Args a) {
+            const Value v = r.get(m, PropertyKey(*r.toString(arg(a, 0))));
+            return v.isObject() ? v : Value::null();
+        });
+        rt.method(map, u"item", 1, [](Runtime& r, const Value& m, Args a) {
+            const Value v = r.get(m, PropertyKey(Runtime::numberToString(r.toIntegerOrInfinity(arg(a, 0)))));
+            return v.isObject() ? v : Value::null();
+        });
+        return Value::object(map);
     });
     accessor(p, u"dataset", [self](Runtime& rt, const Value& t, Args) {
         // A copy of the data-* attributes: reading works; writing goes nowhere yet.
