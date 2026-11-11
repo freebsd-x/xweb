@@ -1578,6 +1578,27 @@ const char* const kScriptPrelude = R"JS(
     close() { this._closed = true; channels.get(this.name)?.delete(this); }
   }
   const reportError = (x) => setTimeout(() => { throw x; }, 0);
+  // window.postMessage, to this window (the only one a page here has): a "message"
+  // event as a task, if the target origin allows. Schedulers use it to yield.
+  {
+    const post = function postMessage(data, targetOrigin, transfer) {
+      let target = targetOrigin;
+      if (targetOrigin && typeof targetOrigin === 'object') target = targetOrigin.targetOrigin;
+      target = target === undefined ? '/' : String(target);
+      const origin = location.origin;
+      if (target !== '*' && target !== '/') {
+        let wanted;
+        try { wanted = new URL(target).origin; } catch (e) { throw new DOMException('the target origin is not a valid URL', 'SyntaxError'); }
+        if (wanted !== origin) return;
+      }
+      const copy = structuredClone(data);
+      setTimeout(() => {
+        const e = new MessageEvent('message', { data: copy, origin, source: global, lastEventId: '', ports: [] });
+        global.dispatchEvent(e);
+      }, 0);
+    };
+    Object.defineProperty(global, 'postMessage', { value: post, writable: true, configurable: true, enumerable: true });
+  }
   for (const [name, value] of [['MessageChannel', MessageChannel], ['MessagePort', MessagePort], ['BroadcastChannel', BroadcastChannel]])
     if (!global[name]) Object.defineProperty(global, name, { value, writable: true, configurable: true, enumerable: false });
 

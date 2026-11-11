@@ -1206,7 +1206,6 @@ void PageScript::Impl::installWindow() {
     method(g, u"focus", 0, [](Runtime&, const Value&, Args) { return Value::undefined(); });
     method(g, u"blur", 0, [](Runtime&, const Value&, Args) { return Value::undefined(); });
     method(g, u"open", 1, [](Runtime&, const Value&, Args) { return Value::null(); });
-    method(g, u"postMessage", 1, [](Runtime&, const Value&, Args) { return Value::undefined(); });
     Object* perf = rt.newObject();
     method(perf, u"now", 0, [self](Runtime&, const Value&, Args) { return Value::number(self->now()); });
     method(perf, u"mark", 1, [](Runtime&, const Value&, Args) { return Value::undefined(); });

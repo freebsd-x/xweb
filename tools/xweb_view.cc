@@ -1524,6 +1524,10 @@ private:
                 r.content_type = lowerCase(got.content_type);
                 r.body = std::move(got.body);
                 r.headers = std::move(got.headers);
+                // XWEB_DEBUG_FETCH=1: what each page fetch came to.
+                if (std::getenv("XWEB_DEBUG_FETCH"))
+                    std::fprintf(stderr, "[fetch] %s %s: %s status %d, %zu bytes\n", req.method.c_str(), req.url.c_str(), r.ok ? "ok" : "FAILED", r.status,
+                                 r.body.size());
                 if (!r.ok) r.error = got.status == fbx::shared::FetchStatus::Denied ? "this address isn't allowed"
                                      : got.status == fbx::shared::FetchStatus::TooLarge ? "the response is too large"
                                      : got.status == fbx::shared::FetchStatus::Unavailable ? "the connection service isn't running"

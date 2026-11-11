@@ -633,3 +633,25 @@ TEST(Inline, TextBottomSitsOnTheParentsTextBottom) {
     EXPECT_FLOAT_EQ(r.box("big").y, 0);
     EXPECT_FLOAT_EQ(r.box("tb").y + 20, 40 + 2.5f);   // bottom edge: baseline (40) + descent
 }
+
+TEST(Positioned, NegativeZIndexGoesUnderTheContent) {
+    const auto r = layout("<div style='position:fixed;z-index:5;width:100px;height:20px'>"
+                          "<div id=bg style='position:absolute;top:0;left:0;right:0;bottom:0;z-index:-1;background:#00f'></div>"
+                          "<div id=c>text</div></div>");
+    int bg = -1, text = -1;
+    for (size_t i = 0; i < r.page.ops.size(); ++i) {
+        const auto& op = r.page.ops[i];
+        if (op.kind == PaintKind::Rect && op.color.b == 255 && op.color.r == 0 && bg < 0) bg = static_cast<int>(i);
+        if (op.kind == PaintKind::Text && op.text == "text") text = static_cast<int>(i);
+    }
+    ASSERT_GE(bg, 0);
+    ASSERT_GE(text, 0);
+    EXPECT_LT(bg, text);   // painted first: under
+    // And the text's box is what's hit there, not the background's.
+    const ElementBox* last = nullptr;
+    for (const auto& b : r.page.boxes)
+        if (b.x <= 5 && b.y <= 5 && b.x + b.w > 5 && b.y + b.h > 5) last = &b;
+    ASSERT_NE(last, nullptr);
+    ASSERT_TRUE(last->node->attr("id"));
+    EXPECT_EQ(*last->node->attr("id"), "c");
+}

@@ -743,3 +743,19 @@ TEST(Script, NodeConstantsAndCustomElementsMadeInsideAnUpgrade) {
         </script>)");
     EXPECT_EQ(p.console, "log:11 16 2 true true\n") << p.console;
 }
+
+TEST(Script, PostMessageToItselfArrivesAsATask) {
+    Page p(R"(<body><script>
+        const got = [];
+        window.addEventListener('message', (e) => { got.push(e.data.k + ':' + (e.source === window) + ':' + e.origin); });
+        window.onmessage = (e) => { if (got.length === 1) console.log(got.join(), 'onmessage too'); };
+        window.postMessage({ k: 'v' }, '*');
+        window.postMessage({ k: 'nope' }, 'https://elsewhere.example');
+        console.log('sync', got.length);
+        </script>)");
+    for (int i = 0; i < 40 && p.script->busy(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        p.script->tick();
+    }
+    EXPECT_EQ(p.console, "log:sync 0\nlog:v:true:https://example.org onmessage too\n") << p.console;
+}

@@ -296,6 +296,7 @@ public:
         record(*root, root->x, root_y);
         paintContents(*root, root->x, root_y, viewport, 1.0f);
         flushPositioned();
+        placeBelowContent();
         page.height = std::max({vh_, max_bottom_, root_y + root->outerHeight() + root->margin_bottom_outer});
         // The canvas's images, under everything: placed for their element, drawn everywhere.
         if (skip_bg && skip_bg->style->background_layers) {
@@ -4050,6 +4051,15 @@ private:
             clip_stack_.push_back({op.x, op.y, op.w, op.h});
             out_->ops.push_back(std::move(op));
         }
+        // A stacking context: its negative z-index descendants go in here, over its own
+        // background and under its content.
+        const size_t outer_ctx_ops = ctx_ops_, outer_ctx_boxes = ctx_boxes_;
+        const bool stacking = &b == root_ || s.position == Position::Fixed || (s.position != Position::Static && s.z_index != 0) ||
+                              s.opacity < 1 || s.linearlyTransformed();
+        if (stacking && !painting_below_) {
+            ctx_ops_ = out_->ops.size();
+            ctx_boxes_ = out_->boxes.size();
+        }
         // Floats paint above their context's in-flow blocks: later siblings' backgrounds
         // must not cover them. So they wait for the context's end.
         const bool context_root = establishesBfc(b);
@@ -4061,7 +4071,7 @@ private:
         for (const auto& kp : b.kids) {
             const Box& k = *kp;
             if (k.outOfFlow()) {
-                positioned_.push_back({&k, cx + k.static_x, cy + k.static_y, cb, opacity, order_++, clipsFor(k)});
+                positioned_.push_back({&k, cx + k.static_x, cy + k.static_y, cb, opacity, order_++, clipsFor(k), ctx_ops_, ctx_boxes_});
                 continue;
             }
             if (k.floating()) {
@@ -4091,12 +4101,14 @@ private:
             if (!clip_stack_.empty()) clip_stack_.pop_back();
         }
         cb_clip_depth_ = outer_cb_clip_depth;
+        ctx_ops_ = outer_ctx_ops;
+        ctx_boxes_ = outer_ctx_boxes;
     }
 
     // Absolute and floated boxes inside inline elements still need painting.
     void collectOutOfFlowIn(const Box& b, float cx, float cy, const Rect& cb, float opacity) {
         for (const auto& kp : b.kids) {
-            if (kp->outOfFlow()) positioned_.push_back({kp.get(), cx + kp->static_x, cy + kp->static_y, cb, opacity, order_++, clipsFor(*kp)});
+            if (kp->outOfFlow()) positioned_.push_back({kp.get(), cx + kp->static_x, cy + kp->static_y, cb, opacity, order_++, clipsFor(*kp), ctx_ops_, ctx_boxes_});
             else if (kp->floating()) pending_floats_.push_back({kp.get(), cx, cy, cb, opacity});
             else if (kp->kind == BoxKind::Inline) collectOutOfFlowIn(*kp, cx, cy, cb, opacity);
         }
@@ -4160,6 +4172,18 @@ private:
             for (const Positioned& p : batch) {
                 const Box& k = *p.box;
                 const ComputedStyle& s = *k.style;
+                // Below its stacking context's content: painted aside, put in its place after.
+                const bool below = s.z_index < 0;
+                std::vector<PaintOp> main_ops;
+                std::vector<ElementBox> main_boxes;
+                const size_t saved_ctx_ops = ctx_ops_, saved_ctx_boxes = ctx_boxes_;
+                if (below) {
+                    main_ops.swap(out_->ops);
+                    main_boxes.swap(out_->boxes);
+                    ++painting_below_;
+                    ctx_ops_ = p.ctx_ops;
+                    ctx_boxes_ = p.ctx_boxes;
+                }
                 const Rect cb = s.position == Position::Fixed ? Rect{0, 0, vw_, vh_} : p.cb;
                 layoutForContainingBlock(k, cb);
                 float x = p.static_x + k.margin[Left], y = p.static_y + k.margin[Top];
@@ -4193,8 +4217,38 @@ private:
                     out_->ops.push_back(std::move(op));
                 }
                 if (transformed) endTransform();
+                if (below) {
+                    below_content_.push_back({p.ctx_ops, p.ctx_boxes, below_content_.size(), std::move(out_->ops), std::move(out_->boxes)});
+                    out_->ops = std::move(main_ops);
+                    out_->boxes = std::move(main_boxes);
+                    --painting_below_;
+                    ctx_ops_ = saved_ctx_ops;
+                    ctx_boxes_ = saved_ctx_boxes;
+                }
             }
         }
+    }
+
+    // Negative z-index paint, into its places: last place first, so earlier places keep
+    // their index; at one place, in the order painted (lower z first).
+    void placeBelowContent() {
+        std::vector<BelowContent*> order;
+        for (BelowContent& b : below_content_) order.push_back(&b);
+        std::stable_sort(order.begin(), order.end(), [](const BelowContent* a, const BelowContent* b) {
+            return a->at_ops != b->at_ops ? a->at_ops > b->at_ops : a->order > b->order;
+        });
+        for (BelowContent* b : order) {
+            const size_t at = std::min(b->at_ops, out_->ops.size());
+            out_->ops.insert(out_->ops.begin() + static_cast<ptrdiff_t>(at), std::make_move_iterator(b->ops.begin()), std::make_move_iterator(b->ops.end()));
+        }
+        std::stable_sort(order.begin(), order.end(), [](const BelowContent* a, const BelowContent* b) {
+            return a->at_boxes != b->at_boxes ? a->at_boxes > b->at_boxes : a->order > b->order;
+        });
+        for (BelowContent* b : order) {
+            const size_t at = std::min(b->at_boxes, out_->boxes.size());
+            out_->boxes.insert(out_->boxes.begin() + static_cast<ptrdiff_t>(at), b->boxes.begin(), b->boxes.end());
+        }
+        below_content_.clear();
     }
 
     struct Positioned {
@@ -4204,6 +4258,13 @@ private:
         float opacity;
         size_t order;
         std::vector<Rect> clips;   // overflow clips between it and its containing block
+        size_t ctx_ops = 0, ctx_boxes = 0;   // where its stacking context's content starts
+    };
+    // A negative z-index box's paint, to go in under its stacking context's content.
+    struct BelowContent {
+        size_t at_ops, at_boxes, order;
+        std::vector<PaintOp> ops;
+        std::vector<ElementBox> boxes;
     };
 
     struct PendingFloat {
@@ -4227,6 +4288,9 @@ private:
     const Box* root_ = nullptr;
     float max_bottom_ = 0;
     std::vector<Positioned> positioned_;
+    std::vector<BelowContent> below_content_;
+    size_t ctx_ops_ = 0, ctx_boxes_ = 0;   // the nearest stacking context's content start
+    int painting_below_ = 0;               // inside a negative z-index box's paint
     std::vector<Rect> clip_stack_;   // overflow clips around what's being painted
     std::vector<Matrix> transforms_; // the transforms around what's being painted, composed
     size_t cb_clip_depth_ = 0;       // how many of them are outside the containing block
