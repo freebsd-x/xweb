@@ -397,8 +397,15 @@ struct PageScript::Impl {
         n->name = src->name;
         n->data = src->data;
         n->attrs = src->attrs;
-        if (deep && depth < kMaxCloneDepth)
+        if (deep && depth < kMaxCloneDepth) {
             for (const Node* c : src->children) n->append(clone(c, true, depth + 1));
+            // A <template>'s contents are copied with it (the loaders of web-component
+            // polyfills check exactly this).
+            if (src->template_content) {
+                n->template_content = doc.make(NodeType::Fragment);
+                for (const Node* c : src->template_content->children) n->template_content->append(clone(c, true, depth + 1));
+            }
+        }
         return n;
     }
 

@@ -615,3 +615,17 @@ TEST(Script, EveryCharacterDataInterfaceIsThere) {
         </script>)");
     EXPECT_EQ(p.console, "log:object,object,object,object true\n") << p.console;
 }
+
+TEST(Script, ClonedTemplatesKeepTheirContents) {
+    // The webcomponents loader's test: fail it and the page swaps in the whole polyfill.
+    Page p(R"(<body><template id=t><i>x</i></template><script>
+        const t = document.createElement('template'), t2 = document.createElement('template');
+        t2.content.appendChild(document.createElement('div'));
+        t.content.appendChild(t2);
+        const c = t.cloneNode(true);
+        const parsed = document.getElementById('t').cloneNode(true);
+        console.log(c.content.childNodes.length, c.content.firstChild.content.childNodes.length,
+                    t.cloneNode(false).content.childNodes.length, parsed.content.firstChild.localName);
+        </script>)");
+    EXPECT_EQ(p.console, "log:1 1 0 i\n") << p.console;
+}

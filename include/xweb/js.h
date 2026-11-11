@@ -524,6 +524,9 @@ public:
     std::vector<std::vector<Value>*> temp_lists;
     // Promises rejected with no handler yet, reported after the jobs run.
     std::vector<Object*> pending_rejections;
+    // A tagged template's strings array, made once per call site: lit and friends
+    // recognise a template by that identity, and remake the DOM when it changes.
+    std::unordered_map<const void*, Object*> template_objects;
     size_t call_depth = 0;
     size_t eval_depth = 0;   // C++ recursion in the interpreter
     std::vector<Value> extra_roots;   // values bindings keep while a script runs

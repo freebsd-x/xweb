@@ -1359,6 +1359,7 @@ void Runtime::collect(bool mid_script) {
         for (const Value& v : *list) markValue(v);
     for (const Job& j : jobs_) { markValue(j.a); markValue(j.b); markValue(j.c); }
     for (Object* p : pending_rejections) markCell(p);
+    for (auto& [site, strings] : template_objects) markCell(strings);
     markModules(todo);
     for (Object* o : {object_prototype, function_prototype, array_prototype, string_prototype, number_prototype, boolean_prototype,
                       symbol_prototype, error_prototype, iterator_prototype, array_iterator_prototype, map_prototype, set_prototype, array_values_,
@@ -2896,6 +2897,18 @@ Value Interpreter::evalTemplate(Node* n, Env* env, bool strict) {
     return Value::string(std::move(out));
 }
 
+// Whether a cached strings array was made for this template's text.
+static bool sameTemplate(Runtime& rt, Object* strings, const Node* t) {
+    const Value raw = rt.get(Value::object(strings), u"raw");
+    if (!raw.isObject()) return false;
+    size_t i = 0;
+    for (size_t k = 0; k < t->kids.size(); k += 2, ++i) {
+        const Value v = rt.get(raw, PropertyKey(utf16(std::to_string(i))));
+        if (!v.isString() || v.asString() != t->kids[k]->str2) return false;
+    }
+    return true;
+}
+
 Value Interpreter::evalTagged(Node* n, Env* env, bool strict) {
     Value this_value;
     Value fn;
@@ -2908,15 +2921,22 @@ Value Interpreter::evalTagged(Node* n, Env* env, bool strict) {
         fn = eval(n->a, env, strict);
     }
     Node* t = n->b;
-    std::vector<Value> cooked, raw;
-    for (size_t i = 0; i < t->kids.size(); i += 2) {
-        cooked.push_back((t->kids[i]->flags & kOptional) ? Value::undefined() : Value::string(t->kids[i]->str));
-        raw.push_back(Value::string(t->kids[i]->str2));
+    Object* strings = nullptr;
+    if (const auto it = rt_.template_objects.find(t); it != rt_.template_objects.end() && sameTemplate(rt_, it->second, t)) strings = it->second;
+    if (!strings) {   // first time here (or a freed program's node address, reused)
+        std::vector<Value> cooked, raw;
+        for (size_t i = 0; i < t->kids.size(); i += 2) {
+            cooked.push_back((t->kids[i]->flags & kOptional) ? Value::undefined() : Value::string(t->kids[i]->str));
+            raw.push_back(Value::string(t->kids[i]->str2));
+        }
+        strings = rt_.newArray(std::move(cooked));
+        args.push_back(Value::object(strings));   // (args is rooted)
+        Object* raw_arr = rt_.newArray(std::move(raw));
+        strings->define(u"raw", {Value::object(raw_arr), nullptr, nullptr, 0});
+        rt_.template_objects[t] = strings;
+    } else {
+        args.push_back(Value::object(strings));
     }
-    Object* strings = rt_.newArray(std::move(cooked));
-    Object* raw_arr = rt_.newArray(std::move(raw));
-    strings->define(u"raw", {Value::object(raw_arr), nullptr, nullptr, 0});
-    args.push_back(Value::object(strings));
     for (size_t i = 1; i < t->kids.size(); i += 2) args.push_back(eval(t->kids[i], env, strict));
     return rt_.call(fn, this_value, args);
 }

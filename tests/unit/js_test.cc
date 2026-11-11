@@ -723,3 +723,12 @@ TEST(Js, RegexAfterAStatementHead) {
                   "var b = (4) / 2;"
                   "a.join('') + b"), "aniw2");
 }
+
+TEST(Js, ATaggedTemplateSiteGivesTheSameStringsEachTime) {
+    // lit tells templates apart by this identity, and rebuilds the DOM when it differs.
+    EXPECT_EQ(run("function tag(s) { return s; }"
+                  "function f(x) { return tag`a${x}b`; }"
+                  "const a = f(1), b = f(2), g = () => tag`q`;"
+                  "[a === b, a.raw === b.raw, g() === g(), tag`q` === g(), a.join()].join()"),
+              "true,true,true,false,a,b");
+}

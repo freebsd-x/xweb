@@ -608,12 +608,7 @@ void PageScript::Impl::installDom() {
     method(proto_document, u"importNode", 1, [self](Runtime& rt, const Value&, Args a) {
         Node* n = self->node(arg(a, 0));
         if (!n || n->type == NodeType::Document) domError(rt, "NotSupportedError", "that node can't be imported");
-        Node* copy = self->clone(n, rt.toBoolean(arg(a, 1)));
-        if (n->template_content && copy->isHtml("template")) {
-            copy->template_content = self->doc.make(NodeType::Fragment);
-            for (const Node* c : n->template_content->children) copy->template_content->append(self->clone(c, true));
-        }
-        return self->wrap(copy);
+        return self->wrap(self->clone(n, rt.toBoolean(arg(a, 1))));
     });
     method(proto_document, u"adoptNode", 1, [self](Runtime& rt, const Value&, Args a) {
         Node* n = self->node(arg(a, 0));
