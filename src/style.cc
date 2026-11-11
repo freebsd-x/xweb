@@ -2834,6 +2834,8 @@ private:
         else if (p == "clip-path") to.clip_path = from.clip_path;
         else if (p == "opacity") to.opacity = from.opacity;
         else if (p == "box-sizing") to.border_box = from.border_box;
+        else if (p == "object-fit") to.object_fit = from.object_fit;
+        else if (p == "object-position") { to.object_x = from.object_x; to.object_y = from.object_y; }
         else if (p == "box-shadow") to.box_shadow = from.box_shadow;
         else if (p == "z-index") to.z_index = from.z_index;
         else if (p == "transform") {
@@ -3037,9 +3039,11 @@ private:
             return;
         }
         if (p == "vertical-align") {
-            if (kw == "top" || kw == "text-top") s.vertical_align = VerticalAlign::Top;
+            if (kw == "top") s.vertical_align = VerticalAlign::Top;
+            else if (kw == "text-top") s.vertical_align = VerticalAlign::TextTop;
             else if (kw == "middle") s.vertical_align = VerticalAlign::Middle;
-            else if (kw == "bottom" || kw == "text-bottom") s.vertical_align = VerticalAlign::Bottom;
+            else if (kw == "bottom") s.vertical_align = VerticalAlign::Bottom;
+            else if (kw == "text-bottom") s.vertical_align = VerticalAlign::TextBottom;
             else if (kw == "sub") s.vertical_align = VerticalAlign::Sub;
             else if (kw == "super") s.vertical_align = VerticalAlign::Super;
             else s.vertical_align = VerticalAlign::Baseline;
@@ -3241,6 +3245,20 @@ private:
             return;
         }
         if (p == "box-sizing") { s.border_box = kw == "border-box"; return; }
+        if (p == "object-fit") {
+            using F = ComputedStyle::Fit;
+            if (kw == "fill") s.object_fit = F::Fill;
+            else if (kw == "contain") s.object_fit = F::Contain;
+            else if (kw == "cover") s.object_fit = F::Cover;
+            else if (kw == "none") s.object_fit = F::None;
+            else if (kw == "scale-down") s.object_fit = F::ScaleDown;
+            return;
+        }
+        if (p == "object-position") {
+            Length x, y;
+            if (positionFrom(v, c, x, y)) { s.object_x = x; s.object_y = y; }
+            return;
+        }
         if (p == "background-color") { oneColor(s.background); return; }
         if (p == "background") {
             BackgroundLayers layers;

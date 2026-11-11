@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -184,11 +185,30 @@ int main(int argc, char** argv) {
                 if (!l) break;
                 Raster svg_raster;
                 const Raster* r = &l->bitmap;
+                const bool cropped = op.u0 > 0 || op.v0 > 0 || op.u1 < 1 || op.v1 < 1;
                 if (l->svg) {
-                    const auto pw = static_cast<uint32_t>(std::clamp(std::lround(op.w), 1L, 4096L));
-                    const auto ph = static_cast<uint32_t>(std::clamp(std::lround(op.h), 1L, 4096L));
+                    // The whole picture at the size it's drawn at (the part shown is op.w x op.h).
+                    const float full_w = cropped ? op.w / std::max(0.001f, op.u1 - op.u0) : op.w;
+                    const float full_h = cropped ? op.h / std::max(0.001f, op.v1 - op.v0) : op.h;
+                    const auto pw = static_cast<uint32_t>(std::clamp(std::lround(full_w), 1L, 4096L));
+                    const auto ph = static_cast<uint32_t>(std::clamp(std::lround(full_h), 1L, 4096L));
                     svg_raster = l->svg->render(pw, ph);
                     r = &svg_raster;
+                }
+                Raster crop;
+                if (cropped && r->width > 0 && r->height > 0) {
+                    const auto at = [](float f, uint32_t n) { return std::min<uint32_t>(n, static_cast<uint32_t>(std::max(0.0f, std::round(f * static_cast<float>(n))))); };
+                    const uint32_t x0 = at(op.u0, r->width), x1 = std::max(x0 + 1, at(op.u1, r->width));
+                    const uint32_t y0 = at(op.v0, r->height), y1 = std::max(y0 + 1, at(op.v1, r->height));
+                    if (x1 <= r->width && y1 <= r->height) {
+                        crop.width = x1 - x0;
+                        crop.height = y1 - y0;
+                        crop.rgba.resize(static_cast<size_t>(crop.width) * crop.height * 4);
+                        for (uint32_t row = 0; row < crop.height; ++row)
+                            std::memcpy(&crop.rgba[static_cast<size_t>(row) * crop.width * 4], &r->rgba[(static_cast<size_t>(y0 + row) * r->width + x0) * 4],
+                                        static_cast<size_t>(crop.width) * 4);
+                        r = &crop;
+                    }
                 }
                 Raster rounded;
                 if (raw.radius > 0 && raw.w > 0 && raw.h > 0) {

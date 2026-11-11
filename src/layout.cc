@@ -1168,6 +1168,13 @@ private:
                     natural_h = lineHeightOf(s);
                 }
             }
+        } else if (n->isHtml("video")) {
+            // Before its frames, a video is the size of its poster.
+            if (const std::string* poster = n->attr("poster"); poster && !poster->empty() && images_)
+                if (const auto size = images_->imageSize(*poster)) {
+                    natural_w = size->first;
+                    natural_h = size->second;
+                }
         } else if (n->ns == Namespace::Svg && n->name == "svg") {
             const auto size_attr = [n](const char* name) -> std::optional<float> {
                 const std::string* v = n->attr(name);
@@ -2992,6 +2999,9 @@ private:
             const float total = a.outerHeight() + a.margin[Top] + a.margin[Bottom];
             if (a.style->vertical_align == VerticalAlign::Middle)
                 return total / 2 + b_.style->font_size * 0.25f;
+            // Its bottom (top) edge where the parent's text bottom (top) is.
+            if (a.style->vertical_align == VerticalAlign::TextBottom) return total - l_.text_.descent(fontOf(*b_.style));
+            if (a.style->vertical_align == VerticalAlign::TextTop) return l_.text_.ascent(fontOf(*b_.style));
             if (a.kind == BoxKind::Replaced && a.last_baseline >= 0)
                 return a.margin[Top] + a.border[Top] + a.padding[Top] + a.last_baseline;
             if (a.kind != BoxKind::InlineBlock || a.style->overflow_clip) return total;
@@ -3219,9 +3229,16 @@ private:
                 return 0.0f;
             };
 
+            // vertical-align: top and bottom boxes sit at the line's edges: they don't take
+            // part in the baseline, and only make the line taller if it's shorter than them.
+            const auto edgeAligned = [](const Box& a) {
+                return a.style->vertical_align == VerticalAlign::Top || a.style->vertical_align == VerticalAlign::Bottom;
+            };
+            const auto totalOf = [](const Box& a) { return a.outerHeight() + a.margin[Top] + a.margin[Bottom]; };
             for (const auto& f : line_) {
                 if (f.atomic) {
-                    const float total = f.atomic->outerHeight() + f.atomic->margin[Top] + f.atomic->margin[Bottom];
+                    if (edgeAligned(*f.atomic)) continue;
+                    const float total = totalOf(*f.atomic);
                     const float to_baseline = atomicBaseline(*f.atomic);
                     above = std::max(above, to_baseline);
                     below = std::max(below, total - to_baseline);
@@ -3234,6 +3251,13 @@ private:
                 above = std::max(above, a + half - shift);
                 below = std::max(below, d + half + shift);
             }
+
+            for (const auto& f : line_)
+                if (f.atomic && edgeAligned(*f.atomic)) {
+                    const float total = totalOf(*f.atomic);
+                    if (f.atomic->style->vertical_align == VerticalAlign::Top) below = std::max(below, total - above);
+                    else above = std::max(above, total - below);
+                }
 
             // Drop whitespace hanging off the end of the line.
             float line_w = line_.empty() ? line_left_ : line_.back().x + line_.back().w;
@@ -3266,7 +3290,9 @@ private:
                 if (f.atomic) {
                     Box* a = f.atomic;
                     a->x = f.x + a->margin[Left];
-                    a->y = baseline - atomicBaseline(*a) + a->margin[Top];
+                    if (a->style->vertical_align == VerticalAlign::Top) a->y = y_ + a->margin[Top];
+                    else if (a->style->vertical_align == VerticalAlign::Bottom) a->y = y_ + above + below - totalOf(*a) + a->margin[Top];
+                    else a->y = baseline - atomicBaseline(*a) + a->margin[Top];
                     f.y = a->y;
                     f.h = a->outerHeight();
                 } else {
@@ -3625,6 +3651,44 @@ private:
         return faded(ph->color, std::clamp(ph->opacity, 0.0f, 1.0f));
     }
 
+    // Where a picture goes in its content box (w x h at x, y) by object-fit and
+    // object-position, and which part of it shows there.
+    void fitPicture(PaintOp& op, const ComputedStyle& s, float x, float y, float w, float h, const std::string& src) {
+        op.x = x;
+        op.y = y;
+        op.w = w;
+        op.h = h;
+        using F = ComputedStyle::Fit;
+        if (s.object_fit == F::Fill || w <= 0 || h <= 0) return;
+        float iw = 0, ih = 0;
+        if (const auto size = images_->imageSize(src)) { iw = size->first; ih = size->second; }
+        else if (const auto ratio = images_->imageRatio(src); ratio && *ratio > 0) { iw = w; ih = w / *ratio; }   // a shape only
+        if (iw <= 0 || ih <= 0) return;
+        const float contain = std::min(w / iw, h / ih), cover = std::max(w / iw, h / ih);
+        float scale = 1;
+        switch (s.object_fit) {
+            case F::Contain: scale = contain; break;
+            case F::Cover: scale = cover; break;
+            case F::None: scale = 1; break;
+            case F::ScaleDown: scale = std::min(1.0f, contain); break;
+            case F::Fill: break;
+        }
+        const float dw = iw * scale, dh = ih * scale;
+        const float dx = x + s.object_x.resolve(w - dw), dy = y + s.object_y.resolve(h - dh);
+        // What of it falls inside the box.
+        const float x0 = std::max(x, dx), y0 = std::max(y, dy);
+        const float x1 = std::min(x + w, dx + dw), y1 = std::min(y + h, dy + dh);
+        if (x1 <= x0 || y1 <= y0) { op.w = op.h = 0; return; }
+        op.x = x0;
+        op.y = y0;
+        op.w = x1 - x0;
+        op.h = y1 - y0;
+        op.u0 = (x0 - dx) / dw;
+        op.v0 = (y0 - dy) / dh;
+        op.u1 = (x1 - dx) / dw;
+        op.v1 = (y1 - dy) / dh;
+    }
+
     void paintReplaced(const Box& b, float x, float y, float opacity) {
         const ComputedStyle& s = *b.style;
         paintFrame(b, x, y, opacity);
@@ -3632,18 +3696,21 @@ private:
         const float cx = x + b.border[Left] + b.padding[Left];
         const float cy = y + b.border[Top] + b.padding[Top];
         const Node* n = b.node;
-        if (n->isHtml("img")) {
-            if (const std::string* src = n->attr("src")) {
-                if (images_ && (images_->imageSize(*src) || images_->imageRatio(*src))) {
-                    PaintOp op;
-                    op.kind = PaintKind::Image;
-                    op.x = cx;
-                    op.y = cy;
-                    op.w = b.width;
-                    op.h = b.height;
-                    op.text = *src;
-                    op.color = faded(Color{255, 255, 255, 255}, opacity);
-                    // border-radius rounds the picture too: inside its border and padding.
+        // A picture: an <img>'s source, or a <video>'s poster (all of a video we show).
+        const bool is_img = n->isHtml("img");
+        if (is_img || n->isHtml("video")) {
+            const std::string* src = n->attr(is_img ? "src" : "poster");
+            if (src && src->empty()) src = nullptr;
+            if (src && images_ && (images_->imageSize(*src) || images_->imageRatio(*src))) {
+                PaintOp op;
+                op.kind = PaintKind::Image;
+                op.text = *src;
+                op.color = faded(Color{255, 255, 255, 255}, opacity);
+                fitPicture(op, s, cx, cy, b.width, b.height, *src);
+                if (op.w <= 0 || op.h <= 0) return;
+                // border-radius rounds the picture too: inside its border and padding (when
+                // the picture reaches the corners).
+                if (op.x <= cx + 0.5f && op.y <= cy + 0.5f && op.x + op.w >= cx + b.width - 0.5f && op.y + op.h >= cy + b.height - 0.5f) {
                     float radii[4][2];
                     const float bw = b.outerWidth(), bh = b.outerHeight();
                     for (int i = 0; i < 4; ++i) {
@@ -3654,16 +3721,15 @@ private:
                     op.radius = std::max(0.0f, radii[0][0] - b.border[Left] - b.padding[Left]);
                     op.radius_y = std::max(0.0f, radii[0][1] - b.border[Top] - b.padding[Top]);
                     if (op.radius <= 0 || op.radius_y <= 0) op.radius = op.radius_y = 0;
-                    out_->ops.push_back(std::move(op));
-                    return;
                 }
+                out_->ops.push_back(std::move(op));
+                return;
             }
             // Not loaded: maybe one a script just added. Ask for it.
-            if (const std::string* src = n->attr("src"); src && images_ && !images_->imageSize(*src) && !images_->imageRatio(*src) &&
-                out_->images_wanted.size() < 512 &&
+            if (src && images_ && out_->images_wanted.size() < 512 &&
                 std::find(out_->images_wanted.begin(), out_->images_wanted.end(), *src) == out_->images_wanted.end())
                 out_->images_wanted.push_back(*src);
-            if (!b.alt.empty()) addText(cx, cy, b.alt, s, opacity);
+            if (is_img && !b.alt.empty()) addText(cx, cy, b.alt, s, opacity);
             return;
         }
         if (n->ns == Namespace::Svg && n->name == "svg") {

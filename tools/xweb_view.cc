@@ -1027,16 +1027,35 @@ private:
         if (const CachedRaster* r = cached(key, [&, pw = pw, ph = ph] { return web::renderSvg(*node, pw, ph, styles, color); })) drawRaster(dl, *r, x, y, op.w, op.h);
     }
 
+    // The part of a picture's pixels an op shows (object-fit: cover crops).
+    static web::Raster croppedTo(web::Raster in, const web::PaintOp& op) {
+        if (op.u0 <= 0 && op.v0 <= 0 && op.u1 >= 1 && op.v1 >= 1) return in;
+        const auto px = [](float f, uint32_t n) { return std::min<uint32_t>(n, static_cast<uint32_t>(std::max(0.0f, std::round(f * static_cast<float>(n))))); };
+        const uint32_t x0 = px(op.u0, in.width), x1 = std::max(x0 + 1, px(op.u1, in.width));
+        const uint32_t y0 = px(op.v0, in.height), y1 = std::max(y0 + 1, px(op.v1, in.height));
+        if (x1 > in.width || y1 > in.height) return in;
+        web::Raster out;
+        out.width = x1 - x0;
+        out.height = y1 - y0;
+        out.rgba.resize(static_cast<size_t>(out.width) * out.height * 4);
+        for (uint32_t row = 0; row < out.height; ++row)
+            std::memcpy(&out.rgba[static_cast<size_t>(row) * out.width * 4], &in.rgba[(static_cast<size_t>(y0 + row) * in.width + x0) * 4],
+                        static_cast<size_t>(out.width) * 4);
+        return out;
+    }
+
     void image(fbx::xrender::DisplayList& dl, const web::PaintOp& op, float x, float y) {
         const LoadedImage* loaded = images_.find(op.text);
         if (!loaded) return;
-        if (loaded->svg || op.tint || op.radius > 0) {
+        const bool cropped = op.u0 > 0 || op.v0 > 0 || op.u1 < 1 || op.v1 < 1;
+        if (loaded->svg || op.tint || op.radius > 0 || (cropped && group_)) {
             // Drawn for this size (an SVG), or only its alpha in a colour (a mask).
             // An SVG, or rounded corners, at the size shown; a mask at the image's own.
             const auto [pw, ph] = loaded->svg || op.radius > 0 ? rasterSize(op.w, op.h) : std::pair<uint32_t, uint32_t>{loaded->width, loaded->height};
             char ptr[32];
             std::snprintf(ptr, sizeof ptr, "%p", static_cast<const void*>(loaded));
-            const std::string key = std::string("i:") + ptr + ":" + std::to_string(pw) + "x" + std::to_string(ph) + (op.tint ? ":" + colorKey(op.color) : "") +
+            const std::string crop_key = cropped ? ":c" + std::to_string(op.u0) + "," + std::to_string(op.v0) + "," + std::to_string(op.u1) + "," + std::to_string(op.v1) : "";
+            const std::string key = std::string("i:") + ptr + ":" + std::to_string(pw) + "x" + std::to_string(ph) + crop_key + (op.tint ? ":" + colorKey(op.color) : "") +
                                     (op.radius > 0 ? ":r" + std::to_string(op.radius) + "," + std::to_string(op.radius_y) + "@" + std::to_string(op.w) + "x" + std::to_string(op.h) : "");
             const bool tint = op.tint;
             const float rx = op.radius, ry = op.radius_y, shown_w = op.w, shown_h = op.h;
@@ -1044,11 +1063,20 @@ private:
             const CachedRaster* r = cached(key, [&, pw = pw, ph = ph] {
                 web::Raster out;
                 if (loaded->svg) {
-                    out = loaded->svg->render(pw, ph);
+                    if (cropped) {
+                        // The whole picture at the size it's drawn at, then the part shown.
+                        const float sw = std::max(1.0f, static_cast<float>(pw) / std::max(0.001f, op.u1 - op.u0));
+                        const float sh = std::max(1.0f, static_cast<float>(ph) / std::max(0.001f, op.v1 - op.v0));
+                        out = croppedTo(loaded->svg->render(static_cast<uint32_t>(std::min(8192.0f, sw)), static_cast<uint32_t>(std::min(8192.0f, sh))), op);
+                        if (out.width != pw || out.height != ph) out = web::resampled(out, pw, ph);
+                    } else {
+                        out = loaded->svg->render(pw, ph);
+                    }
                 } else {
                     out.width = loaded->width;
                     out.height = loaded->height;
                     out.rgba = loaded->pixels;
+                    out = croppedTo(std::move(out), op);
                     if (out.width != pw || out.height != ph) out = web::resampled(out, pw, ph);
                 }
                 if (rx > 0 && shown_w > 0 && shown_h > 0)
@@ -1082,10 +1110,10 @@ private:
         d.pixel_ptr_ = loaded->pixels.data();
         d.pixel_width_ = loaded->width;
         d.pixel_height_ = loaded->height;
-        d.uv_x0_ = 0;
-        d.uv_y0_ = 0;
-        d.uv_x1_ = 1;
-        d.uv_y1_ = 1;
+        d.uv_x0_ = op.u0;
+        d.uv_y0_ = op.v0;
+        d.uv_x1_ = op.u1;
+        d.uv_y1_ = op.v1;
         dl.addCommand(fbx::shared::CommandType::DrawImage, {reinterpret_cast<const uint8_t*>(&d), sizeof(d)});
     }
 

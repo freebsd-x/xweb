@@ -44,7 +44,7 @@ enum class Display {
 };
 enum class Float { None, Left, Right };
 enum class Clear { None, Left, Right, Both };
-enum class VerticalAlign { Baseline, Top, Middle, Bottom, Sub, Super };
+enum class VerticalAlign { Baseline, Top, Middle, Bottom, Sub, Super, TextTop, TextBottom };
 enum class FlexAlign { Auto, Start, End, Center, Stretch, Baseline, SpaceBetween, SpaceAround, SpaceEvenly };
 enum class Position { Static, Relative, Absolute, Fixed };
 enum class TextAlign { Left, Right, Center };
@@ -178,6 +178,9 @@ struct ComputedStyle {
     bool hidden = false;   // visibility: hidden
     bool border_box = false;
     float opacity = 1;
+    // A picture's fit in its box: fill, contain, cover, none, scale-down; and where.
+    enum class Fit : uint8_t { Fill, Contain, Cover, None, ScaleDown } object_fit = Fit::Fill;
+    Length object_x{false, 0, 50}, object_y{false, 0, 50};
 
     // Inherited
     Color color{0, 0, 0, 255};

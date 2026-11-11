@@ -581,3 +581,55 @@ TEST(Positioned, APictureKeepsItsSizeBetweenItsOffsets) {
     EXPECT_FLOAT_EQ(r.box("d").w, 100);
     EXPECT_FLOAT_EQ(r.box("d").h, 50);
 }
+
+TEST(Replaced, ObjectFitPlacesAndCropsThePicture) {
+    // wide.png is 200x100.
+    const auto r = layout("<img id=c src=wide.png style='width:100px;height:100px;object-fit:cover'>"
+                          "<img id=t src=wide.png style='width:100px;height:100px;object-fit:contain;object-position:0 100%'>"
+                          "<img id=n src=wide.png style='width:100px;height:50px;object-fit:none;object-position:left top'>");
+    std::vector<PaintOp> images;
+    for (const auto& op : r.page.ops)
+        if (op.kind == PaintKind::Image) images.push_back(op);
+    ASSERT_EQ(images.size(), 3u);
+    // cover: fills the box, the middle half of the picture.
+    EXPECT_FLOAT_EQ(images[0].w, 100);
+    EXPECT_FLOAT_EQ(images[0].h, 100);
+    EXPECT_FLOAT_EQ(images[0].u0, 0.25f);
+    EXPECT_FLOAT_EQ(images[0].u1, 0.75f);
+    // contain: 100x50, at the bottom.
+    EXPECT_FLOAT_EQ(images[1].w, 100);
+    EXPECT_FLOAT_EQ(images[1].h, 50);
+    EXPECT_FLOAT_EQ(images[1].y - r.box("t").y, 50);
+    EXPECT_FLOAT_EQ(images[1].u1, 1);
+    // none: the picture's own size, its top-left 100x50.
+    EXPECT_FLOAT_EQ(images[2].w, 100);
+    EXPECT_FLOAT_EQ(images[2].u1, 0.5f);
+    EXPECT_FLOAT_EQ(images[2].v1, 0.5f);
+}
+
+TEST(Replaced, AVideoShowsItsPosterAtItsSize) {
+    const auto r = layout("<video id=v poster=wide.png></video>");
+    EXPECT_FLOAT_EQ(r.box("v").w, 200);
+    EXPECT_FLOAT_EQ(r.box("v").h, 100);
+    bool drawn = false;
+    for (const auto& op : r.page.ops)
+        if (op.kind == PaintKind::Image && op.text == "wide.png") drawn = true;
+    EXPECT_TRUE(drawn);
+}
+
+TEST(Inline, TopAndBottomAlignedBoxesSitAtTheLineEdges) {
+    const auto r = layout("<div><img id=t src=wide.png style='width:20px;height:20px;vertical-align:top'>"
+                          "<img id=big src=wide.png style='width:50px;height:50px;vertical-align:top'>"
+                          "<img id=b src=wide.png style='width:20px;height:20px;vertical-align:bottom'></div>");
+    EXPECT_FLOAT_EQ(r.box("t").y, 0);
+    EXPECT_FLOAT_EQ(r.box("big").y, 0);
+    EXPECT_FLOAT_EQ(r.box("b").y, 30);   // its bottom on the bottom of a line the 50px box made
+}
+
+TEST(Inline, TextBottomSitsOnTheParentsTextBottom) {
+    // FixedText: ascent 7.5, descent 2.5 at 10px. Not the same as bottom.
+    const auto r = layout("<div><img id=tb src=wide.png style='width:20px;height:20px;vertical-align:text-bottom'>"
+                          "<img id=big src=wide.png style='width:40px;height:40px'></div>");
+    EXPECT_FLOAT_EQ(r.box("big").y, 0);
+    EXPECT_FLOAT_EQ(r.box("tb").y + 20, 40 + 2.5f);   // bottom edge: baseline (40) + descent
+}

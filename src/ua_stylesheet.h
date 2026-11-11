@@ -57,11 +57,12 @@ a:link { color: #0000EE; text-decoration: underline; }
 mark { background-color: yellow; color: black; }
 nobr { white-space: nowrap; }
 img, video, canvas, iframe, embed, object, svg { display: inline-block; }
+video { object-fit: contain; }
 input, textarea, select, button { display: inline-block; font: 13.3333px sans-serif; line-height: normal; text-align: start; text-indent: 0; text-transform: none; white-space: normal; }
 input { line-height: normal !important; }
 textarea { white-space: pre-wrap; }
 input { border: 2px inset gray; padding: 1px 2px; background-color: white; }
-textarea { border: 1px solid gray; padding: 2px; background-color: white; vertical-align: text-bottom; }
+textarea { border: 1px solid gray; padding: 2px; background-color: white; }
 select { border: 1px solid gray; padding: 0; background-color: white; box-sizing: border-box; }
 input[type=checkbox], input[type=radio] { border: none; padding: 0; margin: 3px 3px 3px 4px; }
 input[type=radio] { margin: 3px 3px 0 5px; }
