@@ -201,6 +201,7 @@ void PageScript::Impl::afterRemove(Node* parent, Node* child, Node* prev, Node* 
 }
 
 void PageScript::Impl::afterAttr(Node* n, const std::string& name, const std::string* old) {
+    ++dom_version;
     queueMutation(u"attributes", n, {}, {}, nullptr, nullptr, &name, old);
     // An image a script points somewhere loads whether or not it's in the page (new
     // Image() for a canvas, preloading): its load event comes when it has.

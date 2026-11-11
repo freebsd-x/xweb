@@ -154,8 +154,9 @@ TEST(Js, SyntaxErrors) {
 
 TEST(Js, Limits) {
     // A loop that never ends is stopped; so is too much memory or nesting.
-    EXPECT_EQ(run("while (true) {}"), "throws: Stopped: the script ran too long");
-    EXPECT_EQ(run("for (;;) { try { } catch (e) { } }"), "throws: Stopped: the script ran too long");
+    // Where it was stopped, to know which script.
+    EXPECT_EQ(run("while (true) {}"), "throws: Stopped: the script ran too long (script:1:14)");
+    EXPECT_EQ(run("for (;;) { try { } catch (e) { } }"), "throws: Stopped: the script ran too long (script:1:10)");
     std::string deep(5000, '(');
     deep += "1" + std::string(5000, ')');
     EXPECT_EQ(run(deep), "throws: SyntaxError: too deeply nested (line 1, column 800)");
@@ -731,4 +732,11 @@ TEST(Js, ATaggedTemplateSiteGivesTheSameStringsEachTime) {
                   "const a = f(1), b = f(2), g = () => tag`q`;"
                   "[a === b, a.raw === b.raw, g() === g(), tag`q` === g(), a.join()].join()"),
               "true,true,true,false,a,b");
+}
+
+TEST(Js, NativesCalledInsideAConstructorAreCalls) {
+    // A Promise executor runs while Promise's constructor does: String() there is still a call.
+    EXPECT_EQ(run("let t; new Promise(() => { t = typeof String(1) + typeof Number('2') + typeof Boolean(0); }); "
+                  "const m = new Map([[1, typeof String(3)]]); t + m.get(1)"),
+              "stringnumberbooleanstring");
 }

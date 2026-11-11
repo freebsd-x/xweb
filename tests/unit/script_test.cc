@@ -833,3 +833,70 @@ TEST(Script, CanvasTextIsPlacedByAlignAndBaseline) {
         </script>)");
     EXPECT_EQ(p.console, "log:20 255 0 0 0\n") << p.console;
 }
+
+TEST(Script, IntlFormattersCanBeCalledWithoutNew) {
+    Page p(R"(<body><script>
+        const d = Intl.DateTimeFormat(), n = Intl.NumberFormat('en-US');
+        let threw = false;
+        try { Intl.PluralRules(); } catch (e) { threw = e instanceof TypeError; }
+        console.log(typeof d.resolvedOptions().timeZone, n.format(1234.5), d instanceof Intl.DateTimeFormat, typeof Intl.Collator().compare, threw);
+        </script>)");
+    EXPECT_EQ(p.console, "log:string 1,234.5 true function true\n") << p.console;
+}
+
+TEST(Script, OffsetParentEndsAtTheBody) {
+    // Bing walks `do { ... } while (n = n.offsetParent)`: it has to end.
+    Page p(R"(<body><div id=d><span id=s>x</span></div><script>
+        let n = document.getElementById('s'), hops = 0;
+        do { hops++; } while ((n = n.offsetParent) && hops < 100);
+        console.log(hops, document.body.offsetParent, document.documentElement.offsetParent, document.createElement('i').offsetParent,
+                    document.getElementById('s').offsetParent === document.body);
+        </script>)");
+    EXPECT_EQ(p.console, "log:2 null null null true\n") << p.console;
+}
+
+TEST(Script, ScriptsLinksAndTitlesHaveText) {
+    Page p(R"(<head><title>T</title><script type="text/rms">var fromRms = 7;</script></head><body><a href=#>link</a><script>
+        const rms = [...document.scripts].find(s => s.type === 'text/rms');
+        (0, eval)(rms.text);
+        console.log(fromRms, document.querySelector('a').text, document.querySelector('title').text);
+        </script>)");
+    EXPECT_EQ(p.console, "log:7 link T\n") << p.console;
+}
+
+TEST(Script, ChildNodesAndChildrenAreLive) {
+    Page p(R"(<body><div id=d><i></i><b class=x></b>text</div><script>
+        const d = document.getElementById('d');
+        const nodes = d.childNodes, kids = d.children, xs = document.getElementsByClassName('x'), bs = d.getElementsByTagName('b');
+        const before = [nodes.length, kids.length, xs.length, bs.length];
+        const f = document.createDocumentFragment();
+        let moved = 0;
+        for (; nodes.length && moved < 100; moved++) f.appendChild(nodes[0]);   // Bing's sj_appHTML
+        const b = document.createElement('b'); b.className = 'x'; d.appendChild(b);
+        console.log(before.join(), moved, nodes.length, kids.length, xs.length, bs.length, d.childNodes === nodes,
+                    nodes instanceof NodeList, Array.isArray(nodes), [...nodes].length, Array.from(kids)[0] === b, nodes.item(0) === b);
+        </script>)");
+    EXPECT_EQ(p.console, "log:3,2,1,1 3 1 1 1 1 true true true 1 true true\n") << p.console;
+}
+
+TEST(Script, LiveListsSurviveCollection) {
+    Page p(R"(<head><title>t</title></head><body><script>
+        const l = document.getElementsByTagName('head');
+        const first = l[0];
+        let junk = [];
+        for (let i = 0; i < 200000; i++) { junk.push({ i, s: 'x' + i }); if (junk.length > 1000) junk = []; }
+        const again = document.getElementsByTagName('head');
+        console.log(l.length, l[0] === first, again[0] === first, Array.from(again).length, !!again[0]);
+        </script>)");
+    EXPECT_EQ(p.console, "log:1 true true 1 true\n") << p.console;
+}
+
+TEST(Script, PerformanceEntriesHaveTheirInterfaces) {
+    Page p(R"(<body><script>
+        performance.mark('m');
+        const [nav] = performance.getEntriesByType('navigation');
+        console.log(nav instanceof PerformanceNavigationTiming, nav instanceof PerformanceEntry,
+                    performance.getEntriesByName('m')[0] instanceof PerformanceMark);
+        </script>)");
+    EXPECT_EQ(p.console, "log:true true true\n") << p.console;
+}

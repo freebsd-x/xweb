@@ -576,13 +576,45 @@ void PageScript::Impl::installElement() {
     });
     accessor(p, u"offsetWidth", [rectOf](Runtime&, const Value& t, Args) { return Value::number(std::round(rectOf(t).w)); });
     accessor(p, u"offsetHeight", [rectOf](Runtime&, const Value& t, Args) { return Value::number(std::round(rectOf(t).h)); });
-    accessor(p, u"offsetLeft", [rectOf](Runtime&, const Value& t, Args) { return Value::number(std::round(rectOf(t).x)); });
-    accessor(p, u"offsetTop", [rectOf](Runtime&, const Value& t, Args) { return Value::number(std::round(rectOf(t).y)); });
+    // offsetParent: the nearest positioned ancestor (or table cell, for a static box), else
+    // the body; none for the body, the root, a fixed box or one outside the page. Offsets
+    // are from it, so summing them up the chain lands on the page position.
+    const auto offsetParentOf = [self](Node* el) -> Node* {
+        if (!el || !self->inDocument(el) || el == self->doc.body() || el->isHtml("html")) return nullptr;
+        const auto position = [self](const Node* n) -> std::string {
+            if (!self->host.computed_style) return "static";
+            const auto m = self->host.computed_style(n);
+            const auto it = m.find("position");
+            return it == m.end() ? "static" : it->second;
+        };
+        const std::string own = position(el);
+        if (own == "fixed") return nullptr;
+        Node* a = el->parent;
+        for (int hops = 0; a && hops < 10000; ++hops) {
+            if (a->type == NodeType::Fragment && a->shadow_host) { a = a->shadow_host; continue; }
+            if (!a->isElement()) break;
+            if (a == self->doc.body() || a->isHtml("html")) return self->doc.body();
+            if (position(a) != "static") return a;
+            if (own == "static" && (a->isHtml("td") || a->isHtml("th") || a->isHtml("table"))) return a;
+            a = a->parent;
+        }
+        return self->doc.body();
+    };
+    accessor(p, u"offsetParent", [self, offsetParentOf](Runtime&, const Value& t, Args) { return self->wrap(offsetParentOf(self->thisElement(t))); });
+    accessor(p, u"offsetLeft", [self, rectOf, offsetParentOf](Runtime&, const Value& t, Args) {
+        const Node* parent = offsetParentOf(self->thisElement(t));
+        const float base = parent && parent != self->doc.body() ? rectOf(self->wrap(const_cast<Node*>(parent))).x : 0;
+        return Value::number(std::round(rectOf(t).x - base));
+    });
+    accessor(p, u"offsetTop", [self, rectOf, offsetParentOf](Runtime&, const Value& t, Args) {
+        const Node* parent = offsetParentOf(self->thisElement(t));
+        const float base = parent && parent != self->doc.body() ? rectOf(self->wrap(const_cast<Node*>(parent))).y : 0;
+        return Value::number(std::round(rectOf(t).y - base));
+    });
     accessor(p, u"clientWidth", [rectOf](Runtime&, const Value& t, Args) { return Value::number(std::round(rectOf(t).w)); });
     accessor(p, u"clientHeight", [rectOf](Runtime&, const Value& t, Args) { return Value::number(std::round(rectOf(t).h)); });
     accessor(p, u"scrollWidth", [rectOf](Runtime&, const Value& t, Args) { return Value::number(std::round(rectOf(t).w)); });
     accessor(p, u"scrollHeight", [rectOf](Runtime&, const Value& t, Args) { return Value::number(std::round(rectOf(t).h)); });
-    accessor(p, u"offsetParent", [self](Runtime&, const Value& t, Args) { return self->wrap(self->doc.body()); });
     accessor(p, u"scrollTop", [](Runtime&, const Value&, Args) { return Value::number(0); }, [](Runtime&, const Value&, Args) { return Value::undefined(); });
     accessor(p, u"scrollLeft", [](Runtime&, const Value&, Args) { return Value::number(0); }, [](Runtime&, const Value&, Args) { return Value::undefined(); });
     method(p, u"scrollIntoView", 0, [self, rectOf](Runtime&, const Value& t, Args) {
@@ -1293,10 +1325,7 @@ void PageScript::Impl::installWindow() {
     method(g, u"open", 1, [](Runtime&, const Value&, Args) { return Value::null(); });
     Object* perf = rt.newObject();
     method(perf, u"now", 0, [self](Runtime&, const Value&, Args) { return Value::number(self->now()); });
-    method(perf, u"mark", 1, [](Runtime&, const Value&, Args) { return Value::undefined(); });
-    method(perf, u"measure", 1, [](Runtime&, const Value&, Args) { return Value::undefined(); });
-    method(perf, u"getEntriesByType", 1, [](Runtime& rt, const Value&, Args) { return Value::object(rt.newArray()); });
-    method(perf, u"getEntriesByName", 1, [](Runtime& rt, const Value&, Args) { return Value::object(rt.newArray()); });
+    // mark, measure and the entries are the prelude's.
     rt.put(perf, u"timeOrigin", Value::number(static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count())));
     rt.put(g, u"performance", Value::object(perf));
 

@@ -352,6 +352,7 @@ struct PageScript::Impl {
     }
 
     void insert(Node* parent, Node* child, Node* before) {
+        ++dom_version;
         if (child == parent) rt.throwError("Error", "HierarchyRequestError: a node can't contain itself");
         for (const Node* p = parent; p; p = p->parent)
             if (p == child) rt.throwError("Error", "HierarchyRequestError: a node can't contain its ancestor");
@@ -376,6 +377,7 @@ struct PageScript::Impl {
     }
 
     void detach(Node* child) {
+        ++dom_version;
         Node* parent = child->parent;
         if (!parent) return;
         const auto it = std::find(parent->children.begin(), parent->children.end(), child);
@@ -807,6 +809,7 @@ struct PageScript::Impl {
     };
     std::unordered_map<const Node*, std::unique_ptr<CanvasSurface>> canvases;
     std::vector<Node*> script_images;   // <img>s a script gave a src, in the page or not
+    uint64_t dom_version = 0;           // bumped by every change to the tree or an attribute: live lists recount
     CanvasSurface& surfaceOf(Node* canvas);
     void installCanvas();
 

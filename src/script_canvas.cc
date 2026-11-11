@@ -409,6 +409,11 @@ void PageScript::Impl::installCanvas() {
         return Value::string(js::utf16("data:image/png;base64," + base64(png)));
     });
     rt.put(rt.global(), u"__xwebCanvas2d", Value::object(n), js::kWritable | js::kConfigurable);
+    // For live lists (childNodes, children, getElementsBy*): what they hold may have
+    // changed once this has.
+    rt.put(rt.global(), u"__xwebDomVersion", Value::object(rt.newFunction(u"domVersion", 0, [self](Runtime&, const Value&, Args) {
+        return Value::number(static_cast<double>(self->dom_version));
+    })), js::kWritable | js::kConfigurable);
 }
 
 std::shared_ptr<const Raster> PageScript::canvasImage(const Node* canvas, uint64_t& version) const {

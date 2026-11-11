@@ -863,7 +863,23 @@ const char* const kScriptPrelude = R"JS(
     };
     document.addEventListener('DOMContentLoaded', () => { const t = perf.now(); nav.domInteractive = nav.domContentLoadedEventStart = nav.domContentLoadedEventEnd = t; });
     global.addEventListener('load', () => { const t = perf.now(); nav.domComplete = nav.loadEventStart = t; setTimeout(() => { nav.loadEventEnd = nav.duration = perf.now(); }, 0); });
-    const all = () => [nav].concat(marks);
+    // The entry interfaces, for instanceof (Reddit checks PerformanceNavigationTiming).
+    class PerformanceEntry { toJSON() { return Object.assign({}, this); } }
+    class PerformanceResourceTiming extends PerformanceEntry {}
+    class PerformanceNavigationTiming extends PerformanceResourceTiming {}
+    class PerformanceMark extends PerformanceEntry {}
+    class PerformanceMeasure extends PerformanceEntry {}
+    class PerformancePaintTiming extends PerformanceEntry {}
+    for (const [name, C] of Object.entries({ PerformanceEntry, PerformanceResourceTiming, PerformanceNavigationTiming, PerformanceMark,
+                                             PerformanceMeasure, PerformancePaintTiming }))
+      if (!global[name]) Object.defineProperty(global, name, { value: C, writable: true, configurable: true });
+    Object.setPrototypeOf(nav, global.PerformanceNavigationTiming.prototype);
+    const typed = (e) => {
+      if (e && typeof e === 'object' && Object.getPrototypeOf(e) === Object.prototype)
+        Object.setPrototypeOf(e, e.entryType === 'mark' ? global.PerformanceMark.prototype : e.entryType === 'measure' ? global.PerformanceMeasure.prototype : global.PerformanceEntry.prototype);
+      return e;
+    };
+    const all = () => [nav].concat(marks.map(typed));
     perf.getEntries = () => all();
     perf.getEntriesByType = t => all().filter(m => m.entryType === t);
     perf.getEntriesByName = (n, t) => all().filter(m => m.name === n && (!t || m.entryType === t));
@@ -943,6 +959,116 @@ const char* const kScriptPrelude = R"JS(
                    'reset', 'resize', 'scroll', 'select', 'submit', 'toggle', 'wheel', 'beforeunload', 'hashchange', 'message', 'offline',
                    'online', 'pagehide', 'pageshow', 'popstate', 'storage', 'unload', 'unhandledrejection', 'animationend', 'transitionend'])
     if (!(('on' + t) in global)) global['on' + t] = null;
+
+  // Live lists: childNodes, children and getElementsBy* follow the tree as it changes
+  // (for (; list.length; ) frag.appendChild(list[0]) must end). Each is a view, kept for
+  // its node, whose contents are looked up again once the tree has changed.
+  if (global.__xwebDomVersion && typeof Node === 'function') {
+    const version = global.__xwebDomVersion;
+    delete global.__xwebDomVersion;
+    const listProto = Object.getPrototypeOf(document.createElement('div').childNodes);
+    const isIndex = (k) => typeof k === 'string' && k !== '' && String(k >>> 0) === k;
+    const live = (compute) => {
+      let cache = null, at = -1;
+      const now = () => { const v = version(); if (!cache || v !== at) { cache = compute(); at = v; } return cache; };
+      const target = Object.setPrototypeOf([], listProto);
+      return new Proxy(target, {
+        get(t, k, r) {
+          if (k === 'length') return now().length;
+          if (isIndex(k)) return now()[+k];
+          return Reflect.get(t, k, r);
+        },
+        has(t, k) { return k === 'length' || (isIndex(k) ? +k < now().length : Reflect.has(t, k)); },
+        ownKeys() { return Array.from(now().keys(), String).concat(['length']); },
+        getOwnPropertyDescriptor(t, k) {
+          if (k === 'length') return { value: now().length, writable: true, enumerable: false, configurable: false };
+          if (isIndex(k) && +k < now().length) return { value: now()[+k], writable: false, enumerable: true, configurable: true };
+          return undefined;
+        },
+        set() { return true; },
+        defineProperty() { return false; },
+        deleteProperty() { return false; },
+      });
+    };
+    const kept = new WeakMap();
+    const keptFor = (node, key, make) => {
+      let m = kept.get(node);
+      if (!m) { m = new Map(); kept.set(node, m); }
+      let l = m.get(key);
+      if (!l) { l = make(); if (m.size < 64) m.set(key, l); }
+      return l;
+    };
+    const liveGetter = (proto, name) => {
+      const d = Object.getOwnPropertyDescriptor(proto, name);
+      if (!d || !d.get) return;
+      const orig = d.get;
+      Object.defineProperty(proto, name, { get() { const node = this; return keptFor(node, name, () => live(() => orig.call(node))); },
+                                           configurable: true, enumerable: d.enumerable });
+    };
+    const liveMethod = (proto, name) => {
+      const orig = proto[name];
+      if (typeof orig !== 'function') return;
+      proto[name] = function (...args) {
+        const node = this;
+        orig.apply(node, args);   // its own checks, and errors, first
+        return keptFor(node, name + '\u0000' + args.map(String).join('\u0000'), () => live(() => orig.apply(node, args)));
+      };
+    };
+    liveGetter(Node.prototype, 'childNodes');
+    for (const P of [Element.prototype, Document.prototype, DocumentFragment.prototype]) {
+      liveGetter(P, 'children');
+      if (P !== DocumentFragment.prototype) { liveMethod(P, 'getElementsByTagName'); liveMethod(P, 'getElementsByClassName'); }
+    }
+    liveMethod(Document.prototype, 'getElementsByName');
+  }
+
+  // navigator.serviceWorker: there, but no worker is ever registered or in control.
+  if (typeof navigator === 'object' && !('serviceWorker' in navigator) && typeof EventTarget === 'function') {
+    const sw = new (class ServiceWorkerContainer extends EventTarget {
+      get controller() { return null; }
+      get ready() { return new Promise(() => {}); }
+      register() { return Promise.reject(new DOMException('service workers are not supported here', 'NotSupportedError')); }
+      getRegistration() { return Promise.resolve(undefined); }
+      getRegistrations() { return Promise.resolve([]); }
+      startMessages() {}
+    })();
+    sw.oncontrollerchange = sw.onmessage = sw.onmessageerror = null;
+    Object.defineProperty(navigator, 'serviceWorker', { value: sw, configurable: true, enumerable: true });
+  }
+
+  // .text: a script's, a link's and a title's text (Bing runs its type="text/rms" blocks
+  // from it).
+  for (const name of ['HTMLScriptElement', 'HTMLAnchorElement', 'HTMLTitleElement'])
+    if (typeof global[name] === 'function' && !Object.getOwnPropertyDescriptor(global[name].prototype, 'text'))
+      Object.defineProperty(global[name].prototype, 'text', {
+        get() { return this.textContent; }, set(v) { this.textContent = String(v); }, configurable: true, enumerable: true,
+      });
+
+  // An <iframe>'s window, as a cross-origin one looks from outside: we don't run what's
+  // inside, so messages to it go nowhere, but scripts that post to it carry on.
+  if (typeof HTMLIFrameElement === 'function') {
+    const frames = new WeakMap();
+    Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {
+      get() {
+        if (!this.isConnected) return null;
+        let w = frames.get(this);
+        if (!w) {
+          const frame = this;
+          w = Object.freeze({
+            postMessage() {}, focus() {}, blur() {}, close() {},
+            addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
+            get closed() { return !frame.isConnected; },
+            get parent() { return global; }, get top() { return global; }, get opener() { return null; },
+            get frames() { return w; }, get self() { return w; }, get window() { return w; }, length: 0,
+            get location() { return { get href() { return frame.src || 'about:blank'; }, replace() {}, assign() {} }; },
+          });
+          frames.set(this, w);
+        }
+        return w;
+      },
+      configurable: true, enumerable: true,
+    });
+  }
 
   // Window: the global object's interface (window instanceof Window, Window.prototype).
   if (typeof global.Window !== 'function' && typeof EventTarget === 'function') {
@@ -1151,7 +1277,10 @@ const char* const kScriptPrelude = R"JS(
       const cache = Symbol(name);
       Object.defineProperty(C.prototype, name, { configurable: true, get() { return this[cache] || (this[cache] = plain.bind(this)); } });
     }
-    Object.assign(Intl, { NumberFormat, DateTimeFormat, RelativeTimeFormat, PluralRules, ListFormat, Collator, Segmenter, DisplayNames,
+    // These three may be called without new (Intl.DateTimeFormat().resolvedOptions()).
+    const callable = (C) => new Proxy(C, { apply(target, self, args) { return new target(...args); } });
+    Object.assign(Intl, { NumberFormat: callable(NumberFormat), DateTimeFormat: callable(DateTimeFormat), RelativeTimeFormat, PluralRules, ListFormat,
+                          Collator: callable(Collator), Segmenter, DisplayNames,
       getCanonicalLocales: l => [].concat(l || []).map(String), supportedValuesOf: () => [] });
     Object.defineProperty(Intl, Symbol.toStringTag, { value: 'Intl', configurable: true });
     // The library's locale-sensitive methods, through the same formats.

@@ -479,6 +479,7 @@ private:
     Value evalArray(Node* n, Env* env, bool strict);
     Value evalTemplate(Node* n, Env* env, bool strict);
     Value evalTagged(Node* n, Env* env, bool strict);
+    void here(const Node* n);
     std::vector<Value> evalArgs(const std::vector<Node*>& args, Env* env, bool strict);
     void assignPattern(Node* pattern, const Value& v, Env* env, bool strict);
     Value superBase(Env* env);
@@ -581,7 +582,12 @@ Object* Runtime::newError(const char* kind, const std::string& message) {
 void Runtime::throwError(const char* kind, const std::string& message) { throw Thrown{Value::object(newError(kind, message))}; }
 
 void Runtime::step() {
-    if (++steps_ > step_budget_) throw Terminated{"the script ran too long"};
+    // Where it was when stopped, to know which script (its stack line, without the "at").
+    if (++steps_ > step_budget_) {
+        std::string where = utf8(stackLine());
+        const size_t at = where.find("at ");
+        throw Terminated{"the script ran too long" + (at == std::string::npos ? std::string() : " (" + where.substr(at + 3) + ")")};
+    }
 }
 
 bool Runtime::isCallable(const Value& v) const {
@@ -1148,6 +1154,14 @@ Value Runtime::call(const Value& fnv, const Value& this_value, std::span<const V
         return proxyCall(*this, f, this_value, args);
     }
     if (f->native) {
+        // Called, not constructed: even inside a constructor's callback (a Promise
+        // executor calling String()), construct_target must not say otherwise.
+        struct Plain {
+            Object*& t;
+            Object* saved;
+            explicit Plain(Object*& target) : t(target), saved(target) { t = nullptr; }
+            ~Plain() { t = saved; }
+        } plain{construct_target};
         if (f->gc_safe) return f->native(*this, this_value, args);
         NoGc no_gc(*this);
         return f->native(*this, this_value, args);
@@ -1188,8 +1202,9 @@ Value Runtime::construct(const Value& fnv, std::span<const Value> args, Object* 
     if (f->native) {
         NoGc no_gc(*this);
         // A built-in constructor knows it's constructing by construct_target.
+        // Put back what it was after: constructors may be nested.
+        struct Reset { Object*& t; Object* saved; ~Reset() { t = saved; } } reset{construct_target, construct_target};
         construct_target = new_target;
-        struct Reset { Object*& t; ~Reset() { t = nullptr; } } reset{construct_target};
         return f->native(*this, Value::empty(), args);
     }
     Interpreter interp(*this, f->code->program);
@@ -2175,6 +2190,15 @@ void Interpreter::declare(Node* decl, Env* env, bool strict) {
     }
 }
 
+// The site errors are reported at: this node, in this interpreter's program.
+void Interpreter::here(const Node* n) {
+    ThrowSite& site = throwSite();
+    site.url = &prog_->url;
+    site.line_starts = &prog_->line_starts;
+    site.line = n->line;
+    site.offset = n->offset;
+}
+
 Completion Interpreter::exec(Node* n, Env* env, bool strict) {
     rt_.step();
     ThrowSite& site = throwSite();
@@ -2658,10 +2682,14 @@ Value Interpreter::eval(Node* n, Env* env, bool strict) {
             return acc;
         }
         case N::Member: {
-            if (n->a->kind == N::Super) return rt_.get(superObject(env), memberKey(n, env, strict), thisValue(env));
+            if (n->a->kind == N::Super) {
+                here(n);
+                return rt_.get(superObject(env), memberKey(n, env, strict), thisValue(env));
+            }
             const Value base = eval(n->a, env, strict);
-            throwSite().line = n->line;   // reading from it is what may fail here
-            throwSite().offset = n->offset;
+            // Reading from it is what may fail here; its program too, as evaluating the
+            // base may have run another's (a getter, a proxy's trap).
+            here(n);
             if ((n->flags & kOptional) && base.isNullish()) throw ShortCircuit{};
             return rt_.get(base, memberKey(n, env, strict));
         }
@@ -2673,10 +2701,10 @@ Value Interpreter::eval(Node* n, Env* env, bool strict) {
             }
         }
         case N::Call:
-            throwSite().line = n->line;
-            throwSite().offset = n->offset;
+            here(n);
             return evalCall(n, env, strict);
         case N::New:
+            here(n);
             throwSite().line = n->line;
             throwSite().offset = n->offset;
             return evalNew(n, env, strict);
@@ -3035,6 +3063,7 @@ Value Interpreter::evalCall(Node* n, Env* env, bool strict) {
             fn = rt_.get(superObject(env), memberKey(callee, env, strict), this_value);
         } else {
             this_value = eval(callee->a, env, strict);
+            here(callee);   // (evaluating it may have run another program)
             if ((callee->flags & kOptional) && this_value.isNullish()) throw ShortCircuit{};
             fn = rt_.get(this_value, memberKey(callee, env, strict));
         }
@@ -3042,6 +3071,7 @@ Value Interpreter::evalCall(Node* n, Env* env, bool strict) {
         try {
             Node* m = callee->a;
             this_value = eval(m->a, env, strict);
+            here(m);
             if ((m->flags & kOptional) && this_value.isNullish()) throw ShortCircuit{};
             fn = rt_.get(this_value, memberKey(m, env, strict));
         } catch (const ShortCircuit&) {
