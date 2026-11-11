@@ -552,3 +552,24 @@ TEST(Raster, RoundedCornersCutTheAlpha) {
     EXPECT_GT(edge, 200);
     EXPECT_EQ(at(img, 1, 1).a, 0);
 }
+
+TEST(Raster, FiltersChangeColoursAndBlurSpreads) {
+    Raster r;
+    r.width = 9;
+    r.height = 1;
+    r.rgba.assign(9 * 4, 0);
+    for (int i = 0; i < 9; ++i) r.rgba[i * 4 + 3] = 255;        // black, opaque
+    r.rgba[4 * 4] = 255;                                         // a red pixel in the middle
+    Raster inv = r;
+    applyFilters(inv, {Filter{Filter::Kind::Invert, 1}}, 1);
+    EXPECT_EQ(inv.rgba[0], 255);                                 // black turned white
+    EXPECT_EQ(inv.rgba[4 * 4], 0);                               // red turned cyan
+    EXPECT_EQ(inv.rgba[4 * 4 + 1], 255);
+    Raster grey = r;
+    applyFilters(grey, {Filter{Filter::Kind::Grayscale, 1}}, 1);
+    EXPECT_EQ(grey.rgba[4 * 4], grey.rgba[4 * 4 + 1]);          // red is grey now
+    Raster blurred = r;
+    applyFilters(blurred, {Filter{Filter::Kind::Blur, 1.5f}}, 1);
+    EXPECT_LT(blurred.rgba[4 * 4], 255);                         // the red spread out...
+    EXPECT_GT(blurred.rgba[3 * 4], 0);                           // ...to its neighbours
+}

@@ -210,6 +210,15 @@ int main(int argc, char** argv) {
                         r = &crop;
                     }
                 }
+                Raster filtered;
+                if (op.filter && !op.filter->empty() && op.w > 0 && op.h > 0) {
+                    // At the size it's shown, so a blur's radius means what it says.
+                    const auto pw = static_cast<uint32_t>(std::clamp(std::ceil(op.w), 1.0f, 4096.0f));
+                    const auto ph = static_cast<uint32_t>(std::clamp(std::ceil(op.h), 1.0f, 4096.0f));
+                    filtered = resampled(*r, pw, ph);
+                    applyFilters(filtered, *op.filter, static_cast<float>(pw) / op.w);
+                    r = &filtered;
+                }
                 Raster rounded;
                 if (raw.radius > 0 && raw.w > 0 && raw.h > 0) {
                     // At the size it's shown, so the edge is crisp.

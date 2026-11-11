@@ -108,6 +108,9 @@ private:
 
 // Rounded corners cut out of an image's alpha (radii in its pixels), antialiased.
 void roundCorners(Raster& image, float rx, float ry);
+// CSS filter functions applied to an image, in order. `scale`: its pixels per CSS px
+// (for blur radii).
+void applyFilters(Raster& image, const std::vector<Filter>& filters, float scale);
 // The image redrawn at this many pixels (bilinear).
 [[nodiscard]] Raster resampled(const Raster& image, uint32_t width, uint32_t height);
 

@@ -36,6 +36,12 @@ struct Length {
     static Length pixels(float v) noexcept { Length l; l.px = v; return l; }
 };
 
+// One function of a filter: list (filter: blur(4px) grayscale(1) ...).
+struct Filter {
+    enum class Kind : uint8_t { Blur, Brightness, Contrast, Grayscale, Invert, Opacity, Saturate, Sepia, HueRotate } kind;
+    float amount = 0;   // px for blur, degrees for hue-rotate, otherwise a fraction (1 = 100%)
+};
+
 enum class Display {
     None, Inline, Block, InlineBlock, ListItem, FlowRoot,
     Table, InlineTable, TableCaption, TableRowGroup, TableRow, TableCell, TableColumn,
@@ -258,6 +264,7 @@ struct ComputedStyle {
     Length radius[4][2];   // corners top-left, top-right, bottom-right, bottom-left; horizontal and vertical
     BorderStyle border_style[4] = {BorderStyle::None, BorderStyle::None, BorderStyle::None, BorderStyle::None};
     std::shared_ptr<const std::vector<BoxShadow>> box_shadow;   // first on top
+    std::shared_ptr<const std::vector<Filter>> filter;          // in order; null for none
     VerticalAlign vertical_align = VerticalAlign::Baseline;
     bool table_fixed = false;
     // Flexbox

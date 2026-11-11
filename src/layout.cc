@@ -3706,6 +3706,7 @@ private:
                 op.kind = PaintKind::Image;
                 op.text = *src;
                 op.color = faded(Color{255, 255, 255, 255}, opacity);
+                op.filter = s.filter;
                 fitPicture(op, s, cx, cy, b.width, b.height, *src);
                 if (op.w <= 0 || op.h <= 0) return;
                 // border-radius rounds the picture too: inside its border and padding (when

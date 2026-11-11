@@ -437,6 +437,74 @@ bool angleDegrees(const Token& t, float& out) {
     return std::isfinite(out);
 }
 
+static bool stopsAtFull(Filter::Kind k) {
+    return k == Filter::Kind::Grayscale || k == Filter::Kind::Invert || k == Filter::Kind::Opacity || k == Filter::Kind::Sepia;
+}
+
+// filter: none, or functions in order. False if any isn't understood (the declaration is
+// then dropped, as a browser does with what it can't parse; drop-shadow() we skip instead).
+bool filterFrom(const Tokens& v, size_t i, const LengthContext& c, std::vector<Filter>& out) {
+    skipWs(v, i);
+    if (i < v.size() && v[i].type == TokenType::Ident && lower(v[i].text) == "none") return true;
+    while (i < v.size()) {
+        if (v[i].type == TokenType::Whitespace) { ++i; continue; }
+        if (v[i].type != TokenType::Function) return false;
+        const std::string name = lower(v[i].text);
+        const size_t open = ++i;
+        int depth = 1;
+        while (i < v.size() && depth > 0) {
+            if (v[i].type == TokenType::Function || v[i].type == TokenType::LeftParen) ++depth;
+            else if (v[i].type == TokenType::RightParen) --depth;
+            ++i;
+        }
+        if (depth != 0) return false;
+        const size_t close = i - 1;
+        // The one argument, if there is one.
+        size_t a = open;
+        while (a < close && v[a].type == TokenType::Whitespace) ++a;
+        const bool none = a >= close;
+        using K = Filter::Kind;
+        Filter f{K::Blur, 0};
+        if (name == "drop-shadow" || name == "url") continue;   // not drawn
+        if (name == "blur") {
+            f.kind = K::Blur;
+            if (!none) {
+                Length l;
+                size_t k = a;
+                if (!lengthAt(v, k, c, l, false)) return false;
+                f.amount = std::max(0.0f, l.px);
+            }
+        } else if (name == "hue-rotate") {
+            f.kind = K::HueRotate;
+            if (!none) {
+                float deg = 0;
+                if (angleDegrees(v[a], deg)) f.amount = deg;
+                else if (v[a].type == TokenType::Number && v[a].number == 0) f.amount = 0;
+                else return false;
+            }
+        } else {
+            static const std::pair<const char*, K> kinds[] = {{"brightness", K::Brightness}, {"contrast", K::Contrast}, {"grayscale", K::Grayscale},
+                                                             {"invert", K::Invert}, {"opacity", K::Opacity}, {"saturate", K::Saturate},
+                                                             {"sepia", K::Sepia}};
+            bool known = false;
+            for (const auto& [n, k] : kinds)
+                if (name == n) { f.kind = k; known = true; }
+            if (!known) return false;
+            f.amount = 1;
+            if (!none) {
+                if (v[a].type == TokenType::Number) f.amount = static_cast<float>(v[a].number);
+                else if (v[a].type == TokenType::Percentage) f.amount = static_cast<float>(v[a].number) / 100.0f;
+                else return false;
+                if (f.amount < 0) return false;
+                // These stop at 100%.
+                if (stopsAtFull(f.kind)) f.amount = std::min(f.amount, 1.0f);
+            }
+        }
+        if (out.size() < 32) out.push_back(f);
+    }
+    return true;
+}
+
 bool transformShift(const Tokens& v, size_t i, const LengthContext& c, Length out[2], float linear[4]) {
     Length x, y;
     float m[4] = {1, 0, 0, 1};
@@ -2838,6 +2906,7 @@ private:
         else if (p == "object-position") { to.object_x = from.object_x; to.object_y = from.object_y; }
         else if (p == "box-shadow") to.box_shadow = from.box_shadow;
         else if (p == "z-index") to.z_index = from.z_index;
+        else if (p == "filter") to.filter = from.filter;
         else if (p == "transform") {
             to.transform_shift[0] = from.transform_shift[0];
             to.transform_shift[1] = from.transform_shift[1];
@@ -3170,6 +3239,11 @@ private:
         if (p == "bottom") { oneLength(s.offset[Bottom], true); return; }
         if (p == "left") { oneLength(s.offset[Left], true); return; }
         if (p == "transform") { (void)transformShift(v, i, c, s.transform_shift, s.transform_linear); return; }
+        if (p == "filter") {
+            std::vector<Filter> fs;
+            if (filterFrom(v, i, c, fs)) s.filter = fs.empty() ? nullptr : std::make_shared<const std::vector<Filter>>(std::move(fs));
+            return;
+        }
         if (p == "rotate") {
             size_t k = i;
             skipWs(v, k);

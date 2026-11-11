@@ -467,3 +467,23 @@ TEST(Pseudo, PlaceholderHasItsOwnStyle) {
     EXPECT_EQ(styles.placeholderOf(byId("c"))->color.r, 0x75);   // the UA's grey stays
     EXPECT_EQ(styles.placeholderOf(byId("d")), nullptr);          // no placeholder, no style
 }
+
+TEST(Filter, FunctionsInOrder) {
+    const auto s = style("<div id=a style='filter: blur(6px) grayscale(50%) invert() hue-rotate(90deg) brightness(2)'></div>"
+                         "<div id=b style='filter: none'></div><div id=c style='filter: blur(2px) nonsense(1)'></div>"
+                         "<div id=d style='filter: drop-shadow(0 0 2px red) sepia(3)'></div>");
+    const auto& a = s.of("a");
+    ASSERT_TRUE(a.filter);
+    ASSERT_EQ(a.filter->size(), 5u);
+    EXPECT_EQ((*a.filter)[0].kind, Filter::Kind::Blur);
+    EXPECT_FLOAT_EQ((*a.filter)[0].amount, 6);
+    EXPECT_FLOAT_EQ((*a.filter)[1].amount, 0.5f);
+    EXPECT_FLOAT_EQ((*a.filter)[2].amount, 1);
+    EXPECT_FLOAT_EQ((*a.filter)[3].amount, 90);
+    EXPECT_FLOAT_EQ((*a.filter)[4].amount, 2);   // brightness may go past 100%
+    EXPECT_FALSE(s.of("b").filter);
+    EXPECT_FALSE(s.of("c").filter);               // a function it doesn't know drops the declaration
+    ASSERT_TRUE(s.of("d").filter);
+    ASSERT_EQ(s.of("d").filter->size(), 1u);      // drop-shadow skipped; sepia clamped
+    EXPECT_FLOAT_EQ((*s.of("d").filter)[0].amount, 1);
+}

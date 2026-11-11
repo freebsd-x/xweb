@@ -392,6 +392,123 @@ void Canvas::drawRaster(const Raster& image, const Matrix& to_canvas, float opac
     }
 }
 
+namespace {
+
+// One pass of a box blur along rows (or columns), `r` pixels each side, on premultiplied
+// floats; what's beyond the edge is transparent.
+void boxBlur(std::vector<float>& px, uint32_t w, uint32_t h, int r, bool rows) {
+    if (r <= 0) return;
+    const uint32_t len = rows ? w : h, count = rows ? h : w;
+    std::vector<float> line(static_cast<size_t>(len) * 4), out(static_cast<size_t>(len) * 4);
+    const float inv = 1.0f / static_cast<float>(2 * r + 1);
+    for (uint32_t k = 0; k < count; ++k) {
+        const auto at = [&](uint32_t i) { return (rows ? (static_cast<size_t>(k) * w + i) : (static_cast<size_t>(i) * w + k)) * 4; };
+        for (uint32_t i = 0; i < len; ++i)
+            for (int c = 0; c < 4; ++c) line[i * 4 + c] = px[at(i) + c];
+        float sum[4] = {0, 0, 0, 0};
+        for (int i = -r; i <= r; ++i)
+            if (i >= 0 && static_cast<uint32_t>(i) < len)
+                for (int c = 0; c < 4; ++c) sum[c] += line[static_cast<size_t>(i) * 4 + c];
+        for (uint32_t i = 0; i < len; ++i) {
+            for (int c = 0; c < 4; ++c) out[i * 4 + c] = sum[c] * inv;
+            const int64_t leave = static_cast<int64_t>(i) - r, enter = static_cast<int64_t>(i) + r + 1;
+            for (int c = 0; c < 4; ++c) {
+                if (leave >= 0) sum[c] -= line[static_cast<size_t>(leave) * 4 + c];
+                if (enter < static_cast<int64_t>(len)) sum[c] += line[static_cast<size_t>(enter) * 4 + c];
+            }
+        }
+        for (uint32_t i = 0; i < len; ++i)
+            for (int c = 0; c < 4; ++c) px[at(i) + c] = out[i * 4 + c];
+    }
+}
+
+void blurImage(Raster& image, float sigma) {
+    const uint32_t w = image.width, h = image.height;
+    if (sigma < 0.5f || w == 0 || h == 0) return;
+    // Three box blurs of this width come close to a Gaussian (the SVG spec's recipe).
+    const int d = std::max(1, static_cast<int>(std::floor(sigma * 3 * std::sqrt(2 * 3.14159265f) / 4 + 0.5f)));
+    const int r = std::min(d / 2, 2000);
+    std::vector<float> px(static_cast<size_t>(w) * h * 4);
+    for (size_t i = 0; i < px.size(); i += 4) {
+        const float a = image.rgba[i + 3] / 255.0f;
+        px[i] = image.rgba[i] / 255.0f * a;
+        px[i + 1] = image.rgba[i + 1] / 255.0f * a;
+        px[i + 2] = image.rgba[i + 2] / 255.0f * a;
+        px[i + 3] = a;
+    }
+    for (int pass = 0; pass < 3; ++pass) {
+        boxBlur(px, w, h, r, true);
+        boxBlur(px, w, h, r, false);
+    }
+    for (size_t i = 0; i < px.size(); i += 4) {
+        const float a = std::clamp(px[i + 3], 0.0f, 1.0f);
+        for (int c = 0; c < 3; ++c) image.rgba[i + c] = a > 0 ? static_cast<uint8_t>(std::lround(std::clamp(px[i + c] / a, 0.0f, 1.0f) * 255)) : 0;
+        image.rgba[i + 3] = static_cast<uint8_t>(std::lround(a * 255));
+    }
+}
+
+}  // namespace
+
+void applyFilters(Raster& image, const std::vector<Filter>& filters, float scale) {
+    using K = Filter::Kind;
+    for (const Filter& f : filters) {
+        if (f.kind == K::Blur) {
+            blurImage(image, f.amount * scale);
+            continue;
+        }
+        // A colour matrix (rows: r, g, b) and an offset, on straight colour; or alpha.
+        float m[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+        float add = 0, alpha = 1;
+        const float a = f.amount;
+        switch (f.kind) {
+            case K::Brightness: for (int i = 0; i < 3; ++i) m[i][i] = a; break;
+            case K::Contrast: for (int i = 0; i < 3; ++i) m[i][i] = a; add = 0.5f - 0.5f * a; break;
+            case K::Invert: for (int i = 0; i < 3; ++i) m[i][i] = 1 - 2 * a; add = a; break;
+            case K::Opacity: alpha = a; break;
+            case K::Grayscale: {
+                const float k = 1 - a;
+                const float g[3][3] = {{0.2126f + 0.7874f * k, 0.7152f - 0.7152f * k, 0.0722f - 0.0722f * k},
+                                       {0.2126f - 0.2126f * k, 0.7152f + 0.2848f * k, 0.0722f - 0.0722f * k},
+                                       {0.2126f - 0.2126f * k, 0.7152f - 0.7152f * k, 0.0722f + 0.9278f * k}};
+                std::memcpy(m, g, sizeof m);
+                break;
+            }
+            case K::Sepia: {
+                const float k = 1 - a;
+                const float g[3][3] = {{0.393f + 0.607f * k, 0.769f - 0.769f * k, 0.189f - 0.189f * k},
+                                       {0.349f - 0.349f * k, 0.686f + 0.314f * k, 0.168f - 0.168f * k},
+                                       {0.272f - 0.272f * k, 0.534f - 0.534f * k, 0.131f + 0.869f * k}};
+                std::memcpy(m, g, sizeof m);
+                break;
+            }
+            case K::Saturate: {
+                const float g[3][3] = {{0.213f + 0.787f * a, 0.715f - 0.715f * a, 0.072f - 0.072f * a},
+                                       {0.213f - 0.213f * a, 0.715f + 0.285f * a, 0.072f - 0.072f * a},
+                                       {0.213f - 0.213f * a, 0.715f - 0.715f * a, 0.072f + 0.928f * a}};
+                std::memcpy(m, g, sizeof m);
+                break;
+            }
+            case K::HueRotate: {
+                const float rad = a * 3.14159265f / 180, c = std::cos(rad), s = std::sin(rad);
+                const float g[3][3] = {{0.213f + c * 0.787f - s * 0.213f, 0.715f - c * 0.715f - s * 0.715f, 0.072f - c * 0.072f + s * 0.928f},
+                                       {0.213f - c * 0.213f + s * 0.143f, 0.715f + c * 0.285f + s * 0.140f, 0.072f - c * 0.072f - s * 0.283f},
+                                       {0.213f - c * 0.213f - s * 0.787f, 0.715f - c * 0.715f + s * 0.715f, 0.072f + c * 0.928f + s * 0.072f}};
+                std::memcpy(m, g, sizeof m);
+                break;
+            }
+            case K::Blur: break;
+        }
+        for (size_t i = 0; i + 3 < image.rgba.size(); i += 4) {
+            const float in[3] = {image.rgba[i] / 255.0f, image.rgba[i + 1] / 255.0f, image.rgba[i + 2] / 255.0f};
+            for (int r = 0; r < 3; ++r) {
+                const float v = m[r][0] * in[0] + m[r][1] * in[1] + m[r][2] * in[2] + add;
+                image.rgba[i + r] = static_cast<uint8_t>(std::lround(std::clamp(v, 0.0f, 1.0f) * 255));
+            }
+            if (alpha != 1) image.rgba[i + 3] = static_cast<uint8_t>(std::lround(image.rgba[i + 3] * alpha));
+        }
+    }
+}
+
 Raster resampled(const Raster& image, uint32_t width, uint32_t height) {
     if (image.width == width && image.height == height) return image;
     Canvas c(width, height);

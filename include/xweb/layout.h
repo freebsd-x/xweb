@@ -60,6 +60,7 @@ struct PaintOp {
     float radius = 0;      // Rect: rounded corners. Image: its corners' horizontal radius
     float radius_y = 0;    // Image: their vertical radius
     float u0 = 0, v0 = 0, u1 = 1, v1 = 1;   // Image: the part of the picture shown (object-fit cover crops)
+    std::shared_ptr<const std::vector<Filter>> filter;   // Image: its CSS filter
     std::string text;      // Text: the run. Image: its source.
     FontSpec font;
     bool tint = false;     // Image: only its alpha, in `color` (a mask over a background colour)

@@ -1048,13 +1048,17 @@ private:
         const LoadedImage* loaded = images_.find(op.text);
         if (!loaded) return;
         const bool cropped = op.u0 > 0 || op.v0 > 0 || op.u1 < 1 || op.v1 < 1;
-        if (loaded->svg || op.tint || op.radius > 0 || (cropped && group_)) {
+        const bool filtered = op.filter && !op.filter->empty();
+        if (loaded->svg || op.tint || op.radius > 0 || filtered || (cropped && group_)) {
             // Drawn for this size (an SVG), or only its alpha in a colour (a mask).
             // An SVG, or rounded corners, at the size shown; a mask at the image's own.
-            const auto [pw, ph] = loaded->svg || op.radius > 0 ? rasterSize(op.w, op.h) : std::pair<uint32_t, uint32_t>{loaded->width, loaded->height};
+            const auto [pw, ph] = loaded->svg || op.radius > 0 || filtered ? rasterSize(op.w, op.h) : std::pair<uint32_t, uint32_t>{loaded->width, loaded->height};
             char ptr[32];
             std::snprintf(ptr, sizeof ptr, "%p", static_cast<const void*>(loaded));
-            const std::string crop_key = cropped ? ":c" + std::to_string(op.u0) + "," + std::to_string(op.v0) + "," + std::to_string(op.u1) + "," + std::to_string(op.v1) : "";
+            std::string filter_key;
+            if (filtered)
+                for (const web::Filter& f : *op.filter) filter_key += ":f" + std::to_string(static_cast<int>(f.kind)) + "=" + std::to_string(f.amount);
+            const std::string crop_key = filter_key + (cropped ? ":c" + std::to_string(op.u0) + "," + std::to_string(op.v0) + "," + std::to_string(op.u1) + "," + std::to_string(op.v1) : std::string());
             const std::string key = std::string("i:") + ptr + ":" + std::to_string(pw) + "x" + std::to_string(ph) + crop_key + (op.tint ? ":" + colorKey(op.color) : "") +
                                     (op.radius > 0 ? ":r" + std::to_string(op.radius) + "," + std::to_string(op.radius_y) + "@" + std::to_string(op.w) + "x" + std::to_string(op.h) : "");
             const bool tint = op.tint;
@@ -1079,6 +1083,7 @@ private:
                     out = croppedTo(std::move(out), op);
                     if (out.width != pw || out.height != ph) out = web::resampled(out, pw, ph);
                 }
+                if (filtered && shown_w > 0) web::applyFilters(out, *op.filter, static_cast<float>(out.width) / shown_w);
                 if (rx > 0 && shown_w > 0 && shown_h > 0)
                     web::roundCorners(out, rx * static_cast<float>(out.width) / shown_w, ry * static_cast<float>(out.height) / shown_h);
                 if (tint)
