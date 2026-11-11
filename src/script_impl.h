@@ -797,6 +797,18 @@ struct PageScript::Impl {
 
     Value browserFetch(Args a);   // script_fetch.cc
 
+    // 2D canvases (script_canvas.cc): each <canvas> a script drew on, its pixels and clip.
+    struct CanvasSurface {
+        std::unique_ptr<Canvas> pixels;
+        std::unique_ptr<Canvas> clip;   // coverage in its alpha; none: no clip
+        uint64_t version = 1;
+        mutable std::shared_ptr<const Raster> shown;   // pixels as a Raster, made when asked
+        mutable uint64_t shown_version = 0;
+    };
+    std::unordered_map<const Node*, std::unique_ptr<CanvasSurface>> canvases;
+    CanvasSurface& surfaceOf(Node* canvas);
+    void installCanvas();
+
     void install();
     void installNode();
     void installElement();

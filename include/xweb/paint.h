@@ -92,6 +92,11 @@ public:
     static Canvas coverage(uint32_t width, uint32_t height, const Contours& contours, bool even_odd);
     // A mask from coverage values, one per pixel.
     static Canvas fromAlpha(uint32_t width, uint32_t height, const std::vector<float>& alpha);
+    // Pixels set outright (no blending), for a 2D canvas's clearRect and image data;
+    // the parts outside the canvas are left out.
+    void clearRect(int x, int y, int w, int h);
+    [[nodiscard]] Raster readRect(int x, int y, int w, int h) const;
+    void writeRect(const Raster& image, int dx, int dy);
 
     void setClip(float x, float y, float w, float h);
     void resetClip();

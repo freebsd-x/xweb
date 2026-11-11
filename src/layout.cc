@@ -3697,6 +3697,22 @@ private:
         const float cx = x + b.border[Left] + b.padding[Left];
         const float cy = y + b.border[Top] + b.padding[Top];
         const Node* n = b.node;
+        // A <canvas>: what its scripts drew, which whoever draws the page asks them for.
+        if (n->isHtml("canvas")) {
+            if (b.width <= 0 || b.height <= 0) return;
+            PaintOp op;
+            op.kind = PaintKind::Image;
+            op.text = kCanvasSource;
+            op.node = n;
+            op.x = cx;
+            op.y = cy;
+            op.w = b.width;
+            op.h = b.height;
+            op.color = faded(Color{255, 255, 255, 255}, opacity);
+            op.filter = s.filter;
+            out_->ops.push_back(std::move(op));
+            return;
+        }
         // A picture: an <img>'s source, or a <video>'s poster (all of a video we show).
         const bool is_img = n->isHtml("img");
         if (is_img || n->isHtml("video")) {

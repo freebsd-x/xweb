@@ -53,6 +53,9 @@ enum class PaintKind {
     TransformBegin, TransformEnd,
 };
 
+// An Image op's source when it's a <canvas> (op.node): its pixels are the page script's.
+inline constexpr const char* kCanvasSource = "xweb:canvas";
+
 struct PaintOp {
     PaintKind kind = PaintKind::Rect;
     float x = 0, y = 0, w = 0, h = 0;

@@ -791,3 +791,20 @@ TEST(Script, MoreReflectedAttributes) {
         </script>)");
     EXPECT_EQ(p.console, "log:GB anonymous no-referrer null true\n") << p.console;
 }
+
+TEST(Script, Canvas2dDrawsPixels) {
+    Page p(R"(<body><canvas id=c width=20 height=10></canvas><script>
+        const c = document.getElementById('c'), x = c.getContext('2d');
+        x.fillStyle = '#ff0000';
+        x.fillRect(0, 0, 10, 10);
+        x.save(); x.translate(10, 0); x.fillStyle = 'rgb(0, 0, 255)'; x.beginPath(); x.rect(0, 0, 10, 10); x.fill(); x.restore();
+        x.clearRect(0, 0, 2, 2);
+        const px = (X, Y) => Array.from(x.getImageData(X, Y, 1, 1).data).join(',');
+        const g = x.createLinearGradient(0, 0, 20, 0); g.addColorStop(0, 'black'); g.addColorStop(1, 'white');
+        const img = x.createImageData(1, 1); img.data.set([1, 2, 3, 255]); x.putImageData(img, 19, 9);
+        const p2 = new Path2D('M0 0 L4 0 L4 4 Z');
+        console.log(px(5, 5), px(15, 5), px(0, 0), px(19, 9), c.toDataURL().slice(0, 22), x.isPointInPath(p2, 3, 1), x.isPointInPath(p2, 1, 3),
+                    c.getContext('2d') === x, c.getContext('webgl'), x.measureText('ab').width > 0, c.width, c.height);
+        </script>)");
+    EXPECT_EQ(p.console, "log:255,0,0,255 0,0,255,255 0,0,0,0 1,2,3,255 data:image/png;base64, true false true null true 20 10\n") << p.console;
+}

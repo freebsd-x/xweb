@@ -564,6 +564,55 @@ void Canvas::composite(const Canvas& layer, float opacity, const Canvas* mask) {
         }
 }
 
+void Canvas::clearRect(int x, int y, int w, int h) {
+    const int x0 = std::max(0, x), y0 = std::max(0, y);
+    const int x1 = std::min<int64_t>(width_, static_cast<int64_t>(x) + w), y1 = std::min<int64_t>(height_, static_cast<int64_t>(y) + h);
+    for (int row = y0; row < y1; ++row)
+        for (int col = x0; col < x1; ++col) std::memset(&px_[(static_cast<size_t>(row) * width_ + col) * 4], 0, 4 * sizeof(float));
+}
+
+Raster Canvas::readRect(int x, int y, int w, int h) const {
+    Raster r;
+    r.width = static_cast<uint32_t>(std::max(0, w));
+    r.height = static_cast<uint32_t>(std::max(0, h));
+    r.rgba.assign(static_cast<size_t>(r.width) * r.height * 4, 0);
+    for (uint32_t row = 0; row < r.height; ++row) {
+        const int64_t sy = static_cast<int64_t>(y) + row;
+        if (sy < 0 || sy >= height_) continue;
+        for (uint32_t col = 0; col < r.width; ++col) {
+            const int64_t sx = static_cast<int64_t>(x) + col;
+            if (sx < 0 || sx >= width_) continue;
+            const float* p = &px_[(static_cast<size_t>(sy) * width_ + static_cast<size_t>(sx)) * 4];
+            uint8_t* o = &r.rgba[(static_cast<size_t>(row) * r.width + col) * 4];
+            const float a = p[3];
+            if (a <= 0) continue;
+            o[0] = toByte(p[0] / a);
+            o[1] = toByte(p[1] / a);
+            o[2] = toByte(p[2] / a);
+            o[3] = toByte(a);
+        }
+    }
+    return r;
+}
+
+void Canvas::writeRect(const Raster& image, int dx, int dy) {
+    for (uint32_t row = 0; row < image.height; ++row) {
+        const int64_t ty = static_cast<int64_t>(dy) + row;
+        if (ty < 0 || ty >= height_) continue;
+        for (uint32_t col = 0; col < image.width; ++col) {
+            const int64_t tx = static_cast<int64_t>(dx) + col;
+            if (tx < 0 || tx >= width_) continue;
+            const uint8_t* i = &image.rgba[(static_cast<size_t>(row) * image.width + col) * 4];
+            float* p = &px_[(static_cast<size_t>(ty) * width_ + static_cast<size_t>(tx)) * 4];
+            const float a = i[3] / 255.0f;
+            p[0] = i[0] / 255.0f * a;
+            p[1] = i[1] / 255.0f * a;
+            p[2] = i[2] / 255.0f * a;
+            p[3] = a;
+        }
+    }
+}
+
 Raster Canvas::toRaster() const {
     Raster r;
     r.width = width_;

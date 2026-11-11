@@ -451,6 +451,7 @@ public:
         page_ = std::move(page);
         images_.setPage(page_.get());
         rasters_.clear();
+        canvas_images_.clear();   // another page's nodes
         dirty_ = true;
     }
     void invalidate() { dirty_ = true; }
@@ -1027,6 +1028,24 @@ private:
         if (const CachedRaster* r = cached(key, [&, pw = pw, ph = ph] { return web::renderSvg(*node, pw, ph, styles, color); })) drawRaster(dl, *r, x, y, op.w, op.h);
     }
 
+    // A <canvas>'s pixels as its scripts left them: a new image (a new texture) each
+    // time they change, the old one let go when it's no longer drawn.
+    const LoadedImage* canvasImage(const web::Node* canvas) {
+        if (!page_ || !page_->script || !canvas) return nullptr;
+        uint64_t version = 0;
+        const std::shared_ptr<const web::Raster> raster = page_->script->canvasImage(canvas, version);
+        if (!raster || raster->empty()) return nullptr;
+        auto& [shown_version, image] = canvas_images_[canvas];
+        if (shown_version != version || image.width == 0) {
+            shown_version = version;
+            image.pixels = raster->rgba;
+            image.width = raster->width;
+            image.height = raster->height;
+            image.id = nextImageId();
+        }
+        return &image;
+    }
+
     // The part of a picture's pixels an op shows (object-fit: cover crops).
     static web::Raster croppedTo(web::Raster in, const web::PaintOp& op) {
         if (op.u0 <= 0 && op.v0 <= 0 && op.u1 >= 1 && op.v1 >= 1) return in;
@@ -1045,7 +1064,7 @@ private:
     }
 
     void image(fbx::xrender::DisplayList& dl, const web::PaintOp& op, float x, float y) {
-        const LoadedImage* loaded = images_.find(op.text);
+        const LoadedImage* loaded = op.text == web::kCanvasSource ? canvasImage(op.node) : images_.find(op.text);
         if (!loaded) return;
         const bool cropped = op.u0 > 0 || op.v0 > 0 || op.u1 < 1 || op.v1 < 1;
         const bool filtered = op.filter && !op.filter->empty();
@@ -1214,6 +1233,7 @@ private:
     uint64_t layout_gen_ = 0;
 
     std::shared_ptr<Page> page_;
+    std::unordered_map<const web::Node*, std::pair<uint64_t, LoadedImage>> canvas_images_;
     std::function<void(const std::shared_ptr<Page>&, std::vector<web::WebFontFace>)> on_fonts_;
     std::function<void(const std::shared_ptr<Page>&, std::vector<std::string>)> on_images_;
     std::unique_ptr<web::StyledDocument> styles_;   // the last layout's, which inline SVG is drawn with

@@ -14,6 +14,7 @@
 
 #include "xweb/dom.h"
 #include "xweb/forms.h"
+#include "xweb/paint.h"
 
 namespace fbx::xweb {
 
@@ -100,6 +101,9 @@ public:
     bool takeDirty();
     // The same, without forgetting it (a script asking where something is now).
     [[nodiscard]] bool dirty() const;
+    // A <canvas>'s pixels as its scripts drew them, and a number that changes whenever
+    // they do (null: nothing was drawn on it).
+    [[nodiscard]] std::shared_ptr<const Raster> canvasImage(const Node* canvas, uint64_t& version) const;
 
 private:
     struct Impl;

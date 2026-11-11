@@ -1568,6 +1568,7 @@ void PageScript::Impl::install() {
     installDocument();
     installWindow();
     installDom();
+    installCanvas();
     // What's written in JavaScript itself (URL, URLSearchParams).
     const Runtime::Result prelude = rt.evaluate(kScriptPrelude, "prelude");
     if (!prelude.ok) report("the script prelude failed: " + prelude.error);
