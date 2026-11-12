@@ -759,3 +759,13 @@ TEST(Js, WithStatement) {
               "1,2,true,number,5,3,outer,mine");
     EXPECT_EQ(run("'use strict'; with ({}) {}"), "throws: SyntaxError: with isn't allowed in strict mode (line 1)");
 }
+
+TEST(Js, ARegexMayFollowAStatementsClosingBrace) {
+    // Minified code: function f(){...}/^loade|c/.test(document.readyState) (Twitter's
+    // widgets.js, Tistory). After an expression's } it still divides.
+    EXPECT_EQ(run("var out = []; function f(){}/a/.test('a') && out.push(1); {}/b/g.test('b') && out.push(2);"
+                  "class C{}/c/.test('c') && out.push(3); switch (1) {}/d/.test('d') && out.push(4);"
+                  "var h = function(){ return 3 }/2; out.push(typeof h, ({}).x/1);"
+                  "out.join()"),
+              "1,2,3,4,number,NaN");
+}

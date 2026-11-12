@@ -723,8 +723,11 @@ struct PageScript::Impl {
         current_script = s;
         const Runtime::Result r = rt.evaluate(code, name);
         if (!r.ok) report(r.error + (r.where.empty() ? " (" + name + ")" : r.where));
-        current_script = saved;
+        // The microtask checkpoint is part of running the script, before currentScript is
+        // put back: what a script's promises do next still sees it (Turbopack's runtime
+        // awaits its chunks, then reads currentScript; Next.js stopped there).
         drainMicrotasks();
+        current_script = saved;
         if (s->attr("src")) fire(s, u"load", false, false);
     }
 

@@ -931,3 +931,79 @@ TEST(Script, QuerySelectorKnowsHas) {
         </script>)");
     EXPECT_EQ(p.console, "log:1 1 true 1\n") << p.console;
 }
+
+TEST(Script, AScriptsPromisesStillSeeItAsCurrent) {
+    // The microtask checkpoint comes before currentScript is restored (Turbopack's
+    // runtime awaits, then asks for document.currentScript.src).
+    Page p(R"(<body><script id=s>
+        Promise.resolve().then(() => console.log(document.currentScript && document.currentScript.id));
+        setTimeout(() => console.log(document.currentScript));
+        </script>)");
+    p.script->tick();
+    EXPECT_EQ(p.console, "log:s\nlog:null\n") << p.console;
+}
+
+TEST(Script, ReadableStreamsRead) {
+    // X's server-rendered data comes as new ReadableStream({ start(controller) { ... } }).
+    Page p(R"(<body><script>
+        const out = [];
+        const s = new ReadableStream({ start(c) { c.enqueue(1); c.enqueue(2); c.close(); } });
+        (async () => {
+          for await (const v of s) out.push(v);
+          let n = 0;
+          const pulled = new ReadableStream({ pull(c) { if (++n > 3) c.close(); else c.enqueue(n * 10); } });
+          const [a, b] = pulled.tee();
+          const ra = a.getReader();
+          let r;
+          while (!(r = await ra.read()).done) out.push(r.value);
+          const t = new TransformStream({ transform(ch, c) { c.enqueue(ch + 1); } });
+          const piped = b.pipeThrough(t).getReader();
+          while (!(r = await piped.read()).done) out.push(r.value);
+          const e = new ReadableStream({ start(c) { c.error(new Error('x')); } });
+          try { await e.getReader().read(); } catch (err) { out.push(err.message); }
+          console.log(out.join(), s.locked, typeof performance.setResourceTimingBufferSize);
+        })();
+        </script>)");
+    for (int i = 0; i < 5; ++i) p.script->tick();
+    EXPECT_EQ(p.console, "log:1,2,10,20,30,11,21,31,x false function\n") << p.console;
+}
+
+TEST(Script, OnHandlersRunOnce) {
+    // Angular's $httpBackend nulls its request in onload: a second call threw.
+    Page p(R"(<body><script>
+        let aborts = 0, messages = 0;
+        const c = new AbortController();
+        c.signal.onabort = () => aborts++;
+        c.abort();
+        const a = new BroadcastChannel('t'), b = new BroadcastChannel('t');
+        b.onmessage = () => messages++;
+        a.postMessage(1);
+        setTimeout(() => setTimeout(() => console.log(aborts, messages)));
+        </script>)");
+    for (int i = 0; i < 5; ++i) p.script->tick();
+    EXPECT_EQ(p.console, "log:1 1\n") << p.console;
+}
+
+TEST(Script, ResponseBodiesAreStreamsAndSelectionIsThere) {
+    // Tistory (Next.js) reads responses with body.getReader() and asks getSelection().
+    Page p(R"(<body><script>
+        (async () => {
+          const r = new Response('hey');
+          const reader = r.body.getReader();
+          const first = await reader.read(), end = await reader.read();
+          const sel = getSelection();
+          sel.removeAllRanges();
+          console.log(new TextDecoder().decode(first.value), end.done, r.bodyUsed, new Response(null).body,
+                      sel.rangeCount, String(sel), document.getSelection() === sel);
+        })();
+        </script>)");
+    for (int i = 0; i < 5; ++i) p.script->tick();
+    EXPECT_EQ(p.console, "log:hey true true null 0  true\n") << p.console;
+}
+
+TEST(Script, DatasetIsADOMStringMap) {
+    Page p(R"(<body data-x-y=1><script>
+        console.log(document.body.dataset instanceof DOMStringMap, document.body.dataset.xY);
+        </script>)");
+    EXPECT_EQ(p.console, "log:true 1\n") << p.console;
+}

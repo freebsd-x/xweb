@@ -99,6 +99,19 @@ private:
         advance();
     }
 
+    // After a } that ends a statement (a block, a function or class declaration, a
+    // switch), a / starts a regex: `function f(){}/re/.test(s)`. The token after it was
+    // read as a division; read it again.
+    void slashStartsRegex() {
+        if (cur_.type != Tok::Punct || (cur_.value != u"/" && cur_.value != u"/=")) return;
+        const bool newline = cur_.newline_before;
+        lex_.reset(cur_.begin, cur_.line);
+        cur_ = lex_.next(true);
+        cur_.newline_before = newline;
+        p_.make_offset = cur_.begin;
+        if (cur_.type == Tok::Eof && !lex_.error.empty()) fail(lex_.error);
+    }
+
     Token peek() {
         const size_t pos = lex_.pos();
         const uint32_t line = lex_.line();
@@ -658,6 +671,7 @@ private:
         }
         popScope();
         advance();
+        slashStartsRegex();
         if (!lexical->empty()) n->lexical = lexical;
         return n;
     }
@@ -841,6 +855,7 @@ private:
             n->kids.push_back(c);
         }
         popScope();
+        slashStartsRegex();
         if (!lexical->empty()) n->lexical = lexical;
         return n;
     }
@@ -877,6 +892,7 @@ private:
         } else if (!strict_) {
             addVar(n->str);   // and visible to the function, as browsers do (Annex B; not in strict code)
         }
+        slashStartsRegex();
         return n;
     }
 
@@ -1041,6 +1057,7 @@ private:
         addLexical(n->str);
         advance();
         classTail(n, begin);
+        slashStartsRegex();
         return n;
     }
 

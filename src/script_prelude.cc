@@ -268,9 +268,7 @@ const char* const kScriptPrelude = R"JS(
       if (st.aborted) return;
       st.aborted = true;
       st.reason = reason === undefined ? domException('signal is aborted without reason', 'AbortError') : reason;
-      const e = new Event('abort');
-      if (typeof this.onabort === 'function') { try { this.onabort.call(this, e); } catch (err) { console.error(err); } }
-      this.dispatchEvent(e);
+      this.dispatchEvent(new Event('abort'));   // (its onabort too)
     }
     static abort(reason) { const s = new AbortSignal(signalState); s._abort(reason); return s; }
     static timeout(ms) {
@@ -546,6 +544,23 @@ const char* const kScriptPrelude = R"JS(
   const bodyData = Symbol('body');
   class Body {
     get bodyUsed() { return this._used === true; }
+    // The body as a stream (Next.js reads its responses with body.getReader()): all of it in
+    // one chunk, the body used once it's read.
+    get body() {
+      if (this[bodyData] === null || this[bodyData] === undefined) return null;
+      if (!this._stream) {
+        const self = this;
+        this._stream = new ReadableStream({
+          pull(c) {
+            const data = self[bodyData] || new Uint8Array(0);
+            self._used = true;
+            if (data.length) c.enqueue(data.slice());
+            c.close();
+          },
+        }, { highWaterMark: 0 });
+      }
+      return this._stream;
+    }
     _take() {
       if (this._used) return Promise.reject(new TypeError('the body has already been read'));
       this._used = true;
@@ -638,12 +653,9 @@ const char* const kScriptPrelude = R"JS(
       this._headers = new Headers(); this._response = null; this._type = '';
       for (const n of ['onreadystatechange', 'onload', 'onerror', 'onabort', 'onloadend', 'onloadstart', 'onprogress', 'ontimeout']) this[n] = null;
     }
-    _fire(type) {
-      const e = new Event(type);
-      const h = this['on' + type];
-      if (typeof h === 'function') { try { h.call(this, e); } catch (err) { console.error(err); } }
-      this.dispatchEvent(e);
-    }
+    // (dispatchEvent calls the on<type> property too: calling it here as well ran
+    // Angular's onload twice, the second time after it had let go of the request.)
+    _fire(type) { this.dispatchEvent(new Event(type)); }
     _state(n) { this.readyState = n; this._fire('readystatechange'); }
     open(method, url, async = true) {
       this._method = String(method).toUpperCase(); this._url = new URL(String(url), document.baseURI).href;
@@ -883,6 +895,9 @@ const char* const kScriptPrelude = R"JS(
     perf.getEntries = () => all();
     perf.getEntriesByType = t => all().filter(m => m.entryType === t);
     perf.getEntriesByName = (n, t) => all().filter(m => m.name === n && (!t || m.entryType === t));
+    // Resource timing: no entries are kept, so the buffer's size is only remembered.
+    if (!perf.setResourceTimingBufferSize) perf.setResourceTimingBufferSize = () => {};
+    if (!perf.clearResourceTimings) perf.clearResourceTimings = () => {};
     if (!perf.timing) {
       const timing = {};
       for (const k of ['navigationStart', 'unloadEventStart', 'unloadEventEnd', 'redirectStart', 'redirectEnd', 'fetchStart', 'domainLookupStart',
@@ -930,11 +945,14 @@ const char* const kScriptPrelude = R"JS(
     const sets = new WeakMap();
     const attrOf = (k) => 'data-' + String(k).replace(/[A-Z]/g, c => '-' + c.toLowerCase());
     const keyOf = (a) => a.slice(5).replace(/-([a-z])/g, (m, c) => c.toUpperCase());
+    // (Instagram asks `dataset instanceof DOMStringMap`.)
+    class DOMStringMap { constructor() { throw new TypeError('Illegal constructor'); } }
+    Object.defineProperty(global, 'DOMStringMap', { value: DOMStringMap, writable: true, configurable: true });
     const datasetOf = function () {
       const el = this;
       let d = sets.get(el);
       if (d) return d;
-      d = new Proxy({}, {
+      d = new Proxy(Object.create(DOMStringMap.prototype), {
         get(_, k) { if (typeof k !== 'string') return undefined; const v = el.getAttribute(attrOf(k)); return v === null ? undefined : v; },
         set(_, k, v) { if (typeof k === 'string') el.setAttribute(attrOf(k), String(v)); return true; },
         has(_, k) { return typeof k === 'string' && el.hasAttribute(attrOf(k)); },
@@ -1020,6 +1038,270 @@ const char* const kScriptPrelude = R"JS(
       if (P !== DocumentFragment.prototype) { liveMethod(P, 'getElementsByTagName'); liveMethod(P, 'getElementsByClassName'); }
     }
     liveMethod(Document.prototype, 'getElementsByName');
+  }
+
+  // Streams (WHATWG): a ReadableStream with its default controller and reader, tee, pipes
+  // and async iteration; WritableStream and TransformStream enough to pipe through. Chunks
+  // are counted, not sized, unless a strategy says how.
+  if (typeof global.ReadableStream !== 'function') {
+    const S = Symbol('stream');
+    class ReadableStreamDefaultController {
+      constructor() { throw new TypeError('Illegal constructor'); }
+      get desiredSize() { const st = this[S]; return st.state === 'errored' ? null : st.state === 'closed' ? 0 : st.hwm - st.queueSize; }
+      enqueue(chunk) {
+        const st = this[S];
+        if (st.closeRequested || st.state !== 'readable') throw new TypeError('the stream is closed or errored');
+        if (st.reads.length) { st.reads.shift().resolve({ value: chunk, done: false }); }
+        else { const size = st.size ? Number(st.size(chunk)) : 1; st.queue.push([chunk, size]); st.queueSize += size; }
+        pull(st);
+      }
+      close() {
+        const st = this[S];
+        if (st.closeRequested || st.state !== 'readable') throw new TypeError('the stream is already closing');
+        st.closeRequested = true;
+        if (!st.queue.length) finish(st);
+      }
+      error(e) { if (this[S].state === 'readable') fail(this[S], e); }
+    }
+    const finish = (st) => {
+      st.state = 'closed';
+      for (const r of st.reads.splice(0)) r.resolve({ value: undefined, done: true });
+      if (st.reader) st.reader[S].closed.resolve();
+    };
+    const fail = (st, e) => {
+      st.state = 'errored'; st.error = e; st.queue = []; st.queueSize = 0;
+      for (const r of st.reads.splice(0)) r.reject(e);
+      if (st.reader) { const c = st.reader[S].closed; c.promise.catch(() => {}); c.reject(e); }
+    };
+    const pull = (st) => {
+      if (!st.started || st.state !== 'readable' || st.closeRequested || !st.source.pull) return;
+      if (st.hwm - st.queueSize <= 0 && !st.reads.length) return;
+      if (st.pulling) { st.pullAgain = true; return; }
+      st.pulling = true;
+      Promise.resolve().then(() => st.source.pull.call(st.sourceObject, st.controller)).then(() => {
+        st.pulling = false;
+        if (st.pullAgain) { st.pullAgain = false; pull(st); }
+      }, e => fail(st, e));
+    };
+    const deferred = () => { const d = {}; d.promise = new Promise((res, rej) => { d.resolve = res; d.reject = rej; }); return d; };
+    class ReadableStreamDefaultReader {
+      constructor(stream) {
+        if (!(stream instanceof ReadableStream)) throw new TypeError('not a ReadableStream');
+        const st = stream[S];
+        if (st.reader) throw new TypeError('the stream is locked');
+        st.reader = this;
+        const closed = deferred();
+        this[S] = { st, closed };
+        if (st.state === 'closed') closed.resolve();
+        else if (st.state === 'errored') { closed.promise.catch(() => {}); closed.reject(st.error); }
+      }
+      get closed() { return this[S].closed.promise; }
+      read() {
+        const st = this[S].st;
+        if (!st) return Promise.reject(new TypeError('the reader was released'));
+        if (st.state === 'errored') return Promise.reject(st.error);
+        if (st.queue.length) {
+          const [value, size] = st.queue.shift();
+          st.queueSize -= size;
+          if (st.closeRequested && !st.queue.length) finish(st); else pull(st);
+          return Promise.resolve({ value, done: false });
+        }
+        if (st.state === 'closed') return Promise.resolve({ value: undefined, done: true });
+        const d = deferred();
+        st.reads.push(d);
+        pull(st);
+        return d.promise;
+      }
+      cancel(reason) { const st = this[S].st; return st ? cancel(st, reason) : Promise.reject(new TypeError('the reader was released')); }
+      releaseLock() {
+        const st = this[S].st;
+        if (!st) return;
+        for (const r of st.reads.splice(0)) r.reject(new TypeError('the reader was released'));
+        if (st.state === 'readable') { const c = this[S].closed; c.promise.catch(() => {}); c.reject(new TypeError('the reader was released')); }
+        st.reader = null;
+        this[S].st = null;
+      }
+    }
+    const cancel = (st, reason) => {
+      if (st.state === 'closed') return Promise.resolve();
+      if (st.state === 'errored') return Promise.reject(st.error);
+      st.queue = []; st.queueSize = 0;
+      finish(st);
+      return Promise.resolve(st.source.cancel ? st.source.cancel.call(st.sourceObject, reason) : undefined).then(() => undefined);
+    };
+    class ReadableStream {
+      constructor(source = {}, strategy = {}) {
+        if (source === null) throw new TypeError('the source must be an object');
+        if (source.type === 'bytes') { /* read as a default stream: chunks come as they're enqueued */ }
+        const controller = Object.create(ReadableStreamDefaultController.prototype);
+        const hwm = strategy.highWaterMark === undefined ? 1 : Number(strategy.highWaterMark);
+        if (Number.isNaN(hwm) || hwm < 0) throw new RangeError('invalid highWaterMark');
+        const st = { state: 'readable', queue: [], queueSize: 0, reads: [], reader: null, closeRequested: false, started: false,
+                     pulling: false, pullAgain: false, hwm, size: strategy.size, controller, sourceObject: source,
+                     source: { pull: source.pull, cancel: source.cancel } };
+        controller[S] = st;
+        this[S] = st;
+        Promise.resolve(source.start ? source.start.call(source, controller) : undefined).then(() => { st.started = true; pull(st); }, e => fail(st, e));
+      }
+      get locked() { return !!this[S].reader; }
+      getReader(options) {
+        if (options && options.mode === 'byob') throw new TypeError('byob readers are not supported');
+        return new ReadableStreamDefaultReader(this);
+      }
+      cancel(reason) { return this[S].reader ? Promise.reject(new TypeError('the stream is locked')) : cancel(this[S], reason); }
+      tee() {
+        const reader = this.getReader();
+        let canceled = 0, reading = false;
+        const branches = [];
+        const pump = () => {
+          if (reading) return Promise.resolve();
+          reading = true;
+          return reader.read().then(({ value, done }) => {
+            reading = false;
+            for (const b of branches) if (!b.canceled) { if (done) b.c.close(); else b.c.enqueue(value); }
+          }, e => { for (const b of branches) b.c.error(e); });
+        };
+        for (let i = 0; i < 2; i++) {
+          const b = { canceled: false, c: null };
+          branches.push(b);
+        }
+        return branches.map(b => new ReadableStream({
+          start(c) { b.c = c; },
+          pull: pump,
+          cancel: (r) => { b.canceled = true; if (++canceled === 2) return reader.cancel(r); },
+        }));
+      }
+      pipeTo(dest, options = {}) {
+        const reader = this.getReader();
+        const writer = dest.getWriter();
+        return new Promise((resolve, reject) => {
+          const step = () => reader.read().then(({ value, done }) => {
+            if (done) {
+              reader.releaseLock(); writer.releaseLock();
+              return (options.preventClose ? Promise.resolve() : dest.close()).then(resolve, reject);
+            }
+            return writer.write(value).then(step);
+          }, e => { reader.releaseLock(); writer.releaseLock(); if (!options.preventAbort) dest.abort(e); reject(e); });
+          step().catch(e => { reader.releaseLock(); writer.releaseLock(); if (!options.preventCancel) this.cancel(e); reject(e); });
+        });
+      }
+      pipeThrough({ writable, readable }, options) { this.pipeTo(writable, options).catch(() => {}); return readable; }
+      values({ preventCancel = false } = {}) {
+        const reader = this.getReader();
+        return {
+          next: () => reader.read().then(r => { if (r.done) reader.releaseLock(); return r; }),
+          return: (value) => { if (!preventCancel) reader.cancel(value); reader.releaseLock(); return Promise.resolve({ value, done: true }); },
+          [Symbol.asyncIterator]() { return this; },
+        };
+      }
+      [Symbol.asyncIterator](options) { return this.values(options); }
+      static from(iterable) {
+        const it = iterable[Symbol.asyncIterator] ? iterable[Symbol.asyncIterator]() : iterable[Symbol.iterator]();
+        return new ReadableStream({
+          pull(c) { return Promise.resolve(it.next()).then(r => (r.done ? c.close() : c.enqueue(r.value))); },
+          cancel(r) { if (it.return) return it.return(r); },
+        });
+      }
+    }
+    class WritableStream {
+      constructor(sink = {}) {
+        const st = this[S] = { state: 'writable', writer: null, chain: Promise.resolve(), sink };
+        const controller = { error: (e) => { st.state = 'errored'; st.error = e; }, signal: undefined };
+        st.controller = controller;
+        st.chain = Promise.resolve(sink.start ? sink.start.call(sink, controller) : undefined);
+      }
+      get locked() { return !!this[S].writer; }
+      getWriter() {
+        const st = this[S];
+        if (st.writer) throw new TypeError('the stream is locked');
+        const stream = this;
+        const writer = {
+          get desiredSize() { return st.state === 'writable' ? 1 : 0; },
+          get ready() { return Promise.resolve(); },
+          get closed() { return st.closedPromise || (st.closedPromise = new Promise((res, rej) => { st.onClosed = res; st.onErrored = rej; })); },
+          write(chunk) {
+            if (st.state !== 'writable') return Promise.reject(st.error || new TypeError('the stream is closed'));
+            return (st.chain = st.chain.then(() => (st.sink.write ? st.sink.write.call(st.sink, chunk, st.controller) : undefined)).then(() => undefined));
+          },
+          close() { return stream.close(); },
+          abort(r) { return stream.abort(r); },
+          releaseLock() { st.writer = null; },
+        };
+        st.writer = writer;
+        return writer;
+      }
+      close() {
+        const st = this[S];
+        if (st.state !== 'writable') return Promise.reject(new TypeError('the stream is closed'));
+        st.state = 'closing';
+        return (st.chain = st.chain.then(() => (st.sink.close ? st.sink.close.call(st.sink) : undefined)).then(() => { st.state = 'closed'; if (st.onClosed) st.onClosed(); }));
+      }
+      abort(reason) {
+        const st = this[S];
+        st.state = 'errored'; st.error = reason;
+        if (st.onErrored) st.onErrored(reason);
+        return Promise.resolve(st.sink.abort ? st.sink.abort.call(st.sink, reason) : undefined).then(() => undefined);
+      }
+    }
+    class TransformStream {
+      constructor(transformer = {}) {
+        let rc;
+        this.readable = new ReadableStream({ start(c) { rc = c; } });
+        const controller = {
+          enqueue: (chunk) => rc.enqueue(chunk), error: (e) => rc.error(e), terminate: () => rc.close(),
+          get desiredSize() { return rc.desiredSize; },
+        };
+        if (transformer.start) transformer.start.call(transformer, controller);
+        this.writable = new WritableStream({
+          write: (chunk) => (transformer.transform ? transformer.transform.call(transformer, chunk, controller) : controller.enqueue(chunk)),
+          close: () => Promise.resolve(transformer.flush ? transformer.flush.call(transformer, controller) : undefined).then(() => { try { rc.close(); } catch (e) {} }),
+          abort: (r) => rc.error(r),
+        });
+      }
+    }
+    class CountQueuingStrategy { constructor({ highWaterMark }) { this.highWaterMark = highWaterMark; } size() { return 1; } }
+    class ByteLengthQueuingStrategy { constructor({ highWaterMark }) { this.highWaterMark = highWaterMark; } size(c) { return c.byteLength; } }
+    for (const C of [ReadableStream, ReadableStreamDefaultReader, ReadableStreamDefaultController, WritableStream, TransformStream,
+                     CountQueuingStrategy, ByteLengthQueuingStrategy])
+      Object.defineProperty(global, C.name, { value: C, writable: true, configurable: true });
+  }
+
+  // getSelection(): nothing is ever selected in the page (no text selection yet), but the
+  // Selection is there to ask and to clear.
+  if (typeof global.getSelection !== 'function') {
+    class Selection {
+      constructor(key) { if (key !== Selection) throw new TypeError('Illegal constructor'); this._ranges = []; }
+      get rangeCount() { return this._ranges.length; }
+      get isCollapsed() { return true; }
+      get type() { return this._ranges.length ? 'Caret' : 'None'; }
+      get anchorNode() { return this._ranges.length ? this._ranges[0].startContainer : null; }
+      get anchorOffset() { return this._ranges.length ? this._ranges[0].startOffset : 0; }
+      get focusNode() { return this.anchorNode; }
+      get focusOffset() { return this.anchorOffset; }
+      get direction() { return 'none'; }
+      getRangeAt(i) {
+        if (i < 0 || i >= this._ranges.length) throw new DOMException('no range at ' + i, 'IndexSizeError');
+        return this._ranges[i];
+      }
+      addRange(r) { if (!this._ranges.length) this._ranges.push(r); }
+      removeRange(r) { this._ranges = this._ranges.filter(x => x !== r); }
+      removeAllRanges() { this._ranges = []; }
+      empty() { this._ranges = []; }
+      collapse(node, offset = 0) {
+        this._ranges = [];
+        if (node && typeof document.createRange === 'function') { const r = document.createRange(); try { r.setStart(node, offset); r.collapse(true); } catch (e) {} this._ranges.push(r); }
+      }
+      setPosition(node, offset) { this.collapse(node, offset); }
+      collapseToStart() {} collapseToEnd() {} extend() {} selectAllChildren() {} deleteFromDocument() {} modify() {}
+      setBaseAndExtent(node, offset) { this.collapse(node, offset); }
+      containsNode() { return false; }
+      toString() { return ''; }
+    }
+    const selection = new Selection(Selection);
+    Object.defineProperty(global, 'Selection', { value: Selection, writable: true, configurable: true });
+    Object.defineProperty(global, 'getSelection', { value: function getSelection() { return selection; }, writable: true, configurable: true });
+    if (typeof Document === 'function' && !Document.prototype.getSelection)
+      Object.defineProperty(Document.prototype, 'getSelection', { value: function getSelection() { return selection; }, writable: true, configurable: true });
   }
 
   // navigator.serviceWorker: there, but no worker is ever registered or in control.
@@ -1699,8 +1981,7 @@ const char* const kScriptPrelude = R"JS(
         setTimeout(() => {
           if (other._closed) return;
           const e = new MessageEvent('message', { data: copy, origin: '' });
-          other.dispatchEvent(e);
-          if (typeof other.onmessage === 'function') try { other.onmessage.call(other, e); } catch (x) { reportError(x); }
+          other.dispatchEvent(e);   // (its onmessage too)
         }, 0);
       }
     }
