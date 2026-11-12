@@ -1088,3 +1088,19 @@ TEST(Script, TokenListsOverOtherAttributes) {
         </script>)");
     EXPECT_EQ(p.console, "log:allow-scripts allow-same-origin allow-popups 3 allow-same-origin true noopener noreferrer true\n") << p.console;
 }
+
+TEST(Script, DatesInTheirTimeZones) {
+    // The Verge renders New York times on the server; hydrating with another zone's text
+    // made React throw the page away (#418).
+    Page p(R"(<body><script>
+        const d = new Date(Date.UTC(2026, 10, 12, 18, 5, 0)), summer = new Date(Date.UTC(2026, 6, 1, 12, 0, 0));
+        const f = (o, x = d) => new Intl.DateTimeFormat('en-US', o).format(x);
+        console.log([f({ month: 'long', day: 'numeric', year: 'numeric', timeZone: 'America/New_York' }),
+                     f({ hour: 'numeric', minute: '2-digit', timeZone: 'America/New_York', timeZoneName: 'short' }),
+                     f({ hour: 'numeric', minute: '2-digit', timeZone: 'America/New_York', timeZoneName: 'short' }, summer),
+                     f({ hour: 'numeric', minute: '2-digit', timeZone: 'Europe/Berlin' }, summer),
+                     f({ hour: 'numeric', timeZone: 'Australia/Sydney' }), f({ day: 'numeric', timeZone: 'Asia/Seoul' }),
+                     d.toLocaleTimeString('en-US', { timeZone: 'UTC' }), d.toLocaleString('en-US', { timeZone: 'UTC' })].join(' | '));
+        </script>)");
+    EXPECT_EQ(p.console, "log:November 12, 2026 | 1:05 PM EST | 8:00 AM EDT | 2:00 PM | 5 AM | 13 | 6:05:00 PM | 11/12/2026, 6:05:00 PM\n") << p.console;
+}

@@ -1714,6 +1714,55 @@ const char* const kScriptPrelude = R"JS(
     }
     const monthsLong = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
     const daysLong = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+    // Time zones, without the zone database (the sandbox can't read one): fixed offsets,
+    // and the US, EU, Australian and New Zealand daylight-saving rules, for the zones most
+    // pages name. In minutes east of UTC; null for one we don't know (then local time).
+    const nthSunday = (y, m, n) => { const first = new Date(Date.UTC(y, m, 1)).getUTCDay(); return 1 + (7 - first) % 7 + 7 * (n - 1); };
+    const lastSunday = (y, m) => { const last = new Date(Date.UTC(y, m + 1, 0)); return last.getUTCDate() - last.getUTCDay(); };
+    const zones = {
+      utc: [0], gmt: [0], 'etc/utc': [0], 'etc/gmt': [0], 'asia/seoul': [540], 'asia/tokyo': [540], 'asia/shanghai': [480],
+      'asia/hong_kong': [480], 'asia/taipei': [480], 'asia/singapore': [480], 'asia/manila': [480], 'asia/kolkata': [330],
+      'asia/calcutta': [330], 'asia/dubai': [240], 'asia/bangkok': [420], 'asia/jakarta': [420], 'asia/ho_chi_minh': [420],
+      'america/phoenix': [-420], 'pacific/honolulu': [-600], 'america/sao_paulo': [-180], 'america/mexico_city': [-360],
+      'australia/brisbane': [600], 'australia/perth': [480],
+      'america/new_york': [-300, 'us'], 'america/detroit': [-300, 'us'], 'america/toronto': [-300, 'us'], 'america/chicago': [-360, 'us'],
+      'america/denver': [-420, 'us'], 'america/los_angeles': [-480, 'us'], 'america/vancouver': [-480, 'us'], 'america/anchorage': [-540, 'us'],
+      'europe/london': [0, 'eu'], 'europe/dublin': [0, 'eu'], 'europe/lisbon': [0, 'eu'],
+      'europe/paris': [60, 'eu'], 'europe/berlin': [60, 'eu'], 'europe/madrid': [60, 'eu'], 'europe/rome': [60, 'eu'], 'europe/amsterdam': [60, 'eu'],
+      'europe/brussels': [60, 'eu'], 'europe/vienna': [60, 'eu'], 'europe/stockholm': [60, 'eu'], 'europe/oslo': [60, 'eu'],
+      'europe/copenhagen': [60, 'eu'], 'europe/warsaw': [60, 'eu'], 'europe/prague': [60, 'eu'], 'europe/zurich': [60, 'eu'],
+      'europe/athens': [120, 'eu'], 'europe/helsinki': [120, 'eu'], 'europe/kiev': [120, 'eu'], 'europe/kyiv': [120, 'eu'], 'europe/bucharest': [120, 'eu'],
+      'australia/sydney': [600, 'au'], 'australia/melbourne': [600, 'au'], 'australia/canberra': [600, 'au'], 'australia/hobart': [600, 'au'],
+      'australia/adelaide': [570, 'au'], 'pacific/auckland': [720, 'nz'],
+    };
+    const usNames = { '-300': ['EST', 'EDT'], '-360': ['CST', 'CDT'], '-420': ['MST', 'MDT'], '-480': ['PST', 'PDT'], '-540': ['AKST', 'AKDT'] };
+    const zoneInfo = (tz, t) => {
+      if (tz === undefined || tz === null) return null;
+      const name = String(tz).toLowerCase();
+      const off = /^([+-])(\d\d):?(\d\d)$/.exec(name);
+      if (off) return { offset: (off[1] === '-' ? -1 : 1) * (Number(off[2]) * 60 + Number(off[3])), dst: false };
+      const etc = /^etc\/gmt([+-]\d{1,2})$/.exec(name);
+      if (etc) return { offset: -Number(etc[1]) * 60, dst: false };
+      const z = zones[name];
+      if (!z) return null;
+      const [std, rule] = z;
+      if (!rule) return { offset: std, dst: false };
+      const y = new Date(t + std * 60000).getUTCFullYear();
+      let start, end;   // in UTC milliseconds
+      if (rule === 'us') { start = Date.UTC(y, 2, nthSunday(y, 2, 2), 2) - std * 60000; end = Date.UTC(y, 10, nthSunday(y, 10, 1), 2) - (std + 60) * 60000; }
+      else if (rule === 'eu') { start = Date.UTC(y, 2, lastSunday(y, 2), 1); end = Date.UTC(y, 9, lastSunday(y, 9), 1); }
+      else if (rule === 'au') { end = Date.UTC(y, 3, nthSunday(y, 3, 1), 3) - (std + 60) * 60000; start = Date.UTC(y, 9, nthSunday(y, 9, 1), 2) - std * 60000; }
+      else { end = Date.UTC(y, 3, nthSunday(y, 3, 1), 3) - (std + 60) * 60000; start = Date.UTC(y, 8, lastSunday(y, 8), 2) - std * 60000; }
+      const dst = start < end ? (t >= start && t < end) : (t >= start || t < end);   // southern summers span the new year
+      return { offset: std + (dst ? 60 : 0), dst, std };
+    };
+    const zoneName = (info) => {
+      if (!info) return null;
+      if (usNames[info.std] && info.std !== undefined) return usNames[info.std][info.dst ? 1 : 0];
+      if (!info.offset) return 'UTC';
+      const h = Math.trunc(Math.abs(info.offset) / 60), m = Math.abs(info.offset) % 60;
+      return 'GMT' + (info.offset < 0 ? '-' : '+') + h + (m ? ':' + pad2(m) : '');
+    };
     class DateTimeFormat {
       constructor(locales, o = {}) {
         this._o = { ...o };
@@ -1727,10 +1776,13 @@ const char* const kScriptPrelude = R"JS(
       _fields(d) {
         d = d === undefined ? new Date() : new Date(typeof d === 'object' ? d.getTime() : d);
         if (Number.isNaN(d.getTime())) throw new RangeError('Invalid time value');
-        const u = this._utc;
-        return { y: u ? d.getUTCFullYear() : d.getFullYear(), m: u ? d.getUTCMonth() : d.getMonth(), d: u ? d.getUTCDate() : d.getDate(),
-                 w: u ? d.getUTCDay() : d.getDay(), h: u ? d.getUTCHours() : d.getHours(), mi: u ? d.getUTCMinutes() : d.getMinutes(),
-                 s: u ? d.getUTCSeconds() : d.getSeconds(), date: d };
+        // In the zone asked for: its wall clock is UTC's, shifted by the zone's offset then.
+        const zone = zoneInfo(this._o.timeZone, d.getTime());
+        const u = !!zone || this._utc;
+        const w = zone ? new Date(d.getTime() + zone.offset * 60000) : d;
+        return { y: u ? w.getUTCFullYear() : d.getFullYear(), m: u ? w.getUTCMonth() : d.getMonth(), d: u ? w.getUTCDate() : d.getDate(),
+                 w: u ? w.getUTCDay() : d.getDay(), h: u ? w.getUTCHours() : d.getHours(), mi: u ? w.getUTCMinutes() : d.getMinutes(),
+                 s: u ? w.getUTCSeconds() : d.getSeconds(), date: d, zone };
       }
       formatToParts(date) {
         const f = this._fields(date), o = this._o, parts = [];
@@ -1762,7 +1814,7 @@ const char* const kScriptPrelude = R"JS(
           tbits.forEach(([t, v], i) => { if (i) parts.push({ type: 'literal', value: ':' }); parts.push({ type: t, value: String(v) }); });
           if (h12 && o.hour) parts.push({ type: 'literal', value: ' ' }, { type: 'dayPeriod', value: f.h < 12 ? 'AM' : 'PM' });
         }
-        if (o.timeZoneName) parts.push({ type: 'literal', value: ' ' }, { type: 'timeZoneName', value: this._utc ? 'UTC' : (String(f.date).match(/\(([^)]+)\)/) || [, 'GMT'])[1] });
+        if (o.timeZoneName) parts.push({ type: 'literal', value: ' ' }, { type: 'timeZoneName', value: zoneName(f.zone) || (this._utc ? 'UTC' : (String(f.date).match(/\(([^)]+)\)/) || [, 'GMT'])[1]) });
         return parts;
       }
       format(date) { return this.formatToParts(date).map(p => p.value).join(''); }
@@ -1862,9 +1914,15 @@ const char* const kScriptPrelude = R"JS(
     Object.defineProperty(Intl, Symbol.toStringTag, { value: 'Intl', configurable: true });
     // The library's locale-sensitive methods, through the same formats.
     Number.prototype.toLocaleString = function (l, o) { return new NumberFormat(l, o).format(this.valueOf()); };
-    Date.prototype.toLocaleDateString = function (l, o = {}) { return new DateTimeFormat(l, Object.keys(o).length ? o : { year: 'numeric', month: 'numeric', day: 'numeric' }).format(this); };
-    Date.prototype.toLocaleTimeString = function (l, o = {}) { return new DateTimeFormat(l, Object.keys(o).length ? o : { hour: 'numeric', minute: '2-digit', second: '2-digit' }).format(this); };
-    Date.prototype.toLocaleString = function (l, o = {}) { return new DateTimeFormat(l, Object.keys(o).length ? o : { year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: '2-digit', second: '2-digit' }).format(this); };
+    // Options that name no fields (a timeZone only, hour12...) get the method's defaults.
+    const dateKeys = ['weekday', 'era', 'year', 'month', 'day', 'dateStyle'], timeKeys = ['hour', 'minute', 'second', 'dayPeriod', 'timeStyle', 'fractionalSecondDigits'];
+    const has = (o, keys) => keys.some(k => o[k] !== undefined);
+    const dateDefaults = { year: 'numeric', month: 'numeric', day: 'numeric' }, timeDefaults = { hour: 'numeric', minute: '2-digit', second: '2-digit' };
+    Date.prototype.toLocaleDateString = function (l, o = {}) { return new DateTimeFormat(l, has(o, dateKeys) ? o : { ...o, ...dateDefaults }).format(this); };
+    Date.prototype.toLocaleTimeString = function (l, o = {}) { return new DateTimeFormat(l, has(o, timeKeys) ? o : { ...o, ...timeDefaults }).format(this); };
+    Date.prototype.toLocaleString = function (l, o = {}) {
+      return new DateTimeFormat(l, has(o, dateKeys) || has(o, timeKeys) ? o : { ...o, ...dateDefaults, ...timeDefaults }).format(this);
+    };
     String.prototype.localeCompare = function (that, l, o) { return new Collator(l, o).compare(String(this), that); };
   }
 
