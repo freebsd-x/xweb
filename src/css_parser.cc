@@ -928,9 +928,135 @@ private:
         SelectorParser selectors(tokens_, begin, prelude_end, 0);
         if (!selectors.list(rule.selectors)) return;
         parseDeclarationsInto(tokens_, block, block_end, rule.declarations);
-        if (rule.declarations.empty()) return;
-        rule.media = media;
-        out.rules.push_back(std::move(rule));
+        if (!rule.declarations.empty()) {
+            rule.media = media;
+            out.rules.push_back(std::move(rule));
+        }
+        nestedRules(sourceOf(begin, prelude_end), block, block_end, media, out, 1);
+    }
+
+    // ── Nesting (CSS Nesting) ──
+    // A style rule's block can hold rules of its own, flattened here: a nested selector's &
+    // is its parent (as :is(parent)), and one without & is inside it. Nested @media and
+    // @supports hold the parent's declarations under their condition. (Next.js's CSS
+    // modules nest: velog.io's header was all nested rules.)
+
+    [[nodiscard]] std::string sourceOf(size_t begin, size_t end) const {
+        while (begin < end && tokens_[begin].type == TokenType::Whitespace) ++begin;
+        while (end > begin && tokens_[end - 1].type == TokenType::Whitespace) --end;
+        if (begin >= end) return {};
+        const uint32_t from = tokens_[begin].begin, to = tokens_[end - 1].end;
+        return from <= to && to <= source_.size() ? std::string(source_.substr(from, to - from)) : std::string{};
+    }
+
+    // The nested selector list `inner` made absolute under `parent`.
+    static std::string combineSelectors(const std::string& parent, const std::string& inner) {
+        const std::vector<Token> t = tokenize(inner);
+        const std::string wrapped = ":is(" + parent + ")";
+        std::string out, part;
+        bool has_amp = false;
+        int depth = 0;
+        const auto finish = [&] {
+            size_t a = part.find_first_not_of(" \t\n\r\f"), b = part.find_last_not_of(" \t\n\r\f");
+            const std::string trimmed = a == std::string::npos ? std::string{} : part.substr(a, b - a + 1);
+            if (!trimmed.empty()) {
+                if (!out.empty()) out += ", ";
+                out += has_amp ? trimmed : wrapped + " " + trimmed;
+            }
+            part.clear();
+            has_amp = false;
+        };
+        for (const Token& tok : t) {
+            if (tok.type == TokenType::Eof) break;
+            const std::string text = tok.end <= inner.size() && tok.begin <= tok.end ? inner.substr(tok.begin, tok.end - tok.begin) : tok.text;
+            if (tok.type == TokenType::Function || tok.type == TokenType::LeftParen || tok.type == TokenType::LeftBracket) ++depth;
+            else if ((tok.type == TokenType::RightParen || tok.type == TokenType::RightBracket) && depth > 0) --depth;
+            if (tok.type == TokenType::Comma && depth == 0) {
+                finish();
+                continue;
+            }
+            if (tok.type == TokenType::Delim && tok.text == "&") {
+                part += wrapped;
+                has_amp = true;
+                continue;
+            }
+            part += text;
+        }
+        finish();
+        return out;
+    }
+
+    void nestedRules(const std::string& parent, size_t begin, size_t end, std::vector<std::vector<Token>>& media, Stylesheet& out, int depth) {
+        if (depth > 16 || parent.empty() || out.rules.size() > 200000) return;
+        Stream s(tokens_, begin, end);
+        while (!s.done()) {
+            s.skipWs();
+            if (s.done()) break;
+            if (s.type() == TokenType::Semicolon) {
+                s.take();
+                continue;
+            }
+            const size_t start = s.pos();
+            if (s.type() == TokenType::AtKeyword) {
+                const std::string name = lower(s.take().text);
+                const size_t prelude = s.pos();
+                while (!s.done() && s.type() != TokenType::LeftBrace && s.type() != TokenType::Semicolon) s.skipComponent();
+                if (s.done() || s.type() == TokenType::Semicolon) {
+                    if (!s.done()) s.take();
+                    continue;
+                }
+                const size_t prelude_end = s.pos(), inner = s.pos() + 1;
+                s.skipComponent();
+                const size_t inner_end = s.pos() > inner ? s.pos() - 1 : inner;
+                std::vector<Token> condition;
+                for (size_t i = prelude; i < prelude_end; ++i)
+                    if (!(condition.empty() && tokens_[i].type == TokenType::Whitespace)) condition.push_back(tokens_[i]);
+                while (!condition.empty() && condition.back().type == TokenType::Whitespace) condition.pop_back();
+                if (name == "media") {
+                    media.push_back(condition);
+                    nestedBlock(parent, inner, inner_end, media, out, depth + 1);
+                    media.pop_back();
+                } else if (name == "supports") {
+                    if (supportsMatches(condition)) nestedBlock(parent, inner, inner_end, media, out, depth + 1);
+                } else if (name == "layer" || name == "scope") {
+                    nestedBlock(parent, inner, inner_end, media, out, depth + 1);
+                }
+                continue;
+            }
+            // A declaration ends at ';'; a rule has a block first.
+            const bool custom = s.type() == TokenType::Ident && s.peek().text.starts_with("--");
+            while (!s.done() && s.type() != TokenType::Semicolon && s.type() != TokenType::LeftBrace) s.skipComponent();
+            if (s.done() || s.type() == TokenType::Semicolon) {
+                if (!s.done()) s.take();
+                continue;
+            }
+            const size_t prelude_end = s.pos(), inner = s.pos() + 1;
+            s.skipComponent();
+            const size_t inner_end = s.pos() > inner ? s.pos() - 1 : inner;
+            if (custom) continue;
+            const std::string selector = combineSelectors(parent, sourceOf(start, prelude_end));
+            if (selector.empty()) continue;
+            styleRule(selector, inner, inner_end, media, out, depth + 1);
+        }
+    }
+
+    // The parent's own declarations in a nested @media/@supports block, and its rules.
+    void nestedBlock(const std::string& parent, size_t begin, size_t end, std::vector<std::vector<Token>>& media, Stylesheet& out, int depth) {
+        styleRule(parent, begin, end, media, out, depth);
+    }
+
+    void styleRule(const std::string& selector, size_t begin, size_t end, std::vector<std::vector<Token>>& media, Stylesheet& out, int depth) {
+        std::vector<Token> t = tokenize(selector);
+        while (!t.empty() && (t.back().type == TokenType::Eof || t.back().type == TokenType::Whitespace)) t.pop_back();
+        Rule rule;
+        SelectorParser selectors(t, 0, t.size(), 0);
+        if (!selectors.list(rule.selectors)) return;
+        parseDeclarationsInto(tokens_, begin, end, rule.declarations);
+        if (!rule.declarations.empty()) {
+            rule.media = media;
+            out.rules.push_back(std::move(rule));
+        }
+        nestedRules(selector, begin, end, media, out, depth);
     }
 
     const std::vector<Token>& tokens_;

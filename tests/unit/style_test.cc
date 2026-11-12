@@ -515,3 +515,33 @@ TEST(Selectors, HasLooksInsideAndAfter) {
     EXPECT_EQ(color("d"), 0xffffff);
     EXPECT_EQ(color("e"), 0);           // its <i> is a sibling, not inside
 }
+
+TEST(Selectors, NestedRulesApply) {
+    // velog.io's CSS modules: .Header_block{.Header_inner{display:flex}} and the like.
+    auto doc = parseHtml("<style>.a{color:#f00; .b{color:#0f0} &.c{color:#00f} > i{color:#fff} &:hover{color:#123}"
+                         " @media (min-width: 100px){color:#0ff; .d{color:#f0f}} @media (max-width: 10px){.e{color:#ff0}} margin-left:3px}"
+                         ".x, .y{ .z{color:#808080} }</style>"
+                         "<div id=a class=a><p id=b class=b></p><i id=i></i><p id=e class=e></p></div><div id=c class='a c'></div>"
+                         "<div id=d class=a><p class=d id=dd></p></div><div class=y><b id=z class=z></b></div>");
+    StyledDocument styles(*doc, css::MediaContext{800, 600});
+    const auto color = [&](const char* id) {
+        std::vector<const Node*> todo{doc->root()};
+        const Node* found = nullptr;
+        while (!todo.empty() && !found) {
+            const Node* n = todo.back();
+            todo.pop_back();
+            if (const std::string* v = n->attr("id"); v && *v == id) found = n;
+            for (const Node* k : n->children) todo.push_back(k);
+        }
+        const Color c = styles.styleOf(found)->color;
+        return (c.r << 16) | (c.g << 8) | c.b;
+    };
+    EXPECT_EQ(color("a"), 0x00ffff);   // the nested @media's declaration, later than color:#f00
+    EXPECT_EQ(color("b"), 0x00ff00);
+    EXPECT_EQ(color("c"), 0x0000ff);
+    EXPECT_EQ(color("i"), 0xffffff);
+    EXPECT_EQ(color("dd"), 0xff00ff);
+    EXPECT_EQ(color("e"), 0x00ffff);   // the @media that doesn't hold: inherits a's
+    EXPECT_EQ(color("z"), 0x808080);
+    EXPECT_FLOAT_EQ(styles.styleOf(doc->root()->children.back()->children.back()->children.front())->margin[3].px, 3);   // after the nested rules
+}
