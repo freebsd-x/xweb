@@ -808,6 +808,29 @@ public:
         out["min-height"] = len(s->min_height);
         out["max-width"] = s->max_width.is_auto ? std::string("none") : len(s->max_width);
         out["max-height"] = s->max_height.is_auto ? std::string("none") : len(s->max_height);
+        static const char* kWhiteSpace[] = {"normal", "pre", "nowrap", "pre-wrap", "pre-line"};
+        out["white-space"] = kWhiteSpace[static_cast<size_t>(s->white_space)];
+        static const char* kTextAlign[] = {"start", "right", "center"};
+        out["text-align"] = kTextAlign[static_cast<size_t>(s->text_align)];
+        static const char* kTransform[] = {"none", "uppercase", "lowercase", "capitalize"};
+        out["text-transform"] = kTransform[static_cast<size_t>(s->text_transform)];
+        out["text-indent"] = s->text_indent.is_auto ? std::string("0px") : len(s->text_indent);
+        out["font-style"] = s->italic ? "italic" : "normal";
+        out["letter-spacing"] = "normal";
+        out["flex-direction"] = std::string(s->flex_column ? "column" : "row") + (s->flex_reverse ? "-reverse" : "");
+        out["flex-wrap"] = s->flex_wrap ? "wrap" : "nowrap";
+        static const char* kAlign[] = {"normal", "flex-start", "flex-end", "center", "stretch", "baseline", "space-between", "space-around", "space-evenly"};
+        out["justify-content"] = kAlign[static_cast<size_t>(s->justify_content)];
+        out["align-items"] = s->align_items == web::FlexAlign::Auto ? "normal" : kAlign[static_cast<size_t>(s->align_items)];
+        out["align-self"] = s->align_self == web::FlexAlign::Auto ? "auto" : kAlign[static_cast<size_t>(s->align_self)];
+        const auto num = [](float v) {
+            char b[32];
+            std::snprintf(b, sizeof b, "%g", v);
+            return std::string(b);
+        };
+        out["flex-grow"] = num(s->flex_grow);
+        out["flex-shrink"] = num(s->flex_shrink);
+        out["flex-basis"] = len(s->flex_basis);
         if (const web::ElementBox* b = boxOf(n)) {
             // The used size: its content box, unless it sizes its border box.
             float w = b->w, h = b->h;

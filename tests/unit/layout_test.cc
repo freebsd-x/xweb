@@ -665,3 +665,27 @@ TEST(Paint, AGradientFadesWithItsBox) {
     ASSERT_FALSE(g->gradient->stops.empty());
     EXPECT_NEAR(g->gradient->stops.front().color.a, 128, 1);
 }
+
+TEST(InlineBlock, ShrinkToFitCountsFloatsBesideTextAndMinWidth) {
+    // Daum's shortcuts: a floated item holding a link that has min-width, an icon floated
+    // before its label, and a clearing ::after block.
+    const auto r = layout("<style>a{display:block;padding:0 10px}a:after{content:'';display:block;clear:both}"
+                          "i{float:left;width:30px;height:10px}</style>"
+                          "<div id=f style='float:left'><a id=a><i></i> label</a></div>"
+                          "<div id=g style='float:left'><a style='min-width:200px'><i></i> x</a></div>");
+    const float label = r.box("a").w - 20;
+    EXPECT_GT(label, 30 + 20);                 // the icon and the word, side by side
+    EXPECT_FLOAT_EQ(r.box("f").w, label + 20);
+    EXPECT_FLOAT_EQ(r.box("g").w, 220);       // min-width, and the padding outside it
+}
+
+TEST(Paint, ABlockPictureIsTranslatedOnce) {
+    // Daum's thumbnails: a frame moved by half its size, the picture in it moved back.
+    const auto r = layout("<div style='position:relative;width:160px;height:100px;margin:40px'>"
+                          "<span style='position:absolute;top:0;left:0;right:0;bottom:0;transform:translate(50%,50%)'>"
+                          "<img id=g width=160 height=100 style='position:absolute;top:0;left:0;transform:translate(-50%,-50%)'></span>"
+                          "<img id=h width=20 height=20 style='display:block;transform:translateX(10px)'></div>");
+    EXPECT_FLOAT_EQ(r.box("g").x, 40);
+    EXPECT_FLOAT_EQ(r.box("g").y, 40);
+    EXPECT_FLOAT_EQ(r.box("h").x, 50);
+}

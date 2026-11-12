@@ -637,8 +637,20 @@ private:
             if (!blank) result.push_back(std::move(run));
             run.reset();
         };
-        for (auto& k : box.kids) {
-            if (k->inFlowBlock() || k->outOfFlow() || (k->floating() && !run)) {
+        // A float that leads into inline content goes in with it, as in Chromium: then the
+        // content's widest line is measured beside it (an icon floated before a label).
+        const auto leadsIntoInline = [&](size_t i) {
+            for (; i < box.kids.size(); ++i) {
+                const Box& k = *box.kids[i];
+                if (k.inFlowBlock()) return false;
+                if (k.floating() || k.outOfFlow() || isBlankText(k)) continue;
+                return true;
+            }
+            return false;
+        };
+        for (size_t i = 0; i < box.kids.size(); ++i) {
+            auto& k = box.kids[i];
+            if (k->inFlowBlock() || k->outOfFlow() || (k->floating() && !run && !leadsIntoInline(i + 1))) {
                 finish();
                 result.push_back(std::move(k));
             } else {
@@ -1049,6 +1061,10 @@ private:
         float w = max_content ? preferredWidth(k) : minContentWidth(k);
         const ComputedStyle& s = *k.style;
         if (!s.width.is_auto && !s.width.hasPercent()) w = s.border_box ? std::max(0.0f, s.width.px - k.frameWidth()) : s.width.px;
+        // min-width and max-width bound what it contributes, as they bound it: a link with
+        // min-width wider than its content made its floated list item too narrow for it.
+        // (Percentages of the unknown width count as none.)
+        if (k.kind != BoxKind::Text) w = clampWidth(k, w, kUnbounded);
         return w + k.frameWidth() + k.margin[Left] + k.margin[Right];
     }
 
@@ -3954,8 +3970,9 @@ private:
             const float fx = cx + f.x;
             if (f.atomic) {
                 float ax = cx + f.atomic->x, ay = cy + f.atomic->y;
-                shift(*f.atomic, ax, ay);
-                // (A picture in a wrapper of its own was transformed with the wrapper.)
+                // (A picture in a wrapper of its own was moved and transformed with the
+                // wrapper: shifted again, a centred thumbnail landed off its frame.)
+                if (f.atomic->node != b.node) shift(*f.atomic, ax, ay);
                 const bool transformed = f.atomic->node != b.node && beginTransform(*f.atomic, ax, ay);
                 if (f.atomic->node != b.node) {
                     record(*f.atomic, ax, ay);
