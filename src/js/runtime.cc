@@ -3174,7 +3174,15 @@ Value Interpreter::evalUnary(Node* n, Env* env, bool strict) {
             if (t->kind == N::OptionalChain) t = t->a;
             if (t->kind == N::Member) {
                 if (t->a->kind == N::Super) rt_.throwError("ReferenceError", "can't delete a super property");
-                const Value base = eval(t->a, env, strict);
+                // In a chain the base can short-circuit too (delete a?.b.c with a nullish):
+                // then nothing is deleted, and that's true. (Uncaught, it ended the browser.)
+                Value base;
+                try {
+                    base = eval(t->a, env, strict);
+                } catch (const ShortCircuit&) {
+                    if (t != n->a) return Value::boolean(true);
+                    throw;
+                }
                 if ((t->flags & kOptional) && base.isNullish()) return Value::boolean(true);
                 const PropertyKey key = memberKey(t, env, strict);
                 Object* o = rt_.toObject(base);

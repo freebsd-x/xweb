@@ -4,6 +4,9 @@
 // Browser app (apps/Browser.xapp), which builds this file in: there "Open in Chromium"
 // hands the page to Chromium for what we can't do yet (scripts, forms, cookies).
 
+#include <cxxabi.h>
+#include <exception>
+#include <typeinfo>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -2373,6 +2376,25 @@ void openInChromium(const std::string& url) {
 
 // The viewer, for xwebview's own main and for the Browser app's.
 int webViewMain(int argc, char** argv) {
+    // An exception nothing caught ends the app (the UI loop is noexcept): say which, so a
+    // crash report has more to go on than SIGABRT.
+    std::set_terminate([] {
+        if (const std::exception_ptr e = std::current_exception()) {
+            try {
+                std::rethrow_exception(e);
+            } catch (const std::exception& x) {
+                std::fprintf(stderr, "[browser] uncaught %s: %s\n", typeid(x).name(), x.what());
+            } catch (const web::js::Terminated& t) {
+                std::fprintf(stderr, "[browser] a script stopped outside a task: %s\n", t.why.c_str());
+            } catch (const web::js::Thrown&) {
+                std::fprintf(stderr, "[browser] a script's exception got out of its task\n");
+            } catch (...) {
+                const std::type_info* type = abi::__cxa_current_exception_type();
+                std::fprintf(stderr, "[browser] uncaught %s\n", type ? type->name() : "exception of another kind");
+            }
+        }
+        std::abort();
+    });
     std::string arg;
     for (int i = 1; i < argc; ++i) {
         if (std::string_view(argv[i]) == "--open") continue;

@@ -769,3 +769,8 @@ TEST(Js, ARegexMayFollowAStatementsClosingBrace) {
                   "out.join()"),
               "1,2,3,4,number,NaN");
 }
+
+TEST(Js, DeleteThroughAShortCircuitedChain) {
+    // delete a?.b.c with a nullish: true, nothing deleted (it used to escape the engine).
+    EXPECT_EQ(run("var a = null, o = { b: { c: 1 } }; [delete a?.b.c, delete o?.b.c, 'c' in o.b, delete a?.b].join()"), "true,true,false,true");
+}

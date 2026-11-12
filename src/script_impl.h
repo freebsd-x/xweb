@@ -240,7 +240,8 @@ struct PageScript::Impl {
     template <typename F>
     void task(F&& f) {
         const size_t envs = rt.env_stack.size(), calls = rt.call_depth, evals = rt.eval_depth;
-        if (envs == 0 && calls == 0) rt.resetSteps();   // a new task, not one inside another
+        const bool outermost = envs == 0 && calls == 0;
+        if (outermost) rt.resetSteps();   // a new task, not one inside another
         try {
             f();
         } catch (const js::Thrown& t) {
@@ -251,6 +252,12 @@ struct PageScript::Impl {
             }
         } catch (const js::Terminated& t) {
             report("Script stopped: " + t.why);
+        } catch (...) {
+            // Anything else is the engine's own mistake. A task nested in another lets it
+            // through (it may be how a coroutine is being unwound); the outermost stops it
+            // here, so one page's script can't take the browser down with it.
+            if (!outermost) throw;
+            report("Script stopped: an internal error in the script engine");
         }
         rt.env_stack.resize(envs);
         rt.call_depth = calls;
