@@ -913,3 +913,21 @@ TEST(Script, ACustomElementsOwnPropertiesStayItsOwn) {
         </script>)");
     EXPECT_EQ(p.console, "log:function 3 false print\n") << p.console;
 }
+
+TEST(Script, ElementsSayTheirNamespace) {
+    // Vue's hydration asks namespaceURI.includes("svg") of every element (namu.wiki).
+    Page p(R"(<body><svg><circle/></svg><script>
+        console.log(document.body.namespaceURI, document.querySelector('circle').namespaceURI.includes('svg'),
+                    document.createElement('div').prefix);
+        </script>)");
+    EXPECT_EQ(p.console, "log:http://www.w3.org/1999/xhtml true null\n") << p.console;
+}
+
+TEST(Script, QuerySelectorKnowsHas) {
+    // CNN's menu script asks for ':has(...)' with an attribute selector inside.
+    Page p(R"(<body><ul><li class=s><a class=l data-t="Live TV">x</a></li><li class=s><a class=l>y</a></li></ul><script>
+        console.log(document.querySelectorAll('.s:has(.l[data-t="Live TV"])').length, document.querySelectorAll('li:has(+ li)').length,
+                    document.querySelector('ul:has(> li > a)') !== null, document.querySelectorAll('li:not(:has(a[data-t]))').length);
+        </script>)");
+    EXPECT_EQ(p.console, "log:1 1 true 1\n") << p.console;
+}

@@ -105,17 +105,37 @@ private:
         const std::string& n = s.name;
         if (n == "not") { for (const auto& a : s.args) if (complex(el, a)) return false; return true; }
         if (n == "is" || n == "where" || n == "matches") { for (const auto& a : s.args) if (complex(el, a)) return true; return false; }
+        if (n == css::kHasAnchor) return el == has_anchor_;
         if (n == "has") {
+            // Each selector relative to this element: looked for among its descendants, or
+            // (led by + or ~) its later siblings and theirs.
+            const Node* saved = has_anchor_;
+            has_anchor_ = el;
+            bool hit = false;
             for (const auto& a : s.args) {
-                std::vector<const Node*> todo(el->children.begin(), el->children.end());
-                while (!todo.empty()) {
+                if (a.parts.size() < 2 || hit) continue;
+                const bool siblings = a.parts[1].combinator == Combinator::NextSibling || a.parts[1].combinator == Combinator::SubsequentSibling;
+                std::vector<const Node*> todo;
+                if (siblings) {
+                    if (el->parent) {
+                        bool after = false;
+                        for (const Node* c : el->parent->children) {
+                            if (after) todo.push_back(c);
+                            if (c == el) after = true;
+                        }
+                    }
+                } else {
+                    todo.assign(el->children.begin(), el->children.end());
+                }
+                while (!todo.empty() && !hit && fuel_ > 0) {
                     const Node* c = todo.back();
                     todo.pop_back();
-                    if (c->isElement() && complex(c, a)) return true;
+                    if (c->isElement() && complex(c, a)) hit = true;
                     todo.insert(todo.end(), c->children.begin(), c->children.end());
                 }
             }
-            return false;
+            has_anchor_ = saved;
+            return hit;
         }
         if (n == "root") return el->parent && el->parent->type == NodeType::Document;
         if (n == "defined") return !(el->ns == Namespace::Html && el->name.find('-') != std::string::npos && el->custom_state != 2);
@@ -166,6 +186,7 @@ private:
     }
 
     long fuel_ = 1'000'000;   // a selector can't make one match take forever
+    const Node* has_anchor_ = nullptr;   // the element a :has() is being asked about
 };
 
 }  // namespace

@@ -53,6 +53,10 @@ struct SimpleSelector {
     std::vector<ComplexSelector> args;   // :not() :is() :where()
 };
 
+// The first compound of each of :has()'s selectors: matches only the element :has() is
+// being asked about, so the rest is relative to it.
+inline constexpr const char* kHasAnchor = "-xweb-has-anchor";
+
 enum class Combinator { Descendant, Child, NextSibling, SubsequentSibling };
 
 struct CompoundSelector {

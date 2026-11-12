@@ -436,7 +436,8 @@ void parseDeclarationsInto(const std::vector<Token>& tokens, size_t begin, size_
 
 class SelectorParser {
 public:
-    SelectorParser(const std::vector<Token>& t, size_t begin, size_t end, int depth) : s_(t, begin, end), depth_(depth) {}
+    SelectorParser(const std::vector<Token>& t, size_t begin, size_t end, int depth, bool relative = false)
+        : s_(t, begin, end), depth_(depth), relative_(relative) {}
 
     bool list(std::vector<ComplexSelector>& out) {
         while (true) {
@@ -454,6 +455,21 @@ private:
     bool complex(ComplexSelector& out) {
         s_.skipWs();
         Combinator next = Combinator::Descendant;
+        if (relative_) {
+            // :has()'s relative selectors: anchored at the element asked about, by a
+            // compound only it matches, and joined to it by the leading combinator (if any).
+            if (s_.type() == TokenType::Delim && (s_.peek().text == ">" || s_.peek().text == "+" || s_.peek().text == "~")) {
+                const char c = s_.take().text[0];
+                next = c == '>' ? Combinator::Child : c == '+' ? Combinator::NextSibling : Combinator::SubsequentSibling;
+                s_.skipWs();
+            }
+            CompoundSelector anchor;
+            SimpleSelector a;
+            a.kind = SimpleKind::PseudoClass;
+            a.name = kHasAnchor;
+            anchor.simple.push_back(std::move(a));
+            out.parts.push_back(std::move(anchor));
+        }
         while (true) {
             CompoundSelector part;
             part.combinator = next;
@@ -487,7 +503,7 @@ private:
                     case SimpleKind::Type:
                     case SimpleKind::PseudoElement: ++sp.types; break;
                     case SimpleKind::PseudoClass: {
-                        if (ss.name == "where") break;
+                        if (ss.name == "where" || ss.name == kHasAnchor) break;
                         if (ss.name == "not" || ss.name == "is" || ss.name == "has") {
                             // Takes on the most specific of its arguments.
                             Specificity best;
@@ -653,6 +669,10 @@ private:
                 if (ss.name == "not") return false;
                 ss.args.clear();   // :is() and :where() forgive: this matches nothing
             }
+        } else if (ss.name == "has") {
+            if (relative_) return false;   // not inside another :has()
+            SelectorParser inner(tokens, arg_begin, arg_end, depth_ + 1, true);
+            if (!inner.list(ss.args)) return false;
         } else if (ss.name == "host" || ss.name == "host-context" || ss.name == "slotted") {
             // Shadow DOM's: :host(sel), :host-context(sel), ::slotted(sel).
             SelectorParser inner(tokens, arg_begin, arg_end, depth_ + 1);
@@ -694,6 +714,7 @@ private:
 
     Stream s_;
     int depth_;
+    bool relative_ = false;
 };
 
 // ── Rules ─────────────────────────────────────────────────────────────────────

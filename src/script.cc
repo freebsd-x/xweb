@@ -382,6 +382,14 @@ void PageScript::Impl::installElement() {
         return str(n->ns == Namespace::Html ? upper(n->name) : n->name);
     });
     accessor(p, u"localName", [self](Runtime&, const Value& t, Args) { return str(self->thisElement(t)->name); });
+    accessor(p, u"namespaceURI", [self](Runtime&, const Value& t, Args) {
+        switch (self->thisElement(t)->ns) {
+            case Namespace::Svg: return str("http://www.w3.org/2000/svg");
+            case Namespace::MathMl: return str("http://www.w3.org/1998/Math/MathML");
+            default: return str("http://www.w3.org/1999/xhtml");
+        }
+    });
+    accessor(p, u"prefix", [](Runtime&, const Value&, Args) { return Value::null(); });
     // Attributes reflected as properties.
     for (const char16_t* name : {u"id", u"title", u"lang", u"dir", u"name", u"placeholder", u"alt", u"rel", u"target", u"role", u"slot"}) {
         const std::string a = js::utf8(name);

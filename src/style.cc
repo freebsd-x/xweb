@@ -1922,6 +1922,32 @@ private:
                 if (matchComplex(el, a)) return true;
             return false;
         }
+        if (n == css::kHasAnchor) return el == has_anchor_;
+        if (n == "has") {
+            // Each selector relative to this element: looked for among its descendants, or
+            // (led by + or ~) its later siblings and theirs.
+            const Node* saved = has_anchor_;
+            has_anchor_ = el;
+            bool hit = false;
+            for (const ComplexSelector& a : s.args) {
+                if (a.parts.size() < 2 || hit) continue;
+                const bool siblings = a.parts[1].combinator == Combinator::NextSibling || a.parts[1].combinator == Combinator::SubsequentSibling;
+                std::vector<const Node*> todo;
+                if (siblings) {
+                    for (const Node* p = info.next; p && fuel_-- > 0; p = siblings_[p].next) todo.push_back(p);
+                } else {
+                    todo.assign(el->children.begin(), el->children.end());
+                }
+                while (!todo.empty() && !hit && fuel_-- > 0) {
+                    const Node* c = todo.back();
+                    todo.pop_back();
+                    if (c->isElement() && matchComplex(c, a)) hit = true;
+                    todo.insert(todo.end(), c->children.begin(), c->children.end());
+                }
+            }
+            has_anchor_ = saved;
+            return hit;
+        }
         if (n == "root") return el->parent && el->parent->type == NodeType::Document;
         if (n == "host" || n == "host-context") {
             if (el != host_context_) return false;
@@ -3943,6 +3969,7 @@ private:
     size_t order_ = 0;
     size_t import_count_ = 0;
     int fuel_ = 0;
+    const Node* has_anchor_ = nullptr;   // the element a :has() is being asked about
     bool border_none_[4] = {true, true, true, true};
 };
 

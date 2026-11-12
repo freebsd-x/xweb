@@ -487,3 +487,31 @@ TEST(Filter, FunctionsInOrder) {
     ASSERT_EQ(s.of("d").filter->size(), 1u);      // drop-shadow skipped; sepia clamped
     EXPECT_FLOAT_EQ((*s.of("d").filter)[0].amount, 1);
 }
+
+TEST(Selectors, HasLooksInsideAndAfter) {
+    auto doc = parseHtml("<style>div{color:#000} .a:has(> i){color:#f00} .b:has(em b){color:#0f0} .c:has(+ p){color:#00f}"
+                         " .d:has(~ .x, nope){color:#fff} .e:has(i){color:#f0f}</style>"
+                         "<div id=a class=a><i></i></div><div id=a2 class=a><span><i></i></span></div>"
+                         "<div id=b class=b><em><span><b></b></span></em></div>"
+                         "<div id=c class=c></div><p></p><div id=d class=d></div><span></span><span class=x></span>"
+                         "<div id=e class=e></div><i></i>");
+    StyledDocument styles(*doc, css::MediaContext{800, 600});
+    const auto color = [&](const char* id) {
+        const Node* found = nullptr;
+        std::vector<const Node*> todo{doc->root()};
+        while (!todo.empty() && !found) {
+            const Node* n = todo.back();
+            todo.pop_back();
+            if (const std::string* v = n->attr("id"); v && *v == id) found = n;
+            for (const Node* k : n->children) todo.push_back(k);
+        }
+        const Color c = styles.styleOf(found)->color;
+        return (c.r << 16) | (c.g << 8) | c.b;
+    };
+    EXPECT_EQ(color("a"), 0xff0000);
+    EXPECT_EQ(color("a2"), 0);          // not a child
+    EXPECT_EQ(color("b"), 0x00ff00);
+    EXPECT_EQ(color("c"), 0x0000ff);
+    EXPECT_EQ(color("d"), 0xffffff);
+    EXPECT_EQ(color("e"), 0);           // its <i> is a sibling, not inside
+}

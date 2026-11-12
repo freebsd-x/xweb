@@ -120,7 +120,11 @@ TEST(CssSelectors, InvalidListsAreRejectedWhole) {
     EXPECT_FALSE(valid("a > "));
     EXPECT_FALSE(valid("a..b"));
     EXPECT_FALSE(valid("#1a"));
-    EXPECT_FALSE(valid("a:has(b)"));
+    EXPECT_TRUE(valid("a:has(b)"));
+    EXPECT_TRUE(valid("a:has(> b, + c ~ d)"));
+    EXPECT_FALSE(valid("a:has()"));
+    EXPECT_FALSE(valid("a:has(b:has(c))"));   // not nested
+    EXPECT_FALSE(valid("a:has(> )"));
     EXPECT_FALSE(valid("svg|a"));
     EXPECT_TRUE(valid("a:is(1bad, b)"));   // :is forgives
     EXPECT_FALSE(valid("a:not(1bad)"));
