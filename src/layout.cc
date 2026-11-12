@@ -53,6 +53,7 @@ struct Box {
     const Box* deco_parent = nullptr;   // an inline with a background or border: the next such out
     float inline_extent = 0;       // how far its widest line reaches, closing padding included
     bool synthetic = false;        // a pseudo-element's image: its node is the layout's own, not the page's
+    uint32_t tree_index = 0;       // where it comes in the box tree, depth first (paint order's tie-break)
     float cb_height_hint = -1;     // its containing block's definite content height, if known: for a
                                    // picture's percentage height (an SVG at height: 100% of a 26px box)
     float last_baseline = -1;      // of the last line box, from the content box's top
@@ -294,6 +295,16 @@ public:
         root->x = root->margin[Left];
         const float root_y = root->margin_top_outer;
         record(*root, root->x, root_y);
+        {
+            uint32_t next = 0;
+            std::vector<Box*> todo{root.get()};
+            while (!todo.empty()) {
+                Box* b = todo.back();
+                todo.pop_back();
+                b->tree_index = next++;
+                for (auto it = b->kids.rbegin(); it != b->kids.rend(); ++it) todo.push_back(it->get());
+            }
+        }
         paintContents(*root, root->x, root_y, viewport, 1.0f);
         flushPositioned();
         placeBelowContent();
@@ -4122,6 +4133,16 @@ private:
                 continue;
             }
             if (k.kind != BoxKind::Block) continue;
+            // z-index on a relatively positioned block lifts it over (or under) the positioned
+            // boxes around it, so it waits its turn with them (Ruliweb's z-index:1 main went
+            // under an absolute ad of its z-index:auto neighbour). Not inside a rotation or
+            // scale, which the later turn wouldn't be inside.
+            if (k.style->position == Position::Relative && k.style->z_index != 0 && transforms_.empty()) {
+                Positioned later{&k, cx, cy, cb, opacity, order_++, clip_stack_, ctx_ops_, ctx_boxes_};
+                later.in_flow = true;
+                positioned_.push_back(std::move(later));
+                continue;
+            }
             paint(k, cx, cy, cb, opacity);
         }
 
@@ -4200,15 +4221,23 @@ private:
     }
 
     void flushPositioned() {
-        // Painted over everything in flow, lowest z-index first; each may add more.
+        // Painted over everything in flow, lowest z-index first, then in tree order. Each may
+        // add more (its own positioned descendants), and those take their turn among the rest
+        // by the same rule: an absolute ad inside a z-index:auto wrapper goes under a later
+        // z-index:1 sibling of the wrapper, not over it (Ruliweb's page was covered).
+        const auto later = [](const Positioned& a, const Positioned& b) {
+            const int za = a.box->style->z_index, zb = b.box->style->z_index;
+            if (za != zb) return za > zb;
+            return a.box->tree_index != b.box->tree_index ? a.box->tree_index > b.box->tree_index : a.order > b.order;
+        };
+        std::make_heap(positioned_.begin(), positioned_.end(), later);
         size_t safety = 0;
         while (!positioned_.empty() && safety++ < 100000) {
-            std::vector<Positioned> batch;
-            batch.swap(positioned_);
-            std::stable_sort(batch.begin(), batch.end(), [](const Positioned& a, const Positioned& b) {
-                return a.box->style->z_index < b.box->style->z_index;
-            });
-            for (const Positioned& p : batch) {
+            std::pop_heap(positioned_.begin(), positioned_.end(), later);
+            const Positioned p = std::move(positioned_.back());
+            positioned_.pop_back();
+            const size_t before = positioned_.size();
+            {
                 const Box& k = *p.box;
                 const ComputedStyle& s = *k.style;
                 // Below its stacking context's content: painted aside, put in its place after.
@@ -4222,6 +4251,45 @@ private:
                     ++painting_below_;
                     ctx_ops_ = p.ctx_ops;
                     ctx_boxes_ = p.ctx_boxes;
+                }
+                if (p.in_flow) {
+                    for (const Rect& c : p.clips) {
+                        PaintOp op;
+                        op.kind = PaintKind::ClipBegin;
+                        op.x = c.x;
+                        op.y = c.y;
+                        op.w = c.w;
+                        op.h = c.h;
+                        out_->ops.push_back(std::move(op));
+                    }
+                    const std::vector<Rect> saved = std::move(clip_stack_);
+                    clip_stack_ = p.clips;
+                    const size_t saved_depth = cb_clip_depth_;
+                    cb_clip_depth_ = clip_stack_.size();
+                    paint(k, p.static_x, p.static_y, p.cb, p.opacity);
+                    // Its floats, whose context has been painted already: now, over it.
+                    while (!pending_floats_.empty()) {
+                        std::vector<PendingFloat> batch;
+                        batch.swap(pending_floats_);
+                        for (const PendingFloat& f : batch) paint(*f.box, f.cx, f.cy, f.cb, f.opacity);
+                    }
+                    clip_stack_ = saved;
+                    cb_clip_depth_ = saved_depth;
+                    for (size_t i = 0; i < p.clips.size(); ++i) {
+                        PaintOp op;
+                        op.kind = PaintKind::ClipEnd;
+                        out_->ops.push_back(std::move(op));
+                    }
+                    if (below) {
+                        below_content_.push_back({p.ctx_ops, p.ctx_boxes, below_content_.size(), std::move(out_->ops), std::move(out_->boxes)});
+                        out_->ops = std::move(main_ops);
+                        out_->boxes = std::move(main_boxes);
+                        --painting_below_;
+                        ctx_ops_ = saved_ctx_ops;
+                        ctx_boxes_ = saved_ctx_boxes;
+                    }
+                    for (size_t i = before; i < positioned_.size(); ++i) std::push_heap(positioned_.begin(), positioned_.begin() + static_cast<ptrdiff_t>(i) + 1, later);
+                    continue;
                 }
                 const Rect cb = s.position == Position::Fixed ? Rect{0, 0, vw_, vh_} : p.cb;
                 layoutForContainingBlock(k, cb);
@@ -4265,6 +4333,7 @@ private:
                     ctx_boxes_ = saved_ctx_boxes;
                 }
             }
+            for (size_t i = before; i < positioned_.size(); ++i) std::push_heap(positioned_.begin(), positioned_.begin() + static_cast<ptrdiff_t>(i) + 1, later);
         }
     }
 
@@ -4298,6 +4367,9 @@ private:
         size_t order;
         std::vector<Rect> clips;   // overflow clips between it and its containing block
         size_t ctx_ops = 0, ctx_boxes = 0;   // where its stacking context's content starts
+        // A relatively positioned block with a z-index, put off to take its turn among the
+        // positioned: painted as in flow from (static_x, static_y), its parent's content box.
+        bool in_flow = false;
     };
     // A negative z-index box's paint, to go in under its stacking context's content.
     struct BelowContent {

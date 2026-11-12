@@ -230,6 +230,25 @@ void PageScript::Impl::installNode() {
             if (c == n) return Value::boolean(true);
         return Value::boolean(false);
     });
+    // Where another node is from this one: the DOCUMENT_POSITION_* bits.
+    method(p, u"compareDocumentPosition", 1, [self](Runtime& rt, const Value& t, Args a) {
+        const Node* me = self->thisNode(t);
+        const Node* other = self->node(arg(a, 0));
+        if (!other) rt.throwError("TypeError", "compareDocumentPosition needs a node");
+        if (other == me) return Value::number(0);
+        std::vector<const Node*> mine, theirs;   // root first
+        for (const Node* n = me; n; n = n->parent) mine.insert(mine.begin(), n);
+        for (const Node* n = other; n; n = n->parent) theirs.insert(theirs.begin(), n);
+        if (mine.front() != theirs.front()) return Value::number(1 | 32 | (me < other ? 4 : 2));
+        size_t i = 0;
+        while (i < mine.size() && i < theirs.size() && mine[i] == theirs[i]) ++i;
+        if (i == mine.size()) return Value::number(16 | 4);    // it's inside me: contained, following
+        if (i == theirs.size()) return Value::number(8 | 2);   // I'm inside it: contains, preceding
+        const auto& kids = mine[i - 1]->children;
+        const auto mine_at = std::find(kids.begin(), kids.end(), mine[i]);
+        const auto theirs_at = std::find(kids.begin(), kids.end(), theirs[i]);
+        return Value::number(theirs_at < mine_at ? 2 : 4);
+    });
     method(p, u"getRootNode", 0, [self](Runtime&, const Value& t, Args) {
         const Node* n = self->thisNode(t);
         while (n->parent) n = n->parent;

@@ -1015,3 +1015,12 @@ TEST(Script, TextDecoderKnowsEucKr) {
         </script>)");
     EXPECT_EQ(p.console, "log:euc-kr \xED\x95\x9C\xEA\xB8\x80\n") << p.console;
 }
+
+TEST(Script, CompareDocumentPosition) {
+    Page p(R"(<body><div id=a><span id=b></span></div><p id=c></p><script>
+        const a = document.getElementById('a'), b = document.getElementById('b'), c = document.getElementById('c');
+        console.log(a.compareDocumentPosition(b), b.compareDocumentPosition(a), a.compareDocumentPosition(c), c.compareDocumentPosition(b),
+                    a.compareDocumentPosition(a), a.compareDocumentPosition(document.createElement('i')) & 1);
+        </script>)");
+    EXPECT_EQ(p.console, "log:20 10 4 2 0 1\n") << p.console;
+}

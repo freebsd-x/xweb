@@ -689,3 +689,18 @@ TEST(Paint, ABlockPictureIsTranslatedOnce) {
     EXPECT_FLOAT_EQ(r.box("g").y, 40);
     EXPECT_FLOAT_EQ(r.box("h").x, 50);
 }
+
+TEST(Paint, PositionedInsideAnAutoBoxGoesUnderALaterZIndex) {
+    // Ruliweb: an absolute ad inside a z-index:auto wrapper, and the page's z-index:1 main.
+    const auto r = layout("<div style='position:absolute;top:0;left:0;width:100px'><div style='position:absolute;top:0;left:0;width:50px;height:50px;background:#f00'></div></div>"
+                          "<div style='position:relative;z-index:1;height:50px;background:#00f'></div>");
+    int red = -1, blue = -1;
+    for (size_t i = 0; i < r.page.ops.size(); ++i) {
+        const auto& op = r.page.ops[i];
+        if (op.kind == PaintKind::Rect && op.color.r == 255 && op.color.b == 0) red = static_cast<int>(i);
+        if (op.kind == PaintKind::Rect && op.color.b == 255 && op.color.r == 0) blue = static_cast<int>(i);
+    }
+    ASSERT_GE(red, 0);
+    ASSERT_GE(blue, 0);
+    EXPECT_LT(red, blue);
+}
