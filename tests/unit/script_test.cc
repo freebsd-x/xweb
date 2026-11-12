@@ -1129,3 +1129,10 @@ TEST(Script, DocumentWriteIsOneStreamPerScript) {
         </script></div><script>console.log(seen.join(), document.querySelector('#d b').textContent, document.querySelectorAll('#d script').length);</script>)");
     EXPECT_EQ(p.console, "log:ran bold 2\n") << p.console;
 }
+
+TEST(Script, NavigatorPluginsAreThereAndEmpty) {
+    Page p(R"(<body><script>
+        console.log(navigator.plugins.length, navigator.mimeTypes.length, navigator.plugins.namedItem('x'), [...navigator.plugins].length, navigator.pdfViewerEnabled);
+        </script>)");
+    EXPECT_EQ(p.console, "log:0 0 null 0 false\n") << p.console;
+}

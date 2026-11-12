@@ -1642,6 +1642,20 @@ const char* const kScriptPrelude = R"JS(
     Object.defineProperty(global, 'MediaError', { value: MediaError, writable: true, configurable: true });
   }
 
+  // navigator.plugins and mimeTypes: empty, as there are none (Chartbeat walks them: its
+  // script stopped on BBC and chosun.com).
+  if (typeof navigator === 'object' && !('plugins' in navigator)) {
+    const empty = (name) => {
+      // (length on the prototype, as Chromium has it: for-in over a list sees only entries.)
+      return Object.create({ item() { return null; }, namedItem() { return null; }, refresh() {}, [Symbol.iterator]: function* () {},
+                             get length() { return 0; }, get [Symbol.toStringTag]() { return name; } });
+    };
+    const plugins = empty('PluginArray'), mimeTypes = empty('MimeTypeArray');
+    Object.defineProperty(navigator, 'plugins', { get() { return plugins; }, configurable: true, enumerable: true });
+    Object.defineProperty(navigator, 'mimeTypes', { get() { return mimeTypes; }, configurable: true, enumerable: true });
+    if (!('pdfViewerEnabled' in navigator)) Object.defineProperty(navigator, 'pdfViewerEnabled', { value: false, configurable: true, enumerable: true });
+  }
+
   // navigator.javaEnabled(): there's no Java (analytics still ask: Danawa).
   if (typeof navigator === 'object' && typeof navigator.javaEnabled !== 'function')
     Object.defineProperty(navigator, 'javaEnabled', { value: function javaEnabled() { return false; }, writable: true, configurable: true });
