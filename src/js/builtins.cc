@@ -1597,7 +1597,36 @@ void Runtime::installBuiltins() {
     });
     method(array_prototype, u"splice", 2, [](Runtime& rt, const Value& t, Args a) {
         Object* o = thisObject(rt, t);
-        if (o->cls != ObjectClass::Array) rt.throwError("TypeError", "splice on a non-array isn't supported");
+        if (o->cls != ObjectClass::Array) {
+            // Anything with a length (Baidu's polyfills splice array-likes): the spec's steps,
+            // element by element.
+            const uint64_t len = rt.lengthOf(o);
+            const uint64_t start = relative(rt, arg(a, 0), len, 0);
+            uint64_t count = 0;
+            if (a.size() == 1) count = len - start;
+            else if (a.size() > 1) count = static_cast<uint64_t>(std::clamp(rt.toIntegerOrInfinity(a[1]), 0.0, static_cast<double>(len - start)));
+            const uint64_t items = a.size() > 2 ? a.size() - 2 : 0;
+            if (len - count + items > 9007199254740991ull) rt.throwError("TypeError", "the length would be too long");
+            checkNewArrayLength(rt, count);
+            std::vector<Value> removed;
+            for (uint64_t k = 0; k < count; ++k) removed.push_back(hasElement(rt, o, start + k) ? elementAt(rt, o, start + k) : Value::empty());
+            const auto key = [](uint64_t i) { return Runtime::numberToString(static_cast<double>(i)); };
+            if (items < count) {
+                for (uint64_t k = start; k < len - count; ++k) {
+                    if (hasElement(rt, o, k + count)) setElement(rt, o, k + items, elementAt(rt, o, k + count));
+                    else rt.deleteProperty(o, key(k + items));
+                }
+                for (uint64_t k = len; k > len - count + items; --k) rt.deleteProperty(o, key(k - 1));
+            } else if (items > count) {
+                for (uint64_t k = len - count; k > start; --k) {
+                    if (hasElement(rt, o, k + count - 1)) setElement(rt, o, k + items - 1, elementAt(rt, o, k + count - 1));
+                    else rt.deleteProperty(o, key(k + items - 1));
+                }
+            }
+            for (uint64_t k = 0; k < items; ++k) setElement(rt, o, start + k, a[2 + k]);
+            setLength(rt, o, len - count + items);
+            return Value::object(rt.newArray(std::move(removed)));
+        }
         const uint64_t len = o->elements.size();
         const uint64_t start = relative(rt, arg(a, 0), len, 0);
         uint64_t count = 0;

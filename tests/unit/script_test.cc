@@ -1024,3 +1024,15 @@ TEST(Script, CompareDocumentPosition) {
         </script>)");
     EXPECT_EQ(p.console, "log:20 10 4 2 0 1\n") << p.console;
 }
+
+TEST(Script, SplitTextMediaErrorJavaAndGenericSplice) {
+    Page p(R"(<body><p id=p>hello world</p><script>
+        const t = document.getElementById('p').firstChild;
+        const rest = t.splitText(5);
+        const like = { 0: 'a', 1: 'b', 2: 'c', length: 3 };
+        const gone = Array.prototype.splice.call(like, 1, 1, 'x', 'y');
+        console.log(t.data + '|' + rest.data, document.getElementById('p').childNodes.length, rest.wholeText,
+                    MediaError.MEDIA_ERR_NETWORK, navigator.javaEnabled(), gone.join(), like.length, like[1] + like[2] + like[3]);
+        </script>)");
+    EXPECT_EQ(p.console, "log:hello| world 2 hello world 2 false b 4 xyc\n") << p.console;
+}

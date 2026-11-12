@@ -1309,6 +1309,42 @@ const char* const kScriptPrelude = R"JS(
       Object.defineProperty(Document.prototype, 'getSelection', { value: function getSelection() { return selection; }, writable: true, configurable: true });
   }
 
+  // Text.splitText (Svelte's hydration splits text nodes: news.daum.net).
+  if (typeof Text === 'function' && !Text.prototype.splitText)
+    Object.defineProperty(Text.prototype, 'splitText', { configurable: true, writable: true, value: function splitText(offset) {
+      offset = offset >>> 0;
+      const data = this.data;
+      if (offset > data.length) throw new DOMException('the offset is past the end of the text', 'IndexSizeError');
+      const rest = (this.ownerDocument || document).createTextNode(data.slice(offset));
+      this.data = data.slice(0, offset);
+      if (this.parentNode) this.parentNode.insertBefore(rest, this.nextSibling);
+      return rest;
+    } });
+  if (typeof Text === 'function')   // (the native one gave only its own text)
+    Object.defineProperty(Text.prototype, 'wholeText', { configurable: true, enumerable: true, get() {
+      let first = this, last = this, text = '';
+      while (first.previousSibling && first.previousSibling.nodeType === 3) first = first.previousSibling;
+      while (last.nextSibling && last.nextSibling.nodeType === 3) last = last.nextSibling;
+      for (let n = first; ; n = n.nextSibling) { text += n.data; if (n === last) break; }
+      return text;
+    } });
+
+  // MediaError, for a media element's error (Reddit's player checks against it).
+  if (typeof global.MediaError !== 'function') {
+    class MediaError {
+      constructor() { throw new TypeError('Illegal constructor'); }
+    }
+    for (const [k, v] of [['MEDIA_ERR_ABORTED', 1], ['MEDIA_ERR_NETWORK', 2], ['MEDIA_ERR_DECODE', 3], ['MEDIA_ERR_SRC_NOT_SUPPORTED', 4]]) {
+      Object.defineProperty(MediaError, k, { value: v, enumerable: true });
+      Object.defineProperty(MediaError.prototype, k, { value: v, enumerable: true });
+    }
+    Object.defineProperty(global, 'MediaError', { value: MediaError, writable: true, configurable: true });
+  }
+
+  // navigator.javaEnabled(): there's no Java (analytics still ask: Danawa).
+  if (typeof navigator === 'object' && typeof navigator.javaEnabled !== 'function')
+    Object.defineProperty(navigator, 'javaEnabled', { value: function javaEnabled() { return false; }, writable: true, configurable: true });
+
   // navigator.serviceWorker: there, but no worker is ever registered or in control.
   if (typeof navigator === 'object' && !('serviceWorker' in navigator) && typeof EventTarget === 'function') {
     const sw = new (class ServiceWorkerContainer extends EventTarget {
