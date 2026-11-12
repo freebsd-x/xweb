@@ -245,6 +245,7 @@ struct Page {
     web::FormState forms;       // what its controls hold; UI thread only
     std::map<std::string, std::string> scripts;   // external scripts' text, by absolute URL
     std::string charset;   // what the page itself was in (empty: UTF-8, as nothing said otherwise)
+    std::set<std::string> sheets_requested;   // stylesheets asked for after it was shown; UI thread only
     std::unique_ptr<web::PageScript> script;      // its scripts' world; UI thread only. Last: it refers to doc
 };
 
@@ -270,7 +271,11 @@ void loadSheets(Page& page, const std::atomic<uint64_t>& generation, uint64_t mi
         if (n->isHtml("link")) {
             const std::string* rel = n->attr("rel");
             const std::string* href = n->attr("href");
-            if (rel && href && lowerCase(*rel).find("stylesheet") != std::string::npos) queue.push_back(web::resolveUrl(page.base, *href));
+            const std::string* as = n->attr("as");
+            // Stylesheets, and styles preloaded to become one (loadCSS: samsung.com/sec).
+            if (rel && href && (lowerCase(*rel).find("stylesheet") != std::string::npos ||
+                                (lowerCase(*rel).find("preload") != std::string::npos && as && lowerCase(*as) == "style")))
+                queue.push_back(web::resolveUrl(page.base, *href));
         } else if (n->isHtml("style")) {
             for (const std::string& ref : web::css::parseStylesheet(n->textContent()).imports)
                 queue.push_back(web::resolveUrl(page.base, ref));
@@ -620,6 +625,7 @@ public:
     void onFontsWanted(std::function<void(const std::shared_ptr<Page>&, std::vector<web::WebFontFace>)> f) { on_fonts_ = std::move(f); }
     // Told after a layout what images its styles call for that haven't been asked for.
     void onImagesWanted(std::function<void(const std::shared_ptr<Page>&, std::vector<std::string>)> f) { on_images_ = std::move(f); }
+    void onSheetsWanted(std::function<void(const std::shared_ptr<Page>&, std::vector<std::string>)> f) { on_sheets_ = std::move(f); }
 
     void show(std::shared_ptr<Page> page) {
         popup_ = nullptr;
@@ -1021,11 +1027,19 @@ private:
             return;
         }
         const Page& page = *page_;
+        // A stylesheet linked since the page came (a script's, or a preload turned into one)
+        // is fetched now and the page styled again when it's here.
+        std::vector<std::string> missing_sheets;
         styles_ = std::make_unique<web::StyledDocument>(
             *page.doc, web::css::MediaContext{width, height},
-            [&page](const std::string& href) {
-                const auto it = page.sheets.find(web::resolveUrl(page.base, href));
-                return it == page.sheets.end() ? std::string{} : it->second;
+            [&page, &missing_sheets](const std::string& href) {
+                std::string url = web::resolveUrl(page.base, href);
+                const auto it = page.sheets.find(url);
+                if (it == page.sheets.end()) {
+                    if (!page.sheets_requested.count(url)) missing_sheets.push_back(std::move(url));
+                    return std::string{};
+                }
+                return it->second;
             },
             [this](const web::ComputedStyle& s) { return web::chWidth(measurer_, s); }, &page_->forms);
         const web::StyledDocument& styles = *styles_;
@@ -1046,6 +1060,10 @@ private:
             if (!page_->requested.count(url)) wanted.push_back(std::move(url));
         }
         if (!wanted.empty() && on_images_) on_images_(page_, std::move(wanted));
+        if (!missing_sheets.empty() && on_sheets_) {
+            for (const std::string& url : missing_sheets) page_->sheets_requested.insert(url);
+            on_sheets_(page_, std::move(missing_sheets));
+        }
         // The engine puts a run's baseline 0.8em below where it's told: answer in those
         // terms, for the baseline the font's own ascent put it on.
         text_y_.assign(layout_.ops.size(), 0);
@@ -1434,6 +1452,7 @@ private:
     std::unordered_map<const web::Node*, std::pair<uint64_t, LoadedImage>> canvas_images_;
     std::function<void(const std::shared_ptr<Page>&, std::vector<web::WebFontFace>)> on_fonts_;
     std::function<void(const std::shared_ptr<Page>&, std::vector<std::string>)> on_images_;
+    std::function<void(const std::shared_ptr<Page>&, std::vector<std::string>)> on_sheets_;
     std::unique_ptr<web::StyledDocument> styles_;   // the last layout's, which inline SVG is drawn with
     std::map<std::string, CachedRaster> rasters_;
     const web::Node* popup_ = nullptr;   // a <select> whose list is open
@@ -1459,6 +1478,37 @@ public:
         node_->onImagesWanted([this](const std::shared_ptr<Page>& page, std::vector<std::string> urls) {
             // Not from inside layout: next turn of the loop.
             XApplication::post([this, page, urls = std::move(urls)]() mutable { loadImages(page, std::move(urls), generation_.load()); });
+        });
+        node_->onSheetsWanted([this](const std::shared_ptr<Page>& page, std::vector<std::string> urls) {
+            const uint64_t mine = generation_.load();
+            std::thread([this, page, urls = std::move(urls), mine] {
+                // Each, with what it imports, then all of them into the page at once.
+                std::vector<std::pair<std::string, std::string>> got_sheets;
+                std::deque<std::string> queue(urls.begin(), urls.end());
+                std::set<std::string> seen;
+                while (!queue.empty() && got_sheets.size() < kMaxSheets && generation_.load() == mine) {
+                    std::string url = std::move(queue.front());
+                    queue.pop_front();
+                    if (!seen.insert(url).second) continue;
+                    Resource got = load(url, web::sameSite(page->url, url));
+                    const bool ok = got.ok && got.http_status < 400;
+                    std::string css = ok ? web::decodeToUtf8(got.body, got.content_type) : std::string{};
+                    for (const std::string& ref : web::css::parseStylesheet(css).imports) queue.push_back(web::resolveUrl(url, ref));
+                    got_sheets.emplace_back(std::move(url), ok ? std::move(css) : std::string("\x01" "failed"));
+                }
+                XApplication::post([this, page, got_sheets = std::move(got_sheets), mine] {
+                    if (generation_.load() != mine) return;
+                    for (const auto& [url, css] : got_sheets) {
+                        const bool ok = css != "\x01" "failed";
+                        if (!page->sheets.count(url)) page->sheets[url] = ok ? css : std::string{};
+                        if (page->script) page->script->sheetLoaded(url, ok);
+                    }
+                    if (page->script) (void)page->script->takeDirty();
+                    for (const auto& [url, css] : got_sheets)
+                        if (css.find("@font-face") != std::string::npos) page->fonts_known = false;   // its fonts too
+                    relayout_wanted_ = true;
+                });
+            }).detach();
         });
     }
 
@@ -1613,6 +1663,12 @@ private:
     void install(const std::shared_ptr<Page>& page, float scroll) {
         node_->show(page);
         startScripts(page);
+        // The stylesheets fetched with the page are here: "load" at their <link>s (a style
+        // preload's onload is how loadCSS makes it a stylesheet).
+        if (page->script) {
+            for (const auto& [url, css] : page->sheets) page->script->sheetLoaded(url, true);
+            if (page->script->takeDirty()) node_->refresh();
+        }
         // Redirected? This is where we are now.
         if (index_ < history_.size()) history_[index_].url = page->url;
         showAddress(page->url);

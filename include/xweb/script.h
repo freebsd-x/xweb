@@ -108,6 +108,9 @@ public:
     void toggle(Node* details);
     // An image has come (or failed): "load" (or "error") at each <img> showing it.
     void imageLoaded(const std::string& url, bool ok);
+    // A stylesheet has come (or failed): "load" (or "error") at each <link> that names it,
+    // as a stylesheet or a style preload (loadCSS's onload switches rel to stylesheet).
+    void sheetLoaded(const std::string& url, bool ok);
 
     // The event loop: due timers, then animation frames, then microtasks.
     void tick();

@@ -1753,6 +1753,24 @@ void PageScript::imageLoaded(const std::string& url, bool ok) {
     s.drainMicrotasks();
 }
 
+void PageScript::sheetLoaded(const std::string& url, bool ok) {
+    Impl& s = *impl_;
+    std::vector<Node*> links, todo{s.doc.root()};
+    while (!todo.empty()) {
+        Node* n = todo.back();
+        todo.pop_back();
+        if (n->isHtml("link"))
+            if (const std::string* href = n->attr("href"); href && resolveUrl(s.host.base, *href) == url) {
+                const std::string rel = n->attr("rel") ? lower(*n->attr("rel")) : std::string{};
+                const std::string as = n->attr("as") ? lower(*n->attr("as")) : std::string{};
+                if (rel.find("stylesheet") != std::string::npos || (rel.find("preload") != std::string::npos && as == "style")) links.push_back(n);
+            }
+        todo.insert(todo.end(), n->children.rbegin(), n->children.rend());
+    }
+    for (Node* n : links) s.fire(n, ok ? u"load" : u"error", false, false);
+    s.drainMicrotasks();
+}
+
 void PageScript::toggle(Node* details) {
     Impl& s = *impl_;
     if (!details) return;

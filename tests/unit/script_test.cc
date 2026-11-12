@@ -1046,3 +1046,35 @@ TEST(Script, SvgInterfacesAndCheckVisibility) {
         </script>)");
     EXPECT_EQ(p.console, "log:true true true true true false true\n") << p.console;
 }
+
+TEST(Script, AStylePreloadHearsItsSheetCome) {
+    // loadCSS (samsung.com/sec): <link rel=preload as=style onload="this.rel='stylesheet'">.
+    Page p(R"(<head><link id=l rel=preload as=style href="https://example.org/a.css" onload="this.onload=null;this.rel='stylesheet'">
+        <link id=m rel=preload as=script href="https://example.org/a.css"></head><body><script>
+        document.getElementById('m').onload = () => console.log('wrong one');
+        </script>)");
+    p.script->sheetLoaded("https://example.org/a.css", true);
+    std::string rel;
+    std::vector<const Node*> todo{p.doc->root()};
+    while (!todo.empty()) {
+        const Node* n = todo.back();
+        todo.pop_back();
+        if (const std::string* id = n->attr("id"); id && *id == "l") rel = *n->attr("rel");
+        for (const Node* k : n->children) todo.push_back(k);
+    }
+    EXPECT_EQ(rel, "stylesheet");
+    EXPECT_EQ(p.console, "") << p.console;
+}
+
+TEST(Script, DomMatrix) {
+    Page p(R"(<body><script>
+        const m = new DOMMatrix('translate(10px, 20px) scale(2)');
+        const p = m.transformPoint(new DOMPoint(1, 1));
+        const inv = m.inverse().transformPoint(p);
+        const r = new DOMMatrix().rotate(90);
+        console.log(String(m), p.x, p.y, Math.round(inv.x), Math.round(inv.y), m.is2D, new DOMMatrix().isIdentity,
+                    Math.round(r.b), new DOMMatrix([1, 0, 0, 1, 5, 6]).multiply(new DOMMatrix([2, 0, 0, 2, 0, 0])).e,
+                    DOMMatrix.fromMatrix({ a: 3, d: 3 }).a);
+        </script>)");
+    EXPECT_EQ(p.console, "log:matrix(2, 0, 0, 2, 10, 20) 12 22 1 1 true true 1 5 3\n") << p.console;
+}
