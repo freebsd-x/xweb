@@ -1104,3 +1104,16 @@ TEST(Script, DatesInTheirTimeZones) {
         </script>)");
     EXPECT_EQ(p.console, "log:November 12, 2026 | 1:05 PM EST | 8:00 AM EDT | 2:00 PM | 5 AM | 13 | 6:05:00 PM | 11/12/2026, 6:05:00 PM\n") << p.console;
 }
+
+TEST(Script, FrameDocumentsAttrNodesAndSmallGlobals) {
+    Page p(R"(<body><iframe id=f></iframe><a id=a href="/x" title="t"></a><script>
+        const f = document.getElementById('f'), d = f.contentWindow.document.open();
+        d.write('<p>hi</p>');
+        d.close();
+        const a = document.getElementById('a'), n = a.getAttributeNode('title');
+        n.value = 'u';
+        console.log(!!f.contentDocument.body, f.contentDocument === d, a.getAttribute('title'), a.getAttributeNode('nope'),
+                    typeof IntersectionObserverEntry, Notification.permission);
+        </script>)");
+    EXPECT_EQ(p.console, "log:true true u null function denied\n") << p.console;
+}

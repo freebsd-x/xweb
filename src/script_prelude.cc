@@ -1583,6 +1583,53 @@ const char* const kScriptPrelude = R"JS(
     }
   }
 
+  // IntersectionObserverEntry (feature checks look for it: inflearn's quicklink).
+  if (typeof global.IntersectionObserverEntry !== 'function') {
+    class IntersectionObserverEntry {
+      constructor(init = {}) { Object.assign(this, { time: 0, rootBounds: null, boundingClientRect: null, intersectionRect: null, isIntersecting: false, intersectionRatio: 0, target: null }, init); }
+    }
+    Object.defineProperty(global, 'IntersectionObserverEntry', { value: IntersectionObserverEntry, writable: true, configurable: true });
+  }
+
+  // Notification: there, but never allowed (no notifications from pages yet).
+  if (typeof global.Notification !== 'function' && typeof EventTarget === 'function') {
+    class Notification extends EventTarget {
+      constructor() { super(); throw new TypeError('notifications are not allowed'); }
+      static get permission() { return 'denied'; }
+      static requestPermission(callback) { if (typeof callback === 'function') setTimeout(() => callback('denied')); return Promise.resolve('denied'); }
+      static get maxActions() { return 0; }
+    }
+    Object.defineProperty(global, 'Notification', { value: Notification, writable: true, configurable: true });
+  }
+
+  // Attr nodes by name, as old jQuery reads attributes (melon.com: getAttributeNode).
+  if (typeof Element === 'function' && !Element.prototype.getAttributeNode) {
+    const attrNode = (el, name) => {
+      if (!el.hasAttribute(name)) return null;
+      return {
+        nodeType: 2, name, localName: name, nodeName: name, specified: true, namespaceURI: null, prefix: null, ownerElement: el,
+        get value() { return el.getAttribute(name); }, set value(v) { el.setAttribute(name, v); },
+        get nodeValue() { return el.getAttribute(name); }, set nodeValue(v) { el.setAttribute(name, v); },
+        get textContent() { return el.getAttribute(name); },
+      };
+    };
+    Object.defineProperty(Element.prototype, 'getAttributeNode', { value: function getAttributeNode(n) { return attrNode(this, String(n).toLowerCase()); }, writable: true, configurable: true });
+    Object.defineProperty(Element.prototype, 'getAttributeNodeNS', { value: function getAttributeNodeNS(ns, n) { return attrNode(this, String(n)); }, writable: true, configurable: true });
+    Object.defineProperty(Element.prototype, 'setAttributeNode', { value: function setAttributeNode(a) {
+      const old = attrNode(this, a.name);
+      const prev = old && { name: old.name, value: old.value };
+      this.setAttribute(a.name, a.value);
+      return prev;
+    }, writable: true, configurable: true });
+    Object.defineProperty(Element.prototype, 'removeAttributeNode', { value: function removeAttributeNode(a) { this.removeAttribute(a.name); return a; }, writable: true, configurable: true });
+    if (typeof Document === 'function' && !Document.prototype.createAttribute)
+      Object.defineProperty(Document.prototype, 'createAttribute', { value: function createAttribute(n) {
+        let v = '';
+        return { nodeType: 2, name: String(n).toLowerCase(), localName: String(n).toLowerCase(), nodeName: String(n).toLowerCase(), specified: true, ownerElement: null,
+                 get value() { return v; }, set value(x) { v = String(x); }, get nodeValue() { return v; }, set nodeValue(x) { v = String(x); } };
+      }, writable: true, configurable: true });
+  }
+
   // MediaError, for a media element's error (Reddit's player checks against it).
   if (typeof global.MediaError !== 'function') {
     class MediaError {
@@ -1638,6 +1685,7 @@ const char* const kScriptPrelude = R"JS(
             get parent() { return global; }, get top() { return global; }, get opener() { return null; },
             get frames() { return w; }, get self() { return w; }, get window() { return w; }, length: 0,
             get location() { return { get href() { return frame.src || 'about:blank'; }, replace() {}, assign() {} }; },
+            get document() { return frameDocument(frame); },
           });
           frames.set(this, w);
         }
@@ -1645,6 +1693,21 @@ const char* const kScriptPrelude = R"JS(
       },
       configurable: true, enumerable: true,
     });
+    // Its document: a blank one of its own (nothing loads in frames yet), which loaders
+    // write their tags into (chosun.com's: contentWindow.document.open()).
+    const docs = new WeakMap();
+    const frameDocument = (frame) => {
+      if (!frame.isConnected) return null;
+      let d = docs.get(frame);
+      if (!d && typeof DOMParser === 'function') {
+        d = new DOMParser().parseFromString('<!doctype html><html><head></head><body></body></html>', 'text/html');
+        for (const [k, f] of [['open', function () { return this; }], ['close', function () {}], ['write', function () {}], ['writeln', function () {}]])
+          Object.defineProperty(d, k, { value: f, writable: true, configurable: true });
+        docs.set(frame, d);
+      }
+      return d || null;
+    };
+    Object.defineProperty(HTMLIFrameElement.prototype, 'contentDocument', { get() { return frameDocument(this); }, configurable: true, enumerable: true });
   }
 
   // Window: the global object's interface (window instanceof Window, Window.prototype).
