@@ -85,8 +85,9 @@ struct FormSubmission {
 
 // What submitting `form` with `submitter` (a submit button, or null) does; nothing if
 // the page can't be submitted this way (a dialog method, an unusable address).
+// `charset`: the page's encoding (empty: UTF-8); the form's accept-charset can say otherwise.
 [[nodiscard]] std::optional<FormSubmission> submitForm(const Node* form, const Node* submitter, const FormState& state,
-                                                       const std::string& document_url);
+                                                       const std::string& document_url, const std::string& charset = {});
 // The submit button Enter in a field uses: the form's first, if any.
 [[nodiscard]] const Node* defaultButton(const Node* form);
 // Whether Enter in a field may submit a form without a submit button: only when it

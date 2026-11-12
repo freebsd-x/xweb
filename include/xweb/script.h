@@ -62,7 +62,9 @@ public:
         std::function<float()> scroll_y;
         // A script the page wants that wasn't fetched ahead (import(), a module's
         // import): fetched now, its text (or nothing) handed back later on this thread.
-        std::function<void(const std::string& url, std::function<void(std::optional<std::string>)> done)> fetch_script;
+        // `charset`: what to read it as if the response doesn't say (a script's charset
+        // attribute; "utf-8" for modules; empty: as the page is).
+        std::function<void(const std::string& url, const std::string& charset, std::function<void(std::optional<std::string>)> done)> fetch_script;
         // fetch() and XMLHttpRequest: the request, and later on this thread its response.
         // The browser decides what a page may reach (see the viewer's policy).
         struct Request {

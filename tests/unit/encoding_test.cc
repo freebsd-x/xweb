@@ -27,3 +27,11 @@ TEST(Encoding, Utf16) {
     EXPECT_EQ(decodeToUtf8(std::string_view("\xFF\xFE\x3D\xD8\x00\xDE", 6)), "\xF0\x9F\x98\x80");
     EXPECT_EQ(decodeToUtf8(std::string_view("\xFF\xFE\x3D\xD8", 4)), "\xEF\xBF\xBD");
 }
+
+TEST(Encoding, EucKr) {
+    // yes24.com says charset=ks_c_5601-1987: EUC-KR by another name.
+    EXPECT_EQ(decodeToUtf8("\xC7\xD1\xB1\xDB!", "text/html; charset=ks_c_5601-1987"), "\xED\x95\x9C\xEA\xB8\x80!");
+    EXPECT_EQ(decodeToUtf8("<meta charset=euc-kr>\x8C\x63"), "<meta charset=euc-kr>\xEB\x98\xA0");   // windows-949's extension
+    EXPECT_EQ(decodeToUtf8("\xC7<", "text/html; charset=euc-kr"), "\xEF\xBF\xBD<");                   // the ASCII trail survives
+    EXPECT_EQ(decodeToUtf8("\xC7", "text/html; charset=euc-kr"), "\xEF\xBF\xBD");
+}

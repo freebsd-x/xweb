@@ -1586,7 +1586,7 @@ void PageScript::Impl::install() {
             return;
         }
         // Not fetched ahead: ask for it, and carry on as a task of its own when it comes.
-        host.fetch_script(url, [this, done](std::optional<std::string> got) {
+        host.fetch_script(url, "utf-8", [this, done](std::optional<std::string> got) {
             js::ModuleSource src;
             if (got) {
                 src.ok = true;

@@ -7,6 +7,7 @@
 #include <cctype>
 #include <random>
 
+#include "xweb/encoding.h"
 #include "xweb/url.h"
 
 namespace fbx::xweb {
@@ -329,7 +330,8 @@ bool implicitSubmissionAllowed(const Node* form) {
     return fields == 1;
 }
 
-std::optional<FormSubmission> submitForm(const Node* form, const Node* submitter, const FormState& state, const std::string& document_url) {
+std::optional<FormSubmission> submitForm(const Node* form, const Node* submitter, const FormState& state, const std::string& document_url,
+                                         const std::string& charset) {
     if (!form || !form->isHtml("form")) return std::nullopt;
     const auto setting = [&](std::string_view on_button, std::string_view on_form) {
         if (submitter && controlKind(submitter) != ControlKind::None)
@@ -346,6 +348,21 @@ std::optional<FormSubmission> submitForm(const Node* form, const Node* submitter
     const Url target = parseUrl(action);
     if (target.scheme != "http" && target.scheme != "https" && target.scheme != "file") return std::nullopt;
 
+    // In the encoding the form asks for (accept-charset's first we know) or else the page's:
+    // a search on an EUC-KR site (yes24) expects EUC-KR.
+    bool euc_kr = isEucKrLabel(charset);
+    if (const std::string* accept = form->attr("accept-charset")) {
+        std::string word;
+        for (size_t i = 0; i <= accept->size(); ++i) {
+            if (i == accept->size() || (*accept)[i] == ' ' || (*accept)[i] == ',') {
+                if (lower(word) == "utf-8") { euc_kr = false; break; }
+                if (isEucKrLabel(word)) { euc_kr = true; break; }
+                word.clear();
+            } else {
+                word += (*accept)[i];
+            }
+        }
+    }
     // The entry list.
     std::vector<std::pair<std::string, std::string>> entries;
     size_t bytes = 0;
@@ -384,12 +401,17 @@ std::optional<FormSubmission> submitForm(const Node* form, const Node* submitter
             continue;
         }
         if (k == ControlKind::Hidden && lower(name) == "_charset_") {
-            add(name, "UTF-8");
+            add(name, euc_kr ? "EUC-KR" : "UTF-8");
             continue;
         }
         add(name, state.value(c));
     }
 
+    if (euc_kr && enctype != "multipart/form-data")
+        for (auto& [n, v] : entries) {
+            n = utf8ToEucKr(n);
+            v = utf8ToEucKr(v);
+        }
     FormSubmission out;
     out.post = post && target.scheme != "file";
     if (!post) {

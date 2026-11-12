@@ -240,6 +240,7 @@ struct Page {
     bool fonts_known = false;   // its @font-face rules are in force, and what they need asked for
     web::FormState forms;       // what its controls hold; UI thread only
     std::map<std::string, std::string> scripts;   // external scripts' text, by absolute URL
+    std::string charset;   // what the page itself was in (empty: UTF-8, as nothing said otherwise)
     std::unique_ptr<web::PageScript> script;      // its scripts' world; UI thread only. Last: it refers to doc
 };
 
@@ -294,6 +295,7 @@ void loadScripts(Page& page, const std::atomic<uint64_t>& generation, uint64_t m
     constexpr size_t kMaxTotalBytes = 64 << 20;
     std::vector<const web::Node*> todo{page.doc->root()};
     std::vector<std::string> urls;
+    std::map<std::string, std::string> charsets;   // a script's charset attribute, by URL
     std::deque<std::pair<std::string, std::string>> modules;   // (its URL, its source if inline)
     web::js::ImportMap import_map;
     while (!todo.empty() && urls.size() < kMaxScripts) {
@@ -310,6 +312,7 @@ void loadScripts(Page& page, const std::atomic<uint64_t>& generation, uint64_t m
                 else modules.emplace_back(std::string{}, n->textContent());
             } else if (src && !n->attr("nomodule") && (t.empty() || t.find("javascript") != std::string::npos || t == "text/ecmascript")) {
                 urls.push_back(web::resolveUrl(page.base, *src));
+                if (const std::string* cs = n->attr("charset")) charsets[urls.back()] = *cs;
             }
         }
         todo.insert(todo.end(), n->children.rbegin(), n->children.rend());
@@ -321,7 +324,15 @@ void loadScripts(Page& page, const std::atomic<uint64_t>& generation, uint64_t m
         Resource got = load(url, web::sameSite(page.url, url));
         if (!got.ok || got.http_status >= 400 || got.body.size() > kMaxScriptBytes) return nullptr;
         total += got.body.size();
-        return &(page.scripts[url] = web::decodeToUtf8(got.body, got.content_type));
+        // A script that doesn't say is in its charset attribute's encoding, else the page's
+        // (yes24's EUC-KR scripts).
+        std::string type = got.content_type;
+        if (web::detectCharset({}, type).empty()) {
+            const auto it = charsets.find(url);
+            const std::string cs = it != charsets.end() ? it->second : page.charset;
+            type = "text/javascript; charset=" + (cs.empty() ? std::string("utf-8") : cs);
+        }
+        return &(page.scripts[url] = web::decodeToUtf8(got.body, type));
     };
     for (const std::string& url : urls) {
         if (generation.load() != mine) return;
@@ -1561,6 +1572,7 @@ private:
             Resource got = post ? loadPost(*post) : load(url, true);
             if (generation_.load() != mine) return;
             page->url = got.ok ? got.final_url : url;
+            if (got.ok) page->charset = web::detectCharset(got.body, got.content_type);
             page->doc = web::parseHtml(htmlFor(got, url), web::ParseOptions{.scripting = true});
             page->base = findBase(*page->doc, page->url);
             loadSheets(*page, generation_, mine);
@@ -1697,7 +1709,7 @@ private:
             return st;
         };
         host.submit = [this, raw](const web::Node* form) {
-            if (auto sub = web::submitForm(form, nullptr, raw->forms, raw->base)) XApplication::post([this, sub = std::move(*sub)] { submit(sub); });
+            if (auto sub = web::submitForm(form, nullptr, raw->forms, raw->base, raw->charset)) XApplication::post([this, sub = std::move(*sub)] { submit(sub); });
         };
         host.focus = [this, raw](const web::Node* n) {
             if (!web::isTypedInto(web::controlKind(n))) return;
@@ -1709,12 +1721,20 @@ private:
         host.scroll_y = [this] { return node_->scrollY(); };
         // import() and anything else not fetched ahead: off the UI thread, back on it.
         std::weak_ptr<Page> weak = page;
-        const std::string page_url = page->url;
-        host.fetch_script = [this, weak, page_url](const std::string& url, std::function<void(std::optional<std::string>)> done) {
-            std::thread([this, weak, page_url, url, done = std::move(done)] {
+        const std::string page_url = page->url, page_charset = page->charset;
+        host.fetch_script = [this, weak, page_url, page_charset](const std::string& url, const std::string& charset,
+                                                                  std::function<void(std::optional<std::string>)> done) {
+            std::thread([this, weak, page_url, page_charset, url, charset, done = std::move(done)] {
                 Resource got = load(url, web::sameSite(page_url, url));
                 std::optional<std::string> body;
-                if (got.ok && got.http_status < 400 && got.body.size() <= (16u << 20)) body = web::decodeToUtf8(got.body, got.content_type);
+                // Not saying: as the script element says (jQuery's scriptCharset: Nate's
+                // EUC-KR boxes), else as the page is.
+                std::string type = got.content_type;
+                if (web::detectCharset({}, type).empty()) {
+                    const std::string& cs = !charset.empty() ? charset : page_charset;
+                    type = "text/javascript; charset=" + (cs.empty() ? std::string("utf-8") : cs);
+                }
+                if (got.ok && got.http_status < 400 && got.body.size() <= (16u << 20)) body = web::decodeToUtf8(got.body, type);
                 // XWEB_DEBUG_SCRIPTS=1: what each script fetch came to.
                 if (std::getenv("XWEB_DEBUG_SCRIPTS"))
                     std::fprintf(stderr, "[script] %s: %s status %d, %zu bytes\n", url.c_str(), body ? "ok" : "FAILED", got.http_status, got.body.size());
@@ -1832,7 +1852,7 @@ private:
             case web::ControlKind::Image:
                 if (const web::Node* form = web::formOwner(n)) {
                     if (page->script && !page->script->submit(const_cast<web::Node*>(form), const_cast<web::Node*>(n))) return;
-                    if (auto sub = web::submitForm(form, n, page->forms, page->base)) XApplication::post([this, sub = std::move(*sub)] { submit(sub); });
+                    if (auto sub = web::submitForm(form, n, page->forms, page->base, page->charset)) XApplication::post([this, sub = std::move(*sub)] { submit(sub); });
                 }
                 break;
             default: break;
@@ -2265,7 +2285,7 @@ private:
             if (page->script->takeDirty()) changed();
             return;
         }
-        auto sub = web::submitForm(form, submitter, page->forms, page->base);
+        auto sub = web::submitForm(form, submitter, page->forms, page->base, page->charset);
         if (!sub) return;
         Browser* browser = browser_;
         XApplication::post([browser, sub = std::move(*sub)] { browser->submit(sub); });

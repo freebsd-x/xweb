@@ -681,7 +681,8 @@ struct PageScript::Impl {
             // fetched now, and run when it comes, as browsers run inserted scripts.
             if (host.fetch_script && pending_script_fetches < kMaxPendingScriptFetches) {
                 ++pending_script_fetches;
-                host.fetch_script(url, [this, s, url](std::optional<std::string> body) {
+                const std::string* cs = s->attr("charset");
+                host.fetch_script(url, isModule(s) ? std::string("utf-8") : cs ? *cs : std::string{}, [this, s, url](std::optional<std::string> body) {
                     --pending_script_fetches;
                     rt.setStepBudget(kTaskBudget);
                     if (!body) {

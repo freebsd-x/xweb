@@ -8,6 +8,7 @@
 
 #include "bigint.h"
 #include "internal.h"
+#include "xweb/encoding.h"
 
 namespace fbx::xweb::js {
 
@@ -992,7 +993,7 @@ void Runtime::installTypedArrays() {
     });
 
     Object* td_proto = newObject();
-    // A decoder's encoding is `primitive` ("utf-8", "utf-16le", "utf-16be", "windows-1252");
+    // A decoder's encoding is `primitive` ("utf-8", "utf-16le", "utf-16be", "windows-1252", "euc-kr");
     // its fatal and ignoreBOM flags are `cursor` bits 1 and 2.
     Object* td = newFunction(u"TextDecoder", 0, [td_proto](Runtime& rt, const Value&, Args a) -> Value {
         Object* nt = rt.construct_target;
@@ -1007,6 +1008,7 @@ void Runtime::installTypedArrays() {
         else if (label == "utf-16be") enc = u"utf-16be";
         else if (label == "windows-1252" || label == "latin1" || label == "iso-8859-1" || label == "ascii" || label == "us-ascii" || label == "l1" || label == "cp1252")
             enc = u"windows-1252";
+        else if (isEucKrLabel(label)) enc = u"euc-kr";
         else rt.throwError("RangeError", "the encoding '" + label + "' isn't supported");
         const Value p = rt.get(Value::object(nt), u"prototype");
         Object* d = rt.newObject(p.isObject() ? p.asObject() : td_proto);
@@ -1033,6 +1035,11 @@ void Runtime::installTypedArrays() {
         const std::u16string& enc = d->primitive.asString();
         const bool fatal = d->cursor & 1, ignore_bom = d->cursor & 2;
         if (enc == u"utf-8") return Value::string(decodeUtf8(rt, p, n, fatal, ignore_bom));
+        if (enc == u"euc-kr") {
+            const std::string text = eucKrToUtf8(std::string_view(reinterpret_cast<const char*>(p), n));
+            if (fatal && text.find("\xEF\xBF\xBD") != std::string::npos) rt.throwError("TypeError", "the data isn't valid EUC-KR");
+            return Value::string(utf16(text));
+        }
         std::u16string out;
         if (enc == u"windows-1252") {
             static const char16_t k80[32] = {0x20AC, 0x81, 0x201A, 0x192, 0x201E, 0x2026, 0x2020, 0x2021, 0x2C6, 0x2030, 0x160, 0x2039, 0x152, 0x8D, 0x17D, 0x8F,

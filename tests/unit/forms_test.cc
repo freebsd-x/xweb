@@ -156,3 +156,17 @@ TEST(Forms, HostileForms) {
     (void)submitForm(byId(*doc, "g"), nullptr, st, "http://h/");
     (void)submitForm(nullptr, nullptr, st, "");
 }
+
+TEST(Forms, AnEucKrPageSubmitsInEucKr) {
+    // yes24's search: the page is EUC-KR, so is its query. What EUC-KR lacks goes as &#n;.
+    auto doc = parseHtml("<form id=f action=/s><input name=q value='\xED\x95\x9C\xEA\xB8\x80 \xF0\x9F\x98\x80'>"
+                         "<input type=hidden name=_charset_></form>"
+                         "<form id=g action=/s accept-charset=utf-8><input name=q value='\xED\x95\x9C'></form>");
+    FormState st;
+    auto sub = submitForm(byId(*doc, "f"), nullptr, st, "http://h/", "ks_c_5601-1987");
+    ASSERT_TRUE(sub);
+    EXPECT_EQ(sub->url, "http://h/s?q=%C7%D1%B1%DB+%26%23128512%3B&_charset_=EUC-KR");
+    sub = submitForm(byId(*doc, "g"), nullptr, st, "http://h/", "euc-kr");
+    ASSERT_TRUE(sub);
+    EXPECT_EQ(sub->url, "http://h/s?q=%ED%95%9C");
+}

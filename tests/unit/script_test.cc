@@ -82,7 +82,7 @@ struct Page {
             pending.push_back([done, res] { done(res); });
         };
         // Scripts not fetched ahead, as a page's own fetch would bring them, a task later.
-        host.fetch_script = [this](const std::string& url, std::function<void(std::optional<std::string>)> done) {
+        host.fetch_script = [this](const std::string& url, const std::string&, std::function<void(std::optional<std::string>)> done) {
             std::optional<std::string> body;
             if (url == "https://example.org/dir/chunk.js") body = "console.log('chunk ran', typeof window.chunkFlag); window.chunkLoaded = true;";
             pending.push_back([done, body] { done(body); });
@@ -1006,4 +1006,12 @@ TEST(Script, DatasetIsADOMStringMap) {
         console.log(document.body.dataset instanceof DOMStringMap, document.body.dataset.xY);
         </script>)");
     EXPECT_EQ(p.console, "log:true 1\n") << p.console;
+}
+
+TEST(Script, TextDecoderKnowsEucKr) {
+    Page p(R"(<body><script>
+        const d = new TextDecoder('ks_c_5601-1987');
+        console.log(d.encoding, d.decode(new Uint8Array([0xC7, 0xD1, 0xB1, 0xDB])));
+        </script>)");
+    EXPECT_EQ(p.console, "log:euc-kr \xED\x95\x9C\xEA\xB8\x80\n") << p.console;
 }

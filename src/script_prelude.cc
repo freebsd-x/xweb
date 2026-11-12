@@ -684,9 +684,14 @@ const char* const kScriptPrelude = R"JS(
       });
     }
     abort() { this._aborted = true; if (this.readyState > 0 && this.readyState < 4) { this._state(4); this._fire('abort'); this._fire('loadend'); } this.readyState = 0; }
+    // Text in the charset the response (or overrideMimeType) names: Nate's EUC-KR keywords.
+    _text() {
+      const m = /charset\s*=\s*"?([^";\s]+)/i.exec(this._override || this._type || '');
+      try { return new TextDecoder(m ? m[1] : 'utf-8').decode(this._bytes); } catch (e) { return new TextDecoder().decode(this._bytes); }
+    }
     get responseText() {
       if (this.responseType !== '' && this.responseType !== 'text') throw new Error('InvalidStateError');
-      return this._bytes ? new TextDecoder().decode(this._bytes) : '';
+      return this._bytes ? this._text() : '';
     }
     get response() {
       if (!this._bytes) return this.responseType === '' || this.responseType === 'text' ? '' : null;
@@ -695,7 +700,7 @@ const char* const kScriptPrelude = R"JS(
         case 'arraybuffer': return this._bytes.slice().buffer;
         case 'blob': { const b = new Blob([], { type: this._type }); b[bytes] = this._bytes.slice(); return b; }
         case 'document': return null;
-        default: return new TextDecoder().decode(this._bytes);
+        default: return this._text();
       }
     }
     get responseXML() { return null; }

@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <iterator>
+#include <unordered_map>
 
 namespace fbx::xweb {
 
@@ -71,6 +73,82 @@ std::string fromUtf16(std::string_view in, bool big_endian) {
     return out;
 }
 
+#include "euc_kr_index.inc"
+
+}  // namespace
+
+bool isEucKrLabel(std::string_view label) {
+    static constexpr std::string_view kLabels[] = {"euc-kr", "cseuckr", "csksc56011987", "iso-ir-149", "korean", "ks_c_5601-1987",
+                                                   "ks_c_5601-1989", "ksc5601", "ksc_5601", "windows-949", "cp949", "uhc"};
+    const std::string l = lower(label);
+    return std::find(std::begin(kLabels), std::end(kLabels), l) != std::end(kLabels);
+}
+
+// The Encoding Standard's EUC-KR decoder: a lead 0x81-0xFE and a trail 0x41-0xFE make a
+// pointer into the index; anything else is U+FFFD (and an ASCII trail is read again).
+std::string eucKrToUtf8(std::string_view bytes) {
+    std::string out;
+    out.reserve(bytes.size() * 3 / 2);
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        const auto b = static_cast<uint8_t>(bytes[i]);
+        if (b < 0x80) {
+            out += static_cast<char>(b);
+            continue;
+        }
+        if (b < 0x81 || b > 0xFE || i + 1 >= bytes.size()) {
+            appendUtf8(out, 0xFFFD);
+            continue;
+        }
+        const auto t = static_cast<uint8_t>(bytes[i + 1]);
+        uint16_t cp = 0;
+        if (t >= 0x41 && t <= 0xFE) cp = kEucKrIndex[(b - 0x81) * 190 + (t - 0x41)];
+        if (cp) {
+            appendUtf8(out, cp);
+            ++i;
+        } else {
+            appendUtf8(out, 0xFFFD);
+            if (t >= 0x80) ++i;   // an ASCII trail is a character of its own
+        }
+    }
+    return out;
+}
+
+// The other way, for forms on an EUC-KR page: what the index has, as its two bytes; the
+// rest as &#n; (the HTML form encoding's way). Expects UTF-8.
+std::string utf8ToEucKr(std::string_view text) {
+    static const auto* const reverse = [] {
+        auto* m = new std::unordered_map<uint16_t, uint16_t>();
+        m->reserve(17100);
+        for (uint16_t p = 0; p < std::size(kEucKrIndex); ++p)
+            if (kEucKrIndex[p] && !m->contains(kEucKrIndex[p])) (*m)[kEucKrIndex[p]] = p;
+        return m;
+    }();
+    std::string out;
+    for (size_t i = 0; i < text.size();) {
+        const auto b = static_cast<uint8_t>(text[i]);
+        uint32_t cp = b;
+        size_t len = 1;
+        if (b >= 0xF0 && i + 3 < text.size()) { cp = ((b & 7u) << 18) | ((text[i + 1] & 0x3Fu) << 12) | ((text[i + 2] & 0x3Fu) << 6) | (text[i + 3] & 0x3Fu); len = 4; }
+        else if (b >= 0xE0 && i + 2 < text.size()) { cp = ((b & 15u) << 12) | ((text[i + 1] & 0x3Fu) << 6) | (text[i + 2] & 0x3Fu); len = 3; }
+        else if (b >= 0xC0 && i + 1 < text.size()) { cp = ((b & 31u) << 6) | (text[i + 1] & 0x3Fu); len = 2; }
+        i += len;
+        if (cp < 0x80) {
+            out += static_cast<char>(cp);
+            continue;
+        }
+        if (cp < 0x10000)
+            if (const auto it = reverse->find(static_cast<uint16_t>(cp)); it != reverse->end()) {
+                out += static_cast<char>(it->second / 190 + 0x81);
+                out += static_cast<char>(it->second % 190 + 0x41);
+                continue;
+            }
+        out += "&#" + std::to_string(cp) + ";";
+    }
+    return out;
+}
+
+namespace {
+
 std::string charsetIn(std::string_view text) {
     std::string s = lower(text);
     const size_t at = s.find("charset");
@@ -85,6 +163,15 @@ std::string charsetIn(std::string_view text) {
 
 }  // namespace
 
+std::string detectCharset(std::string_view bytes, std::string_view content_type) {
+    if (bytes.starts_with("\xEF\xBB\xBF")) return "utf-8";
+    if (bytes.starts_with("\xFF\xFE")) return "utf-16le";
+    if (bytes.starts_with("\xFE\xFF")) return "utf-16be";
+    std::string charset = charsetIn(content_type);
+    if (charset.empty()) charset = charsetIn(bytes.substr(0, 1024));
+    return charset;
+}
+
 std::string decodeToUtf8(std::string_view bytes, std::string_view content_type) {
     if (bytes.starts_with("\xEF\xBB\xBF")) return std::string(bytes.substr(3));
     if (bytes.starts_with("\xFF\xFE")) return fromUtf16(bytes.substr(2), false);
@@ -96,6 +183,7 @@ std::string decodeToUtf8(std::string_view bytes, std::string_view content_type) 
     if (charset == "iso-8859-1" || charset == "latin1" || charset == "latin-1" || charset == "windows-1252" ||
         charset == "cp1252" || charset == "us-ascii" || charset == "ascii" || charset == "iso8859-1")
         return fromCp1252(bytes);
+    if (isEucKrLabel(charset)) return eucKrToUtf8(bytes);
     return std::string(bytes);
 }
 
