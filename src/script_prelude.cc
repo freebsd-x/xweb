@@ -1522,6 +1522,67 @@ const char* const kScriptPrelude = R"JS(
     Object.defineProperty(global, 'WebKitCSSMatrix', { value: DOMMatrix, writable: true, configurable: true });
   }
 
+  // DOMTokenLists over attributes other than class: iframe.sandbox, relList (MDN's live
+  // samples read iframe.sandbox.toString()). Indexable, live, as classList is.
+  {
+    const lists = new WeakMap();
+    const tokens = (el, attr) => { const v = el.getAttribute(attr); return v ? Array.from(new Set(v.trim().split(/[ \t\n\f\r]+/).filter(Boolean))) : []; };
+    const tokenList = (el, attr) => {
+      let byAttr = lists.get(el);
+      if (!byAttr) lists.set(el, (byAttr = new Map()));
+      if (byAttr.has(attr)) return byAttr.get(attr);
+      const set = (list) => el.setAttribute(attr, list.join(' '));
+      const api = {
+        get length() { return tokens(el, attr).length; },
+        item(i) { const t = tokens(el, attr); return i >= 0 && i < t.length ? t[i] : null; },
+        contains(x) { return tokens(el, attr).includes(String(x)); },
+        add(...xs) { const t = tokens(el, attr); for (const x of xs) if (!t.includes(String(x))) t.push(String(x)); set(t); },
+        remove(...xs) { set(tokens(el, attr).filter(t => !xs.map(String).includes(t))); },
+        toggle(x, force) {
+          x = String(x);
+          const has = tokens(el, attr).includes(x);
+          if (has && force !== true) { this.remove(x); return false; }
+          if (!has && force !== false) { this.add(x); return true; }
+          return has;
+        },
+        replace(a, b) { const t = tokens(el, attr); const i = t.indexOf(String(a)); if (i < 0) return false; t[i] = String(b); set(Array.from(new Set(t))); return true; },
+        supports() { return true; },
+        get value() { return el.getAttribute(attr) || ''; },
+        set value(v) { el.setAttribute(attr, String(v)); },
+        toString() { return el.getAttribute(attr) || ''; },
+        forEach(f, that) { tokens(el, attr).forEach((t, i) => f.call(that, t, i, proxy)); },
+        keys() { return tokens(el, attr).keys(); },
+        values() { return tokens(el, attr).values(); },
+        entries() { return tokens(el, attr).entries(); },
+        [Symbol.iterator]() { return tokens(el, attr).values(); },
+      };
+      const proxy = new Proxy(api, {
+        get(o, k) { if (typeof k === 'string' && /^\d+$/.test(k)) return o.item(Number(k)) ?? undefined; const v = o[k]; return typeof v === 'function' ? v.bind(o) : v; },
+        has(o, k) { return typeof k === 'string' && /^\d+$/.test(k) ? Number(k) < o.length : k in o; },
+      });
+      if (typeof DOMTokenList === 'function') Object.setPrototypeOf(api, DOMTokenList.prototype);
+      byAttr.set(attr, proxy);
+      return proxy;
+    };
+    const tokenProp = (C, name, attr) => {
+      if (typeof C !== 'function' || Object.getOwnPropertyDescriptor(C.prototype, name)) return;
+      Object.defineProperty(C.prototype, name, { configurable: true, enumerable: true,
+        get() { return tokenList(this, attr); }, set(v) { this.setAttribute(attr, String(v)); } });
+    };
+    tokenProp(global.HTMLIFrameElement, 'sandbox', 'sandbox');
+    for (const C of [global.HTMLAnchorElement, global.HTMLAreaElement, global.HTMLLinkElement, global.HTMLFormElement]) tokenProp(C, 'relList', 'rel');
+    tokenProp(global.HTMLLinkElement, 'sizes', 'sizes');
+    tokenProp(global.HTMLOutputElement, 'htmlFor', 'for');
+    if (typeof HTMLIFrameElement === 'function') {
+      if (!Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'allow'))
+        Object.defineProperty(HTMLIFrameElement.prototype, 'allow', { configurable: true, enumerable: true,
+          get() { return this.getAttribute('allow') || ''; }, set(v) { this.setAttribute('allow', String(v)); } });
+      if (!Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'allowFullscreen'))
+        Object.defineProperty(HTMLIFrameElement.prototype, 'allowFullscreen', { configurable: true, enumerable: true,
+          get() { return this.hasAttribute('allowfullscreen'); }, set(v) { if (v) this.setAttribute('allowfullscreen', ''); else this.removeAttribute('allowfullscreen'); } });
+    }
+  }
+
   // MediaError, for a media element's error (Reddit's player checks against it).
   if (typeof global.MediaError !== 'function') {
     class MediaError {

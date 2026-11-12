@@ -1078,3 +1078,13 @@ TEST(Script, DomMatrix) {
         </script>)");
     EXPECT_EQ(p.console, "log:matrix(2, 0, 0, 2, 10, 20) 12 22 1 1 true true 1 5 3\n") << p.console;
 }
+
+TEST(Script, TokenListsOverOtherAttributes) {
+    Page p(R"(<body><iframe id=f sandbox="allow-scripts allow-same-origin"></iframe><a id=a rel="noopener"></a><script>
+        const f = document.getElementById('f'), a = document.getElementById('a');
+        f.sandbox.add('allow-popups');
+        a.relList.toggle('noreferrer');
+        console.log(f.sandbox.toString(), f.sandbox.length, f.sandbox[1], f.sandbox.contains('allow-scripts'), a.rel, f.allow === '');
+        </script>)");
+    EXPECT_EQ(p.console, "log:allow-scripts allow-same-origin allow-popups 3 allow-same-origin true noopener noreferrer true\n") << p.console;
+}
