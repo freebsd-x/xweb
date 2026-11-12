@@ -2,6 +2,7 @@
 // Element, events and their dispatch, timers and animation frames, as the DOM and HTML
 // standards describe them, the parts pages use most first.
 
+#include "xweb/picture.h"
 #include "xweb/script.h"
 
 #include "script_impl.h"
@@ -1741,13 +1742,13 @@ void PageScript::imageLoaded(const std::string& url, bool ok) {
         Node* n = todo.back();
         todo.pop_back();
         if (n->isHtml("img"))
-            if (const std::string* src = n->attr("src"); src && resolveUrl(s.host.base, *src) == url) imgs.push_back(n);
+            if (const auto src = imageSourceOf(n, {s.host.viewport_w, s.host.viewport_h}); src && resolveUrl(s.host.base, *src) == url) imgs.push_back(n);
         todo.insert(todo.end(), n->children.rbegin(), n->children.rend());
         if (n->shadow_root) todo.push_back(n->shadow_root);
     }
     for (Node* n : s.script_images)
         if (std::find(imgs.begin(), imgs.end(), n) == imgs.end())
-            if (const std::string* src = n->attr("src"); src && resolveUrl(s.host.base, *src) == url) imgs.push_back(n);
+            if (const auto src = imageSourceOf(n, {s.host.viewport_w, s.host.viewport_h}); src && resolveUrl(s.host.base, *src) == url) imgs.push_back(n);
     for (Node* n : imgs) s.fire(n, ok ? u"load" : u"error", false, false);
     s.drainMicrotasks();
 }

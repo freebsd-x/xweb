@@ -1329,6 +1329,21 @@ const char* const kScriptPrelude = R"JS(
       return text;
     } });
 
+  // Element.checkVisibility(): whether it's rendered at all (no display:none on the way up,
+  // nor content-visibility), and if asked, visible and not transparent.
+  if (typeof Element === 'function' && !Element.prototype.checkVisibility)
+    Object.defineProperty(Element.prototype, 'checkVisibility', { configurable: true, writable: true, value: function checkVisibility(options) {
+      const o = options || {};
+      if (!this.isConnected) return false;
+      for (let e = this; e && e.nodeType === 1; e = e.parentElement) {
+        const cs = getComputedStyle(e);
+        if (cs.display === 'none' || e.hidden || (e.style && e.style.display === 'none')) return false;
+        if ((o.opacityProperty || o.checkOpacity) && Number(cs.opacity) === 0) return false;
+      }
+      if ((o.visibilityProperty || o.checkVisibilityCSS) && getComputedStyle(this).visibility !== 'visible') return false;
+      return true;
+    } });
+
   // MediaError, for a media element's error (Reddit's player checks against it).
   if (typeof global.MediaError !== 'function') {
     class MediaError {

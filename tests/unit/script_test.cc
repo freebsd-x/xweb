@@ -1036,3 +1036,13 @@ TEST(Script, SplitTextMediaErrorJavaAndGenericSplice) {
         </script>)");
     EXPECT_EQ(p.console, "log:hello| world 2 hello world 2 false b 4 xyc\n") << p.console;
 }
+
+TEST(Script, SvgInterfacesAndCheckVisibility) {
+    Page p(R"(<body><svg><a><path/></a><linearGradient/></svg><div id=h style="display:none"><b id=b></b></div><i id=i></i><script>
+        const a = document.querySelector('svg a'), path = document.querySelector('path'), lg = document.querySelector('linearGradient');
+        console.log(a instanceof SVGAElement, path instanceof SVGGeometryElement, path instanceof SVGGraphicsElement,
+                    lg instanceof SVGGradientElement, document.querySelector('svg') instanceof SVGSVGElement,
+                    document.getElementById('b').checkVisibility(), document.getElementById('i').checkVisibility());
+        </script>)");
+    EXPECT_EQ(p.console, "log:true true true true true false true\n") << p.console;
+}

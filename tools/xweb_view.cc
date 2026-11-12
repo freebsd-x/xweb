@@ -41,6 +41,7 @@
 
 #include "xrender/font_manager.h"
 #include FT_SIZES_H
+#include "xweb/picture.h"
 #include "xweb/css.h"
 #include "xweb/encoding.h"
 #include "xweb/forms.h"
@@ -520,13 +521,16 @@ std::optional<web::PageScript::Host::CanvasText> canvasText(const std::string& t
 
 std::vector<std::string> imageSources(const Page& page) {
     std::vector<std::string> out;
+    int win_w = 0, win_h = 0;
+    XApplication::windowSize(win_w, win_h);
+    const web::css::MediaContext viewport{win_w > 0 ? static_cast<float>(win_w) : 1000, win_h > 0 ? static_cast<float>(win_h) - kToolbarHeight : 800};
     std::set<std::string> seen;
     std::vector<const web::Node*> todo{page.doc->root()};
     while (!todo.empty() && out.size() < kMaxImages) {
         const web::Node* n = todo.back();
         todo.pop_back();
         if (n->isHtml("img"))
-            if (const std::string* src = n->attr("src")) {
+            if (const auto src = web::imageSourceOf(n, viewport)) {
                 std::string url = web::resolveUrl(page.base, *src);
                 if (seen.insert(url).second) out.push_back(std::move(url));
             }

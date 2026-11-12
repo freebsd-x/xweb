@@ -1,3 +1,4 @@
+#include "xweb/picture.h"
 #include "xweb/layout.h"
 #include "xweb/forms.h"
 
@@ -1175,7 +1176,8 @@ private:
         bool have_natural = true;
         if (n->isHtml("img")) {
             have_natural = false;
-            const std::string* src = n->attr("src");
+            const std::optional<std::string> chosen = imageSourceOf(n, {vw_, vh_});
+            const std::string* src = chosen ? &*chosen : nullptr;
             if (src && images_) {
                 if (const auto size = images_->imageSize(*src)) {
                     natural_w = size->first;
@@ -3749,7 +3751,8 @@ private:
         // A picture: an <img>'s source, or a <video>'s poster (all of a video we show).
         const bool is_img = n->isHtml("img");
         if (is_img || n->isHtml("video")) {
-            const std::string* src = n->attr(is_img ? "src" : "poster");
+            const std::optional<std::string> chosen = is_img ? imageSourceOf(n, {vw_, vh_}) : std::nullopt;
+            const std::string* src = is_img ? (chosen ? &*chosen : nullptr) : n->attr("poster");
             if (src && src->empty()) src = nullptr;
             if (src && images_ && (images_->imageSize(*src) || images_->imageRatio(*src))) {
                 PaintOp op;

@@ -4,6 +4,7 @@
 // stylesheets, DocumentFragment and <template>'s content.
 
 #include "script_impl.h"
+#include "xweb/picture.h"
 
 #include <stdlib.h>
 
@@ -13,6 +14,31 @@ namespace {
 
 // HTML elements' interfaces, by tag. Those not here are HTMLElement (or, for names that
 // aren't HTML's, HTMLUnknownElement).
+// SVG elements' interfaces: tag, interface, and the interface it's under (null: SVGElement).
+struct SvgInterface {
+    const char* tag;
+    const char* iface;
+    const char* parent;
+};
+constexpr SvgInterface kSvgInterfaces[] = {
+    {"svg", "SVGSVGElement", "SVGGraphicsElement"}, {"g", "SVGGElement", "SVGGraphicsElement"},
+    {"a", "SVGAElement", "SVGGraphicsElement"}, {"use", "SVGUseElement", "SVGGraphicsElement"},
+    {"image", "SVGImageElement", "SVGGraphicsElement"}, {"defs", "SVGDefsElement", "SVGGraphicsElement"},
+    {"switch", "SVGSwitchElement", "SVGGraphicsElement"}, {"foreignObject", "SVGForeignObjectElement", "SVGGraphicsElement"},
+    {"path", "SVGPathElement", "SVGGeometryElement"}, {"rect", "SVGRectElement", "SVGGeometryElement"},
+    {"circle", "SVGCircleElement", "SVGGeometryElement"}, {"ellipse", "SVGEllipseElement", "SVGGeometryElement"},
+    {"line", "SVGLineElement", "SVGGeometryElement"}, {"polyline", "SVGPolylineElement", "SVGGeometryElement"},
+    {"polygon", "SVGPolygonElement", "SVGGeometryElement"},
+    {"text", "SVGTextElement", "SVGTextContentElement"}, {"tspan", "SVGTSpanElement", "SVGTextContentElement"},
+    {"textPath", "SVGTextPathElement", "SVGTextContentElement"},
+    {"linearGradient", "SVGLinearGradientElement", "SVGGradientElement"}, {"radialGradient", "SVGRadialGradientElement", "SVGGradientElement"},
+    {"stop", "SVGStopElement", nullptr}, {"symbol", "SVGSymbolElement", nullptr}, {"clipPath", "SVGClipPathElement", nullptr},
+    {"mask", "SVGMaskElement", nullptr}, {"pattern", "SVGPatternElement", nullptr}, {"marker", "SVGMarkerElement", nullptr},
+    {"filter", "SVGFilterElement", nullptr}, {"title", "SVGTitleElement", nullptr}, {"desc", "SVGDescElement", nullptr},
+    {"style", "SVGStyleElement", nullptr}, {"script", "SVGScriptElement", nullptr}, {"metadata", "SVGMetadataElement", nullptr},
+    {"view", "SVGViewElement", nullptr},
+};
+
 const std::pair<const char*, const char*> kInterfaces[] = {
     {"a", "HTMLAnchorElement"}, {"area", "HTMLAreaElement"}, {"audio", "HTMLAudioElement"}, {"br", "HTMLBRElement"},
     {"base", "HTMLBaseElement"}, {"body", "HTMLBodyElement"}, {"button", "HTMLButtonElement"}, {"canvas", "HTMLCanvasElement"},
@@ -106,8 +132,10 @@ Object* PageScript::Impl::protoFor(const Node* n) {
     }
     if (!proto_html_element) return proto_element;
     if (n->ns == Namespace::Svg) {
-        const auto it = interface_protos.find(n->name == "svg" ? "SVGSVGElement" : "SVGElement");
-        return it != interface_protos.end() ? it->second : proto_svg_element;
+        for (const auto& [tag, iface, parent] : kSvgInterfaces)
+            if (n->name == tag)
+                if (const auto it = interface_protos.find(iface); it != interface_protos.end()) return it->second;
+        return proto_svg_element;
     }
     if (n->ns != Namespace::Html) return proto_element;
     for (const auto& [tag, iface] : kInterfaces)
@@ -205,8 +233,8 @@ void PageScript::Impl::afterAttr(Node* n, const std::string& name, const std::st
     queueMutation(u"attributes", n, {}, {}, nullptr, nullptr, &name, old);
     // An image a script points somewhere loads whether or not it's in the page (new
     // Image() for a canvas, preloading): its load event comes when it has.
-    if (name == "src" && n->isHtml("img") && host.load_image)
-        if (const std::string* src = n->attr("src"); src && !src->empty()) {
+    if ((name == "src" || name == "srcset") && n->isHtml("img") && host.load_image)
+        if (const std::optional<std::string> src = imageSourceOf(n, {host.viewport_w, host.viewport_h})) {
             if (std::find(script_images.begin(), script_images.end(), n) == script_images.end() && script_images.size() < 10000)
                 script_images.push_back(n);
             host.load_image(resolveUrl(host.base, *src));
@@ -370,8 +398,17 @@ void PageScript::Impl::installDom() {
     }
     proto_svg_element = rt.newObject(proto_element);
     Object* svg_ctor = illegal(u"SVGElement", proto_svg_element, element_ctor.isObject() ? element_ctor.asObject() : nullptr);
-    for (const char* iface : {"SVGGraphicsElement", "SVGSVGElement"}) {
-        Object* p = rt.newObject(proto_svg_element);
+    // SVG's interfaces, each over its parent's (the table lists parents first).
+    for (const char* iface : {"SVGGraphicsElement", "SVGGeometryElement", "SVGGradientElement", "SVGTextContentElement"}) {
+        const std::string n = iface;
+        Object* parent = n == "SVGGraphicsElement" || n == "SVGGradientElement" ? proto_svg_element : interface_protos["SVGGraphicsElement"];
+        Object* p = rt.newObject(parent);
+        interface_protos[iface] = p;
+        illegal(js::utf16(iface).c_str(), p, svg_ctor);
+    }
+    for (const auto& [tag, iface, parent] : kSvgInterfaces) {
+        if (interface_protos.count(iface)) continue;
+        Object* p = rt.newObject(parent ? interface_protos[parent] : proto_svg_element);
         interface_protos[iface] = p;
         illegal(js::utf16(iface).c_str(), p, svg_ctor);
     }
@@ -627,15 +664,15 @@ void PageScript::Impl::installDom() {
         Object* img = interface_protos["HTMLImageElement"];
         // What the page's loader says of the image, by the URL it's showing.
         const auto state = [self](const Value& t) {
-            const std::string* v = self->thisElement(t)->attr("src");
-            if (!v || v->empty() || !self->host.image_state) return PageScript::Host::ImageState{true, false, 0, 0};
+            const std::optional<std::string> v = imageSourceOf(self->thisElement(t), {self->host.viewport_w, self->host.viewport_h});
+            if (!v || !self->host.image_state) return PageScript::Host::ImageState{true, false, 0, 0};
             return self->host.image_state(resolveUrl(self->host.base, *v));
         };
         accessor(img, u"complete", [state](Runtime&, const Value& t, Args) { return Value::boolean(state(t).done); });
         accessor(img, u"naturalWidth", [state](Runtime&, const Value& t, Args) { return Value::number(state(t).width); });
         accessor(img, u"naturalHeight", [state](Runtime&, const Value& t, Args) { return Value::number(state(t).height); });
         accessor(img, u"currentSrc", [self](Runtime&, const Value& t, Args) {
-            const std::string* v = self->thisElement(t)->attr("src");
+            const std::optional<std::string> v = imageSourceOf(self->thisElement(t), {self->host.viewport_w, self->host.viewport_h});
             return str(v ? resolveUrl(self->host.base, *v) : std::string{});
         });
         method(img, u"decode", 0, [](Runtime& rt, const Value&, Args) {
@@ -1096,4 +1133,5 @@ void PageScript::Impl::installDom() {
     adoptedAccessor(proto_document, true);
 }
 
-}  // namespace fbx::xweb
+}  // namespace fbx::xweb#include "xweb/picture.h"
+

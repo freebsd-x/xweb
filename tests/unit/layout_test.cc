@@ -8,6 +8,7 @@
 
 #include "xweb/html_parser.h"
 #include "xweb/layout.h"
+#include "xweb/picture.h"
 #include "xweb/style.h"
 
 using namespace fbx::xweb;
@@ -703,4 +704,27 @@ TEST(Paint, PositionedInsideAnAutoBoxGoesUnderALaterZIndex) {
     ASSERT_GE(red, 0);
     ASSERT_GE(blue, 0);
     EXPECT_LT(red, blue);
+}
+
+TEST(Replaced, PictureSourcesAndSrcset) {
+    // news.daum.net: <picture><source srcset type=webp><source srcset><img> with no src.
+    auto doc = parseHtml("<picture><source srcset='a.avif' type='image/avif'><source srcset='w.webp' type='image/webp' media='(max-width: 100px)'>"
+                         "<source srcset='b.jpg 1x, b2.jpg 2x'><img id=p></picture>"
+                         "<img id=s srcset='s300.jpg 300w, s1400.jpg 1400w, s2000.jpg 2000w' src=s.jpg>"
+                         "<img id=x srcset='lo.png, hi.png 2x'><img id=n src=n.png>");
+    const auto byId = [&](const char* id) {
+        std::vector<const Node*> todo{doc->root()};
+        while (!todo.empty()) {
+            const Node* n = todo.back();
+            todo.pop_back();
+            if (const std::string* v = n->attr("id"); v && *v == id) return n;
+            for (const Node* k : n->children) todo.push_back(k);
+        }
+        return static_cast<const Node*>(nullptr);
+    };
+    const css::MediaContext vp{1200, 800};
+    EXPECT_EQ(imageSourceOf(byId("p"), vp).value_or(""), "b.jpg");      // no AVIF; media doesn't hold
+    EXPECT_EQ(imageSourceOf(byId("s"), vp).value_or(""), "s1400.jpg");  // the narrowest at least the viewport
+    EXPECT_EQ(imageSourceOf(byId("x"), vp).value_or(""), "lo.png");
+    EXPECT_EQ(imageSourceOf(byId("n"), vp).value_or(""), "n.png");
 }
