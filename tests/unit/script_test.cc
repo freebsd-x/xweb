@@ -1117,3 +1117,15 @@ TEST(Script, FrameDocumentsAttrNodesAndSmallGlobals) {
         </script>)");
     EXPECT_EQ(p.console, "log:true true u null function denied\n") << p.console;
 }
+
+TEST(Script, DocumentWriteIsOneStreamPerScript) {
+    // yes24's ad server writes a <script> tag in pieces.
+    Page p(R"(<body><div id=d><script>
+        var seen = [];
+        document.write('<script type=');
+        document.write("'");
+        document.write("text/javascript'>seen.push('ran');");
+        document.write('</scr' + 'ipt><b>bold</b>');
+        </script></div><script>console.log(seen.join(), document.querySelector('#d b').textContent, document.querySelectorAll('#d script').length);</script>)");
+    EXPECT_EQ(p.console, "log:ran bold 2\n") << p.console;
+}

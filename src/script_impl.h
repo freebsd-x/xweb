@@ -204,6 +204,30 @@ struct PageScript::Impl {
     bool dirty = false;
     std::string ready_state = "loading";
     Node* current_script = nullptr;
+    std::string write_buffer;   // what the running script has document.write()n, not yet parsed
+
+    // document.write's HTML into the page: after `script` (if it's still there), else at the
+    // end of the body.
+    void insertWritten(const std::string& html, Node* script) {
+        Node* target = script && script->parent ? script->parent : doc.body();
+        if (!target || html.empty()) return;
+        auto frag = parseFragment(html, target->name);
+        if (const Node* holder = frag->documentElement()) {
+            Node* after = nullptr;
+            if (script && script->parent == target) {
+                auto it = std::find(target->children.begin(), target->children.end(), script);
+                after = (it + 1) == target->children.end() ? nullptr : *(it + 1);
+            }
+            for (const Node* c : holder->children) insert(target, clone(c, true), after);
+        }
+    }
+    // The running script is done: what it wrote goes in now, all at once.
+    void flushWrites(Node* script) {
+        if (write_buffer.empty()) return;
+        std::string html;
+        html.swap(write_buffer);   // (scripts in it may write more, after them)
+        insertWritten(html, script);
+    }
     bool running_scripts = false;
     size_t history_length = 1;
 
@@ -735,6 +759,7 @@ struct PageScript::Impl {
         // put back: what a script's promises do next still sees it (Turbopack's runtime
         // awaits its chunks, then reads currentScript; Next.js stopped there).
         drainMicrotasks();
+        flushWrites(s);
         current_script = saved;
         if (s->attr("src")) fire(s, u"load", false, false);
     }

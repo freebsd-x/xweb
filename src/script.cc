@@ -1148,17 +1148,15 @@ void PageScript::Impl::installDocument() {
             std::string html;
             for (const Value& v : a) html += js::utf8(rt.toStringValue(v));
             if (newline) html += "\n";
-            Node* target = self->current_script && self->current_script->parent ? self->current_script->parent : self->doc.body();
-            if (!target) return Value::undefined();
-            auto frag = parseFragment(html, target->name);
-            if (const Node* holder = frag->documentElement()) {
-                Node* after = nullptr;
-                if (self->current_script && self->current_script->parent == target) {
-                    auto it = std::find(target->children.begin(), target->children.end(), self->current_script);
-                    after = (it + 1) == target->children.end() ? nullptr : *(it + 1);
-                }
-                for (const Node* c : holder->children) self->insert(target, self->clone(c, true), after);
+            // While a script runs, what it writes is one stream, parsed when it's done: a
+            // tag may come in pieces (yes24's ad server writes '<script type=', then "'",
+            // then 'text/javascript'...).
+            if (self->current_script) {
+                if (self->write_buffer.size() + html.size() > (16u << 20)) return Value::undefined();
+                self->write_buffer += html;
+                return Value::undefined();
             }
+            self->insertWritten(html, nullptr);
             return Value::undefined();
         };
     };
