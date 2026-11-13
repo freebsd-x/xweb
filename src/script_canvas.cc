@@ -414,6 +414,11 @@ void PageScript::Impl::installCanvas() {
     rt.put(rt.global(), u"__xwebDomVersion", Value::object(rt.newFunction(u"domVersion", 0, [self](Runtime&, const Value&, Args) {
         return Value::number(static_cast<double>(self->dom_version));
     })), js::kWritable | js::kConfigurable);
+    // Marks an object [[IsHTMLDDA]], for document.all (the prelude's; then it's gone).
+    rt.put(rt.global(), u"__xwebHTMLDDA", Value::object(rt.newFunction(u"htmlDDA", 1, [](Runtime&, const Value&, Args a) {
+        if (!a.empty() && a[0].isObject()) a[0].asObject()->html_dda = true;
+        return Value::undefined();
+    })), js::kWritable | js::kConfigurable);
 }
 
 std::shared_ptr<const Raster> PageScript::canvasImage(const Node* canvas, uint64_t& version) const {

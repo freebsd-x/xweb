@@ -1146,3 +1146,13 @@ TEST(Script, SvgAttributesKeepTheirCase) {
         </script>)");
     EXPECT_EQ(p.console, "log:id,viewBox 0 0 24 24 false id,data-x 1\n") << p.console;
 }
+
+TEST(Script, DocumentAllIsHTMLDDA) {
+    Page p(R"(<body><p id=x name=n></p><script>
+        const u = undefined;
+        console.log(typeof document.all, !document.all, document.all == null, document.all === undefined,
+                    !u && u !== document.all, document.all.length > 3, document.all.x === document.getElementById('x'),
+                    document.all('x') === document.all.namedItem('x'), document.all[0].tagName);
+        </script>)");
+    EXPECT_EQ(p.console, "log:undefined true true false true true true true HTML\n") << p.console;
+}

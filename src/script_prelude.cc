@@ -1630,6 +1630,47 @@ const char* const kScriptPrelude = R"JS(
       }, writable: true, configurable: true });
   }
 
+  // document.all: every element, by index, id or name, and callable; and, as browsers have
+  // it, false as a boolean and typeof "undefined" (old IE checks stay false). Polymer-resin
+  // (YouTube) asks `!value && value !== document.all`: with document.all undefined, every
+  // undefined binding came back as its "zClosurez" placeholder, and hid what it bound.
+  if (typeof global.__xwebHTMLDDA === 'function' && typeof Document === 'function') {
+    const mark = global.__xwebHTMLDDA;
+    delete global.__xwebHTMLDDA;
+    const elements = () => document.getElementsByTagName('*');
+    const named = (name) => {
+      name = String(name);
+      const byId = document.getElementById(name);
+      if (byId) return byId;
+      const list = [...elements()].filter(e => e.getAttribute('name') === name);
+      return list.length ? list[0] : null;
+    };
+    const item = (k) => {
+      if (k === undefined) return null;
+      const n = Number(k);
+      if (String(k) !== '' && Number.isInteger(n) && n >= 0) return elements()[n] || null;
+      return named(k);
+    };
+    const api = { item, namedItem: (n) => named(n) };
+    function HTMLAllCollection() { throw new TypeError('Illegal constructor'); }
+    const all = new Proxy(function () {}, {
+      get(t, k) {
+        if (k === 'length') return elements().length;
+        if (k === Symbol.iterator) return function* () { yield* elements(); };
+        if (k === Symbol.toStringTag) return 'HTMLAllCollection';
+        if (k === 'item' || k === 'namedItem') return api[k];
+        if (typeof k === 'string') { const v = item(k); return v === null ? undefined : v; }
+        return undefined;
+      },
+      has(t, k) { return k === 'length' || k === 'item' || k === 'namedItem' || (typeof k === 'string' && item(k) !== null); },
+      apply(t, self, args) { return item(args[0]); },
+      getPrototypeOf() { return HTMLAllCollection.prototype; },
+    });
+    mark(all);
+    Object.defineProperty(global, 'HTMLAllCollection', { value: HTMLAllCollection, writable: true, configurable: true });
+    Object.defineProperty(Document.prototype, 'all', { get() { return all; }, configurable: true, enumerable: true });
+  }
+
   // MediaError, for a media element's error (Reddit's player checks against it).
   if (typeof global.MediaError !== 'function') {
     class MediaError {

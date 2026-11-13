@@ -188,6 +188,8 @@ public:
     size_t cursor = 0;
     Object* target = nullptr;   // an iterator's subject
     uint8_t iter_kind = 0;
+    // [[IsHTMLDDA]] (document.all): false as a boolean, typeof "undefined", == null.
+    bool html_dda = false;
     // A RegExp's compiled pattern; its source is `primitive`.
     std::shared_ptr<const regex::Program> regexp;
     // Internal slots: a built-in closure's captured values, a promise's reactions.

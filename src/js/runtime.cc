@@ -899,7 +899,8 @@ bool Runtime::toBoolean(const Value& v) const {
         case Value::Type::Boolean: return v.asBoolean();
         case Value::Type::Number: return v.asNumber() != 0 && !std::isnan(v.asNumber());
         case Value::Type::String: return !v.asString().empty();
-        case Value::Type::Object: case Value::Type::Symbol: return true;
+        case Value::Type::Object: return !v.asObject()->html_dda;
+        case Value::Type::Symbol: return true;
         case Value::Type::BigInt: return v.bigintDigits().size() > 1;   // a sign and no limbs is 0n
         default: return false;
     }
@@ -1124,6 +1125,7 @@ bool Runtime::sameValue(const Value& a, const Value& b) {
 bool Runtime::looseEquals(const Value& a, const Value& b) {
     if (a.type() == b.type()) return strictEquals(a, b);
     if (a.isNullish() && b.isNullish()) return true;
+    if ((a.isNullish() && b.isObject() && b.asObject()->html_dda) || (b.isNullish() && a.isObject() && a.asObject()->html_dda)) return true;
     if (a.isNullish() || b.isNullish()) return false;
     if (a.isBigInt() || b.isBigInt()) {
         // A BigInt equals a number of the same value, a string that parses to it.
@@ -1157,7 +1159,7 @@ Value Runtime::typeOf(const Value& v) {
         case Value::Type::String: t = u"string"; break;
         case Value::Type::Symbol: t = u"symbol"; break;
         case Value::Type::BigInt: t = u"bigint"; break;
-        case Value::Type::Object: t = isCallable(v) ? u"function" : u"object"; break;
+        case Value::Type::Object: t = v.asObject()->html_dda ? u"undefined" : isCallable(v) ? u"function" : u"object"; break;
         default: break;
     }
     return Value::string(t);
