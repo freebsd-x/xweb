@@ -286,8 +286,13 @@ public:
         std::string error;    // for a failure: what was thrown, as text
         std::string where;    // and where, " (url:line)", if it was an error that knows
     };
-    // Runs a script in the global scope.
-    Result evaluate(std::string_view source, std::string_view name = "script");
+    // Runs a script in the global scope. `want_value`: whether its completion value is
+    // wanted (the result's value); a page's scripts don't need one, and keeping each
+    // statement's held on to strings a script then couldn't grow in place.
+    Result evaluate(std::string_view source, std::string_view name = "script", bool want_value = true);
+    // Whether statements' completion values are kept: while running code whose value
+    // someone wants (eval, a script asked for its result).
+    bool want_completion = true;
 
     // Modules. The loader fetches a module's source by its absolute URL and calls
     // `done` with it, now or later (from the embedder's event loop). Without one,

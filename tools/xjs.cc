@@ -140,7 +140,7 @@ int main(int argc, char** argv) {
             });
         } else {
             rt.base_url = fileUrl(path);
-            const Runtime::Result r = rt.evaluate(src, rt.base_url);
+            const Runtime::Result r = rt.evaluate(src, rt.base_url, false);
             if (!r.ok) {
                 std::cerr << path << ": " << r.error << "\n";
                 status = 1;

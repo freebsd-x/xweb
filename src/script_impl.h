@@ -753,7 +753,7 @@ struct PageScript::Impl {
             return;
         }
         current_script = s;
-        const Runtime::Result r = rt.evaluate(code, name);
+        const Runtime::Result r = rt.evaluate(code, name, false);
         if (!r.ok) report(r.error + (r.where.empty() ? " (" + name + ")" : r.where));
         // The microtask checkpoint is part of running the script, before currentScript is
         // put back: what a script's promises do next still sees it (Turbopack's runtime

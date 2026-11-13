@@ -774,3 +774,12 @@ TEST(Js, DeleteThroughAShortCircuitedChain) {
     // delete a?.b.c with a nullish: true, nothing deleted (it used to escape the engine).
     EXPECT_EQ(run("var a = null, o = { b: { c: 1 } }; [delete a?.b.c, delete o?.b.c, 'c' in o.b, delete a?.b].join()"), "true,true,false,true");
 }
+
+TEST(Js, StringsGrowInPlaceAndEvalKeepsItsValue) {
+    // s += x on a string nothing else holds appends where it is (it was a copy each time:
+    // quadratic). What the right side does to s first still counts.
+    EXPECT_EQ(run("function f() { let s = ''; for (let i = 0; i < 1000; i++) s += 'ab'; let t = s; s += 'c'; return [s.length, t.length].join(); } f()"), "2001,2000");
+    EXPECT_EQ(run("var x = 'a'; x += (x = 'q', 'b'); x"), "ab");
+    EXPECT_EQ(run("eval(\"var y = 'a'; y += 'b'\")"), "ab");
+    EXPECT_EQ(run("var z = 'p'; var w = z; z += z; [z, w].join()"), "pp,p");
+}

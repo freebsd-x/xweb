@@ -1540,12 +1540,18 @@ void Runtime::collect(bool mid_script) {
 
 // ── Evaluating scripts ────────────────────────────────────────────────────────
 
-Runtime::Result Runtime::evaluate(std::string_view source, std::string_view name) {
+Runtime::Result Runtime::evaluate(std::string_view source, std::string_view name, bool want_value) {
     if (!current_co && !onEngineStack()) {
         Result result;
-        runOnEngineStack([&] { result = evaluate(source, name); });
+        runOnEngineStack([&] { result = evaluate(source, name, want_value); });
         return result;
     }
+    struct WantValue {
+        bool& flag;
+        bool saved;
+        ~WantValue() { flag = saved; }
+    } want{want_completion, want_completion};
+    want_completion = want_value;
     Result result;
     std::string error;
     std::shared_ptr<Program> prog(parse(utf16(source), error).release());
@@ -2007,6 +2013,13 @@ Value Interpreter::runBody(FunctionInfo* info, Env* env) {
 }
 
 Value evalCode(Runtime& rt, const std::u16string& source, Env* env, bool strict, bool direct) {
+    // eval's value is its code's completion value: kept while it runs.
+    struct WantValue {
+        bool& flag;
+        bool saved;
+        ~WantValue() { flag = saved; }
+    } want{rt.want_completion, rt.want_completion};
+    rt.want_completion = true;
     Interpreter probe(rt, nullptr);
     EvalContext ctx;
     if (direct) ctx = probe.evalContextOf(env);
@@ -2242,7 +2255,12 @@ Completion Interpreter::exec(Node* n, Env* env, bool strict) {
     site.offset = n->offset;
     EvalDepth depth(rt_);
     switch (n->kind) {
-        case N::ExprStmt: return {CT::Normal, eval(n->a, env, strict)};
+        case N::ExprStmt:
+            if (!rt_.want_completion) {
+                (void)eval(n->a, env, strict);
+                return {CT::Normal, Value::empty()};
+            }
+            return {CT::Normal, eval(n->a, env, strict)};
         case N::VarDecl: declare(n, env, strict); return {CT::Normal, Value::empty()};
         case N::FunctionDecl: {
             // Hoisted already at its function's start; a block's at the block's start.
@@ -3267,6 +3285,34 @@ Value Interpreter::evalAssign(Node* n, Env* env, bool strict) {
         const Value v = eval(n->b, env, strict);
         assignPattern(t, v, env, strict);
         return v;
+    }
+    // s += "...", s a variable whose string nothing else holds: appended where it is, the
+    // string growing as a buffer does, instead of copied whole each time (building HTML a
+    // piece at a time was quadratic: half of a React server render was copying).
+    if (n->op == Op::Add && t->kind == N::Identifier) {
+        Env* where = nullptr;
+        Object* with = nullptr;
+        Binding* b = findBinding(env, t->str, &where, nullptr, &with);
+        if (b && !with && b->is_mutable && b->initialized && !b->function_name && b->value.isString()) {
+            Value old = b->value;   // read before the right side is (it may change the variable)
+            const Value r = eval(n->b, env, strict);
+            // (Evaluating the right side can't have moved the binding: entries never move.)
+            if (r.isString() && b->value.isString() && b->value.stringRef() == old.stringRef()) {
+                old = Value();
+                if (b->value.stringRef().use_count() == 1) {
+                    const std::u16string& add = r.asString();
+                    auto& mine = const_cast<std::u16string&>(*b->value.stringRef());
+                    if (mine.size() + add.size() > (1u << 29)) rt_.throwError("RangeError", "string too long");
+                    if (&mine == &add) mine += std::u16string(add);   // s += s
+                    else mine += add;
+                    return b->value;
+                }
+                old = b->value;
+            }
+            const Value v = binaryOp(Op::Add, old, r);
+            assignName(env, t->str, v, strict);
+            return v;
+        }
     }
     // Compound: read, operate, write. &&=, ||= and ??= only write when they must.
     Value base;
