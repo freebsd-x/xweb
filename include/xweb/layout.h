@@ -41,6 +41,9 @@ public:
     [[nodiscard]] virtual std::optional<std::pair<float, float>> imageSize(const std::string& src) = 0;
     // For a loaded image with a shape but no size (an SVG with only a viewBox): width over height.
     [[nodiscard]] virtual std::optional<float> imageRatio(const std::string& src) { (void)src; return std::nullopt; }
+    // Whether it may still come: then it's an empty box, as browsers show an image loading,
+    // not its alt text (that's for one that failed, or a host that loads none).
+    [[nodiscard]] virtual bool imageLoading(const std::string& src) { (void)src; return false; }
 };
 
 enum class PaintKind {

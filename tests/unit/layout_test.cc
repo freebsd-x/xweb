@@ -728,3 +728,20 @@ TEST(Replaced, PictureSourcesAndSrcset) {
     EXPECT_EQ(imageSourceOf(byId("x"), vp).value_or(""), "lo.png");
     EXPECT_EQ(imageSourceOf(byId("n"), vp).value_or(""), "n.png");
 }
+
+TEST(Replaced, AnImageLoadingShowsNoAltText) {
+    // Inflearn's carousel: every slide's alt text drawn on top of the others while the
+    // pictures were on their way. Browsers show alt text only for a picture that failed.
+    struct Loading : ImageSizes {
+        std::optional<std::pair<float, float>> imageSize(const std::string&) override { return std::nullopt; }
+        bool imageLoading(const std::string& src) override { return src == "coming.png"; }
+    } images;
+    auto doc = parseHtml("<img id=a src=coming.png alt='Slide one'><img id=b src=gone.png alt='Broken'>");
+    StyledDocument styles(*doc, css::MediaContext{400, 300});
+    FixedText measurer;
+    const PageLayout r = layoutPage(*doc, styles, measurer, &images, 400, 300);
+    std::string texts;
+    for (const auto& op : r.ops)
+        if (op.kind == PaintKind::Text) texts += op.text + "|";
+    EXPECT_EQ(texts, "Broken|");
+}

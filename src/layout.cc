@@ -1192,7 +1192,7 @@ private:
             }
             if (!have_natural) {
                 natural_w = natural_h = 0;
-                if (!b.alt.empty()) {
+                if (!b.alt.empty() && !(src && images_ && images_->imageLoading(*src))) {
                     const FontSpec f = fontOf(s);
                     natural_w = text_.width(b.alt, f);
                     natural_h = lineHeightOf(s);
@@ -3783,7 +3783,7 @@ private:
             if (src && images_ && out_->images_wanted.size() < 512 &&
                 std::find(out_->images_wanted.begin(), out_->images_wanted.end(), *src) == out_->images_wanted.end())
                 out_->images_wanted.push_back(*src);
-            if (is_img && !b.alt.empty()) addText(cx, cy, b.alt, s, opacity);
+            if (is_img && !b.alt.empty() && !(src && images_ && images_->imageLoading(*src))) addText(cx, cy, b.alt, s, opacity);
             return;
         }
         if (n->ns == Namespace::Svg && n->name == "svg") {

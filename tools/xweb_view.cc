@@ -599,6 +599,12 @@ public:
         return std::make_pair(static_cast<float>(image->width), static_cast<float>(image->height));
     }
 
+    bool imageLoading(const std::string& src) override {
+        if (!page_) return false;
+        const std::string url = web::resolveUrl(page_->base, src);
+        return !page_->images.count(url) && !page_->failed_images.count(url) && page_->requested.size() < kMaxImages;
+    }
+
     std::optional<float> imageRatio(const std::string& src) override {
         const LoadedImage* image = find(src);
         if (!image || !image->svg) return std::nullopt;
@@ -1951,9 +1957,10 @@ private:
                         XApplication::post([this, page, url, mine] {
                             if (generation_.load() != mine) return;
                             page->failed_images.insert(url);
+                            relayout_wanted_ = true;   // now its alt text shows
                             if (page->script) {
                                 page->script->imageLoaded(url, false);
-                                if (page->script->takeDirty()) relayout_wanted_ = true;
+                                (void)page->script->takeDirty();
                             }
                         });
                     };
@@ -1976,6 +1983,8 @@ private:
                         const uint64_t pixels = static_cast<uint64_t>(image->width) * image->height;
                         if (page->pixels + pixels > kMaxPagePixels) {
                             if (std::getenv("XWEB_DEBUG_IMAGES")) std::fprintf(stderr, "[image] %s: over the page's pixel budget\n", url.c_str());
+                            page->failed_images.insert(url);   // not coming: its alt text, then
+                            relayout_wanted_ = true;
                             return;
                         }
                         page->pixels += pixels;
