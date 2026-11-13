@@ -4093,7 +4093,6 @@ private:
                                    b.height + b.padding[Top] + b.padding[Bottom]}
                             : cb_in;
         const size_t outer_cb_clip_depth = cb_clip_depth_;
-        if (s.position != Position::Static) cb_clip_depth_ = clip_stack_.size();
         if (s.overflow_clip) {
             PaintOp op;
             op.kind = PaintKind::ClipBegin;
@@ -4104,6 +4103,9 @@ private:
             clip_stack_.push_back({op.x, op.y, op.w, op.h});
             out_->ops.push_back(std::move(op));
         }
+        // A containing block: its own clip and those outside it are what its absolutely
+        // positioned descendants get.
+        if (s.position != Position::Static) cb_clip_depth_ = clip_stack_.size();
         // A stacking context: its negative z-index descendants go in here, over its own
         // background and under its content.
         const size_t outer_ctx_ops = ctx_ops_, outer_ctx_boxes = ctx_boxes_;
@@ -4407,13 +4409,17 @@ private:
     int painting_below_ = 0;               // inside a negative z-index box's paint
     std::vector<Rect> clip_stack_;   // overflow clips around what's being painted
     std::vector<Matrix> transforms_; // the transforms around what's being painted, composed
-    size_t cb_clip_depth_ = 0;       // how many of them are outside the containing block
+    // How many of them (from the outside) are the containing block's own clip and its
+    // ancestors': those are what clip a box absolutely positioned in it.
+    size_t cb_clip_depth_ = 0;
 
-    // An absolutely positioned box is clipped by overflow inside its containing block, not
-    // outside it; a fixed one by none.
+    // An absolutely positioned box is clipped by its containing block's overflow and that
+    // block's ancestors', not by the boxes between it and its containing block (CSS 2.1
+    // 11.1.1); a fixed one by none. (This was the other way round: YouTube's whole page,
+    // absolute in a body of no height with overflow:hidden, was clipped away.)
     std::vector<Rect> clipsFor(const Box& k) const {
         if (k.style->position == Position::Fixed) return {};
-        return {clip_stack_.begin() + static_cast<std::ptrdiff_t>(std::min(cb_clip_depth_, clip_stack_.size())), clip_stack_.end()};
+        return {clip_stack_.begin(), clip_stack_.begin() + static_cast<std::ptrdiff_t>(std::min(cb_clip_depth_, clip_stack_.size()))};
     }
     std::vector<PendingFloat> pending_floats_;
     size_t order_ = 0;

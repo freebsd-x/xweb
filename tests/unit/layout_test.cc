@@ -745,3 +745,20 @@ TEST(Replaced, AnImageLoadingShowsNoAltText) {
         if (op.kind == PaintKind::Text) texts += op.text + "|";
     EXPECT_EQ(texts, "Broken|");
 }
+
+TEST(Paint, AnAbsoluteBoxEscapesClipsBetweenItAndItsContainingBlock) {
+    // YouTube: ytd-app absolute (in the viewport) inside a body with overflow:hidden and no
+    // height. Clipped by its containing block's overflow (and outer ones), not by others.
+    const auto r = layout("<div id=e style='overflow:hidden;height:0'><div id=a style='position:absolute;top:0;width:10px;height:10px;background:#f00'></div></div>"
+                          "<div style='position:relative;overflow:hidden;width:20px;height:20px'><div style='overflow:visible'>"
+                          "<div id=b style='position:absolute;top:0;left:0;width:50px;height:50px;background:#00f'></div></div></div>");
+    int depth = 0, red_depth = -1, blue_depth = -1;
+    for (const auto& op : r.page.ops) {
+        if (op.kind == PaintKind::ClipBegin) ++depth;
+        else if (op.kind == PaintKind::ClipEnd) --depth;
+        else if (op.kind == PaintKind::Rect && op.color.r == 255 && op.color.b == 0) red_depth = depth;
+        else if (op.kind == PaintKind::Rect && op.color.b == 255 && op.color.r == 0) blue_depth = depth;
+    }
+    EXPECT_EQ(red_depth, 0);    // e is between it and the viewport: no clip
+    EXPECT_EQ(blue_depth, 1);   // its containing block clips it
+}
