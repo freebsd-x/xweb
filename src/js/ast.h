@@ -134,6 +134,13 @@ struct ThrowSite {
 };
 inline thread_local ThrowSite t_throw_site;
 inline ThrowSite& throwSite() noexcept { return t_throw_site; }
+// The script functions being called, innermost last: each with where it was called from,
+// for an error's stack (as V8 writes it, which pages and their tools read).
+struct CallFrame {
+    ThrowSite site;                   // the call, in its caller
+    const std::u16string* name;       // the function called
+};
+inline thread_local std::vector<CallFrame> t_call_frames;
 // "\n    at url:line:1" for where that is, or nothing: what an error's stack ends with.
 std::u16string stackLine();
 

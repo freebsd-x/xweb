@@ -588,14 +588,32 @@ void Runtime::method(Object* o, const char16_t* name, int length, NativeFunction
 }
 
 std::u16string stackLine() {
-    const ThrowSite& site = throwSite();
-    if (!site.url || site.line == 0) return {};
-    uint32_t col = 1;
-    if (site.line_starts && site.line - 1 < site.line_starts->size() && site.offset >= (*site.line_starts)[site.line - 1])
-        col = site.offset - (*site.line_starts)[site.line - 1] + 1;
-    // As V8 writes a frame, which pages' own error handling knows how to read.
-    return u"\n    at " + utf16(site.url->empty() ? std::string("<anonymous>") : *site.url) + u":" + utf16(std::to_string(site.line)) + u":" +
-           utf16(std::to_string(col));
+    // "url:line:col" for a place, or nothing.
+    const auto where = [](const ThrowSite& site) -> std::u16string {
+        if (!site.url || site.line == 0) return {};
+        uint32_t col = 1;
+        if (site.line_starts && site.line - 1 < site.line_starts->size() && site.offset >= (*site.line_starts)[site.line - 1])
+            col = site.offset - (*site.line_starts)[site.line - 1] + 1;
+        return utf16(site.url->empty() ? std::string("<anonymous>") : *site.url) + u":" + utf16(std::to_string(site.line)) + u":" +
+               utf16(std::to_string(col));
+    };
+    // As V8 writes frames, which pages' own error handling knows how to read: the
+    // innermost function where it is now, then each caller where it made the call.
+    std::u16string out;
+    const ThrowSite* here = &throwSite();
+    size_t frames = 0;
+    for (size_t i = t_call_frames.size(); i-- > 0 && frames < 10; ++frames) {
+        const std::u16string at = where(*here);
+        if (at.empty()) break;
+        const std::u16string& name = *t_call_frames[i].name;
+        out += u"\n    at " + (name.empty() ? at : name + u" (" + at + u")");
+        here = &t_call_frames[i].site;
+    }
+    if (frames < 10) {
+        const std::u16string at = where(*here);
+        if (!at.empty()) out += u"\n    at " + at;
+    }
+    return out;
 }
 
 Object* Runtime::newError(const char* kind, const std::string& message) {
@@ -614,7 +632,13 @@ void Runtime::step() {
     if (++steps_ > step_budget_) {
         std::string where = utf8(stackLine());
         const size_t at = where.find("at ");
-        throw Terminated{"the script ran too long" + (at == std::string::npos ? std::string() : " (" + where.substr(at + 3) + ")")};
+        if (at != std::string::npos) {
+            where = where.substr(at + 3);
+            if (const size_t nl = where.find('\n'); nl != std::string::npos) where.resize(nl);   // the innermost frame
+            if (where.ends_with(")"))
+                if (const size_t open = where.rfind(" ("); open != std::string::npos) where = where.substr(open + 2, where.size() - open - 3);
+        }
+        throw Terminated{"the script ran too long" + (at == std::string::npos ? std::string() : " (" + where + ")")};
     }
 }
 
@@ -1613,6 +1637,9 @@ std::string describeWhere(Runtime& rt, const Value& thrown) {
     if (at == std::u16string::npos) return {};
     const size_t from = at + 8, to = stack.find(u'\n', from);
     std::string where = utf8(stack.substr(from, to == std::u16string::npos ? std::u16string::npos : to - from));
+    // "name (url:line:col)": the place.
+    if (where.ends_with(")"))
+        if (const size_t open = where.rfind(" ("); open != std::string::npos) where = where.substr(open + 2, where.size() - open - 3);
     if (where.size() > 2 && where.ends_with(":1")) where.resize(where.size() - 2);   // no column known
     return " (" + where + ")";
 }
@@ -1994,6 +2021,15 @@ Value Interpreter::callScript(Object* f, const Value& this_value, std::span<cons
     }
     owns_scopes_ = ownsScopes(info);
     if (owns_scopes_) rt_.owned_scopes.push_back(&owned_);   // roots while the call runs
+    // On the call stack an error's stack lists. (Put back to its depth on the way out,
+    // however we leave.)
+    struct Frame {
+        size_t depth;
+        explicit Frame(const std::u16string* name) : depth(t_call_frames.size()) {
+            if (depth < 4096) t_call_frames.push_back({throwSite(), name});
+        }
+        ~Frame() { if (t_call_frames.size() > depth) t_call_frames.resize(depth); }
+    } frame(&info->name);
     Env* env = prepareCall(f, this_value, args, new_target);
     EnvScope scope(rt_, env);
     rt_.safePoint();

@@ -783,3 +783,8 @@ TEST(Js, StringsGrowInPlaceAndEvalKeepsItsValue) {
     EXPECT_EQ(run("eval(\"var y = 'a'; y += 'b'\")"), "ab");
     EXPECT_EQ(run("var z = 'p'; var w = z; z += z; [z, w].join()"), "pp,p");
 }
+
+TEST(Js, ErrorStacksListTheCalls) {
+    EXPECT_EQ(run("function inner() { return new Error('x').stack; } function outer() { return inner(); }"
+                  "var s = outer(); [s.split('\\n').length, /at inner \\(/.test(s), /at outer \\(/.test(s)].join()"), "4,true,true");
+}
