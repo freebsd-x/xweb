@@ -1156,3 +1156,14 @@ TEST(Script, DocumentAllIsHTMLDDA) {
         </script>)");
     EXPECT_EQ(p.console, "log:undefined true true false true true true true HTML\n") << p.console;
 }
+
+TEST(Script, NamespacedAttributes) {
+    Page p(R"(<body><svg><use id=u></use></svg><script>
+        const u = document.getElementById('u');
+        u.setAttributeNS('http://www.w3.org/1999/xlink', 'xlink:href', '#a');
+        console.log(u.getAttribute('xlink:href'), u.getAttributeNS('http://www.w3.org/1999/xlink', 'href'), u.hasAttributeNS(null, 'href'));
+        u.removeAttributeNS('http://www.w3.org/1999/xlink', 'href');
+        console.log(u.hasAttribute('xlink:href'));
+        </script>)");
+    EXPECT_EQ(p.console, "log:#a #a true\nlog:false\n") << p.console;
+}

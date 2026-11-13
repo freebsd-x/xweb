@@ -1671,6 +1671,21 @@ const char* const kScriptPrelude = R"JS(
     Object.defineProperty(Document.prototype, 'all', { get() { return all; }, configurable: true, enumerable: true });
   }
 
+  // The namespaced attribute methods, by qualified name (attributes here keep no namespace):
+  // setAttributeNS(xlinkNS, 'xlink:href', ...) is xlink:href (YouTube's watch page).
+  if (typeof Element === 'function' && !Element.prototype.setAttributeNS) {
+    const find = (el, local) => {
+      if (el.hasAttribute(local)) return local;
+      for (const n of el.getAttributeNames()) if (n.endsWith(':' + local)) return n;
+      return null;
+    };
+    const def = (name, f) => Object.defineProperty(Element.prototype, name, { value: f, writable: true, configurable: true });
+    def('setAttributeNS', function setAttributeNS(ns, qname, value) { this.setAttribute(String(qname), value); });
+    def('getAttributeNS', function getAttributeNS(ns, local) { const n = find(this, String(local)); return n === null ? null : this.getAttribute(n); });
+    def('hasAttributeNS', function hasAttributeNS(ns, local) { return find(this, String(local)) !== null; });
+    def('removeAttributeNS', function removeAttributeNS(ns, local) { const n = find(this, String(local)); if (n !== null) this.removeAttribute(n); });
+  }
+
   // MediaError, for a media element's error (Reddit's player checks against it).
   if (typeof global.MediaError !== 'function') {
     class MediaError {
