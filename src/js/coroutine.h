@@ -100,6 +100,10 @@ void scanCoroutineStack(const Coroutine& co, const std::function<void(uintptr_t)
 bool onEngineStack() noexcept;
 // Deeper than this, on the engine's stack, is "too much recursion".
 const char* engineStackLimit() noexcept;
+// The engine stack's bottom and the lowest a frame may go on it (null until it's made):
+// for the check every evaluation makes, without a call.
+extern const char* g_engine_stack_bottom;
+extern const char* g_engine_stack_limit;
 void runOnEngineStack(const std::function<void()>& fn);
 
 // What a coroutine runs (async.cc).

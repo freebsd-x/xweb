@@ -321,6 +321,9 @@ __attribute__((no_sanitize("address"), noinline)) bool scanActiveStacks(const Ru
     return true;
 }
 
+const char* g_engine_stack_bottom = nullptr;
+const char* g_engine_stack_limit = nullptr;
+
 bool onEngineStack() noexcept {
     const char* sp = static_cast<const char*>(__builtin_frame_address(0));
     return engine.mem && sp > engine.mem && sp < engine.mem + kEngineStackSize;
@@ -337,6 +340,8 @@ void runOnEngineStack(const std::function<void()>& fn) {
         }
         mprotect(m, pageSize(), PROT_NONE);
         engine.mem = static_cast<char*>(m);
+        g_engine_stack_bottom = engine.mem;
+        g_engine_stack_limit = engineStackLimit();
     }
     // A fresh frame at the top each time: nothing stays on it between runs.
     char* top = engine.mem + kEngineStackSize;

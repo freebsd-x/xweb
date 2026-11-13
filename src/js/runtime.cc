@@ -20,8 +20,8 @@ namespace fbx::xweb::js {
 // Near the end of the engine's stack (or, off it, of whatever stack this is: then only
 // the counts guard it).
 inline bool stackExhausted(const char* sp) {
-    const char* limit = engineStackLimit();
-    return limit && onEngineStack() && sp < limit;
+    // On the engine stack (above its bottom) and below the limit (under its top).
+    return sp < g_engine_stack_limit && sp > g_engine_stack_bottom;
 }
 
 
@@ -516,7 +516,9 @@ private:
         if (!o) rt_.throwError("TypeError", "super has no prototype here");
         return o;
     }
-    PropertyKey memberKey(Node* m, Env* env, bool strict);
+    // A member access's key: a.b's from the node (kept there), a[x]'s made into `scratch`.
+    // (`scratch`, a temporary by default, lives to the end of the caller's full expression.)
+    const PropertyKey& memberKey(Node* m, Env* env, bool strict, PropertyKey&& scratch = PropertyKey{});
 
     // ── Iteration, one value at a time (for-of, destructuring) ──
     struct IterRec {
@@ -2648,9 +2650,13 @@ Object* Interpreter::classDefinition(Node* n, Env* env) {
 
 // ── Expressions ──
 
-PropertyKey Interpreter::memberKey(Node* m, Env* env, bool strict) {
-    if (m->flags & kComputed) return rt_.toPropertyKey(eval(m->b, env, strict));
-    return PropertyKey(m->str);
+const PropertyKey& Interpreter::memberKey(Node* m, Env* env, bool strict, PropertyKey&& scratch) {
+    if (m->flags & kComputed) {
+        scratch = rt_.toPropertyKey(eval(m->b, env, strict));
+        return scratch;
+    }
+    if (!m->key) m->key = std::make_unique<PropertyKey>(m->str);
+    return *m->key;
 }
 
 Value Interpreter::superBase(Env* env) {

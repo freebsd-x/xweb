@@ -9,6 +9,8 @@
 #include <string_view>
 #include <vector>
 
+#include "xweb/js.h"
+
 namespace fbx::xweb::js {
 
 enum class Tok : uint8_t {
@@ -78,6 +80,8 @@ struct Node {
     FunctionInfo* fn = nullptr;   // functions, arrows, methods, classes' constructors
     std::shared_ptr<const std::vector<std::u16string>> lexical;   // a block's let/const/class names
     std::shared_ptr<const std::vector<std::u16string>> cache;     // a tagged template's strings
+    // A member access's key (a.b's "b"), made once: each access used to copy the name.
+    std::unique_ptr<PropertyKey> key;
 };
 
 // Node flags.
