@@ -1136,3 +1136,13 @@ TEST(Script, NavigatorPluginsAreThereAndEmpty) {
         </script>)");
     EXPECT_EQ(p.console, "log:0 0 null 0 false\n") << p.console;
 }
+
+TEST(Script, SvgAttributesKeepTheirCase) {
+    Page p(R"(<body><svg id=s></svg><div id=d></div><script>
+        const s = document.getElementById('s'), d = document.getElementById('d');
+        s.setAttribute('viewBox', '0 0 24 24');
+        d.setAttribute('DATA-X', '1');
+        console.log(s.getAttributeNames().join(), s.getAttribute('viewBox'), s.hasAttribute('viewbox'), d.getAttributeNames().join(), d.getAttribute('data-X'));
+        </script>)");
+    EXPECT_EQ(p.console, "log:id,viewBox 0 0 24 24 false id,data-x 1\n") << p.console;
+}

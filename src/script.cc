@@ -467,24 +467,31 @@ void PageScript::Impl::installElement() {
             return Value::undefined();
         });
     }
-    method(p, u"getAttribute", 1, [self](Runtime& rt, const Value& t, Args a) {
-        const std::string* v = self->thisElement(t)->attr(lower(js::utf8(rt.toStringValue(arg(a, 0)))));
+    // An attribute name as the element has it: lower-cased on HTML elements only (an SVG's
+    // viewBox stays viewBox: YouTube's icons were given a second, lower-case one).
+    const auto attrName = [](const Node* el, std::string name) { return el->ns == Namespace::Html ? lower(name) : name; };
+    method(p, u"getAttribute", 1, [self, attrName](Runtime& rt, const Value& t, Args a) {
+        const Node* el = self->thisElement(t);
+        const std::string* v = el->attr(attrName(el, js::utf8(rt.toStringValue(arg(a, 0)))));
         return v ? str(*v) : Value::null();
     });
-    method(p, u"setAttribute", 2, [self](Runtime& rt, const Value& t, Args a) {
-        self->setAttr(self->thisElement(t), lower(js::utf8(rt.toStringValue(arg(a, 0)))), js::utf8(rt.toStringValue(arg(a, 1))));
+    method(p, u"setAttribute", 2, [self, attrName](Runtime& rt, const Value& t, Args a) {
+        Node* el = self->thisElement(t);
+        self->setAttr(el, attrName(el, js::utf8(rt.toStringValue(arg(a, 0)))), js::utf8(rt.toStringValue(arg(a, 1))));
         return Value::undefined();
     });
-    method(p, u"removeAttribute", 1, [self](Runtime& rt, const Value& t, Args a) {
-        self->removeAttr(self->thisElement(t), lower(js::utf8(rt.toStringValue(arg(a, 0)))));
+    method(p, u"removeAttribute", 1, [self, attrName](Runtime& rt, const Value& t, Args a) {
+        Node* el = self->thisElement(t);
+        self->removeAttr(el, attrName(el, js::utf8(rt.toStringValue(arg(a, 0)))));
         return Value::undefined();
     });
-    method(p, u"hasAttribute", 1, [self](Runtime& rt, const Value& t, Args a) {
-        return Value::boolean(self->thisElement(t)->attr(lower(js::utf8(rt.toStringValue(arg(a, 0))))) != nullptr);
+    method(p, u"hasAttribute", 1, [self, attrName](Runtime& rt, const Value& t, Args a) {
+        const Node* el = self->thisElement(t);
+        return Value::boolean(el->attr(attrName(el, js::utf8(rt.toStringValue(arg(a, 0))))) != nullptr);
     });
-    method(p, u"toggleAttribute", 1, [self](Runtime& rt, const Value& t, Args a) {
+    method(p, u"toggleAttribute", 1, [self, attrName](Runtime& rt, const Value& t, Args a) {
         Node* n = self->thisElement(t);
-        const std::string name = lower(js::utf8(rt.toStringValue(arg(a, 0))));
+        const std::string name = attrName(n, js::utf8(rt.toStringValue(arg(a, 0))));
         const bool on = a.size() > 1 ? rt.toBoolean(a[1]) : !n->attr(name);
         if (on) { if (!n->attr(name)) self->setAttr(n, name, ""); }
         else self->removeAttr(n, name);
