@@ -426,7 +426,7 @@ void PageScript::Impl::installElement() {
              {u"autocomplete", "autocomplete"}, {u"pattern", "pattern"}, {u"wrap", "wrap"}, {u"headers", "headers"}, {u"scope", "scope"},
              {u"abbr", "abbr"}, {u"accessKey", "accesskey"}, {u"enterKeyHint", "enterkeyhint"}, {u"inputMode", "inputmode"},
              {u"referrerPolicy", "referrerpolicy"}, {u"decoding", "decoding"}, {u"loading", "loading"}, {u"fetchPriority", "fetchpriority"},
-             {u"nonce", "nonce"}}) {
+             {u"nonce", "nonce"}, {u"content", "content"}, {u"httpEquiv", "http-equiv"}}) {
         const std::string a = attr_name;
         accessor(p, prop, [self, a](Runtime&, const Value& t, Args) { return str(self->attr(self->thisElement(t), a.c_str())); },
                  [self, a](Runtime& rt, const Value& t, Args v) {
@@ -1370,6 +1370,39 @@ void PageScript::Impl::installWindow() {
         const auto values = self->host.computed_style ? self->host.computed_style(n) : std::unordered_map<std::string, std::string>{};
         for (const auto& [k, v] : values) {
             rt.put(o, js::utf16(k), str(v), js::kEnumerable);
+            rt.put(o, js::utf16(camelName(k)), str(v), js::kEnumerable);
+        }
+        // The properties the host doesn't give, as their initial values: a page reads them
+        // and calls string methods on what it gets (Netflix: getComputedStyle(el).content
+        // .replace(...) was undefined).
+        static const std::pair<const char*, const char*> kInitial[] = {
+            {"content", "normal"}, {"cursor", "auto"}, {"pointer-events", "auto"}, {"transform", "none"},
+            {"transform-origin", "50% 50% 0px"}, {"transition", "all 0s ease 0s"}, {"transition-property", "all"},
+            {"transition-duration", "0s"}, {"transition-delay", "0s"}, {"transition-timing-function", "ease"},
+            {"animation", "none 0s ease 0s 1 normal none running"}, {"animation-name", "none"}, {"animation-duration", "0s"},
+            {"animation-delay", "0s"}, {"animation-play-state", "running"}, {"animation-iteration-count", "1"},
+            {"user-select", "auto"}, {"box-shadow", "none"}, {"text-shadow", "none"}, {"text-overflow", "clip"},
+            {"word-break", "normal"}, {"overflow-wrap", "normal"}, {"word-wrap", "normal"}, {"overflow-x", "visible"},
+            {"overflow-y", "visible"}, {"object-fit", "fill"}, {"object-position", "50% 50%"}, {"vertical-align", "baseline"},
+            {"text-decoration", "none solid rgb(0, 0, 0)"}, {"text-decoration-line", "none"}, {"outline", "rgb(0, 0, 0) none 0px"},
+            {"outline-style", "none"}, {"outline-width", "0px"}, {"resize", "none"}, {"will-change", "auto"}, {"filter", "none"},
+            {"backdrop-filter", "none"}, {"clip-path", "none"}, {"mask", "none"}, {"mask-image", "none"}, {"direction", "ltr"},
+            {"writing-mode", "horizontal-tb"}, {"list-style-type", "disc"}, {"list-style", "outside none disc"},
+            {"table-layout", "auto"}, {"border-collapse", "separate"}, {"background-image", "none"}, {"background-size", "auto"},
+            {"background-position", "0% 0%"}, {"background-repeat", "repeat"}, {"background-clip", "border-box"},
+            {"border-radius", "0px"}, {"border-top-left-radius", "0px"}, {"border-top-right-radius", "0px"},
+            {"border-bottom-left-radius", "0px"}, {"border-bottom-right-radius", "0px"}, {"gap", "normal"}, {"row-gap", "normal"},
+            {"column-gap", "normal"}, {"order", "0"}, {"grid-template-columns", "none"}, {"grid-template-rows", "none"},
+            {"grid-auto-flow", "row"}, {"aspect-ratio", "auto"}, {"isolation", "auto"}, {"mix-blend-mode", "normal"},
+            {"scroll-behavior", "auto"}, {"touch-action", "auto"}, {"appearance", "none"}, {"font-variant", "normal"},
+            {"font-stretch", "100%"}, {"text-rendering", "auto"}, {"hyphens", "manual"}, {"tab-size", "8"},
+            {"perspective", "none"}, {"backface-visibility", "visible"}, {"contain", "none"}, {"content-visibility", "visible"},
+            {"inset", "auto"}, {"clear", "none"}, {"caret-color", "auto"}, {"accent-color", "auto"}, {"color-scheme", "normal"},
+        };
+        for (const auto& [k, v] : kInitial) {
+            const std::u16string name = js::utf16(k);
+            if (o->own(PropertyKey(name))) continue;
+            rt.put(o, name, str(v), js::kEnumerable);
             rt.put(o, js::utf16(camelName(k)), str(v), js::kEnumerable);
         }
         Object* holder = o;

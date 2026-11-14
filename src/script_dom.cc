@@ -591,6 +591,8 @@ void PageScript::Impl::installDom() {
             {u"target", {"HTMLAnchorElement", "HTMLAreaElement", "HTMLBaseElement", "HTMLFormElement"}},
             {u"hreflang", {"HTMLAnchorElement", "HTMLAreaElement", "HTMLLinkElement"}},
             {u"media", {"HTMLLinkElement", "HTMLStyleElement", "HTMLSourceElement", "HTMLMetaElement"}},
+            {u"content", {"HTMLMetaElement"}},   // LinkedIn reads meta[name=...].content
+            {u"httpEquiv", {"HTMLMetaElement"}},
             {u"download", {"HTMLAnchorElement", "HTMLAreaElement"}},
             {u"ping", {"HTMLAnchorElement", "HTMLAreaElement"}},
             {u"integrity", {"HTMLLinkElement", "HTMLScriptElement"}},

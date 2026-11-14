@@ -1167,3 +1167,29 @@ TEST(Script, NamespacedAttributes) {
         </script>)");
     EXPECT_EQ(p.console, "log:#a #a true\nlog:false\n") << p.console;
 }
+
+TEST(Script, IntlLocaleAndComputedDefaults) {
+    Page p(R"(<body><p id=p></p><script>
+        const l = new Intl.Locale('ko-kr-u-ca-gregory', { hourCycle: 'h23' });
+        const cs = getComputedStyle(document.getElementById('p'));
+        console.log(l.language, l.region, l.baseName, l.calendar, l.hourCycle, String(l), new Intl.Locale('en').maximize().baseName,
+                    cs.content, typeof cs.cursor, cs.getPropertyValue('pointer-events'));
+        </script>)");
+    EXPECT_EQ(p.console, "log:ko KR ko-KR gregory h23 ko-KR-u-ca-gregory-hc-h23 en-Latn-US normal string auto\n") << p.console;
+}
+
+TEST(Script, MetaContentReflects) {
+    Page p(R"(<head><meta name=x content="hello"></head><body><script>
+        const m = document.querySelector('meta[name=x]');
+        console.log(m.content, document.body.content);
+        </script>)");
+    EXPECT_EQ(p.console, "log:hello undefined\n") << p.console;
+}
+
+TEST(Script, StorageIsAnInterface) {
+    Page p(R"(<body><script>
+        localStorage.setItem('a', '1');
+        console.log(localStorage instanceof Storage, sessionStorage instanceof Storage, localStorage.getItem('a'));
+        </script>)");
+    EXPECT_EQ(p.console, "log:true true 1\n") << p.console;
+}

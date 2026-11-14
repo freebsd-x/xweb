@@ -1686,6 +1686,15 @@ const char* const kScriptPrelude = R"JS(
     def('removeAttributeNS', function removeAttributeNS(ns, local) { const n = find(this, String(local)); if (n !== null) this.removeAttribute(n); });
   }
 
+  // Storage: localStorage and sessionStorage's interface (LinkedIn checks instanceof Storage).
+  if (typeof global.Storage !== 'function') {
+    function Storage() { throw new TypeError('Illegal constructor'); }
+    Object.defineProperty(Storage.prototype, Symbol.toStringTag, { value: 'Storage', configurable: true });
+    for (const name of ['localStorage', 'sessionStorage'])
+      try { if (global[name] && typeof global[name] === 'object') Object.setPrototypeOf(global[name], Storage.prototype); } catch (e) {}
+    Object.defineProperty(global, 'Storage', { value: Storage, writable: true, configurable: true });
+  }
+
   // MediaError, for a media element's error (Reddit's player checks against it).
   if (typeof global.MediaError !== 'function') {
     class MediaError {
@@ -2039,10 +2048,64 @@ const char* const kScriptPrelude = R"JS(
       const cache = Symbol(name);
       Object.defineProperty(C.prototype, name, { configurable: true, get() { return this[cache] || (this[cache] = plain.bind(this)); } });
     }
+    // Intl.Locale: a BCP 47 tag taken apart (language, script, region, -u- keywords), and
+    // the options that override them (Spotify's player makes one).
+    class Locale {
+      constructor(tag, options = {}) {
+        if (typeof tag !== 'string' && !(tag instanceof Locale)) throw new TypeError('a locale must be a string or a Locale');
+        const parts = String(tag).replace(/_/g, '-').split('-');
+        if (!parts[0] || !/^[a-zA-Z]{2,8}$/.test(parts[0])) throw new RangeError('invalid language tag: ' + tag);
+        this._language = parts[0].toLowerCase();
+        let i = 1;
+        if (parts[i] && /^[a-zA-Z]{4}$/.test(parts[i])) { this._script = parts[i][0].toUpperCase() + parts[i].slice(1).toLowerCase(); i++; }
+        if (parts[i] && /^([a-zA-Z]{2}|\d{3})$/.test(parts[i])) { this._region = parts[i].toUpperCase(); i++; }
+        this._keywords = {};
+        const u = parts.findIndex((p, j) => j >= i && p.toLowerCase() === 'u');
+        if (u >= 0) {
+          for (let j = u + 1; j < parts.length && parts[j].length > 1; ) {
+            const key = parts[j++].toLowerCase(), vals = [];
+            while (j < parts.length && parts[j].length > 2) vals.push(parts[j++].toLowerCase());
+            this._keywords[key] = vals.join('-') || 'true';
+          }
+        }
+        for (const [opt, key] of [['calendar', 'ca'], ['collation', 'co'], ['hourCycle', 'hc'], ['caseFirst', 'kf'], ['numberingSystem', 'nu']])
+          if (options[opt] !== undefined) this._keywords[key] = String(options[opt]);
+        if (options.numeric !== undefined) this._keywords.kn = options.numeric ? 'true' : 'false';
+        if (options.language !== undefined) this._language = String(options.language).toLowerCase();
+        if (options.script !== undefined) this._script = String(options.script);
+        if (options.region !== undefined) this._region = String(options.region).toUpperCase();
+      }
+      get language() { return this._language; }
+      get script() { return this._script; }
+      get region() { return this._region; }
+      get baseName() { return [this._language, this._script, this._region].filter(Boolean).join('-'); }
+      get calendar() { return this._keywords.ca; }
+      get collation() { return this._keywords.co; }
+      get hourCycle() { return this._keywords.hc; }
+      get caseFirst() { return this._keywords.kf; }
+      get numberingSystem() { return this._keywords.nu; }
+      get numeric() { return this._keywords.kn === 'true'; }
+      toString() {
+        const keys = Object.keys(this._keywords).sort();
+        return this.baseName + (keys.length ? '-u-' + keys.map(k => this._keywords[k] === 'true' ? k : k + '-' + this._keywords[k]).join('-') : '');
+      }
+      // Likely subtags for the languages pages ask about; others as they are.
+      maximize() {
+        const likely = { en: ['Latn', 'US'], ko: ['Kore', 'KR'], ja: ['Jpan', 'JP'], zh: ['Hans', 'CN'], de: ['Latn', 'DE'], fr: ['Latn', 'FR'],
+                         es: ['Latn', 'ES'], pt: ['Latn', 'BR'], ru: ['Cyrl', 'RU'], it: ['Latn', 'IT'], ar: ['Arab', 'EG'], hi: ['Deva', 'IN'] }[this._language];
+        const m = new Locale(this.toString());
+        if (likely) { m._script = m._script || likely[0]; m._region = m._region || likely[1]; }
+        return m;
+      }
+      minimize() { const m = new Locale(this.toString()); m._script = undefined; return m; }
+      getWeekInfo() { return { firstDay: this._region === 'US' || this._region === 'KR' || this._region === 'JP' ? 7 : 1, weekend: [6, 7], minimalDays: 1 }; }
+      getTextInfo() { return { direction: ['ar', 'he', 'fa', 'ur'].includes(this._language) ? 'rtl' : 'ltr' }; }
+      get [Symbol.toStringTag]() { return 'Intl.Locale'; }
+    }
     // These three may be called without new (Intl.DateTimeFormat().resolvedOptions()).
     const callable = (C) => new Proxy(C, { apply(target, self, args) { return new target(...args); } });
     Object.assign(Intl, { NumberFormat: callable(NumberFormat), DateTimeFormat: callable(DateTimeFormat), RelativeTimeFormat, PluralRules, ListFormat,
-                          Collator: callable(Collator), Segmenter, DisplayNames,
+                          Collator: callable(Collator), Segmenter, DisplayNames, Locale,
       getCanonicalLocales: l => [].concat(l || []).map(String), supportedValuesOf: () => [] });
     Object.defineProperty(Intl, Symbol.toStringTag, { value: 'Intl', configurable: true });
     // The library's locale-sensitive methods, through the same formats.
