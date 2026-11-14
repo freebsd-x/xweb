@@ -188,6 +188,27 @@ Resource load(const std::string& address, bool cookies = false) {
     return r;
 }
 
+// Several at once, the answers in the same order: a page's stylesheets and scripts,
+// which fetched one after another took seconds (bbc.com's 40 scripts: 3.6 s).
+constexpr size_t kFetchWorkers = 8;
+std::vector<Resource> loadAll(const std::vector<std::string>& urls, const std::string& page_url,
+                              const std::atomic<uint64_t>& generation, uint64_t mine) {
+    std::vector<Resource> out(urls.size());
+    std::atomic<size_t> next{0};
+    const auto work = [&] {
+        for (size_t i; (i = next.fetch_add(1)) < urls.size();) {
+            if (generation.load() != mine) return;
+            out[i] = load(urls[i], web::sameSite(page_url, urls[i]));
+        }
+    };
+    const size_t n = std::min(kFetchWorkers, urls.size());
+    std::vector<std::thread> threads;
+    for (size_t i = 1; i < n; ++i) threads.emplace_back(work);
+    if (n) work();
+    for (std::thread& t : threads) t.join();
+    return out;
+}
+
 // A form's POST: only to the web, never to a file.
 Resource loadPost(const web::FormSubmission& sub, bool cookies = true) {
     Resource r;
@@ -283,16 +304,23 @@ void loadSheets(Page& page, const std::atomic<uint64_t>& generation, uint64_t mi
         }
         todo.insert(todo.end(), n->children.rbegin(), n->children.rend());
     }
+    // A wave at a time: the sheets we know of together, then what they @import.
     size_t fetched = 0;
     while (!queue.empty() && fetched < kMaxSheets && generation.load() == mine) {
-        const std::string url = queue.front();
-        queue.pop_front();
-        if (page.sheets.count(url)) continue;
-        ++fetched;
-        Resource got = load(url, web::sameSite(page.url, url));
-        std::string css = got.ok ? web::decodeToUtf8(got.body, got.content_type) : std::string{};
-        for (const std::string& ref : web::css::parseStylesheet(css).imports) queue.push_back(web::resolveUrl(url, ref));
-        page.sheets[url] = std::move(css);
+        std::vector<std::string> wave;
+        std::set<std::string> in_wave;
+        while (!queue.empty() && fetched + wave.size() < kMaxSheets) {
+            std::string url = std::move(queue.front());
+            queue.pop_front();
+            if (!page.sheets.count(url) && in_wave.insert(url).second) wave.push_back(std::move(url));
+        }
+        fetched += wave.size();
+        std::vector<Resource> got = loadAll(wave, page.url, generation, mine);
+        for (size_t i = 0; i < wave.size(); ++i) {
+            std::string css = got[i].ok ? web::decodeToUtf8(got[i].body, got[i].content_type) : std::string{};
+            for (const std::string& ref : web::css::parseStylesheet(css).imports) queue.push_back(web::resolveUrl(wave[i], ref));
+            page.sheets[wave[i]] = std::move(css);
+        }
     }
 }
 
@@ -328,10 +356,25 @@ void loadScripts(Page& page, const std::atomic<uint64_t>& generation, uint64_t m
         todo.insert(todo.end(), n->children.rbegin(), n->children.rend());
     }
     size_t total = 0;
+    // What's been fetched ahead, all at once, to be taken in order below.
+    std::map<std::string, Resource> ahead;
+    const auto fetchAhead = [&](std::vector<std::string> wanted) {
+        std::erase_if(wanted, [&](const std::string& url) { return page.scripts.count(url) || ahead.count(url); });
+        std::sort(wanted.begin(), wanted.end());
+        wanted.erase(std::unique(wanted.begin(), wanted.end()), wanted.end());
+        std::vector<Resource> got = loadAll(wanted, page.url, generation, mine);
+        for (size_t i = 0; i < wanted.size(); ++i) ahead[wanted[i]] = std::move(got[i]);
+    };
     const auto fetch = [&](const std::string& url) -> const std::string* {
         if (const auto it = page.scripts.find(url); it != page.scripts.end()) return &it->second;
         if (total > kMaxTotalBytes) return nullptr;
-        Resource got = load(url, web::sameSite(page.url, url));
+        Resource got;
+        if (auto it = ahead.find(url); it != ahead.end()) {
+            got = std::move(it->second);
+            ahead.erase(it);
+        } else {
+            got = load(url, web::sameSite(page.url, url));
+        }
         if (!got.ok || got.http_status >= 400 || got.body.size() > kMaxScriptBytes) return nullptr;
         total += got.body.size();
         // A script that doesn't say is in its charset attribute's encoding, else the page's
@@ -344,14 +387,30 @@ void loadScripts(Page& page, const std::atomic<uint64_t>& generation, uint64_t m
         }
         return &(page.scripts[url] = web::decodeToUtf8(got.body, type));
     };
+    {
+        std::vector<std::string> wanted = urls;
+        for (const auto& [url, inline_source] : modules)
+            if (!url.empty()) wanted.push_back(url);
+        fetchAhead(std::move(wanted));
+    }
     for (const std::string& url : urls) {
         if (generation.load() != mine) return;
         fetch(url);
     }
-    // Breadth first through the module graph.
+    // Breadth first through the module graph, each level's imports fetched together.
     std::set<std::string> seen;
     size_t fetched = 0;
+    size_t level_end = modules.size();
     while (!modules.empty() && fetched < kMaxModules && generation.load() == mine) {
+        if (level_end == 0) {
+            std::vector<std::string> wanted;
+            for (const auto& [url, inline_source] : modules)
+                if (!url.empty() && !seen.count(url)) wanted.push_back(url);
+            if (wanted.size() > kMaxModules - fetched) wanted.resize(kMaxModules - fetched);
+            fetchAhead(std::move(wanted));
+            level_end = modules.size();
+        }
+        --level_end;
         auto [url, inline_source] = modules.front();
         modules.pop_front();
         const std::string* source = &inline_source;
@@ -1741,20 +1800,37 @@ private:
         const uint64_t mine = ++generation_;
         const float restore = mode == Mode::History ? history_[index_].scroll : (mode == Mode::Reload ? node_->scrollY() : 0);
         std::thread([this, url, mine, restore, post = std::move(post)] {
+            // XWEB_DEBUG_PERF: how long each step of the load took.
+            static const bool perf = std::getenv("XWEB_DEBUG_PERF") != nullptr;
+            const auto t0 = std::chrono::steady_clock::now();
+            const auto mark = [&](const char* what) {
+                if (perf) std::fprintf(stderr, "[perf] load %s at %.0f ms\n", what,
+                                       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+            };
             auto page = std::make_shared<Page>();
             Resource got = post ? loadPost(*post) : load(url, true);
+            mark("page fetched");
             if (generation_.load() != mine) return;
             page->url = got.ok ? got.final_url : url;
             if (got.ok) page->charset = web::detectCharset(got.body, got.content_type);
             page->doc = web::parseHtml(htmlFor(got, url), web::ParseOptions{.scripting = true});
             page->base = findBase(*page->doc, page->url);
-            loadSheets(*page, generation_, mine);
+            mark("parsed");
+            // Together: they fill different parts of the page.
+            std::thread sheets([&] {
+                loadSheets(*page, generation_, mine);
+                mark("stylesheets fetched");
+            });
             loadScripts(*page, generation_, mine);
+            mark("scripts fetched");
+            sheets.join();
             if (generation_.load() != mine) return;
             std::vector<std::string> images = imageSources(*page);
-            XApplication::post([this, page, mine, restore, images = std::move(images)]() mutable {
+            XApplication::post([this, page, mine, restore, images = std::move(images), t0]() mutable {
                 if (generation_.load() != mine) return;
                 install(page, restore);
+                if (perf) std::fprintf(stderr, "[perf] load installed (scripts run) at %.0f ms\n",
+                                       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
                 loadImages(page, std::move(images), mine);
             });
         }).detach();

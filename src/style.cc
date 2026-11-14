@@ -1,10 +1,14 @@
 #include "xweb/style.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include <set>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "ua_stylesheet.h"
@@ -1422,6 +1426,36 @@ void absolutizeUrls(std::vector<Declaration>& decls, const std::string& base) {
     }
 }
 
+// Sheets parsed once: a page's script asking where something is lays it out again,
+// and that took parsing every sheet again (daum.net: 7% of its load). By its text and
+// the URL its url()s are against; dropped wholesale past a budget.
+std::shared_ptr<const css::Stylesheet> parsedSheet(std::string_view text, const std::string& url) {
+    constexpr size_t kBudget = 48u << 20;
+    static std::mutex mutex;
+    static std::unordered_map<std::string, std::shared_ptr<const css::Stylesheet>> cache;
+    static size_t bytes = 0;
+    std::string key;
+    key.reserve(url.size() + 1 + text.size());
+    key.append(url).push_back('\0');
+    key.append(text);
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (const auto it = cache.find(key); it != cache.end()) return it->second;
+    }
+    css::Stylesheet sheet = css::parseStylesheet(text);
+    if (!url.empty())
+        for (css::Rule& rule : sheet.rules) absolutizeUrls(rule.declarations, url);
+    auto shared = std::make_shared<const css::Stylesheet>(std::move(sheet));
+    std::lock_guard<std::mutex> lock(mutex);
+    if (bytes + key.size() > kBudget) {
+        cache.clear();
+        bytes = 0;
+    }
+    bytes += key.size();
+    cache.emplace(std::move(key), shared);
+    return shared;
+}
+
 // ── @font-face ────────────────────────────────────────────────────────────────
 
 constexpr size_t kMaxFontFaces = 512;
@@ -1611,12 +1645,42 @@ struct MatchedDecl {
     size_t order;
 };
 
+// What an element's ancestors must have for a selector to match it: their tags,
+// IDs and classes, hashed, for the filter that turns most selectors down before
+// walking up the tree (daum.net restyled 74 times while it loaded).
+constexpr size_t kMaxAncestorHashes = 4;
+constexpr uint32_t kBloomBits = 12;
+constexpr uint32_t kBloomMask = (1u << kBloomBits) - 1;
+
+uint32_t featureHash(char kind, std::string_view text) {
+    uint32_t h = 2166136261u ^ static_cast<uint8_t>(kind);
+    for (const char c : text) h = (h ^ static_cast<uint8_t>(c)) * 16777619u;
+    return h ? h : 1;
+}
+
 struct IndexedSelector {
     const ComplexSelector* selector;
     const css::Rule* rule;
     Origin origin;
     size_t order;
+    std::array<uint32_t, kMaxAncestorHashes> ancestors{};
+    uint8_t ancestor_count = 0;
 };
+
+// The hashes of what's in the compounds a selector's subject has to be inside of.
+void setAncestorHashes(IndexedSelector& entry) {
+    const auto& parts = entry.selector->parts;
+    for (size_t i = parts.size(); i-- > 1 && entry.ancestor_count < kMaxAncestorHashes;) {
+        const Combinator c = parts[i].combinator;
+        if (c != Combinator::Descendant && c != Combinator::Child) continue;   // a sibling: its parents still count
+        for (const SimpleSelector& x : parts[i - 1].simple) {
+            if (entry.ancestor_count >= kMaxAncestorHashes) break;
+            if (x.kind == SimpleKind::Type) entry.ancestors[entry.ancestor_count++] = featureHash('t', x.name);
+            else if (x.kind == SimpleKind::Id) entry.ancestors[entry.ancestor_count++] = featureHash('i', x.name);
+            else if (x.kind == SimpleKind::Class) entry.ancestors[entry.ancestor_count++] = featureHash('c', x.name);
+        }
+    }
+}
 
 struct Buckets {
     std::unordered_map<std::string, std::vector<IndexedSelector>> by_id, by_class, by_type;
@@ -1661,14 +1725,14 @@ public:
         lengths_.viewport_w = out.media_.width;
         lengths_.viewport_h = out.media_.height;
         target_ = &ua_;
-        addSheet(css::parseStylesheet(detail::kUserAgentStyle), Origin::UserAgent, 0);
-        if (doc.quirks) addSheet(css::parseStylesheet(detail::kQuirksStyle), Origin::UserAgent, 0);
+        addSheet(detail::kUserAgentStyle, Origin::UserAgent, 0);
+        if (doc.quirks) addSheet(detail::kQuirksStyle, Origin::UserAgent, 0);
         // What's for browsers without scripts isn't shown where they run.
-        if (doc.scripting) addSheet(css::parseStylesheet("noscript { display: none }"), Origin::UserAgent, 0);
-        addSheet(css::parseStylesheet("::placeholder { color: #757575 }"), Origin::UserAgent, 0);
+        if (doc.scripting) addSheet("noscript { display: none }", Origin::UserAgent, 0);
+        addSheet("::placeholder { color: #757575 }", Origin::UserAgent, 0);
         target_ = &doc_scope_;
         collectSheets(doc_.root());
-        for (const std::string& css : doc_.root()->adopted_css) addSheet(css::parseStylesheet(css), Origin::Author, 0);   // document.adoptedStyleSheets
+        for (const std::string& css : doc_.root()->adopted_css) addSheet(css, Origin::Author, 0);   // document.adoptedStyleSheets
         collectShadowScopes();
         indexSiblings();
     }
@@ -1683,7 +1747,9 @@ public:
 
 private:
     // `url` is where the sheet came from: its @imports are relative to that.
-    void addSheet(css::Stylesheet sheet, Origin origin, int depth, const std::string& url = {}) {
+    void addSheet(std::string_view text, Origin origin, int depth, const std::string& url = {}) {
+        std::shared_ptr<const css::Stylesheet> parsed = parsedSheet(text, url);
+        const css::Stylesheet& sheet = *parsed;
         if (loader_ && depth < kMaxImportDepth) {
             for (size_t n = 0; n < sheet.imports.size(); ++n) {
                 const std::string& ref = sheet.imports[n];
@@ -1691,7 +1757,7 @@ private:
                 if (n < sheet.import_media.size() && !sheet.import_media[n].empty() && !css::mediaMatches(sheet.import_media[n], out_.media_)) continue;
                 if (++import_count_ > kMaxImports) break;
                 const std::string target = resolveUrl(url, ref);
-                addSheet(css::parseStylesheet(loader_(target)), origin, depth + 1, target);
+                addSheet(loader_(target), origin, depth + 1, target);
             }
         }
         for (const css::FontFaceRule& rule : sheet.font_faces) {
@@ -1699,10 +1765,8 @@ private:
             if (!std::all_of(rule.media.begin(), rule.media.end(), [&](const Tokens& q) { return css::mediaMatches(q, out_.media_); })) continue;
             if (auto face = webFontFrom(rule, url)) out_.font_faces_.push_back(std::move(*face));
         }
-        if (!url.empty())
-            for (css::Rule& rule : sheet.rules) absolutizeUrls(rule.declarations, url);
-        sheets_.push_back(std::make_unique<css::Stylesheet>(std::move(sheet)));
-        const css::Stylesheet& kept = *sheets_.back();
+        sheets_.push_back(std::move(parsed));
+        const css::Stylesheet& kept = sheet;
         for (const css::Rule& rule : kept.rules) {
             const bool applies = std::all_of(rule.media.begin(), rule.media.end(), [&](const Tokens& q) {
                 return css::mediaMatches(q, out_.media_);
@@ -1752,7 +1816,8 @@ private:
                 return;   // ::marker, ::placeholder and so on: nothing to style yet
             }
         }
-        const IndexedSelector entry{&sel, &rule, origin, ++order_};
+        IndexedSelector entry{&sel, &rule, origin, ++order_};
+        setAncestorHashes(entry);
         if (target_->host_el && buckets == &target_->normal)
             for (const SimpleSelector& s : last.simple)
                 if (s.kind == SimpleKind::PseudoClass && (s.name == "host" || s.name == "host-context")) {
@@ -1781,9 +1846,9 @@ private:
             if (n->isHtml("style") || (n->ns == Namespace::Svg && n->name == "style")) {
                 const std::string* media = n->attr("media");
                 if (!media || css::mediaMatches(css::tokenize(*media), out_.media_)) {
-                    addSheet(css::parseStylesheet(n->textContent()), Origin::Author, 0);
+                    addSheet(n->textContent(), Origin::Author, 0);
                     // Rules a script put in its sheet (CSS-in-JS libraries do it this way).
-                    for (const std::string& css : n->adopted_css) addSheet(css::parseStylesheet(css), Origin::Author, 0);
+                    for (const std::string& css : n->adopted_css) addSheet(css, Origin::Author, 0);
                 }
             } else if (n->isHtml("link") && loader_) {
                 const std::string* rel = n->attr("rel");
@@ -1791,8 +1856,8 @@ private:
                 if (rel && href && hasWord(lower(*rel), "stylesheet") && !hasWord(lower(*rel), "alternate")) {
                     const std::string* media = n->attr("media");
                     if (!media || css::mediaMatches(css::tokenize(*media), out_.media_)) {
-                        addSheet(css::parseStylesheet(loader_(*href)), Origin::Author, 0, *href);
-                        for (const std::string& css : n->adopted_css) addSheet(css::parseStylesheet(css), Origin::Author, 0, *href);
+                        addSheet(loader_(*href), Origin::Author, 0, *href);
+                        for (const std::string& css : n->adopted_css) addSheet(css, Origin::Author, 0, *href);
                     }
                 }
             }
@@ -1813,7 +1878,7 @@ private:
                 scope->host_el = n;
                 target_ = scope.get();
                 collectSheets(n->shadow_root);
-                for (const std::string& css : n->shadow_root->adopted_css) addSheet(css::parseStylesheet(css), Origin::Author, 0);
+                for (const std::string& css : n->shadow_root->adopted_css) addSheet(css, Origin::Author, 0);
                 shadow_scopes_[n->shadow_root] = std::move(scope);
                 todo.push_back(n->shadow_root);
             }
@@ -2071,8 +2136,54 @@ private:
         return !sel.parts.empty() && matchFrom(el, sel, sel.parts.size() - 1);
     }
 
+    // The filter has exactly an element's ancestors in it when it's in the document's
+    // own tree, not a shadow tree's, and its parent is the last one pushed.
+    bool bloomCovers(const Node* el) const {
+        if (host_context_) return false;
+        if (bloom_nodes_.empty()) return !(el->parent && el->parent->isElement());
+        return el->parent == bloom_nodes_.back();
+    }
+    bool mayMatch(const IndexedSelector& e) const {
+        for (uint8_t i = 0; i < e.ancestor_count; ++i) {
+            const uint32_t h = e.ancestors[i];
+            if (!bloom_[h & kBloomMask] || !bloom_[(h >> kBloomBits) & kBloomMask]) return false;
+        }
+        return true;
+    }
+    void bloomPush(const Node* el) {
+        bloom_nodes_.push_back(el);
+        bloom_marks_.push_back(bloom_hashes_.size());
+        bloom_hashes_.push_back(featureHash('t', lower(el->name)));
+        if (const std::string* id = el->attr("id")) bloom_hashes_.push_back(featureHash('i', *id));
+        if (const std::string* cls = el->attr("class")) {
+            const std::string_view list = *cls;
+            size_t i = 0;
+            while (i < list.size()) {
+                while (i < list.size() && isWsChar(list[i])) ++i;
+                const size_t b = i;
+                while (i < list.size() && !isWsChar(list[i])) ++i;
+                if (i > b) bloom_hashes_.push_back(featureHash('c', list.substr(b, i - b)));
+            }
+        }
+        for (size_t i = bloom_marks_.back(); i < bloom_hashes_.size(); ++i) {
+            ++bloom_[bloom_hashes_[i] & kBloomMask];
+            ++bloom_[(bloom_hashes_[i] >> kBloomBits) & kBloomMask];
+        }
+    }
+    void bloomPop() {
+        for (size_t i = bloom_marks_.back(); i < bloom_hashes_.size(); ++i) {
+            --bloom_[bloom_hashes_[i] & kBloomMask];
+            --bloom_[(bloom_hashes_[i] >> kBloomBits) & kBloomMask];
+        }
+        bloom_hashes_.resize(bloom_marks_.back());
+        bloom_marks_.pop_back();
+        bloom_nodes_.pop_back();
+    }
+
     void gather(const Node* el, const std::vector<IndexedSelector>& list, std::vector<MatchedDecl>& out) {
+        const bool filtered = bloomCovers(el);
         for (const IndexedSelector& e : list) {
+            if (filtered && !mayMatch(e)) continue;
             if (!matchComplex(el, *e.selector)) continue;
             for (const Declaration& d : e.rule->declarations)
                 out.push_back({&d, d.important, e.origin, e.selector->specificity.key(), e.order});
@@ -3950,18 +4061,26 @@ private:
                 return;
             }
         }
+        const bool pushed = scope == &doc_scope_ && !slot && !host_context_ && bloomCovers(el);
+        if (pushed) bloomPush(el);
         for (const Node* c : el->children)
             if (c->isElement()) walk(c, s, depth + 1, scope, nullptr);
+        if (pushed) bloomPop();
     }
 
     const Document& doc_;
     StyledDocument& out_;
     const StyledDocument::SheetLoader& loader_;
-    std::vector<std::unique_ptr<css::Stylesheet>> sheets_;
+    std::vector<std::shared_ptr<const css::Stylesheet>> sheets_;
     Scope ua_, doc_scope_;
     Scope* target_ = &ua_;   // where addSheet puts rules
     std::unordered_map<const Node*, std::unique_ptr<Scope>> shadow_scopes_;   // by shadow root
     const Node* host_context_ = nullptr;   // the host of the shadow tree being matched in
+    // The ancestor filter: counts of the hashes of the elements walk() is inside of.
+    std::vector<uint32_t> bloom_ = std::vector<uint32_t>(size_t{1} << kBloomBits);
+    std::vector<const Node*> bloom_nodes_;
+    std::vector<size_t> bloom_marks_;
+    std::vector<uint32_t> bloom_hashes_;
     const Node* current_element_ = nullptr;
     bool resolving_pseudo_ = false;
     std::unordered_map<const Node*, SiblingInfo> siblings_;

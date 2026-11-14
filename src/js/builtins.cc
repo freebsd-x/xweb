@@ -1902,10 +1902,11 @@ void Runtime::installBuiltins() {
         }
         return Value::string(std::move(out));
     });
-    const auto thisString = [](Runtime& rt, const Value& t) -> std::u16string {
-        if (t.isString()) return t.asString();
+    // Shared, not copied: charCodeAt in a loop over a long string copied it every call.
+    const auto thisString = [](Runtime& rt, const Value& t) -> JSString {
+        if (t.isString()) return t.stringRef();
         if (t.isNullish()) rt.throwError("TypeError", "String.prototype method called on null or undefined");
-        return *rt.toString(t);
+        return rt.toString(t);
     };
     method(string_prototype, u"toString", 0, [](Runtime& rt, const Value& t, Args) {
         if (t.isString()) return t;
@@ -1914,17 +1915,17 @@ void Runtime::installBuiltins() {
     });
     put(string_prototype, u"valueOf", get(string_prototype, u"toString", Value::object(string_prototype)));
     method(string_prototype, u"charAt", 1, [thisString](Runtime& rt, const Value& t, Args a) {
-        const std::u16string s = thisString(rt, t);
+        const JSString s_ref = thisString(rt, t); const std::u16string& s = *s_ref;
         const double i = rt.toIntegerOrInfinity(arg(a, 0));
         return Value::string(i >= 0 && i < static_cast<double>(s.size()) ? std::u16string(1, s[static_cast<size_t>(i)]) : u"");
     });
     method(string_prototype, u"charCodeAt", 1, [thisString](Runtime& rt, const Value& t, Args a) {
-        const std::u16string s = thisString(rt, t);
+        const JSString s_ref = thisString(rt, t); const std::u16string& s = *s_ref;
         const double i = rt.toIntegerOrInfinity(arg(a, 0));
         return Value::number(i >= 0 && i < static_cast<double>(s.size()) ? s[static_cast<size_t>(i)] : std::nan(""));
     });
     method(string_prototype, u"codePointAt", 1, [thisString](Runtime& rt, const Value& t, Args a) {
-        const std::u16string s = thisString(rt, t);
+        const JSString s_ref = thisString(rt, t); const std::u16string& s = *s_ref;
         const double d = rt.toIntegerOrInfinity(arg(a, 0));
         if (d < 0 || d >= static_cast<double>(s.size())) return Value::undefined();
         const size_t i = static_cast<size_t>(d);
@@ -1934,20 +1935,20 @@ void Runtime::installBuiltins() {
         return Value::number(c);
     });
     method(string_prototype, u"at", 1, [thisString](Runtime& rt, const Value& t, Args a) {
-        const std::u16string s = thisString(rt, t);
+        const JSString s_ref = thisString(rt, t); const std::u16string& s = *s_ref;
         double i = rt.toIntegerOrInfinity(arg(a, 0));
         if (i < 0) i += static_cast<double>(s.size());
         if (i < 0 || i >= static_cast<double>(s.size())) return Value::undefined();
         return Value::string(std::u16string(1, s[static_cast<size_t>(i)]));
     });
     method(string_prototype, u"indexOf", 1, [thisString](Runtime& rt, const Value& t, Args a) {
-        const std::u16string s = thisString(rt, t), needle = *rt.toString(arg(a, 0));
+        const JSString s_ref = thisString(rt, t); const std::u16string& s = *s_ref; const std::u16string needle = *rt.toString(arg(a, 0));
         const double from = std::clamp(rt.toIntegerOrInfinity(arg(a, 1)), 0.0, static_cast<double>(s.size()));
         const size_t at = s.find(needle, static_cast<size_t>(from));
         return Value::number(at == std::u16string::npos ? -1 : static_cast<double>(at));
     });
     method(string_prototype, u"lastIndexOf", 1, [thisString](Runtime& rt, const Value& t, Args a) {
-        const std::u16string s = thisString(rt, t), needle = *rt.toString(arg(a, 0));
+        const JSString s_ref = thisString(rt, t); const std::u16string& s = *s_ref; const std::u16string needle = *rt.toString(arg(a, 0));
         const double n = rt.toNumber(arg(a, 1));
         const size_t from = std::isnan(n) ? std::u16string::npos : static_cast<size_t>(std::clamp(std::trunc(n), 0.0, static_cast<double>(s.size())));
         const size_t at = s.rfind(needle, from);
@@ -1958,29 +1959,29 @@ void Runtime::installBuiltins() {
     };
     method(string_prototype, u"includes", 1, [thisString, noRegex](Runtime& rt, const Value& t, Args a) {
         noRegex(rt, arg(a, 0));
-        const std::u16string s = thisString(rt, t), needle = *rt.toString(arg(a, 0));
+        const JSString s_ref = thisString(rt, t); const std::u16string& s = *s_ref; const std::u16string needle = *rt.toString(arg(a, 0));
         const double from = std::clamp(rt.toIntegerOrInfinity(arg(a, 1)), 0.0, static_cast<double>(s.size()));
         return Value::boolean(s.find(needle, static_cast<size_t>(from)) != std::u16string::npos);
     });
     method(string_prototype, u"startsWith", 1, [thisString, noRegex](Runtime& rt, const Value& t, Args a) {
         noRegex(rt, arg(a, 0));
-        const std::u16string s = thisString(rt, t), needle = *rt.toString(arg(a, 0));
+        const JSString s_ref = thisString(rt, t); const std::u16string& s = *s_ref; const std::u16string needle = *rt.toString(arg(a, 0));
         const size_t from = static_cast<size_t>(std::clamp(rt.toIntegerOrInfinity(arg(a, 1)), 0.0, static_cast<double>(s.size())));
         return Value::boolean(s.compare(from, needle.size(), needle) == 0 && from + needle.size() <= s.size());
     });
     method(string_prototype, u"endsWith", 1, [thisString, noRegex](Runtime& rt, const Value& t, Args a) {
         noRegex(rt, arg(a, 0));
-        const std::u16string s = thisString(rt, t), needle = *rt.toString(arg(a, 0));
+        const JSString s_ref = thisString(rt, t); const std::u16string& s = *s_ref; const std::u16string needle = *rt.toString(arg(a, 0));
         const size_t end = arg(a, 1).isUndefined() ? s.size() : static_cast<size_t>(std::clamp(rt.toIntegerOrInfinity(arg(a, 1)), 0.0, static_cast<double>(s.size())));
         return Value::boolean(needle.size() <= end && s.compare(end - needle.size(), needle.size(), needle) == 0);
     });
     method(string_prototype, u"slice", 2, [thisString](Runtime& rt, const Value& t, Args a) {
-        const std::u16string s = thisString(rt, t);
+        const JSString s_ref = thisString(rt, t); const std::u16string& s = *s_ref;
         const uint64_t b = relative(rt, arg(a, 0), s.size(), 0), e = relative(rt, arg(a, 1), s.size(), s.size());
         return Value::string(b < e ? s.substr(b, e - b) : u"");
     });
     method(string_prototype, u"substring", 2, [thisString](Runtime& rt, const Value& t, Args a) {
-        const std::u16string s = thisString(rt, t);
+        const JSString s_ref = thisString(rt, t); const std::u16string& s = *s_ref;
         const double len = static_cast<double>(s.size());
         double b = std::clamp(rt.toIntegerOrInfinity(arg(a, 0)), 0.0, len);
         double e = arg(a, 1).isUndefined() ? len : std::clamp(rt.toIntegerOrInfinity(arg(a, 1)), 0.0, len);
@@ -1988,18 +1989,18 @@ void Runtime::installBuiltins() {
         return Value::string(s.substr(static_cast<size_t>(b), static_cast<size_t>(e - b)));
     });
     method(string_prototype, u"substr", 2, [thisString](Runtime& rt, const Value& t, Args a) {
-        const std::u16string s = thisString(rt, t);
+        const JSString s_ref = thisString(rt, t); const std::u16string& s = *s_ref;
         const uint64_t b = relative(rt, arg(a, 0), s.size(), 0);
         const double n = arg(a, 1).isUndefined() ? static_cast<double>(s.size()) : std::clamp(rt.toIntegerOrInfinity(arg(a, 1)), 0.0, static_cast<double>(s.size()));
         return Value::string(s.substr(b, static_cast<size_t>(n)));
     });
-    method(string_prototype, u"toUpperCase", 0, [thisString](Runtime& rt, const Value& t, Args) { return Value::string(toCase(thisString(rt, t), true)); });
-    method(string_prototype, u"toLowerCase", 0, [thisString](Runtime& rt, const Value& t, Args) { return Value::string(toCase(thisString(rt, t), false)); });
-    method(string_prototype, u"toLocaleUpperCase", 0, [thisString](Runtime& rt, const Value& t, Args) { return Value::string(toCase(thisString(rt, t), true)); });
-    method(string_prototype, u"toLocaleLowerCase", 0, [thisString](Runtime& rt, const Value& t, Args) { return Value::string(toCase(thisString(rt, t), false)); });
+    method(string_prototype, u"toUpperCase", 0, [thisString](Runtime& rt, const Value& t, Args) { return Value::string(toCase(*thisString(rt, t), true)); });
+    method(string_prototype, u"toLowerCase", 0, [thisString](Runtime& rt, const Value& t, Args) { return Value::string(toCase(*thisString(rt, t), false)); });
+    method(string_prototype, u"toLocaleUpperCase", 0, [thisString](Runtime& rt, const Value& t, Args) { return Value::string(toCase(*thisString(rt, t), true)); });
+    method(string_prototype, u"toLocaleLowerCase", 0, [thisString](Runtime& rt, const Value& t, Args) { return Value::string(toCase(*thisString(rt, t), false)); });
     const auto trimmer = [thisString](bool start, bool end) {
         return [thisString, start, end](Runtime& rt, const Value& t, Args) {
-            const std::u16string s = thisString(rt, t);
+            const JSString s_ref = thisString(rt, t); const std::u16string& s = *s_ref;
             size_t b = 0, e = s.size();
             if (start) while (b < e && isWhite(s[b])) ++b;
             if (end) while (e > b && isWhite(s[e - 1])) --e;
@@ -2012,7 +2013,7 @@ void Runtime::installBuiltins() {
     put(string_prototype, u"trimLeft", get(string_prototype, u"trimStart", Value::object(string_prototype)));
     put(string_prototype, u"trimRight", get(string_prototype, u"trimEnd", Value::object(string_prototype)));
     method(string_prototype, u"split", 2, [thisString](Runtime& rt, const Value& t, Args a) {
-        const std::u16string s = thisString(rt, t);
+        const JSString s_ref = thisString(rt, t); const std::u16string& s = *s_ref;
         const uint32_t limit = arg(a, 1).isUndefined() ? 0xFFFFFFFFu : rt.toUint32(arg(a, 1));
         std::vector<Value> out;
         const std::u16string sep = arg(a, 0).isUndefined() ? u"" : *rt.toString(arg(a, 0));
@@ -2036,7 +2037,7 @@ void Runtime::installBuiltins() {
     });
     const auto replacer = [thisString](bool all) {
         return [thisString, all](Runtime& rt, const Value& t, Args a) {
-            const std::u16string s = thisString(rt, t);
+            const JSString s_ref = thisString(rt, t); const std::u16string& s = *s_ref;
             const std::u16string pat = *rt.toString(arg(a, 0));
             const Value with = arg(a, 1);
             const bool fn = rt.isCallable(with);
@@ -2078,7 +2079,7 @@ void Runtime::installBuiltins() {
     method(string_prototype, u"replace", 2, replacer(false));
     method(string_prototype, u"replaceAll", 2, replacer(true));
     method(string_prototype, u"repeat", 1, [thisString](Runtime& rt, const Value& t, Args a) {
-        const std::u16string s = thisString(rt, t);
+        const JSString s_ref = thisString(rt, t); const std::u16string& s = *s_ref;
         const double n = rt.toIntegerOrInfinity(arg(a, 0));
         if (n < 0 || std::isinf(n)) rt.throwError("RangeError", "invalid repeat count");
         if (s.size() * n > (1u << 29)) rt.throwError("RangeError", "string too long");
@@ -2088,7 +2089,7 @@ void Runtime::installBuiltins() {
     });
     const auto padder = [thisString](bool start) {
         return [thisString, start](Runtime& rt, const Value& t, Args a) {
-            const std::u16string s = thisString(rt, t);
+            const JSString s_ref = thisString(rt, t); const std::u16string& s = *s_ref;
             const double target = rt.toIntegerOrInfinity(arg(a, 0));
             const std::u16string fill = arg(a, 1).isUndefined() ? u" " : *rt.toString(arg(a, 1));
             if (target <= static_cast<double>(s.size()) || fill.empty()) return Value::string(s);
@@ -2102,12 +2103,12 @@ void Runtime::installBuiltins() {
     method(string_prototype, u"padStart", 2, padder(true));
     method(string_prototype, u"padEnd", 2, padder(false));
     method(string_prototype, u"concat", 1, [thisString](Runtime& rt, const Value& t, Args a) {
-        std::u16string s = thisString(rt, t);
+        std::u16string s = *thisString(rt, t);
         for (const Value& v : a) s += *rt.toString(v);
         return Value::string(std::move(s));
     });
     method(string_prototype, u"localeCompare", 1, [thisString](Runtime& rt, const Value& t, Args a) {
-        const std::u16string s = thisString(rt, t), o = *rt.toString(arg(a, 0));
+        const JSString s_ref = thisString(rt, t); const std::u16string& s = *s_ref; const std::u16string o = *rt.toString(arg(a, 0));
         return Value::number(s < o ? -1 : s > o ? 1 : 0);
     });
     method(string_prototype, u"normalize", 0, [thisString](Runtime& rt, const Value& t, Args) { return Value::string(thisString(rt, t)); });
