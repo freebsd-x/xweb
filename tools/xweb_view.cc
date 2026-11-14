@@ -6,6 +6,7 @@
 
 #include <cxxabi.h>
 #include <exception>
+#include <type_traits>
 #include <typeinfo>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -661,7 +662,33 @@ public:
         return c.clamp({width, layout_.height});
     }
 
+    // XWEB_DEBUG_PERF=1: every five seconds, how many paints and layouts there were and
+    // what they took (for finding where the browser's time goes).
+    struct PerfLog {
+        bool on = std::getenv("XWEB_DEBUG_PERF") != nullptr;
+        std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+        int paints = 0, layouts = 0;
+        double paint_ms = 0, layout_ms = 0;
+        void report() {
+            const auto now = std::chrono::steady_clock::now();
+            if (!on || now - since < std::chrono::seconds(5)) return;
+            std::fprintf(stderr, "[perf] 5s: %d paints (%.0f ms), %d layouts (%.0f ms)\n", paints, paint_ms, layouts, layout_ms);
+            since = now;
+            paints = layouts = 0;
+            paint_ms = layout_ms = 0;
+        }
+    } perf_;
+    struct Timed {
+        bool on;
+        double& total;
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        ~Timed() { if (on) total += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(); }
+    };
+
     void paintSelf(fbx::xrender::DisplayList& dl, Offset at) noexcept override {
+        ++perf_.paints;
+        perf_.report();
+        Timed timed{perf_.on, perf_.paint_ms};
         ++paint_frame_;
         fill(dl, at.x_, at.y_, size_.width_, size_.height_, layout_.canvas);
         // Clips nest, but the engine only has "set" and "reset": each is set to what it
@@ -1027,6 +1054,8 @@ private:
     RenderNode* parentNode() const { return parent_.lock().get(); }
 
     void relayout(float width, float height) {
+        ++perf_.layouts;
+        Timed timed{perf_.on, perf_.layout_ms};
         if (!page_ || !page_->doc) {
             layout_ = {};
             text_y_.clear();
@@ -1185,39 +1214,70 @@ private:
         dl.addCommand(fbx::shared::CommandType::DrawImage, {reinterpret_cast<const uint8_t*>(&d), sizeof(d)});
     }
 
+    // A number as cache keys want it: its bytes. (std::to_string(float) goes through
+    // snprintf and the locale's lock: building the keys of a page's gradients each paint was
+    // most of what painting cost.)
+    template <typename T>
+    static std::string keyNum(T v) {
+        static_assert(std::is_arithmetic_v<T>);
+        return std::string(reinterpret_cast<const char*>(&v), sizeof v);
+    }
+
     static std::string colorKey(web::Color c) {
-        return std::to_string((static_cast<uint32_t>(c.r) << 24) | (static_cast<uint32_t>(c.g) << 16) | (static_cast<uint32_t>(c.b) << 8) | c.a);
+        return keyNum((static_cast<uint32_t>(c.r) << 24) | (static_cast<uint32_t>(c.g) << 16) | (static_cast<uint32_t>(c.b) << 8) | c.a);
     }
 
     static std::string gradientKey(const web::Gradient& g) {
-        std::string k = std::to_string(static_cast<int>(g.kind)) + (g.repeating ? "r" : "") + "|" + std::to_string(g.angle) + "|" +
-                        std::to_string(g.to_x) + "," + std::to_string(g.to_y) + "|" + std::to_string(g.center_x.px) + "," +
-                        std::to_string(g.center_x.percent) + "," + std::to_string(g.center_y.px) + "," + std::to_string(g.center_y.percent) +
-                        "|" + (g.circle ? "c" : "e") + std::to_string(static_cast<int>(g.extent)) + (g.explicit_size ? "s" : "") +
-                        std::to_string(g.radius_x.px) + "," + std::to_string(g.radius_x.percent) + "," + std::to_string(g.radius_y.px) + "," +
-                        std::to_string(g.radius_y.percent) + "|" + std::to_string(g.from);
+        std::string k = keyNum(static_cast<int>(g.kind)) + (g.repeating ? "r" : "") + "|" + keyNum(g.angle) + "|" +
+                        keyNum(g.to_x) + "," + keyNum(g.to_y) + "|" + keyNum(g.center_x.px) + "," +
+                        keyNum(g.center_x.percent) + "," + keyNum(g.center_y.px) + "," + keyNum(g.center_y.percent) +
+                        "|" + (g.circle ? "c" : "e") + keyNum(static_cast<int>(g.extent)) + (g.explicit_size ? "s" : "") +
+                        keyNum(g.radius_x.px) + "," + keyNum(g.radius_x.percent) + "," + keyNum(g.radius_y.px) + "," +
+                        keyNum(g.radius_y.percent) + "|" + keyNum(g.from);
         for (const web::GradientStop& st : g.stops)
-            k += "|" + colorKey(st.color) + (st.has_position ? "@" + std::to_string(st.position.px) + "," + std::to_string(st.position.percent) : "");
+            k += "|" + colorKey(st.color) + (st.has_position ? "@" + keyNum(st.position.px) + "," + keyNum(st.position.percent) : "");
         return k;
+    }
+
+    // An op's cache key, kept while its layout stands (and, where its key depends on where it
+    // falls on the pixel grid, for that place): made once, not every paint.
+    struct OpMemo {
+        float fx = NAN, fy = NAN;
+        std::string key;
+    };
+    std::vector<OpMemo> op_memo_;
+    uint64_t op_memo_gen_ = ~0ull;
+    OpMemo* memoFor(const web::PaintOp& op) {
+        if (op_memo_gen_ != layout_gen_ || op_memo_.size() != layout_.ops.size()) {
+            op_memo_.assign(layout_.ops.size(), {});
+            op_memo_gen_ = layout_gen_;
+        }
+        const web::PaintOp* base = layout_.ops.data();
+        if (&op < base || &op >= base + layout_.ops.size()) return nullptr;
+        return &op_memo_[static_cast<size_t>(&op - base)];
     }
 
     void gradient(fbx::xrender::DisplayList& dl, const web::PaintOp& op, float x, float y) {
         if (!op.gradient || op.w <= 0 || op.h <= 0) return;
         const auto [pw, ph] = rasterSize(op.w, op.h);
-        const std::string key = "g:" + gradientKey(*op.gradient) + ":" + std::to_string(op.w) + "x" + std::to_string(op.h);
+        OpMemo* memo = memoFor(op);
+        if (memo && memo->key.empty()) memo->key = "g:" + gradientKey(*op.gradient) + ":" + keyNum(op.w) + "x" + keyNum(op.h);
+        std::string fallback;   // (no copy of the memo's key: a ?: would make one)
+        if (!memo) fallback = "g:" + gradientKey(*op.gradient) + ":" + keyNum(op.w) + "x" + keyNum(op.h);
+        const std::string& key = memo ? memo->key : fallback;
         const web::Gradient& g = *op.gradient;
         const float w = op.w, h = op.h;
         if (const CachedRaster* r = cached(key, [&, pw = pw, ph = ph] { return web::renderGradient(g, w, h, pw, ph); })) drawRaster(dl, *r, x, y, op.w, op.h);
     }
 
     static std::string boxKey(const web::BoxPaint& b) {
-        std::string k = std::to_string(static_cast<int>(b.part));
-        const auto f = [&](float v) { k += "," + std::to_string(v); };
+        std::string k = keyNum(static_cast<int>(b.part));
+        const auto f = [&](float v) { k += "," + keyNum(v); };
         f(b.w); f(b.h); f(b.ox); f(b.oy);
         for (const auto& r : b.radii) { f(r[0]); f(r[1]); }
         for (int i = 0; i < 4; ++i) {
             f(b.border[i]);
-            k += ":" + colorKey(b.colors[i]) + ":" + std::to_string(static_cast<int>(b.styles[i]));
+            k += ":" + colorKey(b.colors[i]) + ":" + keyNum(static_cast<int>(b.styles[i]));
         }
         k += "|" + colorKey(b.background);
         f(b.shadow.x); f(b.shadow.y); f(b.shadow.blur); f(b.shadow.spread);
@@ -1234,7 +1294,16 @@ private:
         box.oy += y - y0;
         const float w = std::ceil(op.w + x - x0), h = std::ceil(op.h + y - y0);
         const auto [pw, ph] = rasterSize(w, h);
-        const std::string key = "b:" + boxKey(box) + ":" + std::to_string(pw) + "x" + std::to_string(ph);
+        OpMemo* memo = memoFor(op);
+        const float fx = x - x0, fy = y - y0;
+        if (memo && (memo->key.empty() || memo->fx != fx || memo->fy != fy)) {
+            memo->key = "b:" + boxKey(box) + ":" + keyNum(pw) + "x" + keyNum(ph);
+            memo->fx = fx;
+            memo->fy = fy;
+        }
+        std::string fallback;
+        if (!memo) fallback = "b:" + boxKey(box) + ":" + keyNum(pw) + "x" + keyNum(ph);
+        const std::string& key = memo ? memo->key : fallback;
         if (const CachedRaster* r = cached(key, [&, pw = pw, ph = ph] { return web::renderBoxPaint(box, w, h, pw, ph); })) drawRaster(dl, *r, x0, y0, w, h);
     }
 
@@ -1243,7 +1312,7 @@ private:
         const auto [pw, ph] = rasterSize(op.w, op.h);
         char ptr[32];
         std::snprintf(ptr, sizeof ptr, "%p", static_cast<const void*>(op.node));
-        const std::string key = std::string("s:") + ptr + ":" + std::to_string(pw) + "x" + std::to_string(ph) + ":" + colorKey(op.color);
+        const std::string key = std::string("s:") + ptr + ":" + keyNum(pw) + "x" + keyNum(ph) + ":" + colorKey(op.color);
         const web::Node* node = op.node;
         const web::StyledDocument* styles = styles_.get();
         const web::Color color = op.color;
@@ -1298,10 +1367,10 @@ private:
             std::snprintf(ptr, sizeof ptr, "%p", static_cast<const void*>(loaded));
             std::string filter_key;
             if (filtered)
-                for (const web::Filter& f : *op.filter) filter_key += ":f" + std::to_string(static_cast<int>(f.kind)) + "=" + std::to_string(f.amount);
-            const std::string crop_key = filter_key + (cropped ? ":c" + std::to_string(op.u0) + "," + std::to_string(op.v0) + "," + std::to_string(op.u1) + "," + std::to_string(op.v1) : std::string());
-            const std::string key = std::string("i:") + ptr + ":" + std::to_string(pw) + "x" + std::to_string(ph) + crop_key + (op.tint ? ":" + colorKey(op.color) : "") +
-                                    (op.radius > 0 ? ":r" + std::to_string(op.radius) + "," + std::to_string(op.radius_y) + "@" + std::to_string(op.w) + "x" + std::to_string(op.h) : "");
+                for (const web::Filter& f : *op.filter) filter_key += ":f" + keyNum(static_cast<int>(f.kind)) + "=" + keyNum(f.amount);
+            const std::string crop_key = filter_key + (cropped ? ":c" + keyNum(op.u0) + "," + keyNum(op.v0) + "," + keyNum(op.u1) + "," + keyNum(op.v1) : std::string());
+            const std::string key = std::string("i:") + ptr + ":" + keyNum(pw) + "x" + keyNum(ph) + crop_key + (op.tint ? ":" + colorKey(op.color) : "") +
+                                    (op.radius > 0 ? ":r" + keyNum(op.radius) + "," + keyNum(op.radius_y) + "@" + keyNum(op.w) + "x" + keyNum(op.h) : "");
             const bool tint = op.tint;
             const float rx = op.radius, ry = op.radius_y, shown_w = op.w, shown_h = op.h;
             const web::Color color = op.color;
@@ -1397,6 +1466,45 @@ private:
         }
     }
 
+    // What the group from `begin` to `end` draws, as a hash: every op's kind, place, colour,
+    // transform and content (an image: its source and whether it's here yet).
+    std::string groupKey(size_t begin, size_t end) {
+        uint64_t h = 1469598103934665603ull;
+        const auto mix = [&](const void* p, size_t n) {
+            const auto* b = static_cast<const unsigned char*>(p);
+            for (size_t i = 0; i < n; ++i) h = (h ^ b[i]) * 1099511628211ull;
+        };
+        const auto str = [&](const std::string& v) { mix(v.data(), v.size()); mix("\0", 1); };
+        for (size_t k = begin; k < end && k < layout_.ops.size(); ++k) {
+            const web::PaintOp& op = layout_.ops[k];
+            mix(&op.kind, sizeof op.kind);
+            const float geom[] = {op.x, op.y, op.w, op.h, op.radius, op.radius_y, op.u0, op.v0, op.u1, op.v1};
+            mix(geom, sizeof geom);
+            mix(&op.color, sizeof op.color);
+            switch (op.kind) {
+                case web::PaintKind::TransformBegin: mix(&op.transform, sizeof op.transform); break;
+                case web::PaintKind::Image: {
+                    str(op.text);
+                    const bool here = images_.find(op.text) != nullptr;
+                    mix(&here, sizeof here);
+                    if (op.filter)
+                        for (const web::Filter& f : *op.filter) {   // (field by field: no padding bytes)
+                            mix(&f.kind, sizeof f.kind);
+                            mix(&f.amount, sizeof f.amount);
+                        }
+                    break;
+                }
+                case web::PaintKind::Gradient: if (op.gradient) str(gradientKey(*op.gradient)); break;
+                case web::PaintKind::Box: if (op.box) str(boxKey(*op.box)); break;
+                case web::PaintKind::Svg: mix(&op.node, sizeof op.node); break;
+                default: str(op.text); break;
+            }
+        }
+        char buf[24];
+        std::snprintf(buf, sizeof buf, "%016llx", static_cast<unsigned long long>(h));
+        return buf;
+    }
+
     // Draws the group from `begin` to `end`; false if it holds text (then it isn't drawn).
     bool drawTransformed(fbx::xrender::DisplayList& dl, size_t begin, size_t end, Offset at) {
         bool text = false;
@@ -1420,8 +1528,10 @@ private:
         const float y = t + at.y_;
         if (y > kMaxWindowHeight + kOffscreenMargin || y + (b - t) < -kOffscreenMargin) return true;
         const auto [pw, ph] = rasterSize(r - l, b - t);
-        const std::string key = "t:" + std::to_string(layout_gen_) + ":" + std::to_string(begin) + ":" +
-                                std::to_string(page_ ? page_->images.size() : 0) + ":" + std::to_string(pw) + "x" + std::to_string(ph);
+        // Keyed by what the group holds, not by the layout it came in: a page that lays
+        // itself out again and again (a ticker, a carousel) used to have every group drawn
+        // anew on the CPU for each layout, which was most of what the browser spent.
+        const std::string key = "t:" + groupKey(begin, end) + ":" + keyNum(l) + "," + keyNum(t) + ":" + keyNum(pw) + "x" + keyNum(ph);
         const web::Matrix to_canvas = web::Matrix::scaling(static_cast<float>(pw) / (r - l), static_cast<float>(ph) / (b - t)).after(web::Matrix::translate(-l, -t));
         const CachedRaster* drawn = cached(key, [&, pw = pw, ph = ph] {
             web::Canvas canvas(pw, ph);
