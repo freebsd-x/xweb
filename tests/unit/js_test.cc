@@ -788,3 +788,11 @@ TEST(Js, ErrorStacksListTheCalls) {
     EXPECT_EQ(run("function inner() { return new Error('x').stack; } function outer() { return inner(); }"
                   "var s = outer(); [s.split('\\n').length, /at inner \\(/.test(s), /at outer \\(/.test(s)].join()"), "4,true,true");
 }
+
+TEST(Js, FunctionArgumentsWhileItRuns) {
+    EXPECT_EQ(run(R"(
+        function f(a, b) { return f.arguments.length + ':' + f.arguments[1]; }
+        function g() { return g.arguments === null; }
+        f(1, 'x', 3) + ' ' + (f.arguments === null) + ' ' + g();
+    )"), "3:x true false");
+}

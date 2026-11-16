@@ -448,7 +448,9 @@ void PageScript::Impl::installElement() {
                  self->setAttr(self->thisElement(t), "class", js::utf8(rt.toStringValue(arg(v, 0))));
                  return Value::undefined();
              });
-    for (const char16_t* name : {u"hidden", u"disabled", u"required", u"readOnly", u"multiple", u"autofocus"}) {
+    // (noModule: what pages ask to tell whether modules run; without it, 11st.co.kr took
+    // its SystemJS fallback and was a blank page.)
+    for (const char16_t* name : {u"hidden", u"disabled", u"required", u"readOnly", u"multiple", u"autofocus", u"noModule"}) {
         const std::string a = lower(js::utf8(name));
         accessor(p, name, [self, a](Runtime&, const Value& t, Args) { return Value::boolean(self->thisElement(t)->attr(a) != nullptr); },
                  [self, a](Runtime& rt, const Value& t, Args v) {

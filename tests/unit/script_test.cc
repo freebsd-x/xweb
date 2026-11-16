@@ -1218,3 +1218,13 @@ TEST(Script, JQueryOnlyPseudoClassesThrow) {
         </script>)");
     EXPECT_EQ(p.console, "log:SyntaxError SyntaxError SyntaxError ok ok\n") << p.console;
 }
+
+TEST(Script, NoModuleSaysModulesRun) {
+    Page p(R"(<body><script>
+        const s = document.createElement('script');
+        console.log('noModule' in s, s.noModule, 'noModule' in document.createElement('div'));
+        s.noModule = true;
+        console.log(s.hasAttribute('nomodule'));
+        </script>)");
+    EXPECT_EQ(p.console, "log:true false false\nlog:true\n") << p.console;
+}

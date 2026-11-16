@@ -1864,6 +1864,12 @@ private:
                 if (cur_.type == Tok::PrivateName) m->str = u"#" + cur_.value;
                 else if (cur_.type == Tok::Identifier || cur_.type == Tok::Keyword) m->str = cur_.value;
                 else fail("expected a property name after .");
+                // A function reading its own `name.arguments` (old cookie helpers do):
+                // its calls make an arguments object, and give it that while they run.
+                if (m->str == u"arguments" && e->kind == N::Identifier && fn_ && !fn_->arrow && !fn_->name.empty() && e->str == fn_->name) {
+                    fn_->own_arguments = true;
+                    fn_->uses_arguments = true;
+                }
                 advance();
                 e = m;
             } else if (is(u"?.")) {

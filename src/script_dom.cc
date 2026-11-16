@@ -593,6 +593,7 @@ void PageScript::Impl::installDom() {
             {u"media", {"HTMLLinkElement", "HTMLStyleElement", "HTMLSourceElement", "HTMLMetaElement"}},
             {u"content", {"HTMLMetaElement"}},   // LinkedIn reads meta[name=...].content
             {u"httpEquiv", {"HTMLMetaElement"}},
+            {u"noModule", {"HTMLScriptElement"}},
             {u"download", {"HTMLAnchorElement", "HTMLAreaElement"}},
             {u"ping", {"HTMLAnchorElement", "HTMLAreaElement"}},
             {u"integrity", {"HTMLLinkElement", "HTMLScriptElement"}},

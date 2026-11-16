@@ -2104,6 +2104,23 @@ Value Interpreter::callScript(Object* f, const Value& this_value, std::span<cons
     } frame(&info->name);
     Env* env = prepareCall(f, this_value, args, new_target);
     EnvScope scope(rt_, env);
+    // f.arguments while this call runs (see FunctionInfo::own_arguments), back after.
+    struct OwnArguments {
+        Object* f = nullptr;
+        Value saved;
+        ~OwnArguments() {
+            if (f)
+                if (Property* p = f->own(PropertyKey(u"arguments")); p && !(p->flags & kAccessor)) p->value = saved;
+        }
+    } own_arguments;
+    if (info->own_arguments && !info->strict) {
+        if (Property* p = f->own(PropertyKey(u"arguments")); p && !(p->flags & kAccessor))
+            if (const VarMap::Entry* a = env->vars.find(u"arguments")) {
+                own_arguments.f = f;
+                own_arguments.saved = p->value;
+                p->value = a->second.value;
+            }
+    }
     rt_.safePoint();
     const Value result = runBody(info, env);
     if (new_target) {
