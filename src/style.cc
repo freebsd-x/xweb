@@ -1,6 +1,8 @@
 #include "xweb/style.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <array>
 #include <cmath>
 #include <cstdlib>
@@ -1751,7 +1753,7 @@ struct Scope {
 
 class StyleResolver {
 public:
-    StyleResolver(const Document& doc, StyledDocument& out, const StyledDocument::SheetLoader& loader)
+    StyleResolver(const Document& doc, StyledDocument& out, const StyledDocument::SheetLoader& loader, const StyledDocument* previous)
         : doc_(doc), out_(out), loader_(loader) {
         lengths_.viewport_w = out.media_.width;
         lengths_.viewport_h = out.media_.height;
@@ -1770,6 +1772,26 @@ public:
         recording_ = false;
         useIndex();
         collectShadowScopes();
+        // Styles kept from the last time only with the same rules (and not too many
+        // generations of kept storage: then everything's styled afresh, and let go).
+        out_.index_id_ = index_kept_.get();
+        out_.index_kept_ = index_kept_;
+        out_.reusable_ = !has_any_anchor_;
+        constexpr size_t kMaxKeptGenerations = 8;
+        // XWEB_NO_STYLE_REUSE=1: everything styled afresh, for telling whether a wrong
+        // style came from keeping one.
+        static const bool no_reuse = std::getenv("XWEB_NO_STYLE_REUSE") != nullptr;
+        if (!no_reuse && previous && previous->reusable_ && out_.reusable_ && previous->index_id_ == out_.index_id_ &&
+            previous->media_.width == out_.media_.width && previous->media_.height == out_.media_.height &&
+            previous->forms_ == out_.forms_) {
+            previous_ = previous;
+            if (previous->kept_.size() + 1 < kMaxKeptGenerations) {
+                out_.kept_ = previous->kept_;
+                out_.kept_.push_back(previous->storage_);
+            } else {
+                copy_kept_ = true;   // copied into this one's storage: the old ones go
+            }
+        }
     }
 
     // The user agent's and the document's rules, indexed: those made last time if the
@@ -1781,6 +1803,8 @@ public:
             std::shared_ptr<Scope> ua, doc;
             std::vector<WebFontFace> fonts;
             size_t order = 0;
+            bool uses_has = false, has_any_anchor = false;
+            std::unordered_set<uint32_t> has_anchors;
         };
         static std::mutex mutex;
         static std::shared_ptr<const Cached> last;
@@ -1800,6 +1824,9 @@ public:
                 doc_p_ = last->doc.get();
                 out_.font_faces_ = last->fonts;
                 order_ = last->order;
+                uses_has_ = last->uses_has;
+                has_any_anchor_ = last->has_any_anchor;
+                has_anchors_ = last->has_anchors;
                 uses_.clear();
                 return;
             }
@@ -1816,6 +1843,9 @@ public:
         made->height = out_.media_.height;
         made->fonts = out_.font_faces_;
         made->order = order_;
+        made->uses_has = uses_has_;
+        made->has_any_anchor = has_any_anchor_;
+        made->has_anchors = has_anchors_;
         made->uses = std::move(uses_);
         uses_.clear();
         ua_p_ = made->ua.get();
@@ -1869,6 +1899,7 @@ private:
             if (!applies) continue;
             for (const ComplexSelector& sel : rule.selectors) {
                 if (sel.parts.empty()) continue;
+                noteHasAnchors(sel);
                 index(sel, rule, origin);
             }
         }
@@ -4120,29 +4151,172 @@ private:
         applyMatched(el, s, pseudo, matched);
         resolving_pseudo_ = false;
         if (needs_content && (!pseudo.has_content || pseudo.display == Display::None)) return;
-        out_.storage_.push_back(std::move(pseudo));
-        into[el] = &out_.storage_.back();
+        out_.storage_->push_back(std::move(pseudo));
+        into[el] = &out_.storage_->back();
     }
 
     // Down the composed tree: a host's shadow tree (in its scope), a slot's assigned
     // nodes (in the host's tree's scope), everyone else's children.
-    void walk(const Node* el, const ComputedStyle& parent, size_t depth, const Scope* scope, const Node* slot) {
+    // ── Keeping styles from the last time ──
+    // An element's style comes from what its selectors can see (itself, its siblings,
+    // its ancestors and theirs), its parent's style, and the rules. Those, hashed: the
+    // same key as last time (same rules, no :has() anywhere) means the same style.
+
+    static uint64_t mix(uint64_t h, uint64_t v) {
+        h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+        return h * 0x100000001B3ull;
+    }
+    static uint64_t mixText(uint64_t h, std::string_view t) {
+        for (const char c : t) h = (h ^ static_cast<uint8_t>(c)) * 0x100000001B3ull;
+        return mix(h, t.size());
+    }
+
+    // Everything about the element itself a selector can ask.
+    uint64_t ownPrint(const Node* el) {
+        if (const auto it = own_prints_.find(el); it != own_prints_.end()) return it->second;
+        uint64_t h = mix(1469598103934665603ull, reinterpret_cast<uintptr_t>(el));
+        h = mixText(h, el->name);
+        h = mix(h, static_cast<uint64_t>(el->ns));
+        h = mix(h, static_cast<uint64_t>(el->custom_state));
+        for (const Attribute& a : el->attrs) h = mixText(mixText(h, a.name), a.value);
+        const bool empty = std::none_of(el->children.begin(), el->children.end(), [](const Node* c) {
+            return c->isElement() || (c->type == NodeType::Text && !c->data.empty());
+        });
+        h = mix(h, empty);
+        if (const FormState* f = out_.forms_) {
+            const ControlKind k = controlKind(el);
+            if (k == ControlKind::Checkbox || k == ControlKind::Radio) h = mix(h, f->checked(el) ? 2 : 3);
+            if (el->isHtml("option")) {
+                const Node* sel = el->parent;
+                if (sel && sel->isHtml("optgroup")) sel = sel->parent;
+                if (sel && sel->isHtml("select")) h = mix(h, static_cast<uint64_t>(f->selected(sel) + 7));
+            }
+        }
+        own_prints_[el] = h;
+        return h;
+    }
+
+    // All of a parent's element children: siblings combinators and :nth-child see them.
+    uint64_t siblingsPrint(const Node* parent) {
+        if (!parent) return 0;
+        if (const auto it = sibling_prints_.find(parent); it != sibling_prints_.end()) return it->second;
+        uint64_t h = 0xC0FFEE;
+        for (const Node* c : parent->children)
+            if (c->isElement()) h = mix(h, ownPrint(c));
+        sibling_prints_[parent] = h;
+        return h;
+    }
+
+    uint64_t elementKey(const Node* el, uint64_t parent_key, const Scope* scope, const Node* slot) {
+        uint64_t h = mix(parent_key, ownPrint(el));
+        if (hasAnchor(el)) h = mix(h, subtreePrint(el->parent ? el->parent : el));
+        h = mix(h, siblingsPrint(el->parent));
+        h = mix(h, reinterpret_cast<uintptr_t>(scope));
+        return mix(h, reinterpret_cast<uintptr_t>(slot));
+    }
+
+    // What an element a :has() is asked of must have (a tag, ID or class of the compound
+    // the :has() is in), into has_anchors_; or, with nothing to tell, has_any_anchor_.
+    void noteHasAnchors(const ComplexSelector& sel) {
+        for (const CompoundSelector& c : sel.parts)
+            for (const SimpleSelector& x : c.simple) {
+                if (x.kind == SimpleKind::PseudoClass && x.name == "has") {
+                    uses_has_ = true;
+                    bool noted = false;
+                    for (const SimpleSelector& y : c.simple) {
+                        if (y.kind == SimpleKind::Type) has_anchors_.insert(featureHash('t', y.name));
+                        else if (y.kind == SimpleKind::Id) has_anchors_.insert(featureHash('i', y.name));
+                        else if (y.kind == SimpleKind::Class) has_anchors_.insert(featureHash('c', y.name));
+                        else continue;
+                        noted = true;
+                        break;
+                    }
+                    if (!noted) has_any_anchor_ = true;
+                }
+                for (const ComplexSelector& a : x.args) noteHasAnchors(a);
+            }
+    }
+
+    // Whether a :has() might be asked of this element.
+    bool hasAnchor(const Node* el) const {
+        if (!uses_has_) return false;
+        if (has_any_anchor_) return true;
+        if (has_anchors_.count(featureHash('t', lower(el->name)))) return true;
+        if (const std::string* id = el->attr("id"); id && has_anchors_.count(featureHash('i', *id))) return true;
+        if (const std::string* cls = el->attr("class")) {
+            const std::string_view list = *cls;
+            size_t i = 0;
+            while (i < list.size()) {
+                while (i < list.size() && isWsChar(list[i])) ++i;
+                const size_t b = i;
+                while (i < list.size() && !isWsChar(list[i])) ++i;
+                if (i > b && has_anchors_.count(featureHash('c', list.substr(b, i - b)))) return true;
+            }
+        }
+        return false;
+    }
+
+    // Everything under a node a :has() could look at (descendants, and through the
+    // parent, later siblings and theirs).
+    uint64_t subtreePrint(const Node* n) {
+        if (const auto it = subtree_prints_.find(n); it != subtree_prints_.end()) return it->second;
+        uint64_t h = 0x5EED;
+        for (const Node* c : n->children)
+            if (c->isElement()) h = mix(mix(h, ownPrint(c)), subtreePrint(c));
+        subtree_prints_[n] = h;
+        return h;
+    }
+
+    // Down the composed tree: a host's shadow tree (in its scope), a slot's assigned
+    // nodes (in the host's tree's scope), everyone else's children.
+    void walk(const Node* el, const ComputedStyle& parent, size_t depth, const Scope* scope, const Node* slot, uint64_t parent_key = 0) {
         if (depth > kMaxStyledDepth) return;
-        out_.storage_.emplace_back();
-        ComputedStyle& s = out_.storage_.back();
-        resolveInto(el, parent, s, scope, slot);
-        out_.styles_[el] = &s;
+        const uint64_t key = elementKey(el, parent_key, scope, slot);
+        out_.keys_[el] = key;
+        const ComputedStyle* kept = nullptr;
+        if (previous_) {
+            const auto k = previous_->keys_.find(el);
+            if (k != previous_->keys_.end() && k->second == key) {
+                const auto st = previous_->styles_.find(el);
+                if (st != previous_->styles_.end()) kept = st->second;
+            }
+        }
+        if (kept) {
+            const auto keep = [&](const ComputedStyle* style) -> const ComputedStyle* {
+                if (!copy_kept_) return style;
+                out_.storage_->push_back(*style);
+                return &out_.storage_->back();
+            };
+            out_.styles_[el] = keep(kept);
+            // What resolving the root would have set: rem and rlh below are of it.
+            if (el->parent && el->parent->type == NodeType::Document) {
+                lengths_.root_font_size = kept->font_size;
+                lengths_.root_line_height = kept->usedLineHeight();
+            }
+            for (auto [from, to] : {std::pair{&previous_->before_, &out_.before_}, std::pair{&previous_->after_, &out_.after_},
+                                    std::pair{&previous_->placeholder_, &out_.placeholder_}})
+                if (const auto it = from->find(el); it != from->end()) (*to)[el] = keep(it->second);
+        }
+        if (!kept) {
+            out_.storage_->emplace_back();
+            ComputedStyle& made = out_.storage_->back();
+            resolveInto(el, parent, made, scope, slot);
+            out_.styles_[el] = &made;
+        }
+        const ComputedStyle& s = *out_.styles_[el];
         // Nothing below gets a box; but an SVG's hidden parts can still be drawn by <use>.
         if (s.display == Display::None && el->ns != Namespace::Svg) return;
-        resolvePseudo(el, s, ua_p_->before, scope->before, scope->host_el, out_.before_);
-        resolvePseudo(el, s, ua_p_->after, scope->after, scope->host_el, out_.after_);
-        if ((el->isHtml("input") || el->isHtml("textarea")) && el->attr("placeholder"))
-            resolvePseudo(el, s, ua_p_->placeholder, scope->placeholder, scope->host_el, out_.placeholder_, false);
+        if (!kept) {
+            resolvePseudo(el, s, ua_p_->before, scope->before, scope->host_el, out_.before_);
+            resolvePseudo(el, s, ua_p_->after, scope->after, scope->host_el, out_.after_);
+            if ((el->isHtml("input") || el->isHtml("textarea")) && el->attr("placeholder"))
+                resolvePseudo(el, s, ua_p_->placeholder, scope->placeholder, scope->host_el, out_.placeholder_, false);
+        }
         if (el->shadow_root) {
             const auto it = shadow_scopes_.find(el->shadow_root);
             const Scope* inner = it == shadow_scopes_.end() ? scope : it->second.get();
             for (const Node* c : el->shadow_root->children)
-                if (c->isElement()) walk(c, s, depth + 1, inner, nullptr);
+                if (c->isElement()) walk(c, s, depth + 1, inner, nullptr, key);
             return;
         }
         if (el->isHtml("slot") && scope->host_el) {
@@ -4151,14 +4325,14 @@ private:
             if (!assigned.empty()) {
                 const Scope* outer = scopeFor(scope->host_el);
                 for (const Node* c : assigned)
-                    if (c->isElement()) walk(c, s, depth + 1, outer, el);
+                    if (c->isElement()) walk(c, s, depth + 1, outer, el, key);
                 return;
             }
         }
         const bool pushed = scope == doc_p_ && !slot && !host_context_ && bloomCovers(el);
         if (pushed) bloomPush(el);
         for (const Node* c : el->children)
-            if (c->isElement()) walk(c, s, depth + 1, scope, nullptr);
+            if (c->isElement()) walk(c, s, depth + 1, scope, nullptr, key);
         if (pushed) bloomPop();
     }
 
@@ -4174,6 +4348,13 @@ private:
         bool to_ua;
     };
     bool recording_ = false, to_ua_ = false;
+    bool uses_has_ = false;   // a rule with :has(): what an element matches can depend on its descendants
+    bool has_any_anchor_ = false;
+    std::unordered_set<uint32_t> has_anchors_;
+    std::unordered_map<const Node*, uint64_t> subtree_prints_;
+    const StyledDocument* previous_ = nullptr;
+    std::unordered_map<const Node*, uint64_t> own_prints_, sibling_prints_;
+    bool copy_kept_ = false;
     std::vector<const Node*> hosts_;   // elements with a shadow root, as the walk for sheets met them
     std::vector<SheetUse> uses_;
     std::shared_ptr<const void> index_kept_;   // what ua_p_ and doc_p_ point into
@@ -4199,9 +4380,9 @@ private:
 };
 
 StyledDocument::StyledDocument(const Document& doc, css::MediaContext media, const SheetLoader& loader, const ChMeasure& measure_ch,
-                               const FormState* forms)
+                               const FormState* forms, const StyledDocument* previous)
     : media_(media), measure_ch_(measure_ch), forms_(forms) {
-    StyleResolver resolver(doc, *this, loader);
+    StyleResolver resolver(doc, *this, loader, previous);
     resolver.run();
 }
 

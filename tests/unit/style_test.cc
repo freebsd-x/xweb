@@ -545,3 +545,101 @@ TEST(Selectors, NestedRulesApply) {
     EXPECT_EQ(color("z"), 0x808080);
     EXPECT_FLOAT_EQ(styles.styleOf(doc->root()->children.back()->children.back()->children.front())->margin[3].px, 3);   // after the nested rules
 }
+
+// Styles kept from the last time (StyledDocument's `previous`) must be what styling
+// afresh gives, whatever changed: an element's own attributes, a sibling, an ancestor,
+// something a :has() looks for, the children an :empty or :first-child sees.
+namespace {
+
+void expectSameAsFresh(const Document& doc, const StyledDocument& kept, const char* step) {
+    const StyledDocument fresh(doc, css::MediaContext{800, 600});
+    std::vector<const Node*> todo{doc.root()};
+    while (!todo.empty()) {
+        const Node* n = todo.back();
+        todo.pop_back();
+        todo.insert(todo.end(), n->children.begin(), n->children.end());
+        if (!n->isElement()) continue;
+        const ComputedStyle* a = kept.styleOf(n);
+        const ComputedStyle* b = fresh.styleOf(n);
+        ASSERT_EQ(a == nullptr, b == nullptr) << step << " <" << n->name << ">";
+        if (!a) continue;
+        const std::string* id = n->attr("id");
+        EXPECT_EQ(a->color, b->color) << step << " #" << (id ? *id : n->name);
+        EXPECT_EQ(a->display, b->display) << step << " #" << (id ? *id : n->name);
+        EXPECT_EQ(a->font_size, b->font_size) << step << " #" << (id ? *id : n->name);
+    }
+}
+
+Node* elementById(Document& doc, const std::string& id) {
+    std::vector<Node*> todo{doc.root()};
+    while (!todo.empty()) {
+        Node* n = todo.back();
+        todo.pop_back();
+        if (const std::string* v = n->attr("id"); v && *v == id) return n;
+        todo.insert(todo.end(), n->children.begin(), n->children.end());
+    }
+    return nullptr;
+}
+
+void setAttribute(Node* n, const std::string& name, const std::string& value) {
+    for (auto& a : n->attrs)
+        if (a.name == name) {
+            a.value = value;
+            return;
+        }
+    n->attrs.push_back({name, value});
+}
+
+}  // namespace
+
+TEST(Restyle, KeptStylesMatchStylingAfresh) {
+    auto doc = parseHtml(R"(<!doctype html><style>
+        .on { color: rgb(200, 0, 0) }
+        .on p { color: rgb(0, 0, 200); font-size: 30px }
+        li + li.x { color: rgb(0, 150, 0) }
+        li:first-child { font-size: 11px }
+        div:has(.flag) { color: rgb(1, 2, 3) }
+        span:empty { display: block }
+        .hide { display: none }
+        html { font-size: 10px }
+        .rem { font-size: 2rem }
+      </style>
+      <div id=box><section><p id=para>text</p></section></div>
+      <ul id=list><li id=a>a</li><li id=b>b</li><li id=c>c</li></ul>
+      <div id=hasbox><em><span id=deep>x</span></em></div>
+      <span id=e></span>)");
+    auto styles = std::make_unique<StyledDocument>(*doc, css::MediaContext{800, 600});
+    const auto again = [&](const char* step) {
+        styles = std::make_unique<StyledDocument>(*doc, css::MediaContext{800, 600}, StyledDocument::SheetLoader{},
+                                                  StyledDocument::ChMeasure{}, nullptr, styles.get());
+        expectSameAsFresh(*doc, *styles, step);
+    };
+    again("nothing changed");
+    setAttribute(elementById(*doc, "e"), "class", "rem");
+    again("a rem font size, the root's style kept");
+    EXPECT_EQ(styles->styleOf(elementById(*doc, "e"))->font_size, 20);
+    setAttribute(elementById(*doc, "box"), "class", "on");
+    again("an ancestor's class");
+    EXPECT_EQ(styles->styleOf(elementById(*doc, "para"))->color, (Color{0, 0, 200, 255}));
+    setAttribute(elementById(*doc, "b"), "class", "x");
+    again("a sibling combinator's subject");
+    Node* list = elementById(*doc, "list");
+    list->remove(elementById(*doc, "a"));
+    again("a first child removed");
+    EXPECT_EQ(styles->styleOf(elementById(*doc, "b"))->font_size, 11);
+    setAttribute(elementById(*doc, "deep"), "class", "flag");
+    again("what a :has() looks for, deep inside");
+    EXPECT_EQ(styles->styleOf(elementById(*doc, "hasbox"))->color, (Color{1, 2, 3, 255}));
+    Node* text = doc->make(NodeType::Text);
+    text->data = "now not empty";
+    elementById(*doc, "e")->append(text);
+    again("an :empty element given text");
+    setAttribute(elementById(*doc, "box"), "class", "on hide");
+    again("an ancestor hidden");
+    setAttribute(elementById(*doc, "box"), "class", "");
+    again("and shown again");
+    for (int i = 0; i < 12; ++i) {
+        setAttribute(elementById(*doc, "c"), "class", i % 2 ? "x" : "");
+        again("many generations of kept styles");
+    }
+}

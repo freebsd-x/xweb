@@ -702,10 +702,16 @@ public:
         dirty_ = true;
         ++change_gen_;
         restyled_.reset();
+        fonts_changed_ = true;   // nothing kept from another page's styles
     }
     void invalidate() {
         dirty_ = true;
         ++change_gen_;
+    }
+    // A web font has come: styles measured in ch are measured again, not kept.
+    void fontsChanged() {
+        fonts_changed_ = true;
+        invalidate();
     }
     [[nodiscard]] Page* page() const { return page_.get(); }
 
@@ -1159,7 +1165,9 @@ private:
                 }
                 return it->second;
             },
-            [this](const web::ComputedStyle& s) { return web::chWidth(measurer_, s); }, &page_->forms);
+            [this](const web::ComputedStyle& s) { return web::chWidth(measurer_, s); }, &page_->forms,
+            // The last styles, for what's unchanged; not once fonts have come since (ch).
+            fonts_changed_ ? nullptr : (restyled_ ? restyled_.get() : styles_.get()));
     }
 
     void relayout(float width, float height) {
@@ -1181,6 +1189,7 @@ private:
         }
         restyled_.reset();
         restyled_missing_.clear();
+        fonts_changed_ = false;
         const web::StyledDocument& styles = *styles_;
         if (!page.fonts_known) {
             page_->fonts_known = true;
@@ -1680,6 +1689,7 @@ private:
     std::vector<std::string> restyled_missing_;
     uint64_t change_gen_ = 0, restyled_gen_ = 0;
     float restyled_w_ = 0, restyled_h_ = 0;
+    bool fonts_changed_ = false;
     uint64_t fresh_gen_ = UINT64_MAX;   // the change a script's forced layout was made after
     std::map<std::string, CachedRaster> rasters_;
     const web::Node* popup_ = nullptr;   // a <select> whose list is open
@@ -2270,7 +2280,9 @@ private:
                         if (!web::webFontUsable(bytes)) continue;
                         XApplication::post([this, url, bytes, mine] {
                             if (!web::addWebFontData(url, bytes)) return;
-                            if (generation_.load() == mine) relayout_wanted_ = true;
+                            if (generation_.load() != mine) return;
+                            relayout_wanted_ = true;
+                            node_->fontsChanged();
                         });
                         break;
                     }

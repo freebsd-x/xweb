@@ -316,8 +316,11 @@ public:
     using ChMeasure = std::function<float(const ComputedStyle&)>;
 
     // `forms`: what the page's controls hold now, for :checked (null: what the page said).
+    // `previous`: the same document styled before, with the same sheets and fonts: an
+    // element whose selectors can see nothing different (itself, its siblings, its
+    // ancestors) keeps the style it had there instead of being matched again.
     StyledDocument(const Document& doc, css::MediaContext media, const SheetLoader& loader = {}, const ChMeasure& measure_ch = {},
-                   const class FormState* forms = nullptr);
+                   const class FormState* forms = nullptr, const StyledDocument* previous = nullptr);
 
     // Nullptr for anything that has no box-generating style (or is too deep).
     [[nodiscard]] const ComputedStyle* styleOf(const Node* element) const;
@@ -337,7 +340,15 @@ private:
     const class FormState* forms_ = nullptr;
     std::unordered_map<const Node*, const ComputedStyle*> styles_;
     std::unordered_map<const Node*, const ComputedStyle*> before_, after_, placeholder_;
-    std::deque<ComputedStyle> storage_;
+    std::shared_ptr<std::deque<ComputedStyle>> storage_ = std::make_shared<std::deque<ComputedStyle>>();
+    // Earlier documents' storage that styles here were kept from.
+    std::vector<std::shared_ptr<const std::deque<ComputedStyle>>> kept_;
+    // What each element's style was worked out from (see StyleResolver::elementKey), and
+    // what the rules were: styles are only kept between documents with the same rules.
+    std::unordered_map<const Node*, uint64_t> keys_;
+    const void* index_id_ = nullptr;
+    std::shared_ptr<const void> index_kept_;
+    bool reusable_ = false;
     std::vector<WebFontFace> font_faces_;
     friend class StyleResolver;
 };
