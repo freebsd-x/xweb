@@ -113,7 +113,7 @@ struct Node {
     Node* d = nullptr;
     std::vector<Node*> kids;
     FunctionInfo* fn = nullptr;   // functions, arrows, methods, classes' constructors
-    std::shared_ptr<const std::vector<std::u16string>> lexical;   // a block's let/const/class names
+    const std::vector<std::u16string>* lexical = nullptr;   // a block's let/const/class names (its Program keeps them)
     // A member access's key (a.b's "b"), made once: each access used to copy the name.
     std::unique_ptr<PropertyKey> key;
     std::unique_ptr<JSString> literal;   // a string literal's value, shared by each evaluation
@@ -202,6 +202,7 @@ struct Program {
     uint32_t make_offset = 0;        // set by the parser: where the token being read starts
     bool module = false;
     std::deque<Node> nodes;
+    std::vector<std::shared_ptr<const std::vector<std::u16string>>> lexicals;   // what nodes' `lexical` point to
     std::deque<FunctionInfo> functions;
     Node* root = nullptr;
     FunctionInfo* top = nullptr;   // the script itself, as a function: its hoisting

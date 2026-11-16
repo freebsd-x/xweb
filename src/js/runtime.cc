@@ -287,7 +287,7 @@ public:
             Object* fn = makeFunction(f->fn, global_env, nullptr);
             g->define(f->str, {Value::object(fn), nullptr, nullptr, kWritable | kEnumerable});
         }
-        declareLexical(global_env, p.root->lexical.get());
+        declareLexical(global_env, p.root->lexical);
         Value last;
         EnvScope scope(rt_, global_env);
         for (Node* s : p.root->kids) {
@@ -308,7 +308,7 @@ public:
             if (!env->vars.count(name)) env->vars[name] = Binding{};
         // Lexical names first: a module's top-level functions are among them, and are
         // initialized at once.
-        declareLexical(env, p.root->lexical.get());
+        declareLexical(env, p.root->lexical);
         for (Node* f : p.top->function_decls) env->vars[f->str] = Binding{Value::object(makeFunction(f->fn, env, nullptr))};
         for (Node* s : p.root->kids) {
             if (s->kind != N::ExportDecl || !(s->flags & kDefault) || !s->a || s->a->kind == N::FunctionDecl || s->a->kind == N::ClassDecl) continue;
@@ -329,7 +329,7 @@ public:
                 var_env->vars[name] = Binding{};
             }
         }
-        declareLexical(lex, p.root->lexical.get());
+        declareLexical(lex, p.root->lexical);
         for (Node* f : p.top->function_decls) {
             const Value fn = Value::object(makeFunction(f->fn, lex, nullptr));
             if (var_object) var_object->define(f->str, {fn, nullptr, nullptr, kDefaultFlags});
@@ -2134,7 +2134,7 @@ Value Interpreter::callScript(Object* f, const Value& this_value, std::span<cons
 
 Value Interpreter::runBody(FunctionInfo* info, Env* env) {
     if (info->expression_body) return eval(info->body, env, info->strict);
-    declareLexical(env, info->body->lexical.get());
+    declareLexical(env, info->body->lexical);
     Completion c = execBlock(info->body->kids, env, info->strict);
     return c.type == CT::Return ? c.value : Value::undefined();
 }
@@ -2418,7 +2418,7 @@ Completion Interpreter::exec(Node* n, Env* env, bool strict) {
             if (!n->lexical && std::none_of(n->kids.begin(), n->kids.end(), [](Node* k) { return k->kind == N::FunctionDecl; }))
                 return execBlock(n->kids, env, strict);
             Env* block = newEnv(env);
-            declareLexical(block, n->lexical.get());
+            declareLexical(block, n->lexical);
             hoistBlockFunctions(n->kids, block);
             EnvScope scope(rt_, block);
             return execBlock(n->kids, block, strict);
@@ -2548,7 +2548,7 @@ Completion Interpreter::forStatement(Node* n, Env* env, bool strict, const std::
     const bool per_iteration = n->a && n->a->kind == N::VarDecl && (n->a->flags & (kLet | kConst)) && (n->flags & kCaptures);
     if (n->lexical) {
         loop = newEnv(env);
-        declareLexical(loop, n->lexical.get());
+        declareLexical(loop, n->lexical);
     }
     EnvScope scope(rt_, loop);
     if (n->a) {
@@ -2699,7 +2699,7 @@ Completion Interpreter::tryStatement(Node* n, Env* env, bool strict) {
 Completion Interpreter::switchStatement(Node* n, Env* env, bool strict, const std::u16string* label) {
     const Value d = eval(n->a, env, strict);
     Env* block = newEnv(env);
-    declareLexical(block, n->lexical.get());
+    declareLexical(block, n->lexical);
     for (Node* c : n->kids) hoistBlockFunctions(c->kids, block);
     EnvScope scope(rt_, block);
     size_t start = n->kids.size();

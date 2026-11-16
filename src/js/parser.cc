@@ -56,7 +56,7 @@ public:
         if (p_.module) checkModuleExports(root, *lexical);
         popScope();
         if (!lex_.error.empty()) fail(lex_.error);
-        root->lexical = lexical;
+        root->lexical = keepLexical(lexical);
         root->fn = top;
         return root;
     }
@@ -198,6 +198,12 @@ private:
             scope_vars_[i].push_back(name);
         }
         addVar(name);
+    }
+
+    // A scope's lexical names, kept by the program for the node that has them.
+    const std::vector<std::u16string>* keepLexical(std::shared_ptr<std::vector<std::u16string>> lexical) {
+        p_.lexicals.push_back(lexical);
+        return lexical.get();
     }
 
     void pushScope(std::vector<std::u16string>* lexical) {
@@ -687,7 +693,7 @@ private:
         popScope();
         advance();
         slashStartsRegex();
-        if (!lexical->empty()) n->lexical = lexical;
+        if (!lexical->empty()) n->lexical = keepLexical(lexical);
         return n;
     }
 
@@ -807,7 +813,7 @@ private:
             n->d = loopBody();
         }
         popScope();
-        if (!lexical->empty()) n->lexical = lexical;
+        if (!lexical->empty()) n->lexical = keepLexical(lexical);
         if (for_await) {
             if (n->kind != N::ForOf) fail("for await needs of");
             n->flags |= kAwait;
@@ -871,7 +877,7 @@ private:
         }
         popScope();
         slashStartsRegex();
-        if (!lexical->empty()) n->lexical = lexical;
+        if (!lexical->empty()) n->lexical = keepLexical(lexical);
         return n;
     }
 
@@ -1002,7 +1008,7 @@ private:
         var_stop_ = saved_stop;
         popScope();
         advance();
-        if (!lexical->empty()) body->lexical = lexical;
+        if (!lexical->empty()) body->lexical = keepLexical(lexical);
         fn->body = body;
         checkParams(fn);
     }
