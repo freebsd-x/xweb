@@ -3,6 +3,7 @@
 // the spec's cover grammars describe: parsed as expressions, then reinterpreted.
 
 #include <algorithm>
+#include <unordered_set>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -177,10 +178,23 @@ private:
 
     // A var declaration: hoisted to its function, through every block on the way,
     // which mustn't have a let, const or class of that name.
+    // Whether a scope's lexical names include this one, by a set kept beside the list:
+    // a list searched for every var was quadratic (YouTube's app declares tens of
+    // thousands of them at its top level). The lists only grow, and live as long as the
+    // parse, so each set catches up with its list's new names.
+    bool inLexical(const std::vector<std::u16string>* list, const std::u16string& name) {
+        auto& [synced, set] = lexical_sets_[list];
+        if (list->size() < synced) {
+            set.clear();
+            synced = 0;
+        }
+        for (; synced < list->size(); ++synced) set.insert((*list)[synced]);
+        return set.count(name) > 0;
+    }
+
     void addVarDecl(const std::u16string& name) {
         for (size_t i = lexical_.size(); i-- > var_stop_;) {
-            const auto& lex = *lexical_[i];
-            if (std::find(lex.begin(), lex.end(), name) != lex.end()) fail("redeclaration of '" + utf8(name) + "'");
+            if (inLexical(lexical_[i], name)) fail("redeclaration of '" + utf8(name) + "'");
             scope_vars_[i].push_back(name);
         }
         addVar(name);
@@ -196,14 +210,15 @@ private:
     }
 
     void addVar(const std::u16string& name) {
-        auto& v = fn_->var_names;
-        if (std::find(v.begin(), v.end(), name) == v.end()) v.push_back(name);
+        // (A set beside the list, as for lexical names: the list searched each time was
+        // a twentieth of loading YouTube.)
+        if (var_sets_[fn_].insert(name).second) fn_->var_names.push_back(name);
     }
 
     void addLexical(const std::u16string& name) {
         if (lexical_.empty()) return;
         auto& v = *lexical_.back();
-        if (std::find(v.begin(), v.end(), name) != v.end()) fail("redeclaration of '" + utf8(name) + "'");
+        if (inLexical(&v, name)) fail("redeclaration of '" + utf8(name) + "'");
         if (const auto& vars = scope_vars_.back(); std::find(vars.begin(), vars.end(), name) != vars.end())
             fail("redeclaration of '" + utf8(name) + "'");
         if (name == u"let") fail("let can't be a lexically declared name");
@@ -1407,8 +1422,56 @@ private:
         return Op::Eq;   // not an assignment
     }
 
+    // Whether the "(" at cur_ can begin arrow parameters, by a look at the tokens after
+    // it: false when it surely can't (something no parameter list has, straight inside
+    // the parentheses, or no "=>" after the ")"), true when it may. Trying each "(" as
+    // parameters, throwing when it wasn't, was a third of loading YouTube (C++ exceptions
+    // unwinding the parser's stack). Leaves the lexer where it was.
+    bool mayBeArrowParams() {
+        const size_t pos = lex_.pos();
+        const uint32_t line = lex_.line();
+        const std::string saved_error = lex_.error;
+        constexpr int kLook = 256;
+        int depth = 1;
+        bool in_default = false;   // after a parameter's "=": any expression, up to its ","
+        bool answer = true;        // (can't tell: may be)
+        for (int n = 0; n < kLook; ++n) {
+            const Token t = lex_.next(false);
+            if (!lex_.error.empty() || t.type == Tok::Eof || t.type == Tok::Template || t.type == Tok::Regex) break;
+            const std::u16string& v = t.value;
+            const bool punct = t.type == Tok::Punct;
+            if (punct && v == u"/") break;   // division or a regex: lexed without knowing which
+            if (punct && v == u"/=") break;
+            if (depth == 1 && !in_default) {
+                // Straight inside: names, patterns, rest, defaults, commas.
+                const bool ok = t.type == Tok::Identifier || (punct && (v == u"," || v == u"..." || v == u"[" || v == u"{" || v == u"=" || v == u")"));
+                if (!ok) {
+                    answer = false;
+                    break;
+                }
+            }
+            if (punct && (v == u"(" || v == u"[" || v == u"{")) {
+                ++depth;
+            } else if (punct && (v == u")" || v == u"]" || v == u"}")) {
+                if (--depth == 0) {
+                    const Token after = lex_.next(false);
+                    answer = lex_.error.empty() && after.type == Tok::Punct && after.value == u"=>" && !after.newline_before;
+                    break;
+                }
+            } else if (depth == 1 && punct && v == u"=") {
+                in_default = true;
+            } else if (depth == 1 && punct && v == u",") {
+                in_default = false;
+            }
+        }
+        lex_.reset(pos, line);
+        lex_.error = saved_error;
+        return answer;
+    }
+
     // Tries `(params) =>` at the current "(": the arrow, or null with nothing consumed.
     Node* tryArrowParams(bool is_async, uint32_t begin) {
+        if (!mayBeArrowParams()) return nullptr;
         const size_t pos = lex_.pos();
         const uint32_t line = lex_.line();
         const Token saved = cur_;
@@ -2141,6 +2204,8 @@ private:
     int depth_ = 0;
     FunctionInfo* fn_ = nullptr;
     std::vector<std::vector<std::u16string>*> lexical_;
+    std::unordered_map<const std::vector<std::u16string>*, std::pair<size_t, std::unordered_set<std::u16string>>> lexical_sets_;
+    std::unordered_map<const FunctionInfo*, std::unordered_set<std::u16string>> var_sets_;
     size_t base_lexical_depth_ = 1;
     std::vector<std::u16string> import_names_;
     // Early errors' bookkeeping.
