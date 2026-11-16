@@ -617,10 +617,12 @@ void PageScript::Impl::installElement() {
     const auto offsetParentOf = [self](Node* el) -> Node* {
         if (!el || !self->inDocument(el) || el == self->doc.body() || el->isHtml("html")) return nullptr;
         const auto position = [self](const Node* n) -> std::string {
+            if (self->host.computed_value) return self->host.computed_value(n, "position").value_or("static");
             if (!self->host.computed_style) return "static";
             const auto m = self->host.computed_style(n);
-            const auto it = m.find("position");
-            return it == m.end() ? "static" : it->second;
+            if (!m) return "static";
+            const auto it = m->find("position");
+            return it == m->end() ? "static" : it->second;
         };
         const std::string own = position(el);
         if (own == "fixed") return nullptr;
@@ -1362,54 +1364,86 @@ void PageScript::Impl::installWindow() {
     rt.put(perf, u"timeOrigin", Value::number(static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count())));
     rt.put(g, u"performance", Value::object(perf));
 
-    // getComputedStyle, from the last layout's styles.
-    method(g, u"getComputedStyle", 1, [self](Runtime& rt, const Value&, Args a) {
+    // getComputedStyle, from the last layout's styles. Each call is an object on a
+    // prototype with a getter per property: a page asks for one or two of them, often
+    // of many elements in a loop, and making all of them every time took a third of
+    // daum.net's script time. The element is the object's slot.
+    static const std::pair<const char*, const char*> kInitial[] = {
+        {"content", "normal"}, {"cursor", "auto"}, {"pointer-events", "auto"}, {"transform", "none"},
+        {"transform-origin", "50% 50% 0px"}, {"transition", "all 0s ease 0s"}, {"transition-property", "all"},
+        {"transition-duration", "0s"}, {"transition-delay", "0s"}, {"transition-timing-function", "ease"},
+        {"animation", "none 0s ease 0s 1 normal none running"}, {"animation-name", "none"}, {"animation-duration", "0s"},
+        {"animation-delay", "0s"}, {"animation-play-state", "running"}, {"animation-iteration-count", "1"},
+        {"user-select", "auto"}, {"box-shadow", "none"}, {"text-shadow", "none"}, {"text-overflow", "clip"},
+        {"word-break", "normal"}, {"overflow-wrap", "normal"}, {"word-wrap", "normal"}, {"overflow-x", "visible"},
+        {"overflow-y", "visible"}, {"object-fit", "fill"}, {"object-position", "50% 50%"}, {"vertical-align", "baseline"},
+        {"text-decoration", "none solid rgb(0, 0, 0)"}, {"text-decoration-line", "none"}, {"outline", "rgb(0, 0, 0) none 0px"},
+        {"outline-style", "none"}, {"outline-width", "0px"}, {"resize", "none"}, {"will-change", "auto"}, {"filter", "none"},
+        {"backdrop-filter", "none"}, {"clip-path", "none"}, {"mask", "none"}, {"mask-image", "none"}, {"direction", "ltr"},
+        {"writing-mode", "horizontal-tb"}, {"list-style-type", "disc"}, {"list-style", "outside none disc"},
+        {"table-layout", "auto"}, {"border-collapse", "separate"}, {"background-image", "none"}, {"background-size", "auto"},
+        {"background-position", "0% 0%"}, {"background-repeat", "repeat"}, {"background-clip", "border-box"},
+        {"border-radius", "0px"}, {"border-top-left-radius", "0px"}, {"border-top-right-radius", "0px"},
+        {"border-bottom-left-radius", "0px"}, {"border-bottom-right-radius", "0px"}, {"gap", "normal"}, {"row-gap", "normal"},
+        {"column-gap", "normal"}, {"order", "0"}, {"grid-template-columns", "none"}, {"grid-template-rows", "none"},
+        {"grid-auto-flow", "row"}, {"aspect-ratio", "auto"}, {"isolation", "auto"}, {"mix-blend-mode", "normal"},
+        {"scroll-behavior", "auto"}, {"touch-action", "auto"}, {"appearance", "none"}, {"font-variant", "normal"},
+        {"font-stretch", "100%"}, {"text-rendering", "auto"}, {"hyphens", "manual"}, {"tab-size", "8"},
+        {"perspective", "none"}, {"backface-visibility", "visible"}, {"contain", "none"}, {"content-visibility", "visible"},
+        {"inset", "auto"}, {"clear", "none"}, {"caret-color", "auto"}, {"accent-color", "auto"}, {"color-scheme", "normal"},
+    };
+    // What the host gives, in its names.
+    static const char* const kHostNames[] = {
+        "display", "visibility", "position", "color", "background-color", "align-items", "align-self", "box-sizing",
+        "flex-basis", "flex-direction", "flex-grow", "flex-shrink", "flex-wrap", "float", "font-family", "font-size",
+        "font-style", "font-weight", "height", "justify-content", "letter-spacing", "line-height", "max-height",
+        "max-width", "min-height", "min-width", "opacity", "overflow", "text-align", "text-indent", "text-transform",
+        "white-space", "width", "z-index", "top", "right", "bottom", "left",
+        "margin-top", "margin-right", "margin-bottom", "margin-left", "padding-top", "padding-right", "padding-bottom", "padding-left",
+        "border-top-width", "border-right-width", "border-bottom-width", "border-left-width",
+        "border-top-style", "border-right-style", "border-bottom-style", "border-left-style",
+        "border-top-color", "border-right-color", "border-bottom-color", "border-left-color",
+    };
+    // A property's value for the element in a computed style object's slot: the host's,
+    // else its initial value, else "".
+    const auto computedValue = [self](Runtime& rt, const Value& t, const std::string& name) -> Value {
+        Object* o = t.isObject() ? t.asObject() : nullptr;
+        Node* n = o && !o->slots.empty() ? self->node(o->slots[0]) : nullptr;
+        if (!n) return str("");
+        if (self->host.computed_value) {
+            if (const auto value = self->host.computed_value(n, name)) return str(*value);
+        } else if (self->host.computed_style) {
+            if (const auto values = self->host.computed_style(n)) {
+                if (const auto it = values->find(name); it != values->end()) return str(it->second);
+            }
+        }
+        for (const auto& [k, v] : kInitial)
+            if (name == k) return str(v);
+        (void)rt;
+        return str("");
+    };
+    Object* computed_proto = rt.newObject();
+    {
+        std::set<std::string> names(std::begin(kHostNames), std::end(kHostNames));
+        for (const auto& [k, v] : kInitial) names.insert(k);
+        for (const std::string& name : names) {
+            const auto get = [computedValue, name](Runtime& rt, const Value& t, Args) { return computedValue(rt, t, name); };
+            accessor(computed_proto, js::utf16(name).c_str(), get);
+            const std::string camel = camelName(name);
+            if (camel != name) accessor(computed_proto, js::utf16(camel).c_str(), get);
+        }
+        method(computed_proto, u"getPropertyValue", 1, [computedValue](Runtime& rt, const Value& t, Args args) {
+            return computedValue(rt, t, js::utf8(rt.toStringValue(arg(args, 0))));
+        });
+        // Kept alive by the global, out of sight.
+        rt.put(g, u"__xwebComputedStyle", Value::object(computed_proto), js::kConfigurable);
+    }
+    method(g, u"getComputedStyle", 1, [self, computed_proto](Runtime& rt, const Value&, Args a) {
         Node* n = self->node(arg(a, 0));
         if (!n || !n->isElement()) rt.throwError("TypeError", "getComputedStyle needs an element");
         Object* o = rt.newObject();
-        const auto values = self->host.computed_style ? self->host.computed_style(n) : std::unordered_map<std::string, std::string>{};
-        for (const auto& [k, v] : values) {
-            rt.put(o, js::utf16(k), str(v), js::kEnumerable);
-            rt.put(o, js::utf16(camelName(k)), str(v), js::kEnumerable);
-        }
-        // The properties the host doesn't give, as their initial values: a page reads them
-        // and calls string methods on what it gets (Netflix: getComputedStyle(el).content
-        // .replace(...) was undefined).
-        static const std::pair<const char*, const char*> kInitial[] = {
-            {"content", "normal"}, {"cursor", "auto"}, {"pointer-events", "auto"}, {"transform", "none"},
-            {"transform-origin", "50% 50% 0px"}, {"transition", "all 0s ease 0s"}, {"transition-property", "all"},
-            {"transition-duration", "0s"}, {"transition-delay", "0s"}, {"transition-timing-function", "ease"},
-            {"animation", "none 0s ease 0s 1 normal none running"}, {"animation-name", "none"}, {"animation-duration", "0s"},
-            {"animation-delay", "0s"}, {"animation-play-state", "running"}, {"animation-iteration-count", "1"},
-            {"user-select", "auto"}, {"box-shadow", "none"}, {"text-shadow", "none"}, {"text-overflow", "clip"},
-            {"word-break", "normal"}, {"overflow-wrap", "normal"}, {"word-wrap", "normal"}, {"overflow-x", "visible"},
-            {"overflow-y", "visible"}, {"object-fit", "fill"}, {"object-position", "50% 50%"}, {"vertical-align", "baseline"},
-            {"text-decoration", "none solid rgb(0, 0, 0)"}, {"text-decoration-line", "none"}, {"outline", "rgb(0, 0, 0) none 0px"},
-            {"outline-style", "none"}, {"outline-width", "0px"}, {"resize", "none"}, {"will-change", "auto"}, {"filter", "none"},
-            {"backdrop-filter", "none"}, {"clip-path", "none"}, {"mask", "none"}, {"mask-image", "none"}, {"direction", "ltr"},
-            {"writing-mode", "horizontal-tb"}, {"list-style-type", "disc"}, {"list-style", "outside none disc"},
-            {"table-layout", "auto"}, {"border-collapse", "separate"}, {"background-image", "none"}, {"background-size", "auto"},
-            {"background-position", "0% 0%"}, {"background-repeat", "repeat"}, {"background-clip", "border-box"},
-            {"border-radius", "0px"}, {"border-top-left-radius", "0px"}, {"border-top-right-radius", "0px"},
-            {"border-bottom-left-radius", "0px"}, {"border-bottom-right-radius", "0px"}, {"gap", "normal"}, {"row-gap", "normal"},
-            {"column-gap", "normal"}, {"order", "0"}, {"grid-template-columns", "none"}, {"grid-template-rows", "none"},
-            {"grid-auto-flow", "row"}, {"aspect-ratio", "auto"}, {"isolation", "auto"}, {"mix-blend-mode", "normal"},
-            {"scroll-behavior", "auto"}, {"touch-action", "auto"}, {"appearance", "none"}, {"font-variant", "normal"},
-            {"font-stretch", "100%"}, {"text-rendering", "auto"}, {"hyphens", "manual"}, {"tab-size", "8"},
-            {"perspective", "none"}, {"backface-visibility", "visible"}, {"contain", "none"}, {"content-visibility", "visible"},
-            {"inset", "auto"}, {"clear", "none"}, {"caret-color", "auto"}, {"accent-color", "auto"}, {"color-scheme", "normal"},
-        };
-        for (const auto& [k, v] : kInitial) {
-            const std::u16string name = js::utf16(k);
-            if (o->own(PropertyKey(name))) continue;
-            rt.put(o, name, str(v), js::kEnumerable);
-            rt.put(o, js::utf16(camelName(k)), str(v), js::kEnumerable);
-        }
-        Object* holder = o;
-        rt.method(o, u"getPropertyValue", 1, [holder](Runtime& r, const Value&, Args args) {
-            const Value v = r.get(holder, PropertyKey(r.toStringValue(arg(args, 0))), Value::object(holder));
-            return v.isUndefined() ? str("") : v;
-        });
+        o->prototype = computed_proto;
+        o->slots.push_back(arg(a, 0));
         return Value::object(o);
     });
     method(g, u"matchMedia", 1, [self](Runtime& rt, const Value&, Args a) {

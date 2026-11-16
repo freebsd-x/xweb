@@ -40,6 +40,13 @@ struct Page {
         host.console = [this](std::string_view level, const std::string& text) { console += std::string(level) + ":" + text + "\n"; };
         host.navigate = [this](const std::string& url) { navigated = url; };
         host.rect = [](const Node*) { return std::optional<ElementRect>(ElementRect{10, 20, 300, 40}); };
+        // A pretend style: each element's display is its id, and it's red.
+        host.computed_style = [](const Node* n) {
+            auto m = std::make_shared<std::unordered_map<std::string, std::string>>();
+            if (const std::string* id = n->attr("id")) (*m)["display"] = *id;
+            (*m)["background-color"] = "rgb(255, 0, 0)";
+            return std::shared_ptr<const std::unordered_map<std::string, std::string>>(m);
+        };
         host.activate = [this](const Node* n) { activated.push_back(n); };
         // Canvas text in a pretend font: 5px a character, 8 above the baseline, 2 below, solid.
         host.canvas_text = [](const std::string& text, const std::string&, float scale, bool render) {
@@ -1192,4 +1199,12 @@ TEST(Script, StorageIsAnInterface) {
         console.log(localStorage instanceof Storage, sessionStorage instanceof Storage, localStorage.getItem('a'));
         </script>)");
     EXPECT_EQ(p.console, "log:true true 1\n") << p.console;
+}
+
+TEST(Script, ComputedStyleReadsTheHostLazily) {
+    Page p(R"(<body><p id=block></p><span id=inline></span><script>
+        const a = getComputedStyle(document.getElementById('block')), b = getComputedStyle(document.getElementById('inline'));
+        console.log(a.display, b.display, a.backgroundColor, b.getPropertyValue('background-color'), a.content, a.getPropertyValue('nope') === '');
+        </script>)");
+    EXPECT_EQ(p.console, "log:block inline rgb(255, 0, 0) rgb(255, 0, 0) normal true\n") << p.console;
 }

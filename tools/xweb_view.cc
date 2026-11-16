@@ -703,6 +703,8 @@ public:
         ++change_gen_;
         restyled_.reset();
         fonts_changed_ = true;   // nothing kept from another page's styles
+        computed_cache_.clear();
+        computed_values_.clear();
     }
     void invalidate() {
         dirty_ = true;
@@ -887,6 +889,8 @@ public:
         if (laid_out_width_ <= 0 || !page_ || !page_->doc) return;
         std::vector<std::string> missing;
         restyled_ = makeStyles(laid_out_width_, laid_out_height_, missing);
+        computed_cache_.clear();
+        computed_values_.clear();
         restyled_gen_ = change_gen_;
         restyled_w_ = laid_out_width_;
         restyled_h_ = laid_out_height_;
@@ -896,8 +900,32 @@ public:
     // Styled since the last layout: a box asked about now needs a layout.
     [[nodiscard]] bool layoutStale() const { return restyled_ != nullptr; }
 
-    [[nodiscard]] std::unordered_map<std::string, std::string> computedStyleOf(const web::Node* n) const {
+    // One property of computedStyleOf (none: not one it gives), kept until the styles or
+    // the layout change.
+    std::optional<std::string> computedValue(const web::Node* n, const std::string& name) {
+        const auto key = std::make_pair(n, name);
+        if (const auto it = computed_values_.find(key); it != computed_values_.end()) return it->second;
+        auto values = computedStyleOf(n, name);
+        const auto it = values.find(name);
+        std::optional<std::string> value;
+        if (it != values.end()) value = std::move(it->second);
+        computed_values_.emplace(key, value);
+        return value;
+    }
+
+    // computedStyleOf, kept per element until the styles or the layout change (each
+    // place they're made anew empties it).
+    std::shared_ptr<const std::unordered_map<std::string, std::string>> computedStyleShared(const web::Node* n) {
+        auto& slot = computed_cache_[n];
+        if (!slot) slot = std::make_shared<const std::unordered_map<std::string, std::string>>(computedStyleOf(n));
+        return slot;
+    }
+
+    // `only`: just that property (a script's getComputedStyle reads one or two of them),
+    // else all of them.
+    [[nodiscard]] std::unordered_map<std::string, std::string> computedStyleOf(const web::Node* n, std::string_view only = {}) const {
         std::unordered_map<std::string, std::string> out;
+        const auto want = [only](std::string_view name) { return only.empty() || name == only; };
         const web::StyledDocument* current = restyled_ ? restyled_.get() : styles_.get();
         const web::ComputedStyle* s = current ? current->styleOf(n) : nullptr;
         // Not rendered (display: none, or inside one): every property still has a value.
@@ -911,28 +939,28 @@ public:
                                          "table-caption", "table-row-group", "table-row", "table-cell", "table-column", "flex",
                                          "inline-flex", "grid", "inline-grid", "contents"};
         const auto idx = static_cast<size_t>(s->display);
-        out["display"] = idx < std::size(kDisplay) ? kDisplay[idx] : "block";
-        out["visibility"] = s->hidden ? "hidden" : "visible";
+        if (want("display")) out["display"] = idx < std::size(kDisplay) ? kDisplay[idx] : "block";
+        if (want("visibility")) out["visibility"] = s->hidden ? "hidden" : "visible";
         static const char* kPosition[] = {"static", "relative", "absolute", "fixed"};
-        out["position"] = kPosition[static_cast<size_t>(s->position)];
+        if (want("position")) out["position"] = kPosition[static_cast<size_t>(s->position)];
         const auto rgb = [](web::Color c) {
             if (c.a == 255) return "rgb(" + std::to_string(c.r) + ", " + std::to_string(c.g) + ", " + std::to_string(c.b) + ")";
             char a[16];
             std::snprintf(a, sizeof a, "%g", c.a / 255.0);
             return "rgba(" + std::to_string(c.r) + ", " + std::to_string(c.g) + ", " + std::to_string(c.b) + ", " + a + ")";
         };
-        out["color"] = rgb(s->color);
-        out["background-color"] = rgb(s->background);
+        if (want("color")) out["color"] = rgb(s->color);
+        if (want("background-color")) out["background-color"] = rgb(s->background);
         const auto px = [](float v) {
             char b[32];
             std::snprintf(b, sizeof b, "%gpx", v);
             return std::string(b);
         };
-        out["font-size"] = px(s->font_size);
-        out["font-weight"] = std::to_string(s->font_weight);
-        out["font-family"] = s->font_family;
-        out["opacity"] = std::to_string(s->opacity).substr(0, 4);
-        out["z-index"] = std::to_string(s->z_index);
+        if (want("font-size")) out["font-size"] = px(s->font_size);
+        if (want("font-weight")) out["font-weight"] = std::to_string(s->font_weight);
+        if (want("font-family")) out["font-family"] = s->font_family;
+        if (want("opacity")) out["opacity"] = std::to_string(s->opacity).substr(0, 4);
+        if (want("z-index")) out["z-index"] = std::to_string(s->z_index);
         // Lengths as specified: px, or the percentage when that's what was said.
         const auto len = [&px](const web::Length& l) {
             if (l.is_auto) return std::string("auto");
@@ -953,48 +981,49 @@ public:
             out[std::string("border-") + kSide[i] + "-color"] = rgb(s->border_color[i]);
             out[kSide[i]] = len(s->offset[i]);
         }
-        out["box-sizing"] = s->border_box ? "border-box" : "content-box";
-        out["float"] = s->float_side == web::Float::Left ? "left" : s->float_side == web::Float::Right ? "right" : "none";
-        out["overflow"] = s->overflow_clip ? "hidden" : "visible";
-        out["line-height"] = s->line_height > 0 ? px(s->line_height) : std::string("normal");
-        out["min-width"] = len(s->min_width);
-        out["min-height"] = len(s->min_height);
-        out["max-width"] = s->max_width.is_auto ? std::string("none") : len(s->max_width);
-        out["max-height"] = s->max_height.is_auto ? std::string("none") : len(s->max_height);
+        if (want("box-sizing")) out["box-sizing"] = s->border_box ? "border-box" : "content-box";
+        if (want("float")) out["float"] = s->float_side == web::Float::Left ? "left" : s->float_side == web::Float::Right ? "right" : "none";
+        if (want("overflow")) out["overflow"] = s->overflow_clip ? "hidden" : "visible";
+        if (want("line-height")) out["line-height"] = s->line_height > 0 ? px(s->line_height) : std::string("normal");
+        if (want("min-width")) out["min-width"] = len(s->min_width);
+        if (want("min-height")) out["min-height"] = len(s->min_height);
+        if (want("max-width")) out["max-width"] = s->max_width.is_auto ? std::string("none") : len(s->max_width);
+        if (want("max-height")) out["max-height"] = s->max_height.is_auto ? std::string("none") : len(s->max_height);
         static const char* kWhiteSpace[] = {"normal", "pre", "nowrap", "pre-wrap", "pre-line"};
-        out["white-space"] = kWhiteSpace[static_cast<size_t>(s->white_space)];
+        if (want("white-space")) out["white-space"] = kWhiteSpace[static_cast<size_t>(s->white_space)];
         static const char* kTextAlign[] = {"start", "right", "center"};
-        out["text-align"] = kTextAlign[static_cast<size_t>(s->text_align)];
+        if (want("text-align")) out["text-align"] = kTextAlign[static_cast<size_t>(s->text_align)];
         static const char* kTransform[] = {"none", "uppercase", "lowercase", "capitalize"};
-        out["text-transform"] = kTransform[static_cast<size_t>(s->text_transform)];
-        out["text-indent"] = s->text_indent.is_auto ? std::string("0px") : len(s->text_indent);
-        out["font-style"] = s->italic ? "italic" : "normal";
-        out["letter-spacing"] = "normal";
-        out["flex-direction"] = std::string(s->flex_column ? "column" : "row") + (s->flex_reverse ? "-reverse" : "");
-        out["flex-wrap"] = s->flex_wrap ? "wrap" : "nowrap";
+        if (want("text-transform")) out["text-transform"] = kTransform[static_cast<size_t>(s->text_transform)];
+        if (want("text-indent")) out["text-indent"] = s->text_indent.is_auto ? std::string("0px") : len(s->text_indent);
+        if (want("font-style")) out["font-style"] = s->italic ? "italic" : "normal";
+        if (want("letter-spacing")) out["letter-spacing"] = "normal";
+        if (want("flex-direction")) out["flex-direction"] = std::string(s->flex_column ? "column" : "row") + (s->flex_reverse ? "-reverse" : "");
+        if (want("flex-wrap")) out["flex-wrap"] = s->flex_wrap ? "wrap" : "nowrap";
         static const char* kAlign[] = {"normal", "flex-start", "flex-end", "center", "stretch", "baseline", "space-between", "space-around", "space-evenly"};
-        out["justify-content"] = kAlign[static_cast<size_t>(s->justify_content)];
-        out["align-items"] = s->align_items == web::FlexAlign::Auto ? "normal" : kAlign[static_cast<size_t>(s->align_items)];
-        out["align-self"] = s->align_self == web::FlexAlign::Auto ? "auto" : kAlign[static_cast<size_t>(s->align_self)];
+        if (want("justify-content")) out["justify-content"] = kAlign[static_cast<size_t>(s->justify_content)];
+        if (want("align-items")) out["align-items"] = s->align_items == web::FlexAlign::Auto ? "normal" : kAlign[static_cast<size_t>(s->align_items)];
+        if (want("align-self")) out["align-self"] = s->align_self == web::FlexAlign::Auto ? "auto" : kAlign[static_cast<size_t>(s->align_self)];
         const auto num = [](float v) {
             char b[32];
             std::snprintf(b, sizeof b, "%g", v);
             return std::string(b);
         };
-        out["flex-grow"] = num(s->flex_grow);
-        out["flex-shrink"] = num(s->flex_shrink);
-        out["flex-basis"] = len(s->flex_basis);
-        if (const web::ElementBox* b = boxOf(n)) {
+        if (want("flex-grow")) out["flex-grow"] = num(s->flex_grow);
+        if (want("flex-shrink")) out["flex-shrink"] = num(s->flex_shrink);
+        if (want("flex-basis")) out["flex-basis"] = len(s->flex_basis);
+        if (const web::ElementBox* b = want("width") || want("height") ? boxOf(n) : nullptr) {
             // The used size: its content box, unless it sizes its border box.
             float w = b->w, h = b->h;
             if (!s->border_box) {
                 for (int i : {1, 3}) w -= s->border_width[i] + (s->padding[i].hasPercent() ? 0 : s->padding[i].px);
                 for (int i : {0, 2}) h -= s->border_width[i] + (s->padding[i].hasPercent() ? 0 : s->padding[i].px);
             }
-            out["width"] = px(std::max(0.0f, w));
-            out["height"] = px(std::max(0.0f, h));
-        } else {
-            out["width"] = out["height"] = "auto";
+            if (want("width")) out["width"] = px(std::max(0.0f, w));
+            if (want("height")) out["height"] = px(std::max(0.0f, h));
+        } else if (want("width") || want("height")) {
+            if (want("width")) out["width"] = "auto";
+            if (want("height")) out["height"] = "auto";
         }
         return out;
     }
@@ -1202,6 +1231,8 @@ private:
         }
         layout_ = web::layoutPage(*page.doc, styles, measurer_, &images_, width, height, &page_->forms);
         ++layout_gen_;
+        computed_cache_.clear();
+        computed_values_.clear();
         std::vector<std::string> wanted;
         for (const std::string& src : layout_.images_wanted) {
             std::string url = web::resolveUrl(page.base, src);
@@ -1686,6 +1717,9 @@ private:
     // Styles made for a script since that layout (getComputedStyle), and what they found
     // missing; used by the next layout if nothing's changed (change_gen_) since.
     std::unique_ptr<web::StyledDocument> restyled_;
+    std::unordered_map<const web::Node*, std::shared_ptr<const std::unordered_map<std::string, std::string>>> computed_cache_;
+    std::map<std::pair<const web::Node*, std::string>, std::optional<std::string>> computed_values_;
+
     std::vector<std::string> restyled_missing_;
     uint64_t change_gen_ = 0, restyled_gen_ = 0;
     float restyled_w_ = 0, restyled_h_ = 0;
@@ -1788,7 +1822,35 @@ public:
     }
 
     // Once a frame: images arrive in bursts, and laying a page out for each would crawl.
+    // The scripts of a page installed a frame ago.
+    void runPendingScripts() {
+        std::shared_ptr<Page> page = std::move(scripts_pending_);
+        scripts_pending_.reset();
+        if (!page || node_->page() != page.get()) return;   // gone on since
+        startScripts(page);
+        // The stylesheets fetched with the page are here: "load" at their <link>s (a style
+        // preload's onload is how loadCSS makes it a stylesheet).
+        if (page->script) {
+            for (const auto& [url, css] : page->sheets) page->script->sheetLoaded(url, true);
+            // Images that came while the page was shown without its scripts: their load
+            // and error events weren't anyone's to have yet.
+            for (const auto& [url, image] : page->images) page->script->imageLoaded(url, true);
+            for (const std::string& url : page->failed_images) page->script->imageLoaded(url, false);
+            if (page->script->takeDirty()) node_->refresh();
+        }
+        static const bool perf = std::getenv("XWEB_DEBUG_PERF") != nullptr;
+        if (perf) std::fprintf(stderr, "[perf] load scripts run at %.0f ms\n",
+                               std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - load_started_).count());
+        XApplication::post([this] { XApplication::setTitle(node_->title().empty() ? "Web" : node_->title()); });
+    }
+
     void onFrame() {
+        // A page shown last frame: its scripts now. (Something posted, so the loop comes
+        // round again rather than wait for input.)
+        if (scripts_pending_) {
+            if (scripts_wait_frames_-- > 0) XApplication::post([] {});
+            else runPendingScripts();
+        }
         // The page's event loop: timers and animation frames.
         if (Page* page = node_->page(); page && page->script) {
             if (page->script->busy()) page->script->tick();
@@ -1806,6 +1868,10 @@ public:
 
 private:
     enum class Mode { New, Reload, History };
+
+    std::shared_ptr<Page> scripts_pending_;   // installed, its scripts not run yet
+    int scripts_wait_frames_ = 0;
+    std::chrono::steady_clock::time_point load_started_ = std::chrono::steady_clock::now();
 
     struct Entry {
         std::string url;
@@ -1860,6 +1926,7 @@ private:
         showAddress(url);
         XApplication::setTitle("Loading...");
         const uint64_t mine = ++generation_;
+        load_started_ = std::chrono::steady_clock::now();
         const float restore = mode == Mode::History ? history_[index_].scroll : (mode == Mode::Reload ? node_->scrollY() : 0);
         std::thread([this, url, mine, restore, post = std::move(post)] {
             // XWEB_DEBUG_PERF: how long each step of the load took.
@@ -1878,22 +1945,32 @@ private:
             page->doc = web::parseHtml(htmlFor(got, url), web::ParseOptions{.scripting = true});
             page->base = findBase(*page->doc, page->url);
             mark("parsed");
-            // Together: they fill different parts of the page.
-            std::thread sheets([&] {
-                loadSheets(*page, generation_, mine);
-                mark("stylesheets fetched");
+            // Its scripts are fetched while it's shown: it can be looked at once its
+            // stylesheets are here (bbc.com: 0.2 s, its scripts 1 s), and they run when
+            // they've all come. (Only this thread fills page->scripts; nothing else reads
+            // them until they run.)
+            std::thread scripts([&] {
+                loadScripts(*page, generation_, mine);
+                mark("scripts fetched");
             });
-            loadScripts(*page, generation_, mine);
-            mark("scripts fetched");
-            sheets.join();
+            loadSheets(*page, generation_, mine);
+            mark("stylesheets fetched");
+            if (generation_.load() == mine) {
+                std::vector<std::string> images = imageSources(*page);
+                XApplication::post([this, page, mine, restore, images = std::move(images), t0]() mutable {
+                    if (generation_.load() != mine) return;
+                    install(page, restore);
+                    if (perf) std::fprintf(stderr, "[perf] load shown at %.0f ms\n",
+                                           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+                    loadImages(page, std::move(images), mine);
+                });
+            }
+            scripts.join();
             if (generation_.load() != mine) return;
-            std::vector<std::string> images = imageSources(*page);
-            XApplication::post([this, page, mine, restore, images = std::move(images), t0]() mutable {
-                if (generation_.load() != mine) return;
-                install(page, restore);
-                if (perf) std::fprintf(stderr, "[perf] load installed (scripts run) at %.0f ms\n",
-                                       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
-                loadImages(page, std::move(images), mine);
+            XApplication::post([this, page, mine] {
+                if (generation_.load() != mine || node_->page() != page.get()) return;
+                scripts_pending_ = page;
+                scripts_wait_frames_ = 1;   // after it's been painted as it came
             });
         }).detach();
     }
@@ -1916,13 +1993,9 @@ private:
 
     void install(const std::shared_ptr<Page>& page, float scroll) {
         node_->show(page);
-        startScripts(page);
-        // The stylesheets fetched with the page are here: "load" at their <link>s (a style
-        // preload's onload is how loadCSS makes it a stylesheet).
-        if (page->script) {
-            for (const auto& [url, css] : page->sheets) page->script->sheetLoaded(url, true);
-            if (page->script->takeDirty()) node_->refresh();
-        }
+        // Its scripts run once they've all come and it's been painted as it came (see
+        // navigate): there's the page to look at meanwhile, not a blank one.
+        scripts_pending_.reset();
         // Redirected? This is where we are now.
         if (index_ < history_.size()) history_[index_].url = page->url;
         showAddress(page->url);
@@ -1958,14 +2031,23 @@ private:
             return std::nullopt;
         };
         host.computed_style = [this, raw = page.get()](const web::Node* n) {
-            // Laid out again once per change, not per question: a script asking for many
-            // boxes or styles in one turn mustn't redo the whole page each time.
             // Styled again, not laid out: styles are all it asks about.
             if (raw->script && raw->script->takeDirty()) {
                 node_->invalidate();
                 node_->restyleForScript();
             }
-            return node_->computedStyleOf(n);
+            return node_->computedStyleShared(n);
+        };
+        host.computed_value = [this, raw = page.get()](const web::Node* n, const std::string& name) {
+            const bool changed = raw->script && raw->script->takeDirty();
+            if (changed) node_->invalidate();
+            // Its width and height are the used ones: those need a layout, the rest styles.
+            if (name == "width" || name == "height") {
+                if (changed || node_->layoutStale()) node_->refreshForScript();
+            } else if (changed) {
+                node_->restyleForScript();
+            }
+            return node_->computedValue(n, name);
         };
         Page* raw = page.get();
         host.activate = [this](const web::Node* n) { activateNode(n); };

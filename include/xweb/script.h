@@ -54,7 +54,12 @@ public:
             uint32_t width = 0, height = 0;
         };
         std::function<ImageState(const std::string& url)> image_state;
-        std::function<std::unordered_map<std::string, std::string>(const Node*)> computed_style;
+        // Shared: the same element's asked about again and again (a script's
+        // getComputedStyle in a loop), so the host keeps it until styles change.
+        std::function<std::shared_ptr<const std::unordered_map<std::string, std::string>>(const Node*)> computed_style;
+        // One property of it (none: not one the host gives), for a page that reads one
+        // or two: making all of them each time was most of what getComputedStyle cost.
+        std::function<std::optional<std::string>(const Node*, const std::string& name)> computed_value;
         std::function<void(const Node*)> activate;     // a click's default action (a link, a checkbox, a submit button)
         std::function<void(const Node*)> submit;       // form.submit(): no event, straight off
         std::function<void(const Node*)> focus;
