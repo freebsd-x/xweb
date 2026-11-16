@@ -1669,6 +1669,71 @@ private:
         return buf;
     }
 
+    // The group drawn into a canvas, each op through to_canvas after its own transform
+    // (or, `unscaled`, without it).
+    web::Raster renderGroup(size_t begin, size_t end, const web::Matrix& to_canvas, int pw, int ph, Offset at, bool unscaled,
+                                            fbx::xrender::DisplayList& dl) {
+        web::Canvas canvas(pw, ph);
+        group_ = &canvas;
+        eachTransformed(begin, end, [&](const web::PaintOp& op, const web::Matrix& m) {
+            const web::Matrix page_to_canvas = unscaled ? to_canvas : to_canvas.after(m);
+            if (op.kind == web::PaintKind::Rect) {
+                canvas.fill(web::transformed(web::roundedRect(op.x, op.y, op.w, op.h, op.radius, op.radius), page_to_canvas), false, web::Paint{op.color, nullptr, 1});
+                return;
+            }
+            // The helpers place things on screen: back to the page, then through.
+            group_m_ = page_to_canvas.after(web::Matrix::translate(-at.x_, -at.y_));
+            const float x = op.x + at.x_, oy = op.y + at.y_;
+            switch (op.kind) {
+                case web::PaintKind::Image: image(dl, op, x, oy); break;
+                case web::PaintKind::Gradient: gradient(dl, op, x, oy); break;
+                case web::PaintKind::Svg: inlineSvg(dl, op, x, oy); break;
+                case web::PaintKind::Box: boxPaint(dl, op, x, oy); break;
+                default: break;
+            }
+        });
+        group_ = nullptr;
+        return canvas.toRaster();
+    }
+
+    // A group only scaled (no rotation or skew), all of it alike: drawn once as it is
+    // untransformed and stretched to where the scale puts it. A scale that animates
+    // (a banner growing in as the page comes) had the whole group drawn again on the
+    // CPU every frame; now it's the same picture each frame. False if it isn't one.
+    bool drawScaled(fbx::xrender::DisplayList& dl, size_t begin, size_t end, Offset at) {
+        bool first = true, ok = true;
+        web::Matrix m0;
+        float l = INFINITY, t = INFINITY, r = -INFINITY, b = -INFINITY;
+        eachTransformed(begin, end, [&](const web::PaintOp& op, const web::Matrix& m) {
+            if (first) {
+                m0 = m;
+                first = false;
+            } else if (m.a != m0.a || m.b != m0.b || m.c != m0.c || m.d != m0.d || m.e != m0.e || m.f != m0.f) {
+                ok = false;
+            }
+            l = std::min(l, op.x);
+            t = std::min(t, op.y);
+            r = std::max(r, op.x + op.w);
+            b = std::max(b, op.y + op.h);
+        });
+        if (first || !ok || m0.b != 0 || m0.c != 0 || !(m0.a > 0) || !(m0.d > 0)) return false;
+        if (!(r > l && b > t) || !std::isfinite(l) || !std::isfinite(t) || !std::isfinite(r) || !std::isfinite(b)) return true;
+        l = std::floor(l);
+        t = std::floor(t);
+        r = std::ceil(r);
+        b = std::ceil(b);
+        const web::Point p0 = m0.apply({l, t}), p1 = m0.apply({r, b});
+        const float y = p0.y + at.y_;
+        if (y > kMaxWindowHeight + kOffscreenMargin || p1.y + at.y_ < -kOffscreenMargin) return true;
+        const auto [pw, ph] = rasterSize(r - l, b - t);
+        // Its content without the outermost transform: the same whatever the scale.
+        const std::string key = "s:" + groupKey(begin + 1, end) + ":" + keyNum(l) + "," + keyNum(t) + ":" + keyNum(pw) + "x" + keyNum(ph);
+        const web::Matrix to_canvas = web::Matrix::scaling(static_cast<float>(pw) / (r - l), static_cast<float>(ph) / (b - t)).after(web::Matrix::translate(-l, -t));
+        const CachedRaster* drawn = cached(key, [&, pw = pw, ph = ph] { return renderGroup(begin, end, to_canvas, pw, ph, at, true, dl); });
+        if (drawn) drawRaster(dl, *drawn, p0.x + at.x_, y, p1.x - p0.x, p1.y - p0.y);
+        return true;
+    }
+
     // Draws the group from `begin` to `end`; false if it holds text (then it isn't drawn).
     bool drawTransformed(fbx::xrender::DisplayList& dl, size_t begin, size_t end, Offset at) {
         bool text = false;
@@ -1684,6 +1749,7 @@ private:
             }
         });
         if (text) return false;
+        if (drawScaled(dl, begin, end, at)) return true;
         if (!(r > l && b > t) || !std::isfinite(l) || !std::isfinite(t) || !std::isfinite(r) || !std::isfinite(b)) return true;
         l = std::floor(l);
         t = std::floor(t);
@@ -1697,29 +1763,7 @@ private:
         // anew on the CPU for each layout, which was most of what the browser spent.
         const std::string key = "t:" + groupKey(begin, end) + ":" + keyNum(l) + "," + keyNum(t) + ":" + keyNum(pw) + "x" + keyNum(ph);
         const web::Matrix to_canvas = web::Matrix::scaling(static_cast<float>(pw) / (r - l), static_cast<float>(ph) / (b - t)).after(web::Matrix::translate(-l, -t));
-        const CachedRaster* drawn = cached(key, [&, pw = pw, ph = ph] {
-            web::Canvas canvas(pw, ph);
-            group_ = &canvas;
-            eachTransformed(begin, end, [&](const web::PaintOp& op, const web::Matrix& m) {
-                const web::Matrix page_to_canvas = to_canvas.after(m);
-                if (op.kind == web::PaintKind::Rect) {
-                    canvas.fill(web::transformed(web::roundedRect(op.x, op.y, op.w, op.h, op.radius, op.radius), page_to_canvas), false, web::Paint{op.color, nullptr, 1});
-                    return;
-                }
-                // The helpers place things on screen: back to the page, then through.
-                group_m_ = page_to_canvas.after(web::Matrix::translate(-at.x_, -at.y_));
-                const float x = op.x + at.x_, oy = op.y + at.y_;
-                switch (op.kind) {
-                    case web::PaintKind::Image: image(dl, op, x, oy); break;
-                    case web::PaintKind::Gradient: gradient(dl, op, x, oy); break;
-                    case web::PaintKind::Svg: inlineSvg(dl, op, x, oy); break;
-                    case web::PaintKind::Box: boxPaint(dl, op, x, oy); break;
-                    default: break;
-                }
-            });
-            group_ = nullptr;
-            return canvas.toRaster();
-        });
+        const CachedRaster* drawn = cached(key, [&, pw = pw, ph = ph] { return renderGroup(begin, end, to_canvas, pw, ph, at, false, dl); });
         if (drawn) drawRaster(dl, *drawn, l + at.x_, t + at.y_, r - l, b - t);
         return true;
     }
