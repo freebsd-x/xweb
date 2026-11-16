@@ -1451,7 +1451,12 @@ private:
 
     void boxPaint(fbx::xrender::DisplayList& dl, const web::PaintOp& op, float x, float y) {
         if (!op.box || op.w <= 0 || op.h <= 0) return;
-        // On whole pixels, its fraction moved inside it, so nothing is resampled.
+        // On whole pixels, its fraction moved inside it, so nothing is resampled. The
+        // fraction to a quarter pixel: scrolling moves the page by any amount, and each
+        // new fraction was a new picture, drawn again on the CPU (shadows blurred again)
+        // every frame of a scroll.
+        x = std::round(x * 4) / 4;
+        y = std::round(y * 4) / 4;
         const float x0 = std::floor(x), y0 = std::floor(y);
         web::BoxPaint box = *op.box;
         box.ox += x - x0;
