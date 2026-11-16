@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <memory_resource>
 #include <mutex>
 #include <set>
 #include <unordered_map>
@@ -1749,6 +1750,9 @@ struct Scope {
     std::deque<SlottedRule> slotted;
     std::deque<PartRule> parts;             // aimed at shadow trees of this tree's elements
     const Node* host_el = nullptr;          // a shadow scope's host
+    // What it is, the same from one restyle to the next while its host and its sheets are
+    // (its address isn't: shadow scopes are made afresh each time). See elementKey.
+    uint64_t ident = 0;
 };
 
 class StyleResolver {
@@ -1891,6 +1895,7 @@ private:
             if (auto face = webFontFrom(rule, url)) out_.font_faces_.push_back(std::move(*face));
         }
         const css::Stylesheet& kept = sheet;
+        if (target_) target_->ident = (target_->ident ^ reinterpret_cast<uintptr_t>(parsed.get())) * 0x100000001B3ull + 0x9E37;
         sheets_.push_back(std::move(parsed));
         for (const css::Rule& rule : kept.rules) {
             const bool applies = std::all_of(rule.media.begin(), rule.media.end(), [&](const Tokens& q) {
@@ -1999,6 +2004,7 @@ private:
             const Node* n = hosts_[i];
             auto scope = std::make_unique<Scope>();
             scope->host_el = n;
+            scope->ident = reinterpret_cast<uintptr_t>(n) * 0x9E3779B97F4A7C15ull + 1;
             target_ = scope.get();
             collectSheets(n->shadow_root);
             for (const std::string& css : n->shadow_root->adopted_css) addSheet(css, Origin::Author, 0);
@@ -4251,7 +4257,7 @@ private:
         uint64_t h = mix(parent_key, ownPrint(el));
         if (hasAnchor(el)) h = mix(h, subtreePrint(el->parent ? el->parent : el));
         h = mix(h, siblingsPrint(el->parent));
-        h = mix(h, reinterpret_cast<uintptr_t>(scope));
+        h = mix(h, scope->host_el ? scope->ident : reinterpret_cast<uintptr_t>(scope));
         return mix(h, reinterpret_cast<uintptr_t>(slot));
     }
 
@@ -4267,6 +4273,12 @@ private:
                         if (y.kind == SimpleKind::Type) has_anchors_.insert(featureHash('t', y.name));
                         else if (y.kind == SimpleKind::Id) has_anchors_.insert(featureHash('i', y.name));
                         else if (y.kind == SimpleKind::Class) has_anchors_.insert(featureHash('c', y.name));
+                        // An attribute it must have ([data-type=X]:has(...), 11st.co.kr's): with
+                        // nothing to tell its subject by, keeping styles was off for the page,
+                        // and each of its scripts' questions restyled all 8800 elements.
+                        else if (y.kind == SimpleKind::Attribute && y.op == AttrOp::Equals && !y.case_insensitive)
+                            has_anchors_.insert(featureHash('v', lower(y.name) + '=' + y.value));   // that value, only those
+                        else if (y.kind == SimpleKind::Attribute) has_anchors_.insert(featureHash('a', lower(y.name)));
                         else continue;
                         noted = true;
                         break;
@@ -4282,6 +4294,10 @@ private:
         if (!uses_has_) return false;
         if (has_any_anchor_) return true;
         if (has_anchors_.count(featureHash('t', lower(el->name)))) return true;
+        for (const Attribute& a : el->attrs) {
+            const std::string name = lower(a.name);
+            if (has_anchors_.count(featureHash('a', name)) || has_anchors_.count(featureHash('v', name + '=' + a.value))) return true;
+        }
         if (const std::string* id = el->attr("id"); id && has_anchors_.count(featureHash('i', *id))) return true;
         if (const std::string* cls = el->attr("class")) {
             const std::string_view list = *cls;
@@ -4391,9 +4407,12 @@ private:
     bool uses_has_ = false;   // a rule with :has(): what an element matches can depend on its descendants
     bool has_any_anchor_ = false;
     std::unordered_set<uint32_t> has_anchors_;
-    std::unordered_map<const Node*, uint64_t> subtree_prints_;
+    // The per-element maps below, from one pool let go at once: freeing them node by node
+    // was a quarter of a restyle of 11st.co.kr's 8800 elements.
+    std::pmr::monotonic_buffer_resource pool_{size_t{1} << 20};
+    std::pmr::unordered_map<const Node*, uint64_t> subtree_prints_{&pool_};
     const StyledDocument* previous_ = nullptr;
-    std::unordered_map<const Node*, uint64_t> own_prints_, sibling_prints_;
+    std::pmr::unordered_map<const Node*, uint64_t> own_prints_{&pool_}, sibling_prints_{&pool_};
     bool copy_kept_ = false;
     std::vector<const Node*> hosts_;   // elements with a shadow root, as the walk for sheets met them
     std::vector<SheetUse> uses_;
@@ -4410,7 +4429,7 @@ private:
     std::vector<uint32_t> bloom_hashes_;
     const Node* current_element_ = nullptr;
     bool resolving_pseudo_ = false;
-    std::unordered_map<const Node*, SiblingInfo> siblings_;
+    std::pmr::unordered_map<const Node*, SiblingInfo> siblings_{&pool_};
     LengthContext lengths_;
     size_t order_ = 0;
     size_t import_count_ = 0;

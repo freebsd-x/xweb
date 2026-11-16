@@ -655,3 +655,28 @@ TEST(Values, LightDarkAnywhereIsTheLightOne) {
     EXPECT_EQ(s.of("c").background, (Color{1, 2, 3, 255}));
     EXPECT_EQ(s.of("w").width.px, 120);
 }
+
+TEST(Restyle, HasAnchoredByAnAttribute) {
+    auto doc = parseHtml(R"(<!doctype html><style>
+        [data-k="card"]:has(.flag) { color: rgb(4, 5, 6) }
+        [data-k="card"]:has(.flag) p { font-size: 25px }
+      </style>
+      <div id=card data-k=card><section><p id=para>x</p><span id=deep>y</span></section></div>
+      <div id=other data-k=other><span id=o>z</span></div>)");
+    auto styles = std::make_unique<StyledDocument>(*doc, css::MediaContext{800, 600});
+    const auto again = [&](const char* step) {
+        styles = std::make_unique<StyledDocument>(*doc, css::MediaContext{800, 600}, StyledDocument::SheetLoader{},
+                                                  StyledDocument::ChMeasure{}, nullptr, styles.get());
+        expectSameAsFresh(*doc, *styles, step);
+    };
+    again("nothing changed");
+    setAttribute(elementById(*doc, "deep"), "class", "flag");
+    again("a flag deep inside the card");
+    EXPECT_EQ(styles->styleOf(elementById(*doc, "card"))->color, (Color{4, 5, 6, 255}));
+    EXPECT_EQ(styles->styleOf(elementById(*doc, "para"))->font_size, 25);
+    setAttribute(elementById(*doc, "deep"), "class", "");
+    again("and gone again");
+    setAttribute(elementById(*doc, "o"), "class", "flag");
+    again("a flag in another card");
+    EXPECT_NE(styles->styleOf(elementById(*doc, "other"))->color, (Color{4, 5, 6, 255}));
+}
