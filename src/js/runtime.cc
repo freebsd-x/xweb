@@ -2831,8 +2831,8 @@ Value Interpreter::eval(Node* n, Env* env, bool strict) {
     switch (n->kind) {
         case N::Number: return Value::number(n->number);
         case N::String:
-            if (!n->literal) n->literal = std::make_shared<const std::u16string>(n->str);
-            return Value::string(n->literal);
+            if (!n->literal) n->literal = std::make_unique<JSString>(std::make_shared<const std::u16string>(n->str));
+            return Value::string(*n->literal);
         case N::Identifier: return lookup(env, n->str, nameHash(n), &nameKey(n), n);
         default: break;
     }

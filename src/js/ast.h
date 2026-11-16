@@ -63,6 +63,39 @@ enum class Op : uint8_t {
 
 struct FunctionInfo;
 
+// A string most nodes don't have (a template part's raw text, a regex's flags, an
+// import's local name): held out of line, so a node is 16 bytes smaller (a page's
+// scripts are millions of nodes). Reads as a std::u16string, empty when there's none.
+class RareString {
+public:
+    RareString() = default;
+    RareString(const RareString& o) : s_(o.s_ ? std::make_unique<std::u16string>(*o.s_) : nullptr) {}
+    RareString& operator=(const RareString& o) {
+        s_ = o.s_ ? std::make_unique<std::u16string>(*o.s_) : nullptr;
+        return *this;
+    }
+    RareString(RareString&&) noexcept = default;
+    RareString& operator=(RareString&&) noexcept = default;
+    RareString& operator=(std::u16string v) {
+        if (v.empty()) s_.reset();
+        else s_ = std::make_unique<std::u16string>(std::move(v));
+        return *this;
+    }
+    [[nodiscard]] const std::u16string& get() const noexcept {
+        static const std::u16string kEmpty;
+        return s_ ? *s_ : kEmpty;
+    }
+    operator const std::u16string&() const noexcept { return get(); }
+    [[nodiscard]] bool empty() const noexcept { return !s_ || s_->empty(); }
+    friend bool operator==(const RareString& a, const std::u16string& b) { return a.get() == b; }
+    friend bool operator==(const std::u16string& a, const RareString& b) { return a == b.get(); }
+    friend bool operator!=(const RareString& a, const std::u16string& b) { return a.get() != b; }
+    friend bool operator!=(const std::u16string& a, const RareString& b) { return a != b.get(); }
+
+private:
+    std::unique_ptr<std::u16string> s_;
+};
+
 inline constexpr uint32_t kGlobalSlot = 0xFFFFFFFFu;
 
 struct Node {
@@ -73,7 +106,7 @@ struct Node {
     uint32_t offset = 0;          // where in its source it starts (a column, with Program::line_starts)
     double number = 0;
     std::u16string str;           // a name, a string's value
-    std::u16string str2;          // a template's raw text, a regex's flags
+    RareString str2;              // a template's raw text, a regex's flags, an import's local name
     Node* a = nullptr;
     Node* b = nullptr;
     Node* c = nullptr;
@@ -83,7 +116,7 @@ struct Node {
     std::shared_ptr<const std::vector<std::u16string>> lexical;   // a block's let/const/class names
     // A member access's key (a.b's "b"), made once: each access used to copy the name.
     std::unique_ptr<PropertyKey> key;
-    JSString literal;             // a string literal's value, shared by each evaluation
+    std::unique_ptr<JSString> literal;   // a string literal's value, shared by each evaluation
     size_t name_hash = 0;         // an identifier's, for scope lookups: 0 until it's asked
     // Where an identifier was found last: this many scopes out, at this slot there (or
     // kGlobalSlot: in none, so the global object's). -1 not yet, -2 never (a with).
