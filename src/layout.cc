@@ -244,7 +244,10 @@ public:
     PageLayout run(const Document& doc) {
         PageLayout page;
         page.width = vw_;
-        page.ops.reserve(4096);   // a news page has thousands: growing there took a tenth of painting
+        // A news page has thousands, and a page laid out again has about as many as last
+        // time: growing there (moving every op each time) took a tenth of painting.
+        thread_local size_t last_ops = 4096;
+        page.ops.reserve(last_ops + last_ops / 4);
         if (const Node* head = doc.head()) {
             for (const Node* c : head->children) {
                 if (c->isHtml("title")) {
@@ -311,6 +314,7 @@ public:
         flushPositioned();
         placeBelowContent();
         page.height = std::max({vh_, max_bottom_, root_y + root->outerHeight() + root->margin_bottom_outer});
+        last_ops = std::max<size_t>(1024, page.ops.size());
         // The canvas's images, under everything: placed for their element, drawn everywhere.
         if (skip_bg && skip_bg->style->background_layers) {
             std::vector<PaintOp> painted = std::move(page.ops);

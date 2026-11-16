@@ -2498,6 +2498,41 @@ private:
         return true;
     }
 
+    // light-dark(a, b) as `a` (the page is always shown light), wherever it is: in a
+    // colour it's understood already, but namu.wiki's bar is
+    // light-dark(linear-gradient(...), ...), and no background was drawn.
+    static bool hasLightDark(const Tokens& v) {
+        return std::any_of(v.begin(), v.end(), [](const Token& t) { return t.type == TokenType::Function && lower(t.text) == "light-dark"; });
+    }
+    static Tokens lightOf(const Tokens& in) {
+        Tokens out;
+        for (size_t i = 0; i < in.size(); ++i) {
+            if (in[i].type != TokenType::Function || lower(in[i].text) != "light-dark") {
+                out.push_back(in[i]);
+                continue;
+            }
+            // Its first argument: up to the comma straight inside it.
+            size_t j = i + 1;
+            int nesting = 1;
+            Tokens first;
+            bool past_comma = false;
+            for (; j < in.size(); ++j) {
+                const Token& t = in[j];
+                if (t.type == TokenType::Function || t.type == TokenType::LeftParen) ++nesting;
+                else if (t.type == TokenType::RightParen && --nesting == 0) break;
+                if (nesting == 1 && t.type == TokenType::Comma) past_comma = true;
+                else if (!past_comma) first.push_back(t);
+            }
+            while (!first.empty() && first.back().type == TokenType::Whitespace) first.pop_back();
+            size_t k = 0;
+            while (k < first.size() && first[k].type == TokenType::Whitespace) ++k;
+            const Tokens light = lightOf(Tokens(first.begin() + static_cast<std::ptrdiff_t>(k), first.end()));
+            out.insert(out.end(), light.begin(), light.end());
+            i = j;   // its ")"
+        }
+        return out;
+    }
+
     static bool hasVar(const Tokens& v) {
         return std::any_of(v.begin(), v.end(), [](const Token& t) { return t.type == TokenType::Function && t.text == "var"; });
     }
@@ -3233,6 +3268,11 @@ private:
                 return;
             }
             vp = &substituted;
+        }
+        Tokens lightened;
+        if (hasLightDark(*vp)) {
+            lightened = lightOf(*vp);
+            vp = &lightened;
         }
         const Tokens& v = *vp;
         const std::string kw = keyword(v);

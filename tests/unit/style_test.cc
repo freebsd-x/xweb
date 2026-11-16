@@ -643,3 +643,15 @@ TEST(Restyle, KeptStylesMatchStylingAfresh) {
         again("many generations of kept styles");
     }
 }
+
+TEST(Values, LightDarkAnywhereIsTheLightOne) {
+    auto s = style(R"(<style>
+        :root { --bar: light-dark(linear-gradient(90deg, #00a69c, #28b472), #000) }
+        #g { background: var(--bar) }
+        #c { background-color: light-dark(rgb(1, 2, 3), black) }
+        #w { width: light-dark(120px, 10px) }
+      </style><div id=g></div><div id=c></div><div id=w></div>)");
+    EXPECT_TRUE(s.of("g").background_layers != nullptr);
+    EXPECT_EQ(s.of("c").background, (Color{1, 2, 3, 255}));
+    EXPECT_EQ(s.of("w").width.px, 120);
+}
