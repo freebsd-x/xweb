@@ -104,7 +104,6 @@ struct Node {
     uint32_t line = 0;
     uint32_t flags = 0;
     uint32_t offset = 0;          // where in its source it starts (a column, with Program::line_starts)
-    double number = 0;
     std::u16string str;           // a name, a string's value
     RareString str2;              // a template's raw text, a regex's flags, an import's local name
     Node* a = nullptr;
@@ -117,7 +116,12 @@ struct Node {
     // A member access's key (a.b's "b"), made once: each access used to copy the name.
     std::unique_ptr<PropertyKey> key;
     std::unique_ptr<JSString> literal;   // a string literal's value, shared by each evaluation
-    size_t name_hash = 0;         // an identifier's, for scope lookups: 0 until it's asked
+    // A number literal's value, or an identifier's name hash for scope lookups (0 until
+    // it's asked): no node is both, and these are millions of nodes.
+    union {
+        double number = 0;
+        size_t name_hash;
+    };
     // Where an identifier was found last: this many scopes out, at this slot there (or
     // kGlobalSlot: in none, so the global object's). -1 not yet, -2 never (a with).
     int32_t scope_hops = -1;
