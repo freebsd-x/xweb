@@ -244,6 +244,7 @@ public:
     PageLayout run(const Document& doc) {
         PageLayout page;
         page.width = vw_;
+        page.ops.reserve(4096);   // a news page has thousands: growing there took a tenth of painting
         if (const Node* head = doc.head()) {
             for (const Node* c : head->children) {
                 if (c->isHtml("title")) {

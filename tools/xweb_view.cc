@@ -643,7 +643,10 @@ std::optional<LoadedImage> decodeImage(const std::string& url, const std::string
 
 class PageImages : public web::ImageSizes {
 public:
-    void setPage(Page* page) { page_ = page; }
+    void setPage(Page* page) {
+        page_ = page;
+        resolved_.clear();
+    }
 
     std::optional<std::pair<float, float>> imageSize(const std::string& src) override {
         const LoadedImage* image = find(src);
@@ -661,7 +664,7 @@ public:
 
     bool imageLoading(const std::string& src) override {
         if (!page_) return false;
-        const std::string url = web::resolveUrl(page_->base, src);
+        const std::string& url = resolved(src);
         return !page_->images.count(url) && !page_->failed_images.count(url) && page_->requested.size() < kMaxImages;
     }
 
@@ -675,12 +678,29 @@ public:
 
     const LoadedImage* find(const std::string& src) const {
         if (!page_) return nullptr;
-        const auto it = page_->images.find(web::resolveUrl(page_->base, src));
+        const auto it = page_->images.find(resolved(src));
         return it == page_->images.end() ? nullptr : it->second.get();
     }
 
 private:
+    // An image's address against the page's base, made once: layout asks about every
+    // image each time (resolving them again was an eighth of daum.net's layouts).
+    const std::string& resolved(const std::string& src) const {
+        if (page_->base != resolved_base_) {
+            resolved_.clear();
+            resolved_base_ = page_->base;
+        }
+        auto it = resolved_.find(src);
+        if (it == resolved_.end()) {
+            if (resolved_.size() > 4096) resolved_.clear();
+            it = resolved_.emplace(src, web::resolveUrl(page_->base, src)).first;
+        }
+        return it->second;
+    }
+
     Page* page_ = nullptr;
+    mutable std::unordered_map<std::string, std::string> resolved_;
+    mutable std::string resolved_base_;
 };
 
 class RenderWebPage : public RenderNode {

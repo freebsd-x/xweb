@@ -131,23 +131,39 @@ std::u16string indexKey(uint64_t i) {
 Object::~Object() = default;
 
 size_t Object::keyHash(const PropertyKey& k) noexcept {
-    if (k.symbol) return (reinterpret_cast<uintptr_t>(k.symbol) >> 4) * 0x9E3779B97F4A7C15ull;
-    size_t h = 1469598103934665603ull;
-    for (const char16_t c : k.name) h = (h ^ c) * 1099511628211ull;
+    if (k.hash) return k.hash;
+    size_t h;
+    if (k.symbol) {
+        h = (reinterpret_cast<uintptr_t>(k.symbol) >> 4) * 0x9E3779B97F4A7C15ull;
+    } else {
+        h = 1469598103934665603ull;
+        for (const char16_t c : k.name) h = (h ^ c) * 1099511628211ull;
+    }
+    k.hash = h;
     return h;
 }
 
 ptrdiff_t Object::find(const PropertyKey& key, size_t hash, bool hashed) const noexcept {
     if (index_.empty()) {
-        for (size_t i = 0; i < props_.size(); ++i)
-            if (props_[i].second.flags != kTombstone && props_[i].first == key) return static_cast<ptrdiff_t>(i);
+        // By hash first (each key's is kept once worked out): one compare per property,
+        // not a string compare.
+        const size_t h = hashed ? hash : keyHash(key);
+        for (size_t i = 0; i < props_.size(); ++i) {
+            const PropertyKey& k = props_[i].first;
+            if (keyHash(k) != h) continue;
+            if (props_[i].second.flags != kTombstone && k == key) return static_cast<ptrdiff_t>(i);
+        }
         return -1;
     }
     const size_t mask = index_.size() - 1;
-    for (size_t i = (hashed ? hash : keyHash(key)) & mask;; i = (i + 1) & mask) {
+    const size_t h = hashed ? hash : keyHash(key);
+    for (size_t i = h & mask;; i = (i + 1) & mask) {
         const uint32_t at = index_[i];
         if (!at) return -1;
         const auto& [k, p] = props_[at - 1];
+        // The stored keys' hashes were worked out when they were placed: most probes
+        // that aren't it are turned down without comparing the names.
+        if (k.hash && k.hash != h) continue;
         if (p.flags != kTombstone && k == key) return at - 1;
     }
 }
@@ -1098,6 +1114,11 @@ double Runtime::toIntegerOrInfinity(const Value& v) {
 int32_t Runtime::toInt32(const Value& v) { return static_cast<int32_t>(toUint32(v)); }
 
 uint32_t Runtime::toUint32(const Value& v) {
+    // A number that fits a 64-bit integer wraps to 32 bits as the spec's modulo does.
+    if (v.isNumber()) {
+        const double n = v.asNumber();
+        if (n > -9.2e18 && n < 9.2e18) return static_cast<uint32_t>(static_cast<int64_t>(n));
+    }
     const double d = toNumber(v);
     if (std::isnan(d) || std::isinf(d) || d == 0) return 0;
     const double m = std::fmod(std::trunc(d), 4294967296.0);
@@ -3068,7 +3089,18 @@ Value Interpreter::binaryOp(Op op, const Value& l, const Value& r) {
                 case Op::Sub: return Value::number(x - y);
                 case Op::Mul: return Value::number(x * y);
                 case Op::Div: return Value::number(x / y);
-                case Op::Mod: return Value::number(std::fmod(x, y));
+                case Op::Mod: {
+                    // Whole numbers, the usual case, without fmod: the result has the
+                    // dividend's sign, a zero one too (-4 % 2 is -0).
+                    if (x > -9.0e15 && x < 9.0e15 && y > -9.0e15 && y < 9.0e15 && y != 0) {
+                        const auto a = static_cast<int64_t>(x), b = static_cast<int64_t>(y);
+                        if (static_cast<double>(a) == x && static_cast<double>(b) == y) {
+                            const int64_t r = a % b;
+                            return Value::number(r == 0 && std::signbit(x) ? -0.0 : static_cast<double>(r));
+                        }
+                    }
+                    return Value::number(std::fmod(x, y));
+                }
                 case Op::Exp: return Value::number(jsPow(x, y));
                 case Op::Shl: return Value::number(static_cast<int32_t>(static_cast<uint32_t>(rt_.toInt32(a)) << (rt_.toUint32(b) & 31)));
                 case Op::Shr: return Value::number(rt_.toInt32(a) >> (rt_.toUint32(b) & 31));

@@ -4,6 +4,7 @@
 #include FT_FREETYPE_H
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
 #include <map>
@@ -210,10 +211,25 @@ std::string familyForCodePoint(const FontSpec& spec, uint32_t cp) {
 }
 
 FT_Face faceFor(const FontSpec& f) {
+    // The last few asked about: layout asks about the same font for run after run (each
+    // through the family list and the font manager's lock, a tenth of a layout).
+    struct Recent {
+        std::string family;
+        int weight = 0;
+        bool italic = false;
+        uint64_t generation = 0;
+        FT_Face face = nullptr;
+    };
+    thread_local std::array<Recent, 8> recent;
+    thread_local size_t next = 0;
+    for (const Recent& r : recent)
+        if (r.generation == g_fonts_generation && r.weight == f.weight && r.italic == f.italic && r.family == f.family) return r.face;
     // A line's metrics come from the first font available, as judged by a space.
     const std::string family = g_faces.empty() ? fontFamilyFor(f.family) : familyForCodePoint(f, ' ');
     auto* face = FontManager::getFace(family, weightOf(f.weight), styleOf(f.italic));
-    return face ? face->ft_face_ : nullptr;
+    Recent& slot = recent[next++ % recent.size()];
+    slot = {f.family, f.weight, f.italic, g_fonts_generation, face ? face->ft_face_ : nullptr};
+    return slot.face;
 }
 
 float scaled(FT_Short units, const FT_Face face, float size) {

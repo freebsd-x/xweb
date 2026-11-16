@@ -81,11 +81,14 @@ private:
 struct PropertyKey {
     std::u16string name;
     Symbol* symbol = nullptr;
+    // Object::keyHash's answer, worked out the first time it's asked (0: not yet). A key
+    // looked up again and again (a member access's, kept on its node) isn't hashed again.
+    mutable size_t hash = 0;
     PropertyKey() = default;
     PropertyKey(std::u16string n) : name(std::move(n)) {}
     PropertyKey(const char16_t* n) : name(n) {}
     explicit PropertyKey(Symbol* s) : symbol(s) {}
-    bool operator==(const PropertyKey&) const = default;
+    bool operator==(const PropertyKey& o) const { return symbol == o.symbol && name == o.name; }
     [[nodiscard]] bool isSymbol() const noexcept { return symbol != nullptr; }
 };
 
