@@ -7,6 +7,7 @@
 #include <cstring>
 #include <limits>
 #include <new>
+#include <optional>
 #include <unordered_set>
 
 #include "ast.h"
@@ -136,14 +137,14 @@ size_t Object::keyHash(const PropertyKey& k) noexcept {
     return h;
 }
 
-ptrdiff_t Object::find(const PropertyKey& key) const noexcept {
+ptrdiff_t Object::find(const PropertyKey& key, size_t hash, bool hashed) const noexcept {
     if (index_.empty()) {
         for (size_t i = 0; i < props_.size(); ++i)
             if (props_[i].second.flags != kTombstone && props_[i].first == key) return static_cast<ptrdiff_t>(i);
         return -1;
     }
     const size_t mask = index_.size() - 1;
-    for (size_t i = keyHash(key) & mask;; i = (i + 1) & mask) {
+    for (size_t i = (hashed ? hash : keyHash(key)) & mask;; i = (i + 1) & mask) {
         const uint32_t at = index_[i];
         if (!at) return -1;
         const auto& [k, p] = props_[at - 1];
@@ -174,6 +175,11 @@ void Object::reindex() {
 
 Property* Object::own(const PropertyKey& key) {
     const ptrdiff_t at = find(key);
+    return at < 0 ? nullptr : &props_[static_cast<size_t>(at)].second;
+}
+
+const Property* Object::ownHashed(const PropertyKey& key, size_t hash) const {
+    const ptrdiff_t at = find(key, hash, true);
     return at < 0 ? nullptr : &props_[static_cast<size_t>(at)].second;
 }
 
@@ -379,10 +385,32 @@ private:
     // binding (`imported` says it was one: those can't be assigned).
     // `with_hit`: where a with statement's object has the name first (the binding is
     // then its property, and nothing is returned). Without it, with scopes are passed by.
-    Binding* findBinding(Env* env, const std::u16string& name, Env** where, bool* imported = nullptr, Object** with_hit = nullptr) {
-        const size_t h = VarMap::hashOf(name);
-        for (Env* e = env; e; e = e->outer) {
+    Binding* findBinding(Env* env, const std::u16string& name, Env** where, bool* imported = nullptr, Object** with_hit = nullptr,
+                         size_t hash = 0, Node* site = nullptr) {
+        const size_t h = hash ? hash : VarMap::hashOf(name);
+        // Where this identifier was found last time. A scope's names are all made when
+        // it is (only a direct eval adds any later), so the same code finds a name in
+        // the same scope at the same place: checked, not searched.
+        const bool cacheable = site && !rt_.direct_eval_seen && site->scope_hops != -2;
+        if (cacheable && site->scope_hops >= 0) {
+            Env* e = env;
+            for (int32_t k = site->scope_hops; k > 0 && e; --k) e = e->outer;
+            if (e && !e->with_object) {
+                if (site->scope_slot != kGlobalSlot) {
+                    if (VarMap::Entry* it = e->vars.at(site->scope_slot, h, name); it && !it->second.import_env) {
+                        if (where) *where = e;
+                        if (imported) *imported = false;
+                        return &it->second;
+                    }
+                } else if (!e->outer && !e->vars.find(name, h)) {
+                    return nullptr;   // the global object's, as last time
+                }
+            }
+        }
+        int32_t hops = 0;
+        for (Env* e = env; e; e = e->outer, ++hops) {
             if (e->with_object) {
+                if (site) site->scope_hops = -2;
                 if (with_hit && withHas(e->with_object, name)) {
                     *with_hit = e->with_object;
                     return nullptr;
@@ -392,6 +420,10 @@ private:
             if (VarMap::Entry* it = e->vars.find(name, h)) {
                 if (where) *where = e;
                 Binding* b = &it->second;
+                if (cacheable && !b->import_env && site->scope_hops != -2) {
+                    site->scope_hops = hops;
+                    site->scope_slot = VarMap::posOf(it);
+                }
                 if (imported) *imported = b->import_env != nullptr;
                 for (int hops = 0; b->import_env; ++hops) {
                     VarMap::Entry* jt = b->import_env->vars.find(b->import_name);
@@ -400,6 +432,10 @@ private:
                 }
                 return b;
             }
+        }
+        if (cacheable && site->scope_hops != -2 && hops > 0) {
+            site->scope_hops = hops - 1;   // the outermost scope, then the global object
+            site->scope_slot = kGlobalSlot;
         }
         return nullptr;
     }
@@ -419,28 +455,41 @@ private:
         return rt_.global();
     }
 
-    Value lookup(Env* env, const std::u16string& name) {
+    // An identifier's name hash, worked out once.
+    static size_t nameHash(Node* n) {
+        if (!n->name_hash) n->name_hash = VarMap::hashOf(n->str);
+        return n->name_hash;
+    }
+
+    // An identifier's name as a property key, made once (globals are looked up by it).
+    static const PropertyKey& nameKey(Node* n) {
+        if (!n->key) n->key = std::make_unique<PropertyKey>(n->str);
+        return *n->key;
+    }
+
+    Value lookup(Env* env, const std::u16string& name, size_t hash = 0, const PropertyKey* name_key = nullptr, Node* site = nullptr) {
         Object* with = nullptr;
-        if (Binding* b = findBinding(env, name, nullptr, nullptr, &with)) {
+        if (Binding* b = findBinding(env, name, nullptr, nullptr, &with, hash, site)) {
             if (!b->initialized) rt_.throwError("ReferenceError", "can't use '" + utf8(name) + "' before it's declared");
             return b->value;
         }
         if (with) return rt_.get(Value::object(with), PropertyKey(name));
         Object* g = globalObject(env);
         if (name == u"undefined") return Value::undefined();
-        const PropertyKey key(name);
+        std::optional<PropertyKey> made;
+        const PropertyKey& key = name_key ? *name_key : made.emplace(name);
         // The usual case, in one lookup: an ordinary global's own data property is
-        // what has() then get() would find first.
+        // what has() then get() would find first. (A name's hash is its key's.)
         if (g->cls != ObjectClass::Proxy && g->cls != ObjectClass::TypedArray && g->cls != ObjectClass::String && g->elements.empty())
-            if (const Property* p = g->own(key); p && !(p->flags & kAccessor)) return p->value;
+            if (const Property* p = hash ? g->ownHashed(key, hash) : g->own(key); p && !(p->flags & kAccessor)) return p->value;
         if (rt_.has(g, key)) return rt_.get(g, key, Value::object(g));
         rt_.throwError("ReferenceError", utf8(name) + " is not defined");
     }
 
-    void assignName(Env* env, const std::u16string& name, const Value& v, bool strict) {
+    void assignName(Env* env, const std::u16string& name, const Value& v, bool strict, Node* site = nullptr) {
         bool imported = false;
         Object* with = nullptr;
-        Binding* b = findBinding(env, name, nullptr, &imported, &with);
+        Binding* b = site ? findBinding(env, name, nullptr, &imported, &with, nameHash(site), site) : findBinding(env, name, nullptr, &imported, &with);
         if (with) {
             rt_.set(with, PropertyKey(name), v, Value::object(with));
             return;
@@ -1908,7 +1957,7 @@ void Interpreter::bindPattern(Node* p, const Value& value, Env* env, bool strict
 
 void Interpreter::assignPattern(Node* p, const Value& value, Env* env, bool strict) {
     switch (p->kind) {
-        case N::Identifier: assignName(env, p->str, value, strict); return;
+        case N::Identifier: assignName(env, p->str, value, strict, p); return;
         case N::Member: {
             const Value base = p->a->kind == N::Super ? thisValue(env) : eval(p->a, env, strict);
             const PropertyKey key = memberKey(p, env, strict);
@@ -2439,7 +2488,26 @@ Completion Interpreter::execLoopBody(Node* body, Env* env, bool strict, const st
 
 Completion Interpreter::forStatement(Node* n, Env* env, bool strict, const std::u16string* label) {
     Env* loop = env;
-    const bool per_iteration = n->a && n->a->kind == N::VarDecl && (n->a->flags & (kLet | kConst));
+    // Only something that keeps a scope (a function made in the loop, or a direct eval)
+    // can tell each iteration's copy from one shared binding: without one, no copies.
+    if (!(n->flags & kCaptureKnown)) {
+        bool captures = false;
+        std::vector<Node*> todo{n->a, n->b, n->c, n->d};
+        while (!todo.empty() && !captures) {
+            Node* k = todo.back();
+            todo.pop_back();
+            if (!k) continue;
+            if (k->fn || k->kind == N::FunctionExpr || k->kind == N::Arrow || k->kind == N::FunctionDecl || k->kind == N::ClassExpr ||
+                k->kind == N::ClassDecl || k->kind == N::Method || (k->kind == N::Identifier && k->str == u"eval")) {
+                captures = true;
+                break;
+            }
+            todo.insert(todo.end(), {k->a, k->b, k->c, k->d});
+            todo.insert(todo.end(), k->kids.begin(), k->kids.end());
+        }
+        n->flags |= kCaptureKnown | (captures ? kCaptures : 0u);
+    }
+    const bool per_iteration = n->a && n->a->kind == N::VarDecl && (n->a->flags & (kLet | kConst)) && (n->flags & kCaptures);
     if (n->lexical) {
         loop = newEnv(env);
         declareLexical(loop, n->lexical.get());
@@ -2721,6 +2789,15 @@ std::vector<Value> Interpreter::evalArgs(const std::vector<Node*>& args, Env* en
 }
 
 Value Interpreter::eval(Node* n, Env* env, bool strict) {
+    // Leaves first: nothing in them recurses but through a call, which checks its own depth.
+    switch (n->kind) {
+        case N::Number: return Value::number(n->number);
+        case N::String:
+            if (!n->literal) n->literal = std::make_shared<const std::u16string>(n->str);
+            return Value::string(n->literal);
+        case N::Identifier: return lookup(env, n->str, nameHash(n), &nameKey(n), n);
+        default: break;
+    }
     EvalDepth depth(rt_);
     switch (n->kind) {
         case N::Number: return Value::number(n->number);
@@ -2732,7 +2809,7 @@ Value Interpreter::eval(Node* n, Env* env, bool strict) {
         case N::String: return Value::string(n->str);
         case N::Boolean: return Value::boolean((n->flags & 1) != 0);   // other bits: parenthesized
         case N::Null: return Value::null();
-        case N::Identifier: return lookup(env, n->str);
+        case N::Identifier: return lookup(env, n->str, nameHash(n), &nameKey(n));
         case N::This: return thisValue(env);
         case N::Template: return evalTemplate(n, env, strict);
         case N::TaggedTemplate: return evalTagged(n, env, strict);
@@ -2944,6 +3021,19 @@ double jsPow(double x, double y) {
 }  // namespace
 
 Value Interpreter::binaryOp(Op op, const Value& l, const Value& r) {
+    // Two numbers compared: the loop condition, each time round.
+    if (l.isNumber() && r.isNumber()) {
+        const double x = l.asNumber(), y = r.asNumber();
+        switch (op) {
+            case Op::Lt: return Value::boolean(x < y);
+            case Op::Gt: return Value::boolean(x > y);
+            case Op::Le: return Value::boolean(x <= y);
+            case Op::Ge: return Value::boolean(x >= y);
+            case Op::Eq: case Op::StrictEq: return Value::boolean(x == y);
+            case Op::Ne: case Op::StrictNe: return Value::boolean(x != y);
+            default: break;
+        }
+    }
     switch (op) {
         case Op::Add: {
             if (l.isNumber() && r.isNumber()) return Value::number(l.asNumber() + r.asNumber());
@@ -3200,6 +3290,7 @@ Value Interpreter::evalCall(Node* n, Env* env, bool strict) {
     // eval(...) by that name, meaning the real eval: code in this very scope.
     if (callee->kind == N::Identifier && callee->str == u"eval" && fn.isObject() && fn.asObject() == rt_.eval_function) {
         if (args.empty() || !args[0].isString()) return args.empty() ? Value::undefined() : args[0];
+        rt_.direct_eval_seen = true;
         return evalCode(rt_, args[0].asString(), env, strict, true);
     }
     if (!rt_.isCallable(fn)) {
@@ -3295,8 +3386,8 @@ Value Interpreter::evalUpdate(Node* n, Env* env, bool strict) {
     };
     Value old;
     if (t->kind == N::Identifier) {
-        const Value now = step(lookup(env, t->str), old);
-        assignName(env, t->str, now, strict);
+        const Value now = step(lookup(env, t->str, nameHash(t), &nameKey(t), t), old);
+        assignName(env, t->str, now, strict, t);
         return (n->flags & kPrefix) ? now : old;
     }
     const Value base = t->a->kind == N::Super ? thisValue(env) : eval(t->a, env, strict);
@@ -3312,7 +3403,7 @@ Value Interpreter::evalAssign(Node* n, Env* env, bool strict) {
         if (t->kind == N::Identifier) {
             // Resolve the name first: a TDZ name errs before the value is computed.
             const Value v = eval(n->b, env, strict);
-            assignName(env, t->str, v, strict);
+            assignName(env, t->str, v, strict, t);
             return v;
         }
         if (t->kind == N::Member) {
@@ -3354,7 +3445,7 @@ Value Interpreter::evalAssign(Node* n, Env* env, bool strict) {
                 old = b->value;
             }
             const Value v = binaryOp(Op::Add, old, r);
-            assignName(env, t->str, v, strict);
+            assignName(env, t->str, v, strict, t);
             return v;
         }
     }
@@ -3363,14 +3454,14 @@ Value Interpreter::evalAssign(Node* n, Env* env, bool strict) {
     PropertyKey key;
     Value old;
     if (t->kind == N::Identifier) {
-        old = lookup(env, t->str);
+        old = lookup(env, t->str, nameHash(t), &nameKey(t), t);
     } else {
         base = eval(t->a, env, strict);
         key = memberKey(t, env, strict);
         old = rt_.get(base, key);
     }
     const auto write = [&](const Value& v) {
-        if (t->kind == N::Identifier) assignName(env, t->str, v, strict);
+        if (t->kind == N::Identifier) assignName(env, t->str, v, strict, t);
         else rt_.set(base, key, v, strict);
         return v;
     };

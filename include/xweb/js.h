@@ -160,6 +160,8 @@ public:
     // Own properties, in the order they were made.
     [[nodiscard]] Property* own(const PropertyKey& key);
     [[nodiscard]] const Property* own(const PropertyKey& key) const;
+    // With the key's hash (keyHash) already worked out: a name looked up over and over.
+    [[nodiscard]] const Property* ownHashed(const PropertyKey& key, size_t hash) const;
     Property& define(const PropertyKey& key, Property p);
     bool remove(const PropertyKey& key);
     [[nodiscard]] std::vector<PropertyKey> ownKeys() const;   // indexes, strings, then symbols, as the spec orders them
@@ -223,7 +225,8 @@ private:
     static constexpr uint8_t kTombstone = 0xFF;
     static constexpr size_t kScanMax = 8;
     [[nodiscard]] static size_t keyHash(const PropertyKey& k) noexcept;
-    [[nodiscard]] ptrdiff_t find(const PropertyKey& key) const noexcept;
+    [[nodiscard]] ptrdiff_t find(const PropertyKey& key) const noexcept { return find(key, 0, false); }
+    [[nodiscard]] ptrdiff_t find(const PropertyKey& key, size_t hash, bool hashed) const noexcept;
     void place(uint32_t pos) noexcept;
     void reindex();
 };
@@ -452,6 +455,9 @@ public:
     Object* typed_array_constructors[11] = {};   // Int8Array … Float64Array, BigInt64Array, BigUint64Array
     Object* data_view_prototype = nullptr;
     Object* eval_function = nullptr;   // the global eval, which a direct call recognizes
+    // A direct eval has run: it can declare names in a scope a lookup was cached past,
+    // so no cached lookup is trusted from then on.
+    bool direct_eval_seen = false;
     std::unordered_map<std::string, Object*> error_prototypes;
     Symbol* sym_iterator = nullptr;
     Symbol* sym_to_primitive = nullptr;

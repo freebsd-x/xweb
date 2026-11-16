@@ -700,8 +700,13 @@ public:
         rasters_.clear();
         canvas_images_.clear();   // another page's nodes
         dirty_ = true;
+        ++change_gen_;
+        restyled_.reset();
     }
-    void invalidate() { dirty_ = true; }
+    void invalidate() {
+        dirty_ = true;
+        ++change_gen_;
+    }
     [[nodiscard]] Page* page() const { return page_.get(); }
 
     [[nodiscard]] Size performLayout(const Constraints& c) noexcept override {
@@ -712,6 +717,8 @@ public:
         // The scroll view shows the window's worth, not the page's height: it would be
         // nothing to scroll otherwise. Windows don't resize, so this stays true.
         if (RenderNode* scroll = parentNode()) scroll->setFixedSize(0, height);
+        // Laid out for a script's question since the last change: that layout stands.
+        if (dirty_ && fresh_gen_ == change_gen_ && width == laid_out_width_ && height == laid_out_height_) dirty_ = false;
         if (dirty_ || width != laid_out_width_ || height != laid_out_height_) {
             dirty_ = false;
             laid_out_width_ = width;
@@ -860,9 +867,33 @@ public:
         if (laid_out_width_ > 0) relayout(laid_out_width_, laid_out_height_);
     }
 
+    // For a script's question about where something is, after it changed the page: laid
+    // out now, and painted at the next frame without being laid out again for it.
+    void refreshForScript() {
+        if (laid_out_width_ <= 0) return;
+        relayout(laid_out_width_, laid_out_height_);
+        dirty_ = true;
+        fresh_gen_ = change_gen_;
+    }
+    // For a script's question about styles: styled now, laid out at the next frame (or
+    // question about a box), with these styles if nothing's changed by then.
+    void restyleForScript() {
+        if (laid_out_width_ <= 0 || !page_ || !page_->doc) return;
+        std::vector<std::string> missing;
+        restyled_ = makeStyles(laid_out_width_, laid_out_height_, missing);
+        restyled_gen_ = change_gen_;
+        restyled_w_ = laid_out_width_;
+        restyled_h_ = laid_out_height_;
+        restyled_missing_ = std::move(missing);
+        dirty_ = true;
+    }
+    // Styled since the last layout: a box asked about now needs a layout.
+    [[nodiscard]] bool layoutStale() const { return restyled_ != nullptr; }
+
     [[nodiscard]] std::unordered_map<std::string, std::string> computedStyleOf(const web::Node* n) const {
         std::unordered_map<std::string, std::string> out;
-        const web::ComputedStyle* s = styles_ ? styles_->styleOf(n) : nullptr;
+        const web::StyledDocument* current = restyled_ ? restyled_.get() : styles_.get();
+        const web::ComputedStyle* s = current ? current->styleOf(n) : nullptr;
         // Not rendered (display: none, or inside one): every property still has a value.
         static const web::ComputedStyle kUnrendered = [] {
             web::ComputedStyle u;
@@ -1112,6 +1143,25 @@ private:
 
     RenderNode* parentNode() const { return parent_.lock().get(); }
 
+    // The page styled for a viewport this size. A stylesheet linked since the page came
+    // (a script's, or a preload turned into one) is put in `missing`, to be fetched and
+    // the page styled again when it's here.
+    std::unique_ptr<web::StyledDocument> makeStyles(float width, float height, std::vector<std::string>& missing) {
+        const Page& page = *page_;
+        return std::make_unique<web::StyledDocument>(
+            *page.doc, web::css::MediaContext{width, height},
+            [&page, &missing](const std::string& href) {
+                std::string url = web::resolveUrl(page.base, href);
+                const auto it = page.sheets.find(url);
+                if (it == page.sheets.end()) {
+                    if (!page.sheets_requested.count(url)) missing.push_back(std::move(url));
+                    return std::string{};
+                }
+                return it->second;
+            },
+            [this](const web::ComputedStyle& s) { return web::chWidth(measurer_, s); }, &page_->forms);
+    }
+
     void relayout(float width, float height) {
         ++perf_.layouts;
         Timed timed{perf_.on, perf_.layout_ms};
@@ -1121,21 +1171,16 @@ private:
             return;
         }
         const Page& page = *page_;
-        // A stylesheet linked since the page came (a script's, or a preload turned into one)
-        // is fetched now and the page styled again when it's here.
         std::vector<std::string> missing_sheets;
-        styles_ = std::make_unique<web::StyledDocument>(
-            *page.doc, web::css::MediaContext{width, height},
-            [&page, &missing_sheets](const std::string& href) {
-                std::string url = web::resolveUrl(page.base, href);
-                const auto it = page.sheets.find(url);
-                if (it == page.sheets.end()) {
-                    if (!page.sheets_requested.count(url)) missing_sheets.push_back(std::move(url));
-                    return std::string{};
-                }
-                return it->second;
-            },
-            [this](const web::ComputedStyle& s) { return web::chWidth(measurer_, s); }, &page_->forms);
+        // Styled already for a script's getComputedStyle, and nothing's changed since.
+        if (restyled_ && restyled_gen_ == change_gen_ && width == restyled_w_ && height == restyled_h_) {
+            styles_ = std::move(restyled_);
+            missing_sheets = std::move(restyled_missing_);
+        } else {
+            styles_ = makeStyles(width, height, missing_sheets);
+        }
+        restyled_.reset();
+        restyled_missing_.clear();
         const web::StyledDocument& styles = *styles_;
         if (!page.fonts_known) {
             page_->fonts_known = true;
@@ -1629,6 +1674,13 @@ private:
     std::function<void(const std::shared_ptr<Page>&, std::vector<std::string>)> on_images_;
     std::function<void(const std::shared_ptr<Page>&, std::vector<std::string>)> on_sheets_;
     std::unique_ptr<web::StyledDocument> styles_;   // the last layout's, which inline SVG is drawn with
+    // Styles made for a script since that layout (getComputedStyle), and what they found
+    // missing; used by the next layout if nothing's changed (change_gen_) since.
+    std::unique_ptr<web::StyledDocument> restyled_;
+    std::vector<std::string> restyled_missing_;
+    uint64_t change_gen_ = 0, restyled_gen_ = 0;
+    float restyled_w_ = 0, restyled_h_ = 0;
+    uint64_t fresh_gen_ = UINT64_MAX;   // the change a script's forced layout was made after
     std::map<std::string, CachedRaster> rasters_;
     const web::Node* popup_ = nullptr;   // a <select> whose list is open
     int popup_highlight_ = -1, popup_first_ = 0;
@@ -1889,19 +1941,19 @@ private:
         host.rect = [this, raw = page.get()](const web::Node* n) -> std::optional<web::ElementRect> {
             // Laid out again once per change, not per question: a script asking for many
             // boxes or styles in one turn mustn't redo the whole page each time.
-            if (raw->script && raw->script->takeDirty()) {
-                node_->refresh();
-                node_->invalidate();
-            }
+            const bool changed = raw->script && raw->script->takeDirty();
+            if (changed) node_->invalidate();
+            if (changed || node_->layoutStale()) node_->refreshForScript();
             if (const web::ElementBox* b = node_->boxOf(n)) return web::ElementRect{b->x, b->y, b->w, b->h};
             return std::nullopt;
         };
         host.computed_style = [this, raw = page.get()](const web::Node* n) {
             // Laid out again once per change, not per question: a script asking for many
             // boxes or styles in one turn mustn't redo the whole page each time.
+            // Styled again, not laid out: styles are all it asks about.
             if (raw->script && raw->script->takeDirty()) {
-                node_->refresh();
                 node_->invalidate();
+                node_->restyleForScript();
             }
             return node_->computedStyleOf(n);
         };

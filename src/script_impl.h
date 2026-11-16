@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <map>
 #include <unordered_map>
@@ -736,6 +738,20 @@ struct PageScript::Impl {
     int pending_script_fetches = 0;
 
     void runScriptCode(Node* s, std::string code, const std::string& name) {
+        // XWEB_DEBUG_PERF: each script that took a while, for finding a slow page's.
+        static const bool perf = std::getenv("XWEB_DEBUG_PERF") != nullptr;
+        const auto started = std::chrono::steady_clock::now();
+        struct Report {
+            bool on;
+            std::chrono::steady_clock::time_point at;
+            const std::string& name;
+            size_t bytes;
+            ~Report() {
+                if (!on) return;
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - at).count();
+                if (ms >= 20) std::fprintf(stderr, "[perf] script %.0f ms (%zu bytes) %s\n", ms, bytes, name.substr(0, 160).c_str());
+            }
+        } report_time{perf, started, name, code.size()};
         Node* saved = current_script;
         rt.setStepBudget(kTaskBudget);
         if (isModule(s)) {

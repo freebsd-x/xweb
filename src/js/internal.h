@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstddef>
+
 // What the interpreter and the built-ins share. Internal to the engine.
 
 #include <memory>
@@ -36,6 +38,7 @@ public:
     struct Slot {
         Entry e;
         size_t h = 0;
+        uint32_t pos = 0;   // its place in the order names were made
     };
 
     [[nodiscard]] static size_t hashOf(std::u16string_view s) noexcept {
@@ -48,27 +51,44 @@ public:
     VarMap(const VarMap& o) { *this = o; }
     VarMap& operator=(const VarMap& o) {
         if (this == &o) return *this;
-        slots_.clear();
+        chunk_.reset();
+        chunk_cap_ = chunk_used_ = 0;
+        extra_.clear();
         index_.clear();
-        slots_.reserve(o.slots_.size());
-        for (const auto& s : o.slots_) add(s->e.first, s->h).second = s->e.second;
+        reserve(o.size());
+        for (size_t i = 0; i < o.size(); ++i) {
+            const Slot* t = o.slot(i);
+            add(t->e.first, t->h).second = t->e.second;
+        }
         return *this;
     }
 
     [[nodiscard]] Entry* find(const std::u16string& name, size_t h) noexcept {
         if (index_.empty()) {
-            for (const auto& s : slots_)
-                if (s->h == h && s->e.first == name) return &s->e;
+            for (uint32_t i = 0; i < chunk_used_; ++i)
+                if (chunk_[i].h == h && chunk_[i].e.first == name) return &chunk_[i].e;
+            for (const auto& t : extra_)
+                if (t->h == h && t->e.first == name) return &t->e;
             return nullptr;
         }
         const size_t mask = index_.size() - 1;
         for (size_t i = h & mask;; i = (i + 1) & mask) {
-            Slot* s = index_[i];
-            if (!s) return nullptr;
-            if (s->h == h && s->e.first == name) return &s->e;
+            Slot* t = index_[i];
+            if (!t) return nullptr;
+            if (t->h == h && t->e.first == name) return &t->e;
         }
     }
     [[nodiscard]] Entry* find(const std::u16string& name) noexcept { return find(name, hashOf(name)); }
+    // The name made pos-th, if that's this one (a cached lookup's check).
+    [[nodiscard]] Entry* at(uint32_t pos, size_t h, const std::u16string& name) noexcept {
+        if (pos >= size()) return nullptr;
+        Slot* t = slot(pos);
+        return t->h == h && t->e.first == name ? &t->e : nullptr;
+    }
+    // Where an entry find gave is in that order.
+    [[nodiscard]] static uint32_t posOf(const Entry* e) noexcept {
+        return reinterpret_cast<const Slot*>(reinterpret_cast<const char*>(e) - offsetof(Slot, e))->pos;
+    }
     [[nodiscard]] size_t count(const std::u16string& name) noexcept { return find(name) ? 1 : 0; }
 
     Binding& operator[](const std::u16string& name) {
@@ -77,50 +97,70 @@ public:
         return add(name, h).second;
     }
 
-    [[nodiscard]] size_t size() const noexcept { return slots_.size(); }
-    void reserve(size_t n) { slots_.reserve(n); }
+    [[nodiscard]] size_t size() const noexcept { return chunk_used_ + extra_.size(); }
+    // Room for n names in one block, made before the first: a call's scope is one
+    // allocation, not one per name.
+    void reserve(size_t n) {
+        if (size() == 0 && n > chunk_cap_) {
+            chunk_ = std::make_unique<Slot[]>(n);
+            chunk_cap_ = static_cast<uint32_t>(n);
+        }
+    }
 
     class iterator {
     public:
-        explicit iterator(const std::unique_ptr<Slot>* p) : p_(p) {}
-        Entry& operator*() const { return (*p_)->e; }
-        iterator& operator++() { ++p_; return *this; }
-        bool operator!=(const iterator& o) const { return p_ != o.p_; }
+        iterator(VarMap* m, size_t i) : m_(m), i_(i) {}
+        Entry& operator*() const { return m_->slot(i_)->e; }
+        iterator& operator++() { ++i_; return *this; }
+        bool operator!=(const iterator& o) const { return i_ != o.i_; }
     private:
-        const std::unique_ptr<Slot>* p_;
+        VarMap* m_;
+        size_t i_;
     };
-    iterator begin() { return iterator(slots_.data()); }
-    iterator end() { return iterator(slots_.data() + slots_.size()); }
+    iterator begin() { return iterator(this, 0); }
+    iterator end() { return iterator(this, size()); }
 
 private:
     static constexpr size_t kScanMax = 8;   // beyond this, keep an index
 
-    Entry& add(const std::u16string& name, size_t h) {
-        slots_.push_back(std::make_unique<Slot>());
-        Slot* s = slots_.back().get();
-        s->e.first = name;
-        s->h = h;
-        if (slots_.size() > kScanMax) {
-            if (index_.size() < slots_.size() * 2) {
-                size_t cap = 32;
-                while (cap < slots_.size() * 4) cap *= 2;
-                index_.assign(cap, nullptr);
-                for (const auto& t : slots_) place(t.get());
-            } else {
-                place(s);
-            }
-        }
-        return s->e;
-    }
-    void place(Slot* s) noexcept {
-        const size_t mask = index_.size() - 1;
-        size_t i = s->h & mask;
-        while (index_[i]) i = (i + 1) & mask;
-        index_[i] = s;
+    [[nodiscard]] Slot* slot(size_t i) const noexcept {
+        return i < chunk_used_ ? &chunk_[i] : extra_[i - chunk_used_].get();
     }
 
-    // Each name its own node, so an Entry never moves.
-    std::vector<std::unique_ptr<Slot>> slots_;
+    Entry& add(const std::u16string& name, size_t h) {
+        Slot* t;
+        if (chunk_used_ < chunk_cap_ && extra_.empty()) {
+            t = &chunk_[chunk_used_++];
+        } else {
+            extra_.push_back(std::make_unique<Slot>());
+            t = extra_.back().get();
+        }
+        t->e.first = name;
+        t->h = h;
+        t->pos = static_cast<uint32_t>(size() - 1);
+        if (size() > kScanMax) {
+            if (index_.size() < size() * 2) {
+                size_t cap = 32;
+                while (cap < size() * 4) cap *= 2;
+                index_.assign(cap, nullptr);
+                for (size_t i = 0; i < size(); ++i) place(slot(i));
+            } else {
+                place(t);
+            }
+        }
+        return t->e;
+    }
+    void place(Slot* t) noexcept {
+        const size_t mask = index_.size() - 1;
+        size_t i = t->h & mask;
+        while (index_[i]) i = (i + 1) & mask;
+        index_[i] = t;
+    }
+
+    // Entries never move: the reserved block's, and each one past it in its own node.
+    std::unique_ptr<Slot[]> chunk_;
+    uint32_t chunk_cap_ = 0, chunk_used_ = 0;
+    std::vector<std::unique_ptr<Slot>> extra_;
     std::vector<Slot*> index_;
 };
 

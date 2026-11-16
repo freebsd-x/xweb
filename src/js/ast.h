@@ -63,6 +63,8 @@ enum class Op : uint8_t {
 
 struct FunctionInfo;
 
+inline constexpr uint32_t kGlobalSlot = 0xFFFFFFFFu;
+
 struct Node {
     N kind;
     Op op = Op::None;
@@ -82,6 +84,12 @@ struct Node {
     std::shared_ptr<const std::vector<std::u16string>> cache;     // a tagged template's strings
     // A member access's key (a.b's "b"), made once: each access used to copy the name.
     std::unique_ptr<PropertyKey> key;
+    JSString literal;             // a string literal's value, shared by each evaluation
+    size_t name_hash = 0;         // an identifier's, for scope lookups: 0 until it's asked
+    // Where an identifier was found last: this many scopes out, at this slot there (or
+    // kGlobalSlot: in none, so the global object's). -1 not yet, -2 never (a with).
+    int32_t scope_hops = -1;
+    uint32_t scope_slot = 0;
 };
 
 // Node flags.
@@ -97,6 +105,7 @@ enum : uint32_t {
     kNamespace = 65536,                       // import * as ns, export * as ns
     kHoisted = 131072,                        // export default function () {}: made at link time
     kStaticBlock = 262144,                    // a class's static { ... } (with kStatic | kField)
+    kCaptureKnown = 1u << 19, kCaptures = 1u << 20,   // For: whether its parts make functions or eval
 };
 
 struct FunctionInfo {

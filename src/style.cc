@@ -1426,6 +1426,37 @@ void absolutizeUrls(std::vector<Declaration>& decls, const std::string& base) {
     }
 }
 
+// The same for a style attribute's declarations (and presentational hints), and a
+// media attribute's tokens: a restyle a script forced parsed every one of them again.
+template <typename T, typename Make>
+std::shared_ptr<const T> cachedParse(std::string_view text, Make make) {
+    constexpr size_t kBudget = 8u << 20;
+    static std::mutex mutex;
+    static std::unordered_map<std::string, std::shared_ptr<const T>> cache;
+    static size_t bytes = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (const auto it = cache.find(std::string(text)); it != cache.end()) return it->second;
+    }
+    auto made = std::make_shared<const T>(make(text));
+    std::lock_guard<std::mutex> lock(mutex);
+    if (bytes + text.size() + 64 > kBudget) {
+        cache.clear();
+        bytes = 0;
+    }
+    bytes += text.size() + 64;
+    cache.emplace(std::string(text), made);
+    return made;
+}
+
+std::shared_ptr<const std::vector<Declaration>> parsedDeclarations(std::string_view text) {
+    return cachedParse<std::vector<Declaration>>(text, [](std::string_view t) { return css::parseDeclarations(t); });
+}
+
+std::shared_ptr<const std::vector<css::Token>> mediaTokens(std::string_view text) {
+    return cachedParse<std::vector<css::Token>>(text, [](std::string_view t) { return css::tokenize(t); });
+}
+
 // Sheets parsed once: a page's script asking where something is lays it out again,
 // and that took parsing every sheet again (daum.net: 7% of its load). By its text and
 // the URL its url()s are against; dropped wholesale past a budget.
@@ -1724,17 +1755,74 @@ public:
         : doc_(doc), out_(out), loader_(loader) {
         lengths_.viewport_w = out.media_.width;
         lengths_.viewport_h = out.media_.height;
-        target_ = &ua_;
+        // Which sheets apply, in order, first; their rules indexed only if that's not
+        // the same as last time (a script asking for layout again and again).
+        recording_ = true;
+        to_ua_ = true;
         addSheet(detail::kUserAgentStyle, Origin::UserAgent, 0);
         if (doc.quirks) addSheet(detail::kQuirksStyle, Origin::UserAgent, 0);
         // What's for browsers without scripts isn't shown where they run.
         if (doc.scripting) addSheet("noscript { display: none }", Origin::UserAgent, 0);
         addSheet("::placeholder { color: #757575 }", Origin::UserAgent, 0);
-        target_ = &doc_scope_;
+        to_ua_ = false;
         collectSheets(doc_.root());
         for (const std::string& css : doc_.root()->adopted_css) addSheet(css, Origin::Author, 0);   // document.adoptedStyleSheets
+        recording_ = false;
+        useIndex();
         collectShadowScopes();
-        indexSiblings();
+    }
+
+    // The user agent's and the document's rules, indexed: those made last time if the
+    // sheets and the viewport are the same, else made now (and kept for next time).
+    void useIndex() {
+        struct Cached {
+            std::vector<SheetUse> uses;
+            float width = 0, height = 0;
+            std::shared_ptr<Scope> ua, doc;
+            std::vector<WebFontFace> fonts;
+            size_t order = 0;
+        };
+        static std::mutex mutex;
+        static std::shared_ptr<const Cached> last;
+        const auto same = [&](const Cached& c) {
+            if (c.width != out_.media_.width || c.height != out_.media_.height || c.uses.size() != uses_.size()) return false;
+            for (size_t i = 0; i < uses_.size(); ++i)
+                if (c.uses[i].sheet != uses_[i].sheet || c.uses[i].origin != uses_[i].origin || c.uses[i].to_ua != uses_[i].to_ua ||
+                    c.uses[i].url != uses_[i].url)
+                    return false;
+            return true;
+        };
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (last && same(*last)) {
+                index_kept_ = last;
+                ua_p_ = last->ua.get();
+                doc_p_ = last->doc.get();
+                out_.font_faces_ = last->fonts;
+                order_ = last->order;
+                uses_.clear();
+                return;
+            }
+        }
+        auto made = std::make_shared<Cached>();
+        made->ua = std::make_shared<Scope>();
+        made->doc = std::make_shared<Scope>();
+        for (const SheetUse& use : uses_) {
+            target_ = use.to_ua ? made->ua.get() : made->doc.get();
+            applySheet(use.sheet, use.origin, use.url);
+        }
+        target_ = nullptr;
+        made->width = out_.media_.width;
+        made->height = out_.media_.height;
+        made->fonts = out_.font_faces_;
+        made->order = order_;
+        made->uses = std::move(uses_);
+        uses_.clear();
+        ua_p_ = made->ua.get();
+        doc_p_ = made->doc.get();
+        index_kept_ = made;
+        std::lock_guard<std::mutex> lock(mutex);
+        last = std::move(made);
     }
 
     void run() {
@@ -1742,7 +1830,7 @@ public:
         if (!root) return;
         ComputedStyle initial;
         std::vector<const Node*> stack;
-        walk(root, initial, 0, &doc_scope_, nullptr);
+        walk(root, initial, 0, doc_p_, nullptr);
     }
 
 private:
@@ -1760,13 +1848,20 @@ private:
                 addSheet(loader_(target), origin, depth + 1, target);
             }
         }
+        if (recording_) uses_.push_back({std::move(parsed), origin, url, to_ua_});
+        else applySheet(std::move(parsed), origin, url);
+    }
+
+    // A sheet's font faces taken, and its rules indexed into target_.
+    void applySheet(std::shared_ptr<const css::Stylesheet> parsed, Origin origin, const std::string& url) {
+        const css::Stylesheet& sheet = *parsed;
         for (const css::FontFaceRule& rule : sheet.font_faces) {
             if (out_.font_faces_.size() >= kMaxFontFaces) break;
             if (!std::all_of(rule.media.begin(), rule.media.end(), [&](const Tokens& q) { return css::mediaMatches(q, out_.media_); })) continue;
             if (auto face = webFontFrom(rule, url)) out_.font_faces_.push_back(std::move(*face));
         }
-        sheets_.push_back(std::move(parsed));
         const css::Stylesheet& kept = sheet;
+        sheets_.push_back(std::move(parsed));
         for (const css::Rule& rule : kept.rules) {
             const bool applies = std::all_of(rule.media.begin(), rule.media.end(), [&](const Tokens& q) {
                 return css::mediaMatches(q, out_.media_);
@@ -1845,7 +1940,7 @@ private:
             todo.pop_back();
             if (n->isHtml("style") || (n->ns == Namespace::Svg && n->name == "style")) {
                 const std::string* media = n->attr("media");
-                if (!media || css::mediaMatches(css::tokenize(*media), out_.media_)) {
+                if (!media || css::mediaMatches(*mediaTokens(*media), out_.media_)) {
                     addSheet(n->textContent(), Origin::Author, 0);
                     // Rules a script put in its sheet (CSS-in-JS libraries do it this way).
                     for (const std::string& css : n->adopted_css) addSheet(css, Origin::Author, 0);
@@ -1855,36 +1950,30 @@ private:
                 const std::string* href = n->attr("href");
                 if (rel && href && hasWord(lower(*rel), "stylesheet") && !hasWord(lower(*rel), "alternate")) {
                     const std::string* media = n->attr("media");
-                    if (!media || css::mediaMatches(css::tokenize(*media), out_.media_)) {
+                    if (!media || css::mediaMatches(*mediaTokens(*media), out_.media_)) {
                         addSheet(loader_(*href), Origin::Author, 0, *href);
                         for (const std::string& css : n->adopted_css) addSheet(css, Origin::Author, 0, *href);
                     }
                 }
             }
+            if (n->shadow_root) hosts_.push_back(n);   // its scope made next (collectShadowScopes)
             todo.insert(todo.end(), n->children.rbegin(), n->children.rend());
         }
     }
 
-    // Every shadow root's scope, its sheets and its adopted ones.
+    // Every shadow root's scope, its sheets and its adopted ones: the hosts the walk for
+    // sheets found, and those inside their shadow trees as theirs are walked.
     void collectShadowScopes() {
-        std::vector<const Node*> todo{doc_.root()};
-        size_t count = 0;
-        while (!todo.empty() && count < 10'000) {
-            const Node* n = todo.back();
-            todo.pop_back();
-            if (n->shadow_root) {
-                ++count;
-                auto scope = std::make_unique<Scope>();
-                scope->host_el = n;
-                target_ = scope.get();
-                collectSheets(n->shadow_root);
-                for (const std::string& css : n->shadow_root->adopted_css) addSheet(css, Origin::Author, 0);
-                shadow_scopes_[n->shadow_root] = std::move(scope);
-                todo.push_back(n->shadow_root);
-            }
-            todo.insert(todo.end(), n->children.rbegin(), n->children.rend());
+        for (size_t i = 0; i < hosts_.size() && i < 10'000; ++i) {
+            const Node* n = hosts_[i];
+            auto scope = std::make_unique<Scope>();
+            scope->host_el = n;
+            target_ = scope.get();
+            collectSheets(n->shadow_root);
+            for (const std::string& css : n->shadow_root->adopted_css) addSheet(css, Origin::Author, 0);
+            shadow_scopes_[n->shadow_root] = std::move(scope);
         }
-        target_ = &doc_scope_;
+        target_ = nullptr;
     }
 
     const Scope* scopeFor(const Node* el) const {
@@ -1892,7 +1981,7 @@ private:
             const auto it = shadow_scopes_.find(root);
             if (it != shadow_scopes_.end()) return it->second.get();
         }
-        return &doc_scope_;
+        return doc_p_;
     }
 
     struct SiblingInfo {
@@ -1902,27 +1991,30 @@ private:
         int count = 0;
     };
 
-    void indexSiblings() {
-        std::vector<const Node*> todo{doc_.root()};
-        while (!todo.empty()) {
-            const Node* n = todo.back();
-            todo.pop_back();
-            const Node* prev = nullptr;
-            int index = 0;
-            for (const Node* c : n->children) {
-                if (!c->isElement()) continue;
-                SiblingInfo info;
-                info.prev = prev;
-                info.index = ++index;
-                if (prev) siblings_[prev].next = c;
-                siblings_[c] = info;
-                prev = c;
-                todo.push_back(c);
-            }
-            for (const Node* c : n->children)
-                if (c->isElement()) siblings_[c].count = index;
-            if (n->shadow_root) todo.push_back(n->shadow_root);
+    // An element's place among its element siblings, worked out for all its parent's
+    // children the first time one is asked about: most elements never are (only
+    // sibling combinators and :nth-child and the like ask), and doing every element
+    // each restyle cost more than matching.
+    const SiblingInfo& sib(const Node* el) {
+        if (const auto it = siblings_.find(el); it != siblings_.end()) return it->second;
+        static const SiblingInfo kNone;
+        const Node* n = el->parent;
+        if (!n) return kNone;
+        const Node* prev = nullptr;
+        int index = 0;
+        for (const Node* c : n->children) {
+            if (!c->isElement()) continue;
+            SiblingInfo info;
+            info.prev = prev;
+            info.index = ++index;
+            if (prev) siblings_[prev].next = c;
+            siblings_[c] = info;
+            prev = c;
         }
+        for (const Node* c : n->children)
+            if (c->isElement()) siblings_[c].count = index;
+        const auto it = siblings_.find(el);
+        return it != siblings_.end() ? it->second : kNone;
     }
 
     // ── Matching ──────────────────────────────────────────────────────────────
@@ -1975,8 +2067,7 @@ private:
 
     bool matchPseudo(const Node* el, const SimpleSelector& s) {
         const std::string& n = s.name;
-        const auto sibIt = siblings_.find(el);
-        const SiblingInfo info = sibIt == siblings_.end() ? SiblingInfo{} : sibIt->second;
+        const SiblingInfo info = sib(el);
         if (n == "not") {
             for (const ComplexSelector& a : s.args)
                 if (matchComplex(el, a)) return false;
@@ -1999,7 +2090,7 @@ private:
                 const bool siblings = a.parts[1].combinator == Combinator::NextSibling || a.parts[1].combinator == Combinator::SubsequentSibling;
                 std::vector<const Node*> todo;
                 if (siblings) {
-                    for (const Node* p = info.next; p && fuel_-- > 0; p = siblings_[p].next) todo.push_back(p);
+                    for (const Node* p = info.next; p && fuel_-- > 0; p = sib(p).next) todo.push_back(p);
                 } else {
                     todo.assign(el->children.begin(), el->children.end());
                 }
@@ -2038,9 +2129,9 @@ private:
         if (n == "nth-last-child") return nthMatches(s.a, s.b, info.count - info.index + 1);
         if (n == "first-of-type" || n == "last-of-type" || n == "only-of-type" || n == "nth-of-type" || n == "nth-last-of-type") {
             int before = 0, after = 0;
-            for (const Node* p = info.prev; p && fuel_-- > 0; p = siblings_[p].prev)
+            for (const Node* p = info.prev; p && fuel_-- > 0; p = sib(p).prev)
                 if (p->name == el->name) ++before;
-            for (const Node* p = info.next; p && fuel_-- > 0; p = siblings_[p].next)
+            for (const Node* p = info.next; p && fuel_-- > 0; p = sib(p).next)
                 if (p->name == el->name) ++after;
             if (n == "first-of-type") return before == 0;
             if (n == "last-of-type") return after == 0;
@@ -2109,12 +2200,11 @@ private:
                 return p && matchFrom(p, sel, before);
             }
             case Combinator::NextSibling: {
-                const auto it = siblings_.find(el);
-                return it != siblings_.end() && it->second.prev && matchFrom(it->second.prev, sel, before);
+                const Node* prev = sib(el).prev;
+                return prev && matchFrom(prev, sel, before);
             }
             case Combinator::SubsequentSibling: {
-                const auto it = siblings_.find(el);
-                for (const Node* p = it == siblings_.end() ? nullptr : it->second.prev; p; p = siblings_[p].prev)
+                for (const Node* p = sib(el).prev; p; p = sib(p).prev)
                     if (matchFrom(p, sel, before)) return true;
                 return false;
             }
@@ -3731,7 +3821,7 @@ private:
         inherit(parent, s);
         std::vector<MatchedDecl> matched;
         host_context_ = nullptr;
-        collect(el, ua_.normal, matched);
+        collect(el, ua_p_->normal, matched);
         host_context_ = scope->host_el;
         collect(el, scope->normal, matched);
         // A host's own :host rules, below the rules of the tree it's in.
@@ -3783,13 +3873,17 @@ private:
 
         std::string hint_text;
         hints(el, hint_text);
-        std::vector<Declaration> hint_decls;
-        if (!hint_text.empty()) hint_decls = css::parseDeclarations(hint_text);
-        for (const Declaration& d : hint_decls) matched.push_back({&d, false, Origin::Hint, 0, 0});
+        std::shared_ptr<const std::vector<Declaration>> hint_decls;
+        if (!hint_text.empty()) {
+            hint_decls = parsedDeclarations(hint_text);
+            for (const Declaration& d : *hint_decls) matched.push_back({&d, false, Origin::Hint, 0, 0});
+        }
 
-        std::vector<Declaration> inline_decls;
-        if (const std::string* style_attr = el->attr("style")) inline_decls = css::parseDeclarations(*style_attr);
-        for (const Declaration& d : inline_decls) matched.push_back({&d, d.important, Origin::Inline, 0, 0});
+        std::shared_ptr<const std::vector<Declaration>> inline_decls;
+        if (const std::string* style_attr = el->attr("style")) {
+            inline_decls = parsedDeclarations(*style_attr);
+            for (const Declaration& d : *inline_decls) matched.push_back({&d, d.important, Origin::Inline, 0, 0});
+        }
 
         applyMatched(el, parent, s, matched);
     }
@@ -4040,10 +4134,10 @@ private:
         out_.styles_[el] = &s;
         // Nothing below gets a box; but an SVG's hidden parts can still be drawn by <use>.
         if (s.display == Display::None && el->ns != Namespace::Svg) return;
-        resolvePseudo(el, s, ua_.before, scope->before, scope->host_el, out_.before_);
-        resolvePseudo(el, s, ua_.after, scope->after, scope->host_el, out_.after_);
+        resolvePseudo(el, s, ua_p_->before, scope->before, scope->host_el, out_.before_);
+        resolvePseudo(el, s, ua_p_->after, scope->after, scope->host_el, out_.after_);
         if ((el->isHtml("input") || el->isHtml("textarea")) && el->attr("placeholder"))
-            resolvePseudo(el, s, ua_.placeholder, scope->placeholder, scope->host_el, out_.placeholder_, false);
+            resolvePseudo(el, s, ua_p_->placeholder, scope->placeholder, scope->host_el, out_.placeholder_, false);
         if (el->shadow_root) {
             const auto it = shadow_scopes_.find(el->shadow_root);
             const Scope* inner = it == shadow_scopes_.end() ? scope : it->second.get();
@@ -4061,7 +4155,7 @@ private:
                 return;
             }
         }
-        const bool pushed = scope == &doc_scope_ && !slot && !host_context_ && bloomCovers(el);
+        const bool pushed = scope == doc_p_ && !slot && !host_context_ && bloomCovers(el);
         if (pushed) bloomPush(el);
         for (const Node* c : el->children)
             if (c->isElement()) walk(c, s, depth + 1, scope, nullptr);
@@ -4072,8 +4166,20 @@ private:
     StyledDocument& out_;
     const StyledDocument::SheetLoader& loader_;
     std::vector<std::shared_ptr<const css::Stylesheet>> sheets_;
-    Scope ua_, doc_scope_;
-    Scope* target_ = &ua_;   // where addSheet puts rules
+    // Which sheets apply, collected before their rules are indexed.
+    struct SheetUse {
+        std::shared_ptr<const css::Stylesheet> sheet;
+        Origin origin;
+        std::string url;
+        bool to_ua;
+    };
+    bool recording_ = false, to_ua_ = false;
+    std::vector<const Node*> hosts_;   // elements with a shadow root, as the walk for sheets met them
+    std::vector<SheetUse> uses_;
+    std::shared_ptr<const void> index_kept_;   // what ua_p_ and doc_p_ point into
+    const Scope* ua_p_ = nullptr;
+    const Scope* doc_p_ = nullptr;
+    Scope* target_ = nullptr;   // where applySheet puts rules
     std::unordered_map<const Node*, std::unique_ptr<Scope>> shadow_scopes_;   // by shadow root
     const Node* host_context_ = nullptr;   // the host of the shadow tree being matched in
     // The ancestor filter: counts of the hashes of the elements walk() is inside of.
