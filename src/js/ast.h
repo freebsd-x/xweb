@@ -81,7 +81,6 @@ struct Node {
     std::vector<Node*> kids;
     FunctionInfo* fn = nullptr;   // functions, arrows, methods, classes' constructors
     std::shared_ptr<const std::vector<std::u16string>> lexical;   // a block's let/const/class names
-    std::shared_ptr<const std::vector<std::u16string>> cache;     // a tagged template's strings
     // A member access's key (a.b's "b"), made once: each access used to copy the name.
     std::unique_ptr<PropertyKey> key;
     JSString literal;             // a string literal's value, shared by each evaluation
