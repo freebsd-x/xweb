@@ -1269,9 +1269,9 @@ Value Runtime::call(const Value& fnv, const Value& this_value, std::span<const V
     CallRootsScope roots(*this, &fnv, &this_value, args);
     step();
     if (f->bound_target) {
-        std::vector<Value> all = f->bound_args;
+        std::vector<Value> all = f->bound ? f->bound->args : std::vector<Value>{};
         all.insert(all.end(), args.begin(), args.end());
-        return call(Value::object(f->bound_target), f->bound_this, all);
+        return call(Value::object(f->bound_target), f->bound ? f->bound->this_value : Value::undefined(), all);
     }
     if (f->cls == ObjectClass::Proxy) {
         NoGc no_gc(*this);
@@ -1315,7 +1315,7 @@ Value Runtime::construct(const Value& fnv, std::span<const Value> args, Object* 
     CallRootsScope roots(*this, &fnv, nullptr, args);
     step();
     if (f->bound_target) {
-        std::vector<Value> all = f->bound_args;
+        std::vector<Value> all = f->bound ? f->bound->args : std::vector<Value>{};
         all.insert(all.end(), args.begin(), args.end());
         return construct(Value::object(f->bound_target), all, new_target == f ? f->bound_target : new_target);
     }
@@ -1559,8 +1559,10 @@ void Runtime::collect(bool mid_script) {
             }
             for (const Value& v : o->elements) markValue(v);
             markCell(o->bound_target);
-            markValue(o->bound_this);
-            for (const Value& v : o->bound_args) markValue(v);
+            if (o->bound) {
+                markValue(o->bound->this_value);
+                for (const Value& v : o->bound->args) markValue(v);
+            }
             if (o->cls == ObjectClass::WeakMap || o->cls == ObjectClass::WeakSet) {
                 weak_collections.push_back(o);   // its entries live only as long as their keys
             } else if (o->cls == ObjectClass::WeakRef) {

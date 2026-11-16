@@ -179,8 +179,13 @@ public:
     bool gc_safe = false;
     std::shared_ptr<FunctionData> code;
     Object* bound_target = nullptr;
-    Value bound_this;
-    std::vector<Value> bound_args;
+    // A bound function's this and leading arguments: out of line, as few objects are one
+    // (every object carried them: an object was 512 bytes; a page keeps 250 000).
+    struct BoundData {
+        Value this_value;
+        std::vector<Value> args;
+    };
+    std::unique_ptr<BoundData> bound;
     bool constructor = false;   // can be called with new
     bool class_constructor = false;   // can only be called with new
     bool length_readonly = false;     // an array whose length was made non-writable

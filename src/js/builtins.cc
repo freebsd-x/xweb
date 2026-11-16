@@ -979,10 +979,11 @@ void Runtime::installBuiltins() {
         Object* target = t.asObject();
         Object* b = rt.allocate<Object>(target->prototype, ObjectClass::Function);
         b->bound_target = target;
-        b->bound_this = arg(a, 0);
-        if (a.size() > 1) b->bound_args.assign(a.begin() + 1, a.end());
+        b->bound = std::make_unique<Object::BoundData>();
+        b->bound->this_value = arg(a, 0);
+        if (a.size() > 1) b->bound->args.assign(a.begin() + 1, a.end());
         b->constructor = target->constructor;
-        const double len = std::max(0.0, rt.toIntegerOrInfinity(rt.get(t, u"length")) - static_cast<double>(b->bound_args.size()));
+        const double len = std::max(0.0, rt.toIntegerOrInfinity(rt.get(t, u"length")) - static_cast<double>(b->bound->args.size()));
         rt.put(b, u"length", Value::number(len), kConfigurable);
         const Value name = rt.get(t, u"name");
         rt.put(b, u"name", Value::string(u"bound " + (name.isString() ? name.asString() : std::u16string())), kConfigurable);
