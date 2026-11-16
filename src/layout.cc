@@ -1131,12 +1131,16 @@ private:
             }
             b.width = saved;
         } else {
+            // Floats side by side; and a block after them that doesn't clear them has
+            // its content beside them too (a float in an anonymous block next to one before
+            // it: daum.net's service links, an icon and a label, each floated).
             float floats = 0;
             for (auto& k : b.kids) {
                 if (k->outOfFlow()) continue;
+                if (k->style && k->style->clear != Clear::None) floats = 0;
                 const float w = outerIntrinsic(*k, max_content);
                 if (k->floating() && max_content) floats += w;
-                else result = std::max(result, w);
+                else result = std::max(result, w + (max_content ? floats : 0.0f));
             }
             result = std::max(result, floats);
         }

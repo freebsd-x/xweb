@@ -13,4 +13,6 @@ body{margin:10px;font:14px/20px monospace}.l{float:left;width:100px;height:60px}
 <div class="box w"><span class=s>shrink</span>text after the shrunk float wraps at the narrow width</div><div style=clear:both></div>
 <div class=box><span style=float:right>right word</span>line text comes first in the source but sits to the left</div>
 <div class=box style=height:20px><div class=l style=height:100px></div></div><p>below tall float</p>
+<!-- Shrink-to-fit with an icon float, then a label float in an anonymous block, then a clearfix: side by side. -->
+<ul style="margin:0;padding:0;list-style:none;float:left"><li style=float:left><a style="display:block;min-width:60px;padding:10px 12px 0;margin:0 4px;height:44px;box-sizing:border-box;background:#eee"><span style="float:left;width:24px;height:24px;margin-right:8px;background:#f80"></span> <span style="float:left">Map</span><span style="display:block;clear:both"></span></a></li><li style=float:left><a style="display:block;min-width:60px;padding:10px 12px 0;margin:0 4px;height:44px;box-sizing:border-box;background:#eee"><span style="float:left;width:24px;height:24px;margin-right:8px;background:#f80"></span> <span style="float:left">Community</span><span style="display:block;clear:both"></span></a></li></ul><div style=clear:both></div>
 </body></html>
