@@ -1208,3 +1208,13 @@ TEST(Script, ComputedStyleReadsTheHostLazily) {
         </script>)");
     EXPECT_EQ(p.console, "log:block inline rgb(255, 0, 0) rgb(255, 0, 0) normal true\n") << p.console;
 }
+
+TEST(Script, JQueryOnlyPseudoClassesThrow) {
+    Page p(R"(<body><a>x</a><script>
+        const r = [];
+        for (const sel of ['a:first', 'a:eq(0)', 'div:visible', 'a:hover', 'a:first-child'])
+            try { document.querySelectorAll(sel); r.push('ok'); } catch (e) { r.push(e.name); }
+        console.log(r.join(' '));
+        </script>)");
+    EXPECT_EQ(p.console, "log:SyntaxError SyntaxError SyntaxError ok ok\n") << p.console;
+}

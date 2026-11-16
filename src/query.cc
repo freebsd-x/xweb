@@ -191,11 +191,35 @@ private:
 
 }  // namespace
 
+namespace {
+
+// jQuery's own pseudo-classes, which no browser's selectors have: querySelectorAll must
+// throw on them, for jQuery (Sizzle) tries it first and only does the selector itself
+// when it throws. Taken as matching nothing, yes24.com's carousel found none of its
+// slides ($(...).find('a:first')) and showed an empty banner.
+bool hasNonStandardPseudo(const std::vector<css::ComplexSelector>& list) {
+    static const char* const kJQueryOnly[] = {"first", "last", "eq", "gt", "lt", "even", "odd", "visible", "hidden",
+                                               "input", "button", "submit", "image", "reset", "file", "password", "radio",
+                                               "checkbox", "text", "header", "contains", "animated", "parent", "selected"};
+    for (const css::ComplexSelector& c : list)
+        for (const css::CompoundSelector& compound : c.parts)
+            for (const css::SimpleSelector& s : compound.simple) {
+                if (s.kind == css::SimpleKind::PseudoClass)
+                    for (const char* name : kJQueryOnly)
+                        if (s.name == name) return true;
+                if (!s.args.empty() && hasNonStandardPseudo(s.args)) return true;
+            }
+    return false;
+}
+
+}  // namespace
+
 std::optional<std::vector<css::ComplexSelector>> parseSelectors(std::string_view text) {
     std::vector<css::Token> tokens = css::tokenize(text);
     while (!tokens.empty() && (tokens.back().type == css::TokenType::Eof || tokens.back().type == css::TokenType::Whitespace)) tokens.pop_back();
     std::vector<css::ComplexSelector> out;
     if (tokens.empty() || !css::parseSelectorList(tokens, out)) return std::nullopt;
+    if (hasNonStandardPseudo(out)) return std::nullopt;
     return out;
 }
 
