@@ -1,5 +1,6 @@
 #include "xweb/text_measurer.h"
 
+#include <cstring>
 #include <ft2build.h>
 #include FT_FREETYPE_H
 
@@ -7,6 +8,7 @@
 #include <array>
 #include <cctype>
 #include <cmath>
+#include <cstring>
 #include <map>
 #include <optional>
 #include <set>
@@ -374,6 +376,7 @@ float XrenderTextMeasurer::runWidth(std::string_view utf8, const std::string& fa
 float XrenderTextMeasurer::width(std::string_view utf8, const FontSpec& font) {
     if (fonts_generation_ != g_fonts_generation) {
         cache_.clear();
+        cache_used_ = 0;
         fonts_generation_ = g_fonts_generation;
     }
     uint64_t key = 1469598103934665603ull;
@@ -389,13 +392,40 @@ float XrenderTextMeasurer::width(std::string_view utf8, const FontSpec& font) {
     add(0x100 + static_cast<uint64_t>(static_cast<int64_t>(font.size * 64)));
     add(0x200 + static_cast<uint64_t>(font.weight));
     add(font.italic ? 0x301 : 0x300);
-    for (const char c : utf8) add(static_cast<uint8_t>(c));
+    // The text eight bytes at a time.
+    size_t i = 0;
+    for (; i + 8 <= utf8.size(); i += 8) {
+        uint64_t chunk;
+        std::memcpy(&chunk, utf8.data() + i, 8);
+        add(chunk);
+        key ^= key >> 29;
+    }
+    for (; i < utf8.size(); ++i) add(static_cast<uint8_t>(utf8[i]));
     add(0x400 + utf8.size());
-    const auto it = cache_.find(key);
-    if (it != cache_.end()) return it->second;
+    key ^= key >> 32;
+    if (key == 0) key = 1;   // (0 is an empty place)
+    // Open addressing, a power of two places: a word's width found in a probe or two.
+    if (cache_used_ * 2 >= cache_.size()) {
+        std::vector<std::pair<uint64_t, float>> old(std::max<size_t>(4096, cache_.size() * 2));
+        old.swap(cache_);
+        cache_used_ = 0;
+        for (const auto& [k, v] : old)
+            if (k) {
+                size_t j = k & (cache_.size() - 1);
+                while (cache_[j].first) j = (j + 1) & (cache_.size() - 1);
+                cache_[j] = {k, v};
+                ++cache_used_;
+            }
+    }
+    size_t j = key & (cache_.size() - 1);
+    while (cache_[j].first) {
+        if (cache_[j].first == key) return cache_[j].second;
+        j = (j + 1) & (cache_.size() - 1);
+    }
     float w = 0;
     for (const FontRun& run : fontRuns(utf8, font)) w += runWidth(utf8.substr(run.begin, run.end - run.begin), run.family, font);
-    cache_.emplace(key, w);
+    cache_[j] = {key, w};
+    ++cache_used_;
     return w;
 }
 

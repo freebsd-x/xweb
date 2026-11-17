@@ -83,13 +83,16 @@ int main(int argc, char** argv) {
         using Clock = std::chrono::steady_clock;
         const auto ms = [](Clock::time_point a) { return std::chrono::duration<double, std::milli>(Clock::now() - a).count(); };
         double fresh = 0, kept = 0, laid = 0;
+        const bool only_layout = std::getenv("XWEB_LAYOUT_BENCH_ONLY") != nullptr;   // (for profiling it)
         for (int i = 0; i < n; ++i) {
             auto t = Clock::now();
-            const StyledDocument again(*doc, {w, h}, sheet_text, ch);
-            fresh += ms(t);
-            t = Clock::now();
-            const StyledDocument reused(*doc, {w, h}, sheet_text, ch, nullptr, &styles);
-            kept += ms(t);
+            if (!only_layout) {
+                const StyledDocument again(*doc, {w, h}, sheet_text, ch);
+                fresh += ms(t);
+                t = Clock::now();
+                const StyledDocument reused(*doc, {w, h}, sheet_text, ch, nullptr, &styles);
+                kept += ms(t);
+            }
             t = Clock::now();
             const PageLayout l = layoutPage(*doc, styles, text, &images, w, h);
             laid += ms(t);

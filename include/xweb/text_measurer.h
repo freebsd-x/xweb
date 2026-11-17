@@ -52,7 +52,8 @@ private:
     [[nodiscard]] float runWidth(std::string_view utf8, const std::string& family, const FontSpec& font);
     // Pages repeat their words: by a 64-bit hash of the font and the text (a key string
     // made and hashed for each word was half of measuring them).
-    std::unordered_map<uint64_t, float> cache_;
+    std::vector<std::pair<uint64_t, float>> cache_;   // (key 0: empty)
+    size_t cache_used_ = 0;
     std::string last_family_ = std::string(1, '\0');   // (no family's)
     uint64_t last_family_hash_ = 0;
     uint64_t fonts_generation_ = 0;

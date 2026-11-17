@@ -821,6 +821,13 @@ bool Runtime::has(Object* o, const PropertyKey& key) {
 }
 
 bool Runtime::set(Object* o, const PropertyKey& key, const Value& v, const Value& receiver) {
+    // The usual case: an ordinary object's own writable property, set on it. (Found once,
+    // not by the walk up the chain and again on the receiver.)
+    if ((o->cls == ObjectClass::Ordinary || o->cls == ObjectClass::Function) && receiver.isObject() && receiver.asObject() == o)
+        if (Property* own = o->own(key); own && !(own->flags & kAccessor) && (own->flags & kWritable)) {
+            own->value = v;
+            return true;
+        }
     if (o->cls == ObjectClass::Proxy) return proxySet(*this, o, key, v, receiver);
     // A typed array's elements: never up the chain, never a new property.
     if (!key.isSymbol() && o->cls == ObjectClass::TypedArray) {
