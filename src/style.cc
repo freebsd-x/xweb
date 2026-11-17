@@ -1938,11 +1938,11 @@ public:
         walk(root, initial, 0, doc_p_, nullptr);
         static const bool dbg = std::getenv("XWEB_DEBUG_RESTYLE") != nullptr;
         if (dbg)
-            std::fprintf(stderr, "[restyle] %zu elements, %zu kept, %.0f ms; previous %d context %d\n", out_.keys_.size(), dbg_kept_,
+            std::fprintf(stderr, "[restyle] %zu elements, %zu kept, %zu shared, %.0f ms; previous %d context %d\n", out_.keys_.size(), dbg_kept_, dbg_shared_,
                          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), previous_ != nullptr,
                          has_context_);
     }
-    size_t dbg_kept_ = 0, dbg_roots_ = 0;
+    size_t dbg_kept_ = 0, dbg_roots_ = 0, dbg_shared_ = 0;
 
 private:
     // `url` is where the sheet came from: its @imports are relative to that.
@@ -2160,18 +2160,22 @@ private:
         const std::string* found = el->attr(s.name);
         if (!found) return false;
         if (s.op == AttrOp::Exists) return true;
-        std::string have = *found, want = s.value;
+        // (Copied only to fold case.)
+        std::string have_folded, want_folded;
+        std::string_view have = *found, want = s.value;
         if (s.case_insensitive || s.name == "type") {
-            have = lower(have);
-            want = lower(want);
+            have_folded = lower(have);
+            want_folded = lower(want);
+            have = have_folded;
+            want = want_folded;
         }
         switch (s.op) {
             case AttrOp::Equals: return have == want;
             case AttrOp::Includes: return !want.empty() && hasWord(have, want);
-            case AttrOp::DashMatch: return have == want || have.starts_with(want + "-");
+            case AttrOp::DashMatch: return have == want || (have.size() > want.size() && have.starts_with(want) && have[want.size()] == '-');
             case AttrOp::Prefix: return !want.empty() && have.starts_with(want);
             case AttrOp::Suffix: return !want.empty() && have.ends_with(want);
-            case AttrOp::Substring: return !want.empty() && have.find(want) != std::string::npos;
+            case AttrOp::Substring: return !want.empty() && have.find(want) != std::string_view::npos;
             case AttrOp::Exists: return true;
         }
         return false;
@@ -4045,7 +4049,10 @@ private:
         }
         // The rules' declarations (the hints' and the style attribute's are its own print's).
         uint64_t rules = 0x4A5;
-        bool shareable = !resolving_pseudo_ && el->parent && el->parent->type != NodeType::Document;
+        // XWEB_NO_STYLE_SHARING=1: each element's style worked out on its own (for telling
+        // whether a wrong style came from sharing one).
+        static const bool no_sharing = std::getenv("XWEB_NO_STYLE_SHARING") != nullptr;
+        bool shareable = !no_sharing && !resolving_pseudo_ && el->parent && el->parent->type != NodeType::Document;
         for (const MatchedDecl& m : matched) {
             if (m.origin != Origin::Hint && m.origin != Origin::Inline)
                 rules = mix(mix(rules, reinterpret_cast<uintptr_t>(m.decl)), (m.important ? 2u : 1u) + 4u * static_cast<unsigned>(m.origin));
@@ -4058,10 +4065,30 @@ private:
         // text, as their parsed declarations' places can be reused).
         uint64_t share_key = 0;
         if (shareable) {
-            share_key = mix(mix(rules, reinterpret_cast<uintptr_t>(&parent)), mixText(0x51A, hint_text));
+            // The parent's style by what it was made from, when that's known: cousins too
+            // (each card of a grid's same parts), not only siblings.
+            const auto pid = style_ids_.find(&parent);
+            const uint64_t parent_id = pid != style_ids_.end() ? pid->second : reinterpret_cast<uintptr_t>(&parent);
+            share_key = mix(mix(rules, parent_id), mixText(0x51A, hint_text));
             share_key = mixText(share_key, inline_decls ? *el->attr("style") : std::string_view("\x01"));
+            style_ids_[&s] = share_key;
             if (const auto it = shared_styles_.find(share_key); it != shared_styles_.end()) {
+                static const bool check = std::getenv("XWEB_CHECK_SHARING") != nullptr;
+                if (check) {
+                    ComputedStyle own = s;
+                    applyMatched(el, parent, own, matched);
+                    const ComputedStyle& o = *it->second;
+                    const bool same = own.color == o.color && own.background == o.background && own.display == o.display &&
+                                      own.font_size == o.font_size && own.font_weight == o.font_weight && own.font_family == o.font_family &&
+                                      own.position == o.position && own.width.px == o.width.px && own.height.px == o.height.px &&
+                                      own.margin[0].px == o.margin[0].px && own.margin[3].px == o.margin[3].px &&
+                                      own.padding[0].px == o.padding[0].px && own.opacity == o.opacity && own.z_index == o.z_index &&
+                                      own.hidden == o.hidden && own.line_height == o.line_height && own.float_side == o.float_side &&
+                                      own.border_width[0] == o.border_width[0] && own.border_color[0] == o.border_color[0];
+                    if (!same) std::fprintf(stderr, "[sharing] differs at <%s class=%s>\n", el->name.c_str(), el->attr("class") ? el->attr("class")->c_str() : "");
+                }
                 s = *it->second;
+                ++dbg_shared_;
                 return;
             }
         }
@@ -4757,6 +4784,7 @@ private:
     const Node* current_element_ = nullptr;
     // Styles worked out this run, by what they came from (see resolveInto).
     std::pmr::unordered_map<uint64_t, const ComputedStyle*> shared_styles_{&pool_};
+    std::pmr::unordered_map<const ComputedStyle*, uint64_t> style_ids_{&pool_};   // by what each was made from
     bool resolving_pseudo_ = false;
     std::pmr::unordered_map<const Node*, SiblingInfo> siblings_{&pool_};
     LengthContext lengths_;

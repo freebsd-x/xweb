@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <optional>
 #include <utility>
+#include <chrono>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -75,6 +76,27 @@ int main(int argc, char** argv) {
     }
     const StyledDocument styles(*doc, {w, h}, sheet_text, ch);
     fbx::xweb::tools::FileImages images(base);
+    // XWEB_LAYOUT_BENCH=N: styled afresh, styled again (all kept) and laid out N times
+    // each, and how long each took on average, for measuring the engine on a real page.
+    if (const char* bench = std::getenv("XWEB_LAYOUT_BENCH")) {
+        const int n = std::max(1, std::atoi(bench));
+        using Clock = std::chrono::steady_clock;
+        const auto ms = [](Clock::time_point a) { return std::chrono::duration<double, std::milli>(Clock::now() - a).count(); };
+        double fresh = 0, kept = 0, laid = 0;
+        for (int i = 0; i < n; ++i) {
+            auto t = Clock::now();
+            const StyledDocument again(*doc, {w, h}, sheet_text, ch);
+            fresh += ms(t);
+            t = Clock::now();
+            const StyledDocument reused(*doc, {w, h}, sheet_text, ch, nullptr, &styles);
+            kept += ms(t);
+            t = Clock::now();
+            const PageLayout l = layoutPage(*doc, styles, text, &images, w, h);
+            laid += ms(t);
+        }
+        std::fprintf(stderr, "bench: styling %.1f ms, restyling (all kept) %.1f ms, layout %.1f ms\n", fresh / n, kept / n, laid / n);
+        return 0;
+    }
     const PageLayout page = layoutPage(*doc, styles, text, &images, w, h);
     // In document order, whatever order they were painted in.
     std::unordered_map<const Node*, const ElementBox*> by_node;

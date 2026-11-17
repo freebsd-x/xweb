@@ -378,7 +378,14 @@ float XrenderTextMeasurer::width(std::string_view utf8, const FontSpec& font) {
     }
     uint64_t key = 1469598103934665603ull;
     const auto add = [&key](uint64_t v) { key = (key ^ v) * 1099511628211ull; };
-    for (const char c : font.family) add(static_cast<uint8_t>(c));
+    // The family's part, as last time when it's the same one (a page's long font stacks,
+    // hashed a byte at a time for every word, were most of measuring).
+    if (font.family != last_family_) {
+        last_family_ = font.family;
+        for (const char c : font.family) add(static_cast<uint8_t>(c));
+        last_family_hash_ = key;
+    }
+    key = last_family_hash_;
     add(0x100 + static_cast<uint64_t>(static_cast<int64_t>(font.size * 64)));
     add(0x200 + static_cast<uint64_t>(font.weight));
     add(font.italic ? 0x301 : 0x300);
