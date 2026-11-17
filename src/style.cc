@@ -4175,6 +4175,36 @@ private:
             return a.order < b.order;
         });
 
+        // all: the declarations before the last one go (but custom properties); unset
+        // leaves what's inherited, initial not even that, revert the user agent's sheet's.
+        // (A reset's `all: unset` then its own declarations: toss.im's buttons and links.)
+        // What the user agent's sheet says, for a revert after an all: (all of them).
+        bool all_reset = false;   // its appearance too: not drawn as the native control
+        std::vector<MatchedDecl> ua_decls;
+        for (const MatchedDecl& m : matched)
+            if (m.origin == Origin::UserAgent && !m.important) ua_decls.push_back(m);
+        for (size_t i = matched.size(); i-- > 0;) {
+            const MatchedDecl& m = matched[i];
+            if (m.decl->name != "all" || m.origin == Origin::UserAgent) continue;
+            const std::string kw = keyword(m.decl->value);
+            if (kw != "unset" && kw != "initial" && kw != "inherit" && kw != "revert" && kw != "revert-layer") break;
+            std::vector<MatchedDecl> kept;
+            for (size_t j = 0; j < matched.size(); ++j) {
+                if (j == i) continue;
+                const bool custom = matched[j].decl->name.starts_with("--");
+                const bool ua = matched[j].origin == Origin::UserAgent && (kw == "revert" || kw == "revert-layer");
+                if (j > i || custom || ua) kept.push_back(matched[j]);
+            }
+            if (kw == "initial") {
+                const auto custom = s.custom;
+                s = ComputedStyle{};
+                s.custom = custom;
+            }
+            matched = std::move(kept);
+            all_reset = kw != "revert" && kw != "revert-layer";
+            break;
+        }
+
         // Old pages' <p> at the top of the body has no top margin: the quirk applies only
         // to margins the page didn't ask for itself.
         const auto setByPage = [&](const char* longhand) {
@@ -4192,6 +4222,7 @@ private:
             }
             return false;
         });
+        if (all_reset) s.native_look = false;
         s.ua_margin_top = !setByPage("margin-top");
         s.ua_margin_bottom = !setByPage("margin-bottom");
 
@@ -4318,6 +4349,20 @@ private:
         for (const MatchedDecl& m : matched) {
             const std::string& p = m.decl->name;
             if (first(p) || p.starts_with("--")) continue;
+            // revert: as the user agent's sheet has it. A reset's `all: unset; display:
+            // revert` (toss.im's) made every element inline and showed its scripts' text.
+            if (m.origin != Origin::UserAgent) {
+                const std::string kw = keyword(m.decl->value);
+                if (kw == "revert" || kw == "revert-layer") {
+                    const Declaration* ua = nullptr;
+                    for (const MatchedDecl& u : ua_decls)
+                        if (u.decl->name == p) ua = u.decl;
+                    if (ua) {
+                        apply(s, parent, p, ua->value);
+                        continue;
+                    }
+                }
+            }
             apply(s, parent, p, m.decl->value);
         }
 

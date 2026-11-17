@@ -794,6 +794,26 @@ TEST(Selectors, NthChildOfASelector) {
     EXPECT_NE(styles.styleOf(elementById(*doc, "e"))->font_size, 30);
 }
 
+TEST(Values, RevertIsTheUserAgentsValue) {
+    // A reset's `all: unset; display: revert` (toss.im's).
+    auto doc = parseHtml(R"(<!doctype html><style>* { display: revert } div { display: inline } .r { display: revert }</style>
+      <div id=d class=r></div><script id=s class=r></script><span id=p class=r></span>)");
+    const StyledDocument styles(*doc, css::MediaContext{800, 600});
+    EXPECT_EQ(styles.styleOf(elementById(*doc, "d"))->display, Display::Block);
+    ASSERT_NE(styles.styleOf(elementById(*doc, "s")), nullptr);
+    EXPECT_EQ(styles.styleOf(elementById(*doc, "s"))->display, Display::None);
+    EXPECT_EQ(styles.styleOf(elementById(*doc, "p"))->display, Display::Inline);
+
+    // all: unset drops what came before it; what comes after still counts.
+    auto doc2 = parseHtml(R"(<!doctype html><style>a { color: rgb(0, 0, 238) } .u { all: unset; display: revert } .u.k { font-size: 30px }</style>
+      <div style='color: rgb(1, 2, 3)'><a id=a class='u k' href=#>x</a><script id=s class=u></script></div>)");
+    const StyledDocument styles2(*doc2, css::MediaContext{800, 600});
+    EXPECT_EQ(styles2.styleOf(elementById(*doc2, "a"))->color, (Color{1, 2, 3, 255}));   // inherited, not the link's
+    EXPECT_EQ(styles2.styleOf(elementById(*doc2, "a"))->font_size, 30);
+    ASSERT_NE(styles2.styleOf(elementById(*doc2, "s")), nullptr);
+    EXPECT_EQ(styles2.styleOf(elementById(*doc2, "s"))->display, Display::None);   // reverted past the unset
+}
+
 // With :has() only of the element styled, a change under an anchor restyles the anchor,
 // and its children only when what it matched changed (they inherit from it).
 TEST(Restyle, UnderAHasAnchorOnlyTheAnchorRestyles) {
