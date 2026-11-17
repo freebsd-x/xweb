@@ -321,6 +321,12 @@ public:
     // ancestors) keeps the style it had there instead of being matched again.
     StyledDocument(const Document& doc, css::MediaContext media, const SheetLoader& loader = {}, const ChMeasure& measure_ch = {},
                    const class FormState* forms = nullptr, const StyledDocument* previous = nullptr);
+    // Only `target` and its ancestors styled, as a whole document's styling would (with
+    // `previous` as that does): for one element's style, in a fraction of the time. Null
+    // when it can't be done so (in a shadow tree, a slot, under display: none).
+    [[nodiscard]] static std::unique_ptr<StyledDocument> chainOf(const Node* target, const Document& doc, css::MediaContext media,
+                                                                 const SheetLoader& loader, const ChMeasure& measure_ch,
+                                                                 const class FormState* forms, const StyledDocument* previous);
 
     // Nullptr for anything that has no box-generating style (or is too deep).
     [[nodiscard]] const ComputedStyle* styleOf(const Node* element) const;
@@ -335,6 +341,8 @@ public:
     [[nodiscard]] const std::vector<WebFontFace>& fontFaces() const noexcept { return font_faces_; }
 
 private:
+    StyledDocument(css::MediaContext media, const ChMeasure& measure_ch, const class FormState* forms)
+        : media_(media), measure_ch_(measure_ch), forms_(forms) {}
     css::MediaContext media_;
     ChMeasure measure_ch_;
     const class FormState* forms_ = nullptr;

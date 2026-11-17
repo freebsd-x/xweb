@@ -720,6 +720,69 @@ TEST(Restyle, AnOwnBoxStyleAttributeKeepsTheChildren) {
     EXPECT_EQ(styles2->styleOf(elementById(*doc2, "i"))->margin[0].px, 20);
 }
 
+// One element's style by styling only it and its ancestors: as styling the whole page
+// gives, kept parts and changed ones, and not done where that can't tell (display: none).
+TEST(Restyle, AChainOfAncestorsStylesAsTheWholePage) {
+    auto doc = parseHtml(R"(<!doctype html><style>
+        html { font-size: 20px } .big p { font-size: 2rem } .red .x { color: rgb(200, 0, 0) }
+        div:has(> .flag) .x { color: rgb(0, 0, 200) } .gone { display: none }
+      </style>
+      <div id=outer class=big><section id=mid><p id=p><span id=x class=x>x</span></p></section><b id=f></b></div>
+      <div class=gone><i id=hidden>h</i></div>)");
+    auto styles = std::make_unique<StyledDocument>(*doc, css::MediaContext{800, 600});
+    const auto chainSameAsFresh = [&](const char* id, const char* step) {
+        const Node* n = elementById(*doc, id);
+        auto chain = StyledDocument::chainOf(n, *doc, css::MediaContext{800, 600}, {}, {}, nullptr, styles.get());
+        ASSERT_TRUE(chain) << step;
+        const StyledDocument fresh(*doc, css::MediaContext{800, 600});
+        EXPECT_EQ(chain->styleOf(n)->color, fresh.styleOf(n)->color) << step;
+        EXPECT_EQ(chain->styleOf(n)->font_size, fresh.styleOf(n)->font_size) << step;
+    };
+    chainSameAsFresh("x", "nothing changed");
+    setAttribute(elementById(*doc, "mid"), "class", "red");
+    chainSameAsFresh("x", "an ancestor's class");
+    setAttribute(elementById(*doc, "f"), "class", "flag");
+    chainSameAsFresh("x", "a :has() anchor's");
+    chainSameAsFresh("p", "rem");
+    EXPECT_FALSE(StyledDocument::chainOf(elementById(*doc, "hidden"), *doc, css::MediaContext{800, 600}, {}, {}, nullptr, styles.get()));
+}
+
+// Siblings: one added after an element changes nothing of it, unless it can be asked
+// about those after it (:last-child), and one added before does.
+TEST(Restyle, SiblingsAddedAfterKeepWhatsBefore) {
+    auto doc = parseHtml(R"(<!doctype html><style>
+        li:last-child { color: rgb(1, 1, 1) } .a + .b { color: rgb(2, 2, 2) } p:first-child { font-size: 30px }
+      </style>
+      <div id=box><p id=p><i id=i>i</i></p><ul id=ul><li id=l1>1</li><li id=l2>2</li></ul></div>)");
+    auto styles = std::make_unique<StyledDocument>(*doc, css::MediaContext{800, 600});
+    const auto again = [&](const char* step) {
+        styles = std::make_unique<StyledDocument>(*doc, css::MediaContext{800, 600}, StyledDocument::SheetLoader{},
+                                                  StyledDocument::ChMeasure{}, nullptr, styles.get());
+        expectSameAsFresh(*doc, *styles, step);
+    };
+    const auto element = [&](const char* tag, const char* cls) {
+        Node* n = doc->make(NodeType::Element);
+        n->name = tag;
+        if (cls) setAttribute(n, "class", cls);
+        return n;
+    };
+    again("nothing changed");
+    const ComputedStyle* i = styles->styleOf(elementById(*doc, "i"));
+    elementById(*doc, "box")->append(element("div", nullptr));
+    again("a div after");
+    EXPECT_EQ(styles->styleOf(elementById(*doc, "i")), i);   // kept
+    elementById(*doc, "ul")->append(element("li", nullptr));
+    again("an li after the last");
+    EXPECT_NE(styles->styleOf(elementById(*doc, "l2"))->color, (Color{1, 1, 1, 255}));
+    Node* box = elementById(*doc, "box");
+    box->insertBefore(element("span", "a"), box->children.front());
+    again("one before the first");
+    EXPECT_NE(styles->styleOf(elementById(*doc, "p"))->font_size, 30);
+    setAttribute(elementById(*doc, "p"), "class", "b");
+    again("and a + b");
+    EXPECT_EQ(styles->styleOf(elementById(*doc, "p"))->color, (Color{2, 2, 2, 255}));
+}
+
 // With :has() only of the element styled, a change under an anchor restyles the anchor,
 // and its children only when what it matched changed (they inherit from it).
 TEST(Restyle, UnderAHasAnchorOnlyTheAnchorRestyles) {

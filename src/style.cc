@@ -1811,11 +1811,15 @@ public:
             bool uses_has = false, has_any_anchor = false, has_context = false;
             std::unordered_set<uint32_t> has_anchors, has_context_anchors;
             std::vector<const CompoundSelector*> has_context_compounds;
-            bool style_selector = false;
+            bool style_selector = false, follow_any = false, follow_exact_any = false;
             std::unordered_set<std::string> inherit_used;
+            std::unordered_set<uint32_t> follow_anchors, follow_exact_anchors;
         };
         static std::mutex mutex;
-        static std::shared_ptr<const Cached> last;
+        // The last few: a page and its iframes' documents styled in turn each made theirs
+        // again, and with it, styled everything afresh (11st.co.kr's 9000 elements).
+        static std::vector<std::shared_ptr<const Cached>> recent;
+        constexpr size_t kRecent = 4;
         const auto same = [&](const Cached& c) {
             if (c.width != out_.media_.width || c.height != out_.media_.height || c.uses.size() != uses_.size()) return false;
             for (size_t i = 0; i < uses_.size(); ++i)
@@ -1826,7 +1830,15 @@ public:
         };
         {
             std::lock_guard<std::mutex> lock(mutex);
-            if (last && same(*last)) {
+            std::shared_ptr<const Cached> last;
+            for (size_t i = 0; i < recent.size(); ++i)
+                if (same(*recent[i])) {
+                    last = recent[i];
+                    recent.erase(recent.begin() + static_cast<ptrdiff_t>(i));
+                    recent.insert(recent.begin(), last);   // most recent first
+                    break;
+                }
+            if (last) {
                 index_kept_ = last;
                 ua_p_ = last->ua.get();
                 doc_p_ = last->doc.get();
@@ -1839,6 +1851,10 @@ public:
                 has_context_anchors_ = last->has_context_anchors;
                 has_context_compounds_ = last->has_context_compounds;
                 style_selector_ = last->style_selector;
+                follow_any_ = last->follow_any;
+                follow_anchors_ = last->follow_anchors;
+                follow_exact_any_ = last->follow_exact_any;
+                follow_exact_anchors_ = last->follow_exact_anchors;
                 inherit_used_ = last->inherit_used;
                 uses_.clear();
                 return;
@@ -1863,6 +1879,10 @@ public:
         made->has_context_anchors = has_context_anchors_;
         made->has_context_compounds = has_context_compounds_;
         made->style_selector = style_selector_;
+        made->follow_any = follow_any_;
+        made->follow_anchors = follow_anchors_;
+        made->follow_exact_any = follow_exact_any_;
+        made->follow_exact_anchors = follow_exact_anchors_;
         made->inherit_used = inherit_used_;
         made->uses = std::move(uses_);
         uses_.clear();
@@ -1870,7 +1890,43 @@ public:
         doc_p_ = made->doc.get();
         index_kept_ = made;
         std::lock_guard<std::mutex> lock(mutex);
-        last = std::move(made);
+        recent.insert(recent.begin(), std::move(made));
+        if (recent.size() > kRecent) recent.pop_back();
+    }
+
+    // Only `target` and its ancestors, as run() would style them (for a script's question
+    // about one element's style, not the whole page's 9000). False if it's somewhere that
+    // takes more (a shadow tree or a slot) or isn't styled (too deep, or in display: none):
+    // a full run then.
+    bool runChain(const Node* target) {
+        std::vector<const Node*> chain;
+        for (const Node* n = target; n && n->type != NodeType::Document; n = n->parent) {
+            if (!n->isElement() || n->shadow_root || chain.size() > kMaxStyledDepth) return false;
+            chain.push_back(n);
+        }
+        if (chain.empty() || !chain.back()->parent || chain.back() != doc_.documentElement()) return false;
+        std::reverse(chain.begin(), chain.end());
+        ComputedStyle initial;
+        const ComputedStyle* parent = &initial;
+        uint64_t parent_key = 0, parent_full_key = 0;
+        size_t pushed = 0;
+        bool ok = true;
+        for (const Node* el : chain) {
+            const auto [style, key, children_key] = visit(el, *parent, doc_p_, nullptr, parent_key, parent_full_key);
+            if (el != target && style->display == Display::None && el->ns != Namespace::Svg) {
+                ok = false;
+                break;
+            }
+            if (el != target && !host_context_ && bloomCovers(el)) {
+                bloomPush(el);
+                ++pushed;
+            }
+            parent = style;
+            parent_key = children_key;
+            parent_full_key = key;
+        }
+        while (pushed--) bloomPop();
+        return ok;
     }
 
     void run() {
@@ -1927,6 +1983,7 @@ private:
                 if (sel.parts.empty()) continue;
                 noteHasAnchors(sel);
                 if (!style_selector_) style_selector_ = asksForStyleAttribute(sel);
+                noteFollowing(sel);
                 index(sel, rule, origin);
             }
             for (const Declaration& d : rule.declarations)
@@ -3986,16 +4043,30 @@ private:
             inline_decls = parsedDeclarations(*style_attr);
             for (const Declaration& d : *inline_decls) matched.push_back({&d, d.important, Origin::Inline, 0, 0});
         }
-        if (match_print) {
-            // The rules' declarations (the hints' and the style attribute's are its own print's).
-            uint64_t h = 0x4A5;
-            for (const MatchedDecl& m : matched)
-                if (m.origin != Origin::Hint && m.origin != Origin::Inline)
-                    h = mix(mix(h, reinterpret_cast<uintptr_t>(m.decl)), (m.important ? 2u : 1u) + 4u * static_cast<unsigned>(m.origin));
-            *match_print = h;
+        // The rules' declarations (the hints' and the style attribute's are its own print's).
+        uint64_t rules = 0x4A5;
+        bool shareable = !resolving_pseudo_ && el->parent && el->parent->type != NodeType::Document;
+        for (const MatchedDecl& m : matched) {
+            if (m.origin != Origin::Hint && m.origin != Origin::Inline)
+                rules = mix(mix(rules, reinterpret_cast<uintptr_t>(m.decl)), (m.important ? 2u : 1u) + 4u * static_cast<unsigned>(m.origin));
+            if (m.decl->name == "content") shareable = false;   // attr() is the element's
         }
+        if (match_print) *match_print = rules;
 
+        // The same declarations from the same parent's style come to the same style: a
+        // list's items, a grid's cards, styled once (by the hints' and style attribute's
+        // text, as their parsed declarations' places can be reused).
+        uint64_t share_key = 0;
+        if (shareable) {
+            share_key = mix(mix(rules, reinterpret_cast<uintptr_t>(&parent)), mixText(0x51A, hint_text));
+            share_key = mixText(share_key, inline_decls ? *el->attr("style") : std::string_view("\x01"));
+            if (const auto it = shared_styles_.find(share_key); it != shared_styles_.end()) {
+                s = *it->second;
+                return;
+            }
+        }
         applyMatched(el, parent, s, matched);
+        if (shareable) shared_styles_.emplace(share_key, &s);
     }
 
     void collect(const Node* el, const Buckets& buckets, std::vector<MatchedDecl>& matched) {
@@ -4278,16 +4349,85 @@ private:
         return h;
     }
 
-    // All of a parent's element children: siblings combinators and :nth-child see them.
-    uint64_t siblingsPrint(const Node* parent) {
+    // The element siblings before one: all that `+`, `~`, :first-child and :nth-child see
+    // (with no :last-child and the like, a sibling added after it changes nothing of it: a
+    // script adding to the end of the body restyled all of a 9000-element page).
+    uint64_t precedingPrint(const Node* el) {
+        if (const auto it = preceding_prints_.find(el); it != preceding_prints_.end()) return it->second;
+        const Node* parent = el->parent;
         if (!parent) return 0;
-        if (const auto it = sibling_prints_.find(parent); it != sibling_prints_.end()) return it->second;
         uint64_t h = 0xC0FFEE;
         for (const Node* c : parent->children)
-            if (c->isElement()) h = mix(h, ownPrint(c));
-        sibling_prints_[parent] = h;
-        return h;
+            if (c->isElement()) {
+                preceding_prints_[c] = h;
+                h = mix(h, ownPrint(c));
+            }
+        const auto it = preceding_prints_.find(el);
+        return it != preceding_prints_.end() ? it->second : 0;
     }
+
+    // What :nth-last-child and the like see of the siblings after one (`exact`): how many,
+    // and how many of its type; or what :last-child and :only-child do: whether any.
+    // (Exact counts for those too changed every child's key, a whole page's, when a
+    // script added to the end of the body.)
+    uint64_t followingPrint(const Node* el, bool exact) {
+        auto& prints = exact ? following_exact_ : following_any_;
+        if (const auto it = prints.find(el); it != prints.end()) return it->second;
+        const Node* parent = el->parent;
+        if (!parent) return 0;
+        std::unordered_map<std::string_view, uint32_t> of_type;
+        uint32_t after = 0;
+        for (auto it = parent->children.rbegin(); it != parent->children.rend(); ++it) {
+            const Node* c = *it;
+            if (!c->isElement()) continue;
+            uint32_t same = of_type[c->name];
+            const uint32_t all = exact ? after : std::min<uint32_t>(after, 1);
+            if (!exact) same = std::min<uint32_t>(same, 1);
+            prints[c] = mix(0xF0110, (static_cast<uint64_t>(all) << 32) | same);
+            ++after;
+            ++of_type[c->name];
+        }
+        const auto it = prints.find(el);
+        return it != prints.end() ? it->second : 0;
+    }
+
+    // `exact`: counts them (:nth-last-*), not just whether there are any.
+    static bool asksForFollowing(const SimpleSelector& x, bool exact) {
+        if (x.kind == SimpleKind::PseudoClass &&
+            (exact ? x.name == "nth-last-child" || x.name == "nth-last-of-type"
+                   : x.name == "last-child" || x.name == "only-child" || x.name == "nth-last-child" || x.name == "last-of-type" ||
+                         x.name == "only-of-type" || x.name == "nth-last-of-type"))
+            return true;
+        for (const ComplexSelector& a : x.args)
+            for (const CompoundSelector& c : a.parts)
+                for (const SimpleSelector& y : c.simple)
+                    if (asksForFollowing(y, exact)) return true;
+        return false;
+    }
+
+    // The compounds asking about siblings after: what an element must have to be asked
+    // (into follow_anchors_, as noteHasAnchors), or, with nothing to tell, follow_any_.
+    void noteFollowing(const ComplexSelector& sel) {
+        for (const CompoundSelector& c : sel.parts) {
+            if (std::none_of(c.simple.begin(), c.simple.end(), [](const SimpleSelector& x) { return asksForFollowing(x, false); })) continue;
+            const bool exact = std::any_of(c.simple.begin(), c.simple.end(), [](const SimpleSelector& x) { return asksForFollowing(x, true); });
+            auto& anchors = exact ? follow_exact_anchors_ : follow_anchors_;
+            bool noted = false;
+            for (const SimpleSelector& y : c.simple) {
+                if (y.kind == SimpleKind::Type) anchors.insert(featureHash('t', y.name));
+                else if (y.kind == SimpleKind::Id) anchors.insert(featureHash('i', y.name));
+                else if (y.kind == SimpleKind::Class) anchors.insert(featureHash('c', y.name));
+                else if (y.kind == SimpleKind::Attribute && y.op == AttrOp::Equals && !y.case_insensitive)
+                    anchors.insert(featureHash('v', lower(y.name) + '=' + y.value));
+                else if (y.kind == SimpleKind::Attribute) anchors.insert(featureHash('a', lower(y.name)));
+                else continue;
+                noted = true;
+                break;
+            }
+            if (!noted) (exact ? follow_exact_any_ : follow_any_) = true;
+        }
+    }
+
 
     // `parent_key`: what its parent's children's keys start from (`parent_full_key`: the
     // parent's own). `children_base`: what its children's start from, but for a :has()
@@ -4298,7 +4438,9 @@ private:
         // Its own style attribute's `inherit`s are of anything in the parent's.
         if (style_attr && style_attr->find("inherit") != std::string::npos) parent_key = parent_full_key;
         uint64_t h = mix(parent_key, ownPrint(el));
-        h = mix(h, siblingsPrint(el->parent));
+        h = mix(h, precedingPrint(el));
+        if (follow_exact_any_ || anchorIn(el, follow_exact_anchors_)) h = mix(h, followingPrint(el, true));
+        else if (follow_any_ || anchorIn(el, follow_anchors_)) h = mix(h, followingPrint(el, false));
         h = mix(h, scope->host_el ? scope->ident : reinterpret_cast<uintptr_t>(scope));
         h = mix(h, reinterpret_cast<uintptr_t>(slot));
         if (children_base) *children_base = mix(h, style_attr ? styleAttrPrint(*style_attr, true) : 0);
@@ -4446,9 +4588,14 @@ private:
 
     // Down the composed tree: a host's shadow tree (in its scope), a slot's assigned
     // nodes (in the host's tree's scope), everyone else's children.
-    void walk(const Node* el, const ComputedStyle& parent, size_t depth, const Scope* scope, const Node* slot, uint64_t parent_key = 0,
-              uint64_t parent_full_key = 0) {
-        if (depth > kMaxStyledDepth) return;
+    // One element styled (kept, or resolved), its pseudo-elements too unless it's display:
+    // none: its style, its key, and what its children's start from.
+    struct Visited {
+        const ComputedStyle* style;
+        uint64_t key, children_key;
+    };
+    Visited visit(const Node* el, const ComputedStyle& parent, const Scope* scope, const Node* slot, uint64_t parent_key,
+                  uint64_t parent_full_key) {
         uint64_t base = 0;
         bool anchored = false;
         const uint64_t key = elementKey(el, parent_key, parent_full_key, scope, slot, &base, &anchored);
@@ -4498,8 +4645,6 @@ private:
             const auto pp = previous_->keys_.find(el->parent);
             if (pk != out_.keys_.end() && pp != previous_->keys_.end() && pk->second == pp->second) {
                 ++dbg_roots_;
-                const std::string* id = el->attr("id");
-                const std::string* cls = el->attr("class");
                 std::string attrs;
                 for (const Attribute& a : el->attrs) attrs += a.name + "=" + a.value.substr(0, 60) + " ";
                 std::fprintf(stderr, "[restyle]   at <%s %s> anchored %d had-key %d\n", el->name.c_str(), attrs.c_str(), anchored,
@@ -4523,14 +4668,22 @@ private:
         const uint64_t children_key =
             have_print ? mix(base, match_print) : anchored ? mix(base, subtreePrint(el->parent ? el->parent : el)) : base;
         const ComputedStyle& s = *out_.styles_[el];
-        // Nothing below gets a box; but an SVG's hidden parts can still be drawn by <use>.
-        if (s.display == Display::None && el->ns != Namespace::Svg) return;
-        if (!kept) {
+        if (!kept && !(s.display == Display::None && el->ns != Namespace::Svg)) {
             resolvePseudo(el, s, ua_p_->before, scope->before, scope->host_el, out_.before_);
             resolvePseudo(el, s, ua_p_->after, scope->after, scope->host_el, out_.after_);
             if ((el->isHtml("input") || el->isHtml("textarea")) && el->attr("placeholder"))
                 resolvePseudo(el, s, ua_p_->placeholder, scope->placeholder, scope->host_el, out_.placeholder_, false);
         }
+        return {&s, key, children_key};
+    }
+
+    void walk(const Node* el, const ComputedStyle& parent, size_t depth, const Scope* scope, const Node* slot, uint64_t parent_key = 0,
+              uint64_t parent_full_key = 0) {
+        if (depth > kMaxStyledDepth) return;
+        const auto [style, key, children_key] = visit(el, parent, scope, slot, parent_key, parent_full_key);
+        const ComputedStyle& s = *style;
+        // Nothing below gets a box; but an SVG's hidden parts can still be drawn by <use>.
+        if (s.display == Display::None && el->ns != Namespace::Svg) return;
         if (el->shadow_root) {
             const auto it = shadow_scopes_.find(el->shadow_root);
             const Scope* inner = it == shadow_scopes_.end() ? scope : it->second.get();
@@ -4570,6 +4723,9 @@ private:
     bool uses_has_ = false;   // a rule with :has(): what an element matches can depend on its descendants
     bool has_any_anchor_ = false;
     bool style_selector_ = false;   // a selector asks about style attributes ([style])
+    // Elements asked about siblings after them (:last-child, ...): any, or with these.
+    bool follow_any_ = false, follow_exact_any_ = false;
+    std::unordered_set<uint32_t> follow_anchors_, follow_exact_anchors_;   // (exact: :nth-last-*)
     std::unordered_set<std::string> inherit_used_;   // properties a rule gives `inherit`
     int box_inherited_ = -1;   // whether one of those is one of kOwnBoxProperties' (-1: not known yet)
     bool has_context_ = false;   // a :has() asked for another element, of any element
@@ -4582,7 +4738,8 @@ private:
     std::pmr::monotonic_buffer_resource pool_{size_t{1} << 20};
     std::pmr::unordered_map<const Node*, uint64_t> subtree_prints_{&pool_};
     const StyledDocument* previous_ = nullptr;
-    std::pmr::unordered_map<const Node*, uint64_t> own_prints_{&pool_}, sibling_prints_{&pool_};
+    std::pmr::unordered_map<const Node*, uint64_t> own_prints_{&pool_}, preceding_prints_{&pool_},
+        following_exact_{&pool_}, following_any_{&pool_};
     bool copy_kept_ = false;
     std::vector<const Node*> hosts_;   // elements with a shadow root, as the walk for sheets met them
     std::vector<SheetUse> uses_;
@@ -4598,6 +4755,8 @@ private:
     std::vector<size_t> bloom_marks_;
     std::vector<uint32_t> bloom_hashes_;
     const Node* current_element_ = nullptr;
+    // Styles worked out this run, by what they came from (see resolveInto).
+    std::pmr::unordered_map<uint64_t, const ComputedStyle*> shared_styles_{&pool_};
     bool resolving_pseudo_ = false;
     std::pmr::unordered_map<const Node*, SiblingInfo> siblings_{&pool_};
     LengthContext lengths_;
@@ -4613,6 +4772,15 @@ StyledDocument::StyledDocument(const Document& doc, css::MediaContext media, con
     : media_(media), measure_ch_(measure_ch), forms_(forms) {
     StyleResolver resolver(doc, *this, loader, previous);
     resolver.run();
+}
+
+std::unique_ptr<StyledDocument> StyledDocument::chainOf(const Node* target, const Document& doc, css::MediaContext media,
+                                                        const SheetLoader& loader, const ChMeasure& measure_ch, const FormState* forms,
+                                                        const StyledDocument* previous) {
+    std::unique_ptr<StyledDocument> out(new StyledDocument(media, measure_ch, forms));
+    StyleResolver resolver(doc, *out, loader, previous);
+    if (!resolver.runChain(target)) return nullptr;
+    return out;
 }
 
 const ComputedStyle* StyledDocument::beforeOf(const Node* element) const {

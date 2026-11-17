@@ -2,6 +2,7 @@
 
 // Measures text with the same fonts and shaping that xrender draws it with.
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -49,7 +50,9 @@ public:
 
 private:
     [[nodiscard]] float runWidth(std::string_view utf8, const std::string& family, const FontSpec& font);
-    std::unordered_map<std::string, float> cache_;   // pages repeat their words
+    // Pages repeat their words: by a 64-bit hash of the font and the text (a key string
+    // made and hashed for each word was half of measuring them).
+    std::unordered_map<uint64_t, float> cache_;
     uint64_t fonts_generation_ = 0;
 };
 

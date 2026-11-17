@@ -376,20 +376,19 @@ float XrenderTextMeasurer::width(std::string_view utf8, const FontSpec& font) {
         cache_.clear();
         fonts_generation_ = g_fonts_generation;
     }
-    std::string key;
-    key.reserve(utf8.size() + font.family.size() + 16);
-    key += font.family;
-    key += '\x01';
-    key += std::to_string(static_cast<int>(font.size * 64));
-    key += '\x01';
-    key += std::to_string(font.weight);
-    key += font.italic ? 'i' : 'n';
-    key.append(utf8);
+    uint64_t key = 1469598103934665603ull;
+    const auto add = [&key](uint64_t v) { key = (key ^ v) * 1099511628211ull; };
+    for (const char c : font.family) add(static_cast<uint8_t>(c));
+    add(0x100 + static_cast<uint64_t>(static_cast<int64_t>(font.size * 64)));
+    add(0x200 + static_cast<uint64_t>(font.weight));
+    add(font.italic ? 0x301 : 0x300);
+    for (const char c : utf8) add(static_cast<uint8_t>(c));
+    add(0x400 + utf8.size());
     const auto it = cache_.find(key);
     if (it != cache_.end()) return it->second;
     float w = 0;
     for (const FontRun& run : fontRuns(utf8, font)) w += runWidth(utf8.substr(run.begin, run.end - run.begin), run.family, font);
-    cache_.emplace(std::move(key), w);
+    cache_.emplace(key, w);
     return w;
 }
 
