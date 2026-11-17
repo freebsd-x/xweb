@@ -1264,10 +1264,49 @@ const char* const kScriptPrelude = R"JS(
         });
       }
     }
+    // Text to UTF-8 bytes and back, a chunk at a time (React Router's single fetch
+    // streams its data through one: ohou.se's page was blank without it).
+    class TextEncoderStream extends TransformStream {
+      constructor() {
+        const encoder = new TextEncoder();
+        super({ transform(chunk, c) { const s = String(chunk); if (s) c.enqueue(encoder.encode(s)); } });
+      }
+      get encoding() { return 'utf-8'; }
+    }
+    class TextDecoderStream extends TransformStream {
+      constructor(label = 'utf-8', options = {}) {
+        const decoder = new TextDecoder(label, options);
+        const utf8 = decoder.encoding === 'utf-8';
+        let pending = new Uint8Array(0);   // a UTF-8 character's first bytes, its rest in the next chunk
+        super({
+          transform(chunk, c) {
+            let b = chunk instanceof Uint8Array ? chunk : ArrayBuffer.isView(chunk) ? new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength) : new Uint8Array(chunk);
+            if (pending.length) { const both = new Uint8Array(pending.length + b.length); both.set(pending); both.set(b, pending.length); b = both; }
+            let end = b.length;
+            if (utf8) {
+              let i = end - 1, back = 0;
+              while (i >= 0 && back < 3 && (b[i] & 0xC0) === 0x80) { --i; ++back; }
+              if (i >= 0) {
+                const lead = b[i], need = lead >= 0xF0 ? 4 : lead >= 0xE0 ? 3 : lead >= 0xC0 ? 2 : 1;
+                if (end - i < need) end = i;
+              }
+            }
+            pending = b.slice(end);
+            const s = decoder.decode(b.subarray(0, end));
+            if (s) c.enqueue(s);
+          },
+          flush(c) { if (pending.length) { const s = decoder.decode(pending); if (s) c.enqueue(s); } },
+        });
+        this._decoder = decoder;
+      }
+      get encoding() { return this._decoder.encoding; }
+      get fatal() { return this._decoder.fatal; }
+      get ignoreBOM() { return this._decoder.ignoreBOM; }
+    }
     class CountQueuingStrategy { constructor({ highWaterMark }) { this.highWaterMark = highWaterMark; } size() { return 1; } }
     class ByteLengthQueuingStrategy { constructor({ highWaterMark }) { this.highWaterMark = highWaterMark; } size(c) { return c.byteLength; } }
     for (const C of [ReadableStream, ReadableStreamDefaultReader, ReadableStreamDefaultController, WritableStream, TransformStream,
-                     CountQueuingStrategy, ByteLengthQueuingStrategy])
+                     TextEncoderStream, TextDecoderStream, CountQueuingStrategy, ByteLengthQueuingStrategy])
       Object.defineProperty(global, C.name, { value: C, writable: true, configurable: true });
   }
 

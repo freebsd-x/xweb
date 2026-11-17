@@ -1142,7 +1142,12 @@ private:
             float floats = 0;
             for (auto& k : b.kids) {
                 if (k->outOfFlow()) continue;
-                if (k->style && k->style->clear != Clear::None) floats = 0;
+                // (The floats before it are as wide as they are: a clearfix after a float,
+                // fmkorea.com's headings, made a shrink-to-fit box as narrow as its padding.)
+                if (k->style && k->style->clear != Clear::None) {
+                    result = std::max(result, floats);
+                    floats = 0;
+                }
                 const float w = outerIntrinsic(*k, max_content);
                 if (k->floating() && max_content) floats += w;
                 else result = std::max(result, w + (max_content ? floats : 0.0f));

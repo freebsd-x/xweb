@@ -975,6 +975,28 @@ TEST(Script, ReadableStreamsRead) {
     EXPECT_EQ(p.console, "log:1,2,10,20,30,11,21,31,x false function\n") << p.console;
 }
 
+TEST(Script, TextStreamsEncodeAndDecode) {
+    // React Router's single fetch: new ReadableStream(...).pipeThrough(new TextEncoderStream()).
+    Page p(R"(<body><script>
+        const out = [];
+        (async () => {
+          const bytes = new ReadableStream({ start(c) { c.enqueue('hé'); c.enqueue('llo'); c.close(); } }).pipeThrough(new TextEncoderStream());
+          const chunks = [];
+          for await (const b of bytes) chunks.push(b);
+          out.push(chunks.map(b => b.length).join('+'));
+          // Back, with a character split across chunks.
+          const all = new Uint8Array([...chunks[0], ...chunks[1]]);
+          const text = new ReadableStream({ start(c) { c.enqueue(all.slice(0, 2)); c.enqueue(all.slice(2)); c.close(); } }).pipeThrough(new TextDecoderStream());
+          let s = '';
+          for await (const t of text) s += t;
+          out.push(s, new TextEncoderStream().encoding);
+          console.log(out.join(' '));
+        })();
+        </script>)");
+    for (int i = 0; i < 5; ++i) p.script->tick();
+    EXPECT_EQ(p.console, "log:3+3 h\u00e9llo utf-8\n") << p.console;
+}
+
 TEST(Script, OnHandlersRunOnce) {
     // Angular's $httpBackend nulls its request in onload: a second call threw.
     Page p(R"(<body><script>

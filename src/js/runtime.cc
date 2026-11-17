@@ -739,7 +739,20 @@ Object* Runtime::newError(const char* kind, const std::string& message) {
     return e;
 }
 
-void Runtime::throwError(const char* kind, const std::string& message) { throw Thrown{Value::object(newError(kind, message))}; }
+// XWEB_DEBUG_ERRORS=1: each error the engine throws, and where, even one a script catches
+// (a page that reports its own errors, without a stack, hides where it went wrong).
+void Runtime::throwError(const char* kind, const std::string& message) {
+    static const bool debug = std::getenv("XWEB_DEBUG_ERRORS") != nullptr;
+    Object* error = newError(kind, message);
+    if (debug) {
+        std::string where;
+        if (const Property* p = error->own(PropertyKey(u"stack")); p && p->value.isString()) where = utf8(p->value.asString());
+        for (char& c : where)
+            if (c == '\n') c = ' ';
+        std::fprintf(stderr, "[js-error] %s: %s | %s\n", kind, message.c_str(), where.substr(0, 600).c_str());
+    }
+    throw Thrown{Value::object(error)};
+}
 
 void Runtime::step() {
     // Where it was when stopped, to know which script (its stack line, without the "at").

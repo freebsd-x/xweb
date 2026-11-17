@@ -676,6 +676,15 @@ TEST(Positioned, NegativeZIndexStaysInAMovedList) {
     }
 }
 
+TEST(Float, AClearfixAfterAFloatKeepsItsWidth) {
+    // fmkorea.com's headings: a floated link, then h1::after { display: block; clear: both }.
+    const auto r = layout("<style>.c:after{content:'';display:block;clear:both}</style>"
+                          "<div id=outer style='float:left'><h1 id=h class=c style='float:left;margin:0'>"
+                          "<a id=a style='float:left;width:80px;height:10px'></a></h1></div>");
+    EXPECT_FLOAT_EQ(r.box("h").w, 80);
+    EXPECT_FLOAT_EQ(r.box("outer").w, 80);
+}
+
 TEST(Paint, AGradientFadesWithItsBox) {
     const auto r = layout("<div style='opacity:0.5'><div style='width:10px;height:10px;background:linear-gradient(#f00,#00f)'></div></div>");
     const PaintOp* g = nullptr;
