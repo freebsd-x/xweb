@@ -97,6 +97,8 @@ private:
 };
 
 inline constexpr uint32_t kGlobalSlot = 0xFFFFFFFFu;
+// kGlobalPos + n: in none, the global object's property made n-th (as last found there).
+inline constexpr uint32_t kGlobalPos = 0x80000000u;
 
 struct Node {
     N kind;

@@ -195,6 +195,13 @@ Property* Object::own(const PropertyKey& key) {
     return at < 0 ? nullptr : &props_[static_cast<size_t>(at)].second;
 }
 
+Property* Object::ownAt(size_t pos, const PropertyKey& key, size_t hash) noexcept {
+    if (pos >= props_.size()) return nullptr;
+    auto& [k, p] = props_[pos];
+    if (p.flags == kTombstone || k.isSymbol() != key.isSymbol() || keyHash(k) != hash || k.name.size() != key.name.size()) return nullptr;
+    return &p;
+}
+
 const Property* Object::ownHashed(const PropertyKey& key, size_t hash) const {
     const ptrdiff_t at = find(key, hash, true);
     return at < 0 ? nullptr : &props_[static_cast<size_t>(at)].second;
@@ -422,7 +429,7 @@ private:
                 e = e->outer;
             }
             if (e && !e->with_object) {
-                if (site->scope_slot != kGlobalSlot) {
+                if (site->scope_slot < kGlobalPos) {
                     if (VarMap::Entry* it = e->vars.at(site->scope_slot, h, name); it && !it->second.import_env) {
                         if (where) *where = e;
                         if (imported) *imported = false;
@@ -501,13 +508,26 @@ private:
         }
         if (with) return rt_.get(Value::object(with), PropertyKey(name));
         Object* g = globalObject(env);
-        if (name == u"undefined") return Value::undefined();
         std::optional<PropertyKey> made;
         const PropertyKey& key = name_key ? *name_key : site ? nameKey(site) : made.emplace(name);
         // The usual case, in one lookup: an ordinary global's own data property is
-        // what has() then get() would find first. (A name's hash is its key's.)
-        if (g->cls != ObjectClass::Proxy && g->cls != ObjectClass::TypedArray && g->cls != ObjectClass::String && g->elements.empty())
-            if (const Property* p = hash ? g->ownHashed(key, hash) : g->own(key); p && !(p->flags & kAccessor)) return p->value;
+        // what has() then get() would find first. (A name's hash is its key's.) Where it
+        // was last time, if it's there still (a script's top-level vars, each use).
+        if (g->cls != ObjectClass::Proxy && g->cls != ObjectClass::TypedArray && g->cls != ObjectClass::String && g->elements.empty() && hash) {
+            const bool cached = site && site->scope_slot >= kGlobalPos && site->scope_slot != kGlobalSlot;
+            if (cached)
+                if (const Property* p = g->ownAt(site->scope_slot - kGlobalPos, key, hash); p && !(p->flags & kAccessor)) return p->value;
+            const ptrdiff_t at = g->ownPos(key, hash);
+            if (at >= 0) {
+                const Property* p = g->ownAt(static_cast<size_t>(at), key, hash);
+                if (p && !(p->flags & kAccessor)) {
+                    if (site && site->scope_slot >= kGlobalPos && static_cast<uint64_t>(at) < kGlobalSlot - kGlobalPos)
+                        site->scope_slot = kGlobalPos + static_cast<uint32_t>(at);
+                    return p->value;
+                }
+            }
+        }
+        if (name == u"undefined") return Value::undefined();
         if (rt_.has(g, key)) return rt_.get(g, key, Value::object(g));
         rt_.throwError("ReferenceError", utf8(name) + " is not defined");
     }
@@ -531,8 +551,22 @@ private:
             return;
         }
         Object* g = globalObject(env);
+        // A global var where it was last time (as lookup), or found once: set there.
+        if (site && site->scope_slot >= kGlobalPos && (g->cls == ObjectClass::Ordinary || g->cls == ObjectClass::Function)) {
+            const size_t h = nameHash(site);
+            Property* p = site->scope_slot != kGlobalSlot ? g->ownAt(site->scope_slot - kGlobalPos, nameKey(site), h) : nullptr;
+            if (!p) {
+                const ptrdiff_t at = g->ownPos(nameKey(site), h);
+                p = at >= 0 ? g->ownAt(static_cast<size_t>(at), nameKey(site), h) : nullptr;
+                if (p && static_cast<uint64_t>(at) < kGlobalSlot - kGlobalPos) site->scope_slot = kGlobalPos + static_cast<uint32_t>(at);
+            }
+            if (p && !(p->flags & kAccessor) && (p->flags & kWritable)) {
+                p->value = v;
+                return;
+            }
+        }
         if (strict && !rt_.has(g, name)) rt_.throwError("ReferenceError", utf8(name) + " is not defined");
-        rt_.set(g, name, v, Value::object(g));
+        rt_.set(g, site ? nameKey(site) : PropertyKey(name), v, Value::object(g));
     }
 
     // Declares a pattern's names in env with these values (let/const/params/catch).

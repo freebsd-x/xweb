@@ -165,6 +165,10 @@ public:
     [[nodiscard]] const Property* own(const PropertyKey& key) const;
     // With the key's hash (keyHash) already worked out: a name looked up over and over.
     [[nodiscard]] const Property* ownHashed(const PropertyKey& key, size_t hash) const;
+    // Where an own property is in the order they were made (-1: none), and the one there
+    // if it's still that name's (a lookup's cached place, checked).
+    [[nodiscard]] ptrdiff_t ownPos(const PropertyKey& key, size_t hash) const noexcept { return find(key, hash, true); }
+    [[nodiscard]] Property* ownAt(size_t pos, const PropertyKey& key, size_t hash) noexcept;
     Property& define(const PropertyKey& key, Property p);
     bool remove(const PropertyKey& key);
     [[nodiscard]] std::vector<PropertyKey> ownKeys() const;   // indexes, strings, then symbols, as the spec orders them
