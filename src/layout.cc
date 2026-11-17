@@ -3173,11 +3173,15 @@ private:
                 addWord(word, it);
                 return;
             }
+            // word-break: keep-all, no breaks between CJK characters (Korean words stay
+            // whole: donga.com's menu wrapped a syllable or two a line); break-all, between
+            // any two.
+            const auto wb = it.style->word_break;
             size_t start = 0;
             for (size_t i = 0; i < word.size();) {
                 size_t len = 1;
                 const uint32_t cp = decodeAt(word, i, len);
-                const bool cjk = breaksAroundCodePoint(cp);
+                const bool cjk = wb == ComputedStyle::WordBreak::BreakAll || (wb != ComputedStyle::WordBreak::KeepAll && breaksAroundCodePoint(cp));
                 const bool hyphen = cp == '-' && i > start && i + 1 < word.size();
                 if (cjk && i > start) {
                     addWord(word.substr(start, i - start), it);

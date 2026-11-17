@@ -3220,6 +3220,7 @@ private:
             to.block_align = from.block_align;
         }
         else if (p == "text-transform") to.text_transform = from.text_transform;
+        else if (p == "word-break") to.word_break = from.word_break;
         else if (p == "white-space") to.white_space = from.white_space;
         else if (p == "text-overflow") to.text_overflow_ellipsis = from.text_overflow_ellipsis;
         else if (p == "list-style-type" || p == "list-style") to.list_style = from.list_style;
@@ -3903,6 +3904,12 @@ private:
             s.block_align = kw == "-webkit-center" ? 1 : kw == "-webkit-right" ? 2 : 0;
             return;
         }
+        if (p == "word-break") {
+            if (kw == "normal" || kw == "break-word") s.word_break = ComputedStyle::WordBreak::Normal;
+            else if (kw == "break-all") s.word_break = ComputedStyle::WordBreak::BreakAll;
+            else if (kw == "keep-all") s.word_break = ComputedStyle::WordBreak::KeepAll;
+            return;
+        }
         if (p == "text-transform") {
             if (kw == "none") s.text_transform = TextTransform::None;
             else if (kw == "uppercase") s.text_transform = TextTransform::Uppercase;
@@ -3973,6 +3980,7 @@ private:
         s.block_align = parent.block_align;
         s.parent_block_align = parent.block_align;
         s.text_transform = parent.text_transform;
+        s.word_break = parent.word_break;
         s.white_space = parent.white_space;
         s.list_style = parent.list_style;
         s.text_indent = parent.text_indent;

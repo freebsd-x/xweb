@@ -685,6 +685,16 @@ TEST(Float, AClearfixAfterAFloatKeepsItsWidth) {
     EXPECT_FLOAT_EQ(r.box("outer").w, 80);
 }
 
+TEST(Inline, WordBreakKeepAllAndBreakAll) {
+    // Korean pages' body { word-break: keep-all }: a narrow box doesn't split a word.
+    const auto keep = layout("<div id=d style='width:10px;word-break:keep-all'>\xEC\x8A\xA4\xED\x8F\xAC\xEC\xB8\xA0</div>");
+    const auto normal = layout("<div id=d style='width:10px'>\xEC\x8A\xA4\xED\x8F\xAC\xEC\xB8\xA0</div>");
+    EXPECT_LT(keep.box("d").h, normal.box("d").h);   // one line, not three
+    const auto all = layout("<div id=d style='width:10px;word-break:break-all'>abcdef</div>");
+    const auto plain = layout("<div id=d style='width:10px'>abcdef</div>");
+    EXPECT_GT(all.box("d").h, plain.box("d").h);   // broken between letters
+}
+
 TEST(Paint, AGradientFadesWithItsBox) {
     const auto r = layout("<div style='opacity:0.5'><div style='width:10px;height:10px;background:linear-gradient(#f00,#00f)'></div></div>");
     const PaintOp* g = nullptr;

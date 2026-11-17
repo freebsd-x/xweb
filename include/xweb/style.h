@@ -203,6 +203,9 @@ struct ComputedStyle {
     // is the parent's, which is what places this box.
     uint8_t block_align = 0, parent_block_align = 0;
     TextTransform text_transform = TextTransform::None;
+    // word-break: where lines may break inside words. KeepAll: not between CJK
+    // characters (Korean sites' body { word-break: keep-all }); BreakAll: anywhere.
+    enum class WordBreak : uint8_t { Normal, BreakAll, KeepAll } word_break = WordBreak::Normal;
     WhiteSpace white_space = WhiteSpace::Normal;
     ListStyle list_style = ListStyle::Disc;
     Length text_indent;
