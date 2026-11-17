@@ -783,6 +783,17 @@ TEST(Restyle, SiblingsAddedAfterKeepWhatsBefore) {
     EXPECT_EQ(styles->styleOf(elementById(*doc, "p"))->color, (Color{2, 2, 2, 255}));
 }
 
+TEST(Selectors, NthChildOfASelector) {
+    auto doc = parseHtml(R"(<!doctype html><style>
+        li:nth-child(2 of .x) { color: rgb(1, 2, 3) } li:nth-last-child(1 of .x) { font-size: 30px }
+      </style><ul><li id=a class=x></li><li id=b></li><li id=c class=x></li><li id=d class=x></li><li id=e></li></ul>)");
+    const StyledDocument styles(*doc, css::MediaContext{800, 600});
+    EXPECT_EQ(styles.styleOf(elementById(*doc, "c"))->color, (Color{1, 2, 3, 255}));
+    EXPECT_NE(styles.styleOf(elementById(*doc, "b"))->color, (Color{1, 2, 3, 255}));
+    EXPECT_EQ(styles.styleOf(elementById(*doc, "d"))->font_size, 30);
+    EXPECT_NE(styles.styleOf(elementById(*doc, "e"))->font_size, 30);
+}
+
 // With :has() only of the element styled, a change under an anchor restyles the anchor,
 // and its children only when what it matched changed (they inherit from it).
 TEST(Restyle, UnderAHasAnchorOnlyTheAnchorRestyles) {

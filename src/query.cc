@@ -141,6 +141,22 @@ private:
         if (n == "defined") return !(el->ns == Namespace::Html && el->name.find('-') != std::string::npos && el->custom_state != 2);
         if (n == "host") return false;   // from outside a shadow tree, nothing is its host
         if (n == "scope") return false;
+        // :nth-child(An+B of S): it matches S, and it's that place among its siblings that do.
+        if ((n == "nth-child" || n == "nth-last-child") && !s.args.empty()) {
+            const auto inS = [&](const Node* x) {
+                for (const ComplexSelector& a : s.args)
+                    if (complex(x, a)) return true;
+                return false;
+            };
+            if (!el->parent || !inS(el)) return false;
+            int index = 0, count = 0;
+            for (const Node* c : el->parent->children) {
+                if (!c->isElement() || !inS(c)) continue;
+                ++count;
+                if (c == el) index = count;
+            }
+            return nth(s.a, s.b, n == "nth-child" ? index : count - index + 1);
+        }
         const Position p = positionOf(el);
         if (n == "first-child") return p.index == 1;
         if (n == "last-child") return p.index == p.count;

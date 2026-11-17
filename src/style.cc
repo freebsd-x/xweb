@@ -2247,6 +2247,24 @@ private:
         if (n == "first-child") return info.index == 1;
         if (n == "last-child") return info.index == info.count;
         if (n == "only-child") return info.count == 1;
+        // :nth-child(An+B of S): it matches S, and it's that place among its siblings that do.
+        if ((n == "nth-child" || n == "nth-last-child") && !s.args.empty()) {
+            const auto inS = [&](const Node* x) {
+                for (const ComplexSelector& a : s.args)
+                    if (matchComplex(x, a)) return true;
+                return false;
+            };
+            if (!inS(el)) return false;
+            int place = 1;
+            if (n == "nth-child") {
+                for (const Node* p = info.prev; p && fuel_-- > 0; p = sib(p).prev)
+                    if (inS(p)) ++place;
+            } else {
+                for (const Node* p = info.next; p && fuel_-- > 0; p = sib(p).next)
+                    if (inS(p)) ++place;
+            }
+            return nthMatches(s.a, s.b, place);
+        }
         if (n == "nth-child") return nthMatches(s.a, s.b, info.index);
         if (n == "nth-last-child") return nthMatches(s.a, s.b, info.count - info.index + 1);
         if (n == "first-of-type" || n == "last-of-type" || n == "only-of-type" || n == "nth-of-type" || n == "nth-last-of-type") {
@@ -4426,15 +4444,17 @@ private:
         if (!parent) return 0;
         std::unordered_map<std::string_view, uint32_t> of_type;
         uint32_t after = 0;
+        uint64_t whats_after = 0xAF7E;   // (exact: what they are too, for :nth-last-child(... of S))
         for (auto it = parent->children.rbegin(); it != parent->children.rend(); ++it) {
             const Node* c = *it;
             if (!c->isElement()) continue;
             uint32_t same = of_type[c->name];
             const uint32_t all = exact ? after : std::min<uint32_t>(after, 1);
             if (!exact) same = std::min<uint32_t>(same, 1);
-            prints[c] = mix(0xF0110, (static_cast<uint64_t>(all) << 32) | same);
+            prints[c] = mix(exact ? whats_after : 0xF0110, (static_cast<uint64_t>(all) << 32) | same);
             ++after;
             ++of_type[c->name];
+            if (exact) whats_after = mix(whats_after, ownPrint(c));
         }
         const auto it = prints.find(el);
         return it != prints.end() ? it->second : 0;

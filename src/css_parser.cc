@@ -682,7 +682,13 @@ private:
             for (size_t i = arg_begin; i < arg_end && i < tokens.size(); ++i) {
                 const Token& t = tokens[i];
                 if (t.type == TokenType::Ident) {
-                    if (lower(t.text) == "of") return false;   // "of S" isn't supported
+                    if (lower(t.text) == "of") {
+                        // :nth-child(An+B of S), :nth-last-child(...): counting those matching S.
+                        if (ss.name != "nth-child" && ss.name != "nth-last-child") return false;
+                        SelectorParser inner(tokens, i + 1, arg_end, depth_ + 1);
+                        if (!inner.list(ss.args) || ss.args.empty()) return false;
+                        break;
+                    }
                     text += t.text;
                 } else if (t.type == TokenType::Number) {
                     if (t.number >= 0 && !text.empty() && text.back() != '+' && text.back() != '-') text += "+";
