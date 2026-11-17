@@ -34,6 +34,7 @@ using Tokens = std::vector<Token>;
 namespace {
 
 constexpr int kSelectorFuel = 20000;          // match steps per element
+constexpr size_t kMaxContextCompounds = 256;   // :has() compounds asked for another element, tried per anchor restyled
 constexpr size_t kMaxVarTokens = 4096;        // tokens one value can expand to
 constexpr int kMaxVarDepth = 16;
 constexpr int kMaxImportDepth = 4;
@@ -1807,8 +1808,11 @@ public:
             std::shared_ptr<Scope> ua, doc;
             std::vector<WebFontFace> fonts;
             size_t order = 0;
-            bool uses_has = false, has_any_anchor = false;
-            std::unordered_set<uint32_t> has_anchors;
+            bool uses_has = false, has_any_anchor = false, has_context = false;
+            std::unordered_set<uint32_t> has_anchors, has_context_anchors;
+            std::vector<const CompoundSelector*> has_context_compounds;
+            bool style_selector = false;
+            std::unordered_set<std::string> inherit_used;
         };
         static std::mutex mutex;
         static std::shared_ptr<const Cached> last;
@@ -1831,6 +1835,11 @@ public:
                 uses_has_ = last->uses_has;
                 has_any_anchor_ = last->has_any_anchor;
                 has_anchors_ = last->has_anchors;
+                has_context_ = last->has_context;
+                has_context_anchors_ = last->has_context_anchors;
+                has_context_compounds_ = last->has_context_compounds;
+                style_selector_ = last->style_selector;
+                inherit_used_ = last->inherit_used;
                 uses_.clear();
                 return;
             }
@@ -1850,6 +1859,11 @@ public:
         made->uses_has = uses_has_;
         made->has_any_anchor = has_any_anchor_;
         made->has_anchors = has_anchors_;
+        made->has_context = has_context_;
+        made->has_context_anchors = has_context_anchors_;
+        made->has_context_compounds = has_context_compounds_;
+        made->style_selector = style_selector_;
+        made->inherit_used = inherit_used_;
         made->uses = std::move(uses_);
         uses_.clear();
         ua_p_ = made->ua.get();
@@ -1864,8 +1878,15 @@ public:
         if (!root) return;
         ComputedStyle initial;
         std::vector<const Node*> stack;
+        const auto t0 = std::chrono::steady_clock::now();
         walk(root, initial, 0, doc_p_, nullptr);
+        static const bool dbg = std::getenv("XWEB_DEBUG_RESTYLE") != nullptr;
+        if (dbg)
+            std::fprintf(stderr, "[restyle] %zu elements, %zu kept, %.0f ms; previous %d context %d\n", out_.keys_.size(), dbg_kept_,
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), previous_ != nullptr,
+                         has_context_);
     }
+    size_t dbg_kept_ = 0, dbg_roots_ = 0;
 
 private:
     // `url` is where the sheet came from: its @imports are relative to that.
@@ -1905,8 +1926,11 @@ private:
             for (const ComplexSelector& sel : rule.selectors) {
                 if (sel.parts.empty()) continue;
                 noteHasAnchors(sel);
+                if (!style_selector_) style_selector_ = asksForStyleAttribute(sel);
                 index(sel, rule, origin);
             }
+            for (const Declaration& d : rule.declarations)
+                if (keyword(d.value) == "inherit") inherit_used_.insert(d.name);
         }
     }
 
@@ -3894,7 +3918,8 @@ private:
         s.stroke_dasharray = parent.stroke_dasharray;
     }
 
-    void resolveInto(const Node* el, const ComputedStyle& parent, ComputedStyle& s, const Scope* scope, const Node* slot) {
+    void resolveInto(const Node* el, const ComputedStyle& parent, ComputedStyle& s, const Scope* scope, const Node* slot,
+                     uint64_t* match_print = nullptr) {
         inherit(parent, s);
         std::vector<MatchedDecl> matched;
         host_context_ = nullptr;
@@ -3960,6 +3985,14 @@ private:
         if (const std::string* style_attr = el->attr("style")) {
             inline_decls = parsedDeclarations(*style_attr);
             for (const Declaration& d : *inline_decls) matched.push_back({&d, d.important, Origin::Inline, 0, 0});
+        }
+        if (match_print) {
+            // The rules' declarations (the hints' and the style attribute's are its own print's).
+            uint64_t h = 0x4A5;
+            for (const MatchedDecl& m : matched)
+                if (m.origin != Origin::Hint && m.origin != Origin::Inline)
+                    h = mix(mix(h, reinterpret_cast<uintptr_t>(m.decl)), (m.important ? 2u : 1u) + 4u * static_cast<unsigned>(m.origin));
+            *match_print = h;
         }
 
         applyMatched(el, parent, s, matched);
@@ -4224,7 +4257,10 @@ private:
         h = mixText(h, el->name);
         h = mix(h, static_cast<uint64_t>(el->ns));
         h = mix(h, static_cast<uint64_t>(el->custom_state));
-        for (const Attribute& a : el->attrs) h = mixText(mixText(h, a.name), a.value);
+        // (Not its style attribute, which no selector sees unless one asks for [style]: that's
+        // in its key, by styleAttrPrint.)
+        for (const Attribute& a : el->attrs)
+            if (style_selector_ || a.name != "style") h = mixText(mixText(h, a.name), a.value);
         const bool empty = std::none_of(el->children.begin(), el->children.end(), [](const Node* c) {
             return c->isElement() || (c->type == NodeType::Text && !c->data.empty());
         });
@@ -4253,52 +4289,128 @@ private:
         return h;
     }
 
-    uint64_t elementKey(const Node* el, uint64_t parent_key, const Scope* scope, const Node* slot) {
+    // `parent_key`: what its parent's children's keys start from (`parent_full_key`: the
+    // parent's own). `children_base`: what its children's start from, but for a :has()
+    // anchor (`anchored`), which adds to it (see walk).
+    uint64_t elementKey(const Node* el, uint64_t parent_key, uint64_t parent_full_key, const Scope* scope, const Node* slot,
+                        uint64_t* children_base = nullptr, bool* anchored = nullptr) {
+        const std::string* style_attr = el->attr("style");
+        // Its own style attribute's `inherit`s are of anything in the parent's.
+        if (style_attr && style_attr->find("inherit") != std::string::npos) parent_key = parent_full_key;
         uint64_t h = mix(parent_key, ownPrint(el));
-        if (hasAnchor(el)) h = mix(h, subtreePrint(el->parent ? el->parent : el));
         h = mix(h, siblingsPrint(el->parent));
         h = mix(h, scope->host_el ? scope->ident : reinterpret_cast<uintptr_t>(scope));
-        return mix(h, reinterpret_cast<uintptr_t>(slot));
+        h = mix(h, reinterpret_cast<uintptr_t>(slot));
+        if (children_base) *children_base = mix(h, style_attr ? styleAttrPrint(*style_attr, true) : 0);
+        if (style_attr) h = mix(h, styleAttrPrint(*style_attr, false));
+        const bool anchor = hasAnchor(el);
+        if (anchored) *anchored = anchor;
+        if (anchor) h = mix(h, subtreePrint(el->parent ? el->parent : el));
+        return h;
     }
+
+    // A style attribute, for the element's key; or (`for_children`) only what its children
+    // can see of it: nothing, when all it sets is an element's own box (a carousel's
+    // width or transform, set and cleared around each question of 11st.co.kr's Swiper,
+    // restyled all of every slide each time), and nothing has those `inherit`.
+    uint64_t styleAttrPrint(const std::string& text, bool for_children) {
+        const uint64_t all = mixText(0x57A1E, text);
+        if (!for_children) return all;
+        if (box_inherited_ < 0) {
+            // `inherit` for any of them, a shorthand or longhand of one, or `all`: then
+            // children see all of it.
+            box_inherited_ = 0;
+            for (const std::string& n : inherit_used_)
+                for (const std::string& p : kOwnBoxProperties)
+                    if (n == "all" || n.starts_with(p) || p.starts_with(n)) box_inherited_ = 1;
+        }
+        if (box_inherited_) return all;
+        const std::shared_ptr<const std::vector<Declaration>> decls = parsedDeclarations(text);
+        for (const Declaration& d : *decls)
+            if (!kOwnBoxProperties.count(d.name)) return all;
+        return 0;   // as for none
+    }
+    static inline const std::unordered_set<std::string> kOwnBoxProperties = {
+        "width", "height", "min-width", "min-height", "max-width", "max-height", "inline-size", "block-size",
+        "margin", "margin-top", "margin-right", "margin-bottom", "margin-left", "padding", "padding-top", "padding-right",
+        "padding-bottom", "padding-left", "top", "right", "bottom", "left", "inset", "transform", "transform-origin",
+        "translate", "rotate", "scale", "transition", "transition-duration", "transition-delay", "transition-property",
+        "transition-timing-function", "will-change", "z-index", "opacity", "flex", "flex-basis", "flex-grow", "flex-shrink",
+        "order"};
 
     // What an element a :has() is asked of must have (a tag, ID or class of the compound
     // the :has() is in), into has_anchors_; or, with nothing to tell, has_any_anchor_.
-    void noteHasAnchors(const ComplexSelector& sel) {
-        for (const CompoundSelector& c : sel.parts)
+    // `subject`: the selector is (in) what a rule's subject must match, so a :has() in its
+    // last compound is asked of the element being styled only. One anywhere else (`.a:has(.b)
+    // .c`) is asked of an ancestor or a sibling for it: has_context_.
+    void noteHasAnchors(const ComplexSelector& sel, bool subject = true) {
+        for (size_t i = 0; i < sel.parts.size(); ++i) {
+            const CompoundSelector& c = sel.parts[i];
+            const bool is_subject = subject && i + 1 == sel.parts.size();
             for (const SimpleSelector& x : c.simple) {
                 if (x.kind == SimpleKind::PseudoClass && x.name == "has") {
                     uses_has_ = true;
-                    bool noted = false;
-                    for (const SimpleSelector& y : c.simple) {
-                        if (y.kind == SimpleKind::Type) has_anchors_.insert(featureHash('t', y.name));
-                        else if (y.kind == SimpleKind::Id) has_anchors_.insert(featureHash('i', y.name));
-                        else if (y.kind == SimpleKind::Class) has_anchors_.insert(featureHash('c', y.name));
-                        // An attribute it must have ([data-type=X]:has(...), 11st.co.kr's): with
-                        // nothing to tell its subject by, keeping styles was off for the page,
-                        // and each of its scripts' questions restyled all 8800 elements.
-                        else if (y.kind == SimpleKind::Attribute && y.op == AttrOp::Equals && !y.case_insensitive)
-                            has_anchors_.insert(featureHash('v', lower(y.name) + '=' + y.value));   // that value, only those
-                        else if (y.kind == SimpleKind::Attribute) has_anchors_.insert(featureHash('a', lower(y.name)));
-                        else continue;
-                        noted = true;
-                        break;
+                    // Those asked for another element are noted twice: as anchors, and as
+                    // anchors whose children's keys must have what's under them.
+                    if (!is_subject && (has_context_compounds_.empty() || has_context_compounds_.back() != &c))
+                        has_context_compounds_.push_back(&c);
+                    for (const bool context : {false, true}) {
+                        if (context && is_subject) break;
+                        auto& anchors = context ? has_context_anchors_ : has_anchors_;
+                        bool noted = false;
+                        for (const SimpleSelector& y : c.simple) {
+                            if (y.kind == SimpleKind::Type) anchors.insert(featureHash('t', y.name));
+                            else if (y.kind == SimpleKind::Id) anchors.insert(featureHash('i', y.name));
+                            else if (y.kind == SimpleKind::Class) anchors.insert(featureHash('c', y.name));
+                            // An attribute it must have ([data-type=X]:has(...), 11st.co.kr's): with
+                            // nothing to tell its subject by, keeping styles was off for the page,
+                            // and each of its scripts' questions restyled all 8800 elements.
+                            else if (y.kind == SimpleKind::Attribute && y.op == AttrOp::Equals && !y.case_insensitive)
+                                anchors.insert(featureHash('v', lower(y.name) + '=' + y.value));   // that value, only those
+                            else if (y.kind == SimpleKind::Attribute) anchors.insert(featureHash('a', lower(y.name)));
+                            else continue;
+                            noted = true;
+                            break;
+                        }
+                        if (!noted) (context ? has_context_ : has_any_anchor_) = true;
                     }
-                    if (!noted) has_any_anchor_ = true;
                 }
-                for (const ComplexSelector& a : x.args) noteHasAnchors(a);
+                // :has()'s own argument is asked of what's under the anchor (in its print);
+                // :is() and the like are of the element itself; anything else, unknown.
+                const bool same = x.kind == SimpleKind::PseudoClass &&
+                                  (x.name == "has" || x.name == "is" || x.name == "where" || x.name == "not" || x.name == "matches" ||
+                                   x.name == "-webkit-any" || x.name == "-moz-any");
+                for (const ComplexSelector& a : x.args) noteHasAnchors(a, is_subject && same);
             }
+        }
+    }
+
+    static bool asksForStyleAttribute(const ComplexSelector& sel) {
+        for (const CompoundSelector& c : sel.parts)
+            for (const SimpleSelector& x : c.simple) {
+                if (x.kind == SimpleKind::Attribute && lower(x.name) == "style") return true;
+                for (const ComplexSelector& a : x.args)
+                    if (asksForStyleAttribute(a)) return true;
+            }
+        return false;
     }
 
     // Whether a :has() might be asked of this element.
     bool hasAnchor(const Node* el) const {
         if (!uses_has_) return false;
-        if (has_any_anchor_) return true;
-        if (has_anchors_.count(featureHash('t', lower(el->name)))) return true;
+        return has_any_anchor_ || anchorIn(el, has_anchors_);
+    }
+    // Whether one might be asked of it for another element (its descendant or sibling).
+    bool contextAnchor(const Node* el) const { return has_context_ || anchorIn(el, has_context_anchors_); }
+
+    static bool anchorIn(const Node* el, const std::unordered_set<uint32_t>& anchors) {
+        if (anchors.empty()) return false;
+        if (anchors.count(featureHash('t', lower(el->name)))) return true;
         for (const Attribute& a : el->attrs) {
             const std::string name = lower(a.name);
-            if (has_anchors_.count(featureHash('a', name)) || has_anchors_.count(featureHash('v', name + '=' + a.value))) return true;
+            if (anchors.count(featureHash('a', name)) || anchors.count(featureHash('v', name + '=' + a.value))) return true;
         }
-        if (const std::string* id = el->attr("id"); id && has_anchors_.count(featureHash('i', *id))) return true;
+        if (const std::string* id = el->attr("id"); id && anchors.count(featureHash('i', *id))) return true;
         if (const std::string* cls = el->attr("class")) {
             const std::string_view list = *cls;
             size_t i = 0;
@@ -4306,7 +4418,7 @@ private:
                 while (i < list.size() && isWsChar(list[i])) ++i;
                 const size_t b = i;
                 while (i < list.size() && !isWsChar(list[i])) ++i;
-                if (i > b && has_anchors_.count(featureHash('c', list.substr(b, i - b)))) return true;
+                if (i > b && anchors.count(featureHash('c', list.substr(b, i - b)))) return true;
             }
         }
         return false;
@@ -4325,10 +4437,22 @@ private:
 
     // Down the composed tree: a host's shadow tree (in its scope), a slot's assigned
     // nodes (in the host's tree's scope), everyone else's children.
-    void walk(const Node* el, const ComputedStyle& parent, size_t depth, const Scope* scope, const Node* slot, uint64_t parent_key = 0) {
+    void walk(const Node* el, const ComputedStyle& parent, size_t depth, const Scope* scope, const Node* slot, uint64_t parent_key = 0,
+              uint64_t parent_full_key = 0) {
         if (depth > kMaxStyledDepth) return;
-        const uint64_t key = elementKey(el, parent_key, scope, slot);
+        uint64_t base = 0;
+        bool anchored = false;
+        const uint64_t key = elementKey(el, parent_key, parent_full_key, scope, slot, &base, &anchored);
         out_.keys_[el] = key;
+        // A :has() anchor's children: keyed by the rules it matched, not by everything under
+        // it (with that, each change under one restyled all of it: 11st.co.kr's script
+        // building its page restyled 1400 elements a time, 60-100 ms each). And if a :has()
+        // can be asked of it for them (`[data-type=X]:has(...) .item`), by which of those
+        // compounds it matches.
+        const bool context_anchor = anchored && contextAnchor(el);
+        const bool print_matches = anchored && (!context_anchor || has_context_compounds_.size() <= kMaxContextCompounds);
+        uint64_t match_print = 0;
+        bool have_print = false;
         const ComputedStyle* kept = nullptr;
         if (previous_) {
             const auto k = previous_->keys_.find(el);
@@ -4344,6 +4468,12 @@ private:
                 return &out_.storage_->back();
             };
             out_.styles_[el] = keep(kept);
+            ++dbg_kept_;
+            if (print_matches)
+                if (const auto it = previous_->has_prints_.find(el); it != previous_->has_prints_.end()) {
+                    match_print = it->second;
+                    have_print = true;
+                }
             // What resolving the root would have set: rem and rlh below are of it.
             if (el->parent && el->parent->type == NodeType::Document) {
                 lengths_.root_font_size = kept->font_size;
@@ -4353,12 +4483,36 @@ private:
                                     std::pair{&previous_->placeholder_, &out_.placeholder_}})
                 if (const auto it = from->find(el); it != from->end()) (*to)[el] = keep(it->second);
         }
+        static const bool dbg = std::getenv("XWEB_DEBUG_RESTYLE") != nullptr;
+        if (dbg && !kept && previous_ && el->parent && dbg_roots_ < 6) {
+            const auto pk = out_.keys_.find(el->parent);
+            const auto pp = previous_->keys_.find(el->parent);
+            if (pk != out_.keys_.end() && pp != previous_->keys_.end() && pk->second == pp->second) {
+                ++dbg_roots_;
+                const std::string* id = el->attr("id");
+                const std::string* cls = el->attr("class");
+                std::string attrs;
+                for (const Attribute& a : el->attrs) attrs += a.name + "=" + a.value.substr(0, 60) + " ";
+                std::fprintf(stderr, "[restyle]   at <%s %s> anchored %d had-key %d\n", el->name.c_str(), attrs.c_str(), anchored,
+                             previous_->keys_.count(el) ? 1 : 0);
+            }
+        }
         if (!kept) {
             out_.storage_->emplace_back();
             ComputedStyle& made = out_.storage_->back();
-            resolveInto(el, parent, made, scope, slot);
+            resolveInto(el, parent, made, scope, slot, print_matches ? &match_print : nullptr);
+            if (print_matches && context_anchor) {
+                for (const CompoundSelector* c : has_context_compounds_) {
+                    fuel_ = kSelectorFuel;
+                    match_print = mix(match_print, matchCompound(el, *c) ? 0x1F : 0x2F);
+                }
+            }
+            have_print = print_matches;
             out_.styles_[el] = &made;
         }
+        if (have_print) out_.has_prints_[el] = match_print;
+        const uint64_t children_key =
+            have_print ? mix(base, match_print) : anchored ? mix(base, subtreePrint(el->parent ? el->parent : el)) : base;
         const ComputedStyle& s = *out_.styles_[el];
         // Nothing below gets a box; but an SVG's hidden parts can still be drawn by <use>.
         if (s.display == Display::None && el->ns != Namespace::Svg) return;
@@ -4372,7 +4526,7 @@ private:
             const auto it = shadow_scopes_.find(el->shadow_root);
             const Scope* inner = it == shadow_scopes_.end() ? scope : it->second.get();
             for (const Node* c : el->shadow_root->children)
-                if (c->isElement()) walk(c, s, depth + 1, inner, nullptr, key);
+                if (c->isElement()) walk(c, s, depth + 1, inner, nullptr, children_key, key);
             return;
         }
         if (el->isHtml("slot") && scope->host_el) {
@@ -4381,14 +4535,14 @@ private:
             if (!assigned.empty()) {
                 const Scope* outer = scopeFor(scope->host_el);
                 for (const Node* c : assigned)
-                    if (c->isElement()) walk(c, s, depth + 1, outer, el, key);
+                    if (c->isElement()) walk(c, s, depth + 1, outer, el, children_key, key);
                 return;
             }
         }
         const bool pushed = scope == doc_p_ && !slot && !host_context_ && bloomCovers(el);
         if (pushed) bloomPush(el);
         for (const Node* c : el->children)
-            if (c->isElement()) walk(c, s, depth + 1, scope, nullptr, key);
+            if (c->isElement()) walk(c, s, depth + 1, scope, nullptr, children_key, key);
         if (pushed) bloomPop();
     }
 
@@ -4406,6 +4560,13 @@ private:
     bool recording_ = false, to_ua_ = false;
     bool uses_has_ = false;   // a rule with :has(): what an element matches can depend on its descendants
     bool has_any_anchor_ = false;
+    bool style_selector_ = false;   // a selector asks about style attributes ([style])
+    std::unordered_set<std::string> inherit_used_;   // properties a rule gives `inherit`
+    int box_inherited_ = -1;   // whether one of those is one of kOwnBoxProperties' (-1: not known yet)
+    bool has_context_ = false;   // a :has() asked for another element, of any element
+    std::unordered_set<uint32_t> has_context_anchors_;   // of these (as has_anchors_)
+    // The compounds with those (in the rules' sheets, kept by the index or sheets_).
+    std::vector<const CompoundSelector*> has_context_compounds_;
     std::unordered_set<uint32_t> has_anchors_;
     // The per-element maps below, from one pool let go at once: freeing them node by node
     // was a quarter of a restyle of 11st.co.kr's 8800 elements.

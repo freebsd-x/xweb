@@ -2477,7 +2477,7 @@ const char* const kScriptPrelude = R"JS(
     constructor(key) {
       super();
       if (key !== portKey) throw new TypeError('Illegal constructor');
-      this._other = null; this._started = false; this._closed = false; this._queue = []; this._onmessage = null; this.onmessageerror = null;
+      this._other = null; this._started = false; this._closed = false; this._queue = []; this._pending = 0; this._onmessage = null; this.onmessageerror = null;
     }
     get onmessage() { return this._onmessage; }
     set onmessage(f) { this._onmessage = typeof f === 'function' ? f : null; this.start(); }
@@ -2490,18 +2490,21 @@ const char* const kScriptPrelude = R"JS(
     }
     start() { if (this._started) return; this._started = true; this._flush(); }
     close() { this._closed = true; this._queue.length = 0; }
+    // Each message its own task. (One task for the queue and whatever its handlers
+    // posted meanwhile never ended for a scheduler that yields by posting a message,
+    // React's: 11st.co.kr's page held the window for 32 seconds.)
     _flush() {
-      if (this._pending) return;
-      this._pending = true;
-      setTimeout(() => {
-        this._pending = false;
-        while (this._queue.length && !this._closed) {
+      for (let n = this._queue.length - this._pending; n > 0; --n) {
+        this._pending++;
+        setTimeout(() => {
+          this._pending--;
+          if (!this._queue.length || this._closed) return;
           const data = this._queue.shift();
           const e = new MessageEvent('message', { data, origin: '', ports: [] });
           this.dispatchEvent(e);
           if (this._onmessage) try { this._onmessage.call(this, e); } catch (x) { reportError(x); }
-        }
-      }, 0);
+        }, 0);
+      }
     }
   }
   const portKey = {};

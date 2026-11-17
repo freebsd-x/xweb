@@ -346,6 +346,9 @@ private:
     // What each element's style was worked out from (see StyleResolver::elementKey), and
     // what the rules were: styles are only kept between documents with the same rules.
     std::unordered_map<const Node*, uint64_t> keys_;
+    // A :has() anchor's rules that matched (a print of them): what its children's keys
+    // are made from, instead of everything under it.
+    std::unordered_map<const Node*, uint64_t> has_prints_;
     const void* index_id_ = nullptr;
     std::shared_ptr<const void> index_kept_;
     bool reusable_ = false;

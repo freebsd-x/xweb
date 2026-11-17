@@ -407,10 +407,19 @@ private:
         // Where this identifier was found last time. A scope's names are all made when
         // it is (only a direct eval adds any later), so the same code finds a name in
         // the same scope at the same place: checked, not searched.
-        const bool cacheable = site && !rt_.direct_eval_seen && site->scope_hops != -2;
+        // (Unless a direct eval has since declared vars in a scope on the way: then it's
+        // searched. Turning this off for the whole page at the first such eval made every
+        // name a search on pages with one, 11st.co.kr's.)
+        const bool cacheable = site && site->scope_hops != -2;
         if (cacheable && site->scope_hops >= 0) {
             Env* e = env;
-            for (int32_t k = site->scope_hops; k > 0 && e; --k) e = e->outer;
+            for (int32_t k = site->scope_hops; k > 0 && e; --k) {
+                if (e->eval_vars) {
+                    e = nullptr;
+                    break;
+                }
+                e = e->outer;
+            }
             if (e && !e->with_object) {
                 if (site->scope_slot != kGlobalSlot) {
                     if (VarMap::Entry* it = e->vars.at(site->scope_slot, h, name); it && !it->second.import_env) {
@@ -2186,6 +2195,7 @@ Value evalCode(Runtime& rt, const std::u16string& source, Env* env, bool strict,
         var_env = rt.global_env_;
         var_object = rt.global();
     }
+    if (direct) var_env->eval_vars = true;   // a cached place a name was found is checked past it
     return interp.runEval(lex, var_env, var_object, false);
 }
 
@@ -3341,7 +3351,6 @@ Value Interpreter::evalCall(Node* n, Env* env, bool strict) {
     // eval(...) by that name, meaning the real eval: code in this very scope.
     if (callee->kind == N::Identifier && callee->str == u"eval" && fn.isObject() && fn.asObject() == rt_.eval_function) {
         if (args.empty() || !args[0].isString()) return args.empty() ? Value::undefined() : args[0];
-        rt_.direct_eval_seen = true;
         return evalCode(rt_, args[0].asString(), env, strict, true);
     }
     if (!rt_.isCallable(fn)) {

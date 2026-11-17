@@ -1858,8 +1858,27 @@ void PageScript::scrolled() { impl_->fire(nullptr, u"scroll", false, false); }
 void PageScript::tick() {
     Impl& s = *impl_;
     const double now = s.now();
-    // Due timers, earliest first; at most so many a tick, so the page can't starve the window.
-    for (int ran = 0; ran < 200; ++ran) {
+    // XWEB_DEBUG_PERF: a timer or frame callback that held the page up, by its name and text.
+    static const bool perf = std::getenv("XWEB_DEBUG_PERF") != nullptr;
+    const auto timed = [&](const char* what, const Value& fn, auto&& run) {
+        const double t0 = perf ? s.now() : 0;
+        run();
+        if (!perf) return;
+        if (const double ms = s.now() - t0; ms >= 50) {
+            std::string text;
+            try {
+                const Value proto = s.rt.get(s.rt.get(Value::object(s.rt.global()), u"Function"), u"prototype");
+                text = js::utf8(*s.rt.toString(s.rt.call(s.rt.get(proto, u"toString"), fn, {})));
+            } catch (...) {
+            }
+            for (char& c : text)
+                if (c == '\n') c = ' ';
+            std::fprintf(stderr, "[perf] %s %.0f ms: %s\n", what, ms, text.substr(0, 200).c_str());
+        }
+    };
+    // Due timers, earliest first; at most so many a tick (and for so long), so the page
+    // can't starve the window.
+    for (int ran = 0; ran < 200 && (ran == 0 || s.now() - now < 30); ++ran) {
         auto it = std::min_element(s.timers.begin(), s.timers.end(), [](const Impl::Timer& a, const Impl::Timer& b) {
             return a.due < b.due || (a.due == b.due && a.id < b.id);
         });
@@ -1867,7 +1886,7 @@ void PageScript::tick() {
         Impl::Timer t = *it;
         if (t.repeat) it->due = now + t.interval;
         else s.timers.erase(it);
-        s.task([&] { s.rt.call(t.fn, Value::object(s.rt.global()), t.args); });
+        timed("timer", t.fn, [&] { s.task([&] { s.rt.call(t.fn, Value::object(s.rt.global()), t.args); }); });
         s.drainMicrotasks();
     }
     if (!s.frames.empty()) {
@@ -1877,7 +1896,7 @@ void PageScript::tick() {
         for (size_t i = 0; i < s.running_frames.size(); ++i) {
             const Value fn = s.running_frames[i].second;
             if (!s.rt.isCallable(fn)) continue;   // cancelled during this round
-            s.task([&] { s.rt.call(fn, Value::undefined(), std::span<const Value>(&stamp, 1)); });
+            timed("frame", fn, [&] { s.task([&] { s.rt.call(fn, Value::undefined(), std::span<const Value>(&stamp, 1)); }); });
         }
         s.running_frames.clear();
         s.drainMicrotasks();

@@ -680,3 +680,79 @@ TEST(Restyle, HasAnchoredByAnAttribute) {
     again("a flag in another card");
     EXPECT_NE(styles->styleOf(elementById(*doc, "other"))->color, (Color{4, 5, 6, 255}));
 }
+
+// A style attribute setting only the element's own box (a carousel's width) restyles it,
+// not what's in it; one its children can see does.
+TEST(Restyle, AnOwnBoxStyleAttributeKeepsTheChildren) {
+    const auto restyler = [](std::unique_ptr<Document>& doc, std::unique_ptr<StyledDocument>& styles) {
+        return [&](const char* step) {
+            styles = std::make_unique<StyledDocument>(*doc, css::MediaContext{800, 600}, StyledDocument::SheetLoader{},
+                                                      StyledDocument::ChMeasure{}, nullptr, styles.get());
+            expectSameAsFresh(*doc, *styles, step);
+        };
+    };
+    auto doc = parseHtml(R"(<!doctype html><style>.slide b { color: rgb(1, 2, 3) }</style>
+      <div id=slide class=slide><p><b id=b>b</b></p></div>)");
+    auto styles = std::make_unique<StyledDocument>(*doc, css::MediaContext{800, 600});
+    const auto again = restyler(doc, styles);
+    again("nothing changed");
+    const ComputedStyle* b = styles->styleOf(elementById(*doc, "b"));
+    setAttribute(elementById(*doc, "slide"), "style", "width: 1240px; transform: translate3d(-10px, 0, 0)");
+    again("its width and transform");
+    EXPECT_EQ(styles->styleOf(elementById(*doc, "b")), b);   // kept
+    setAttribute(elementById(*doc, "slide"), "style", "");
+    again("cleared");
+    EXPECT_EQ(styles->styleOf(elementById(*doc, "b")), b);
+    setAttribute(elementById(*doc, "slide"), "style", "width: 10px; color: rgb(9, 9, 9)");
+    again("and a color, which its children inherit");
+    EXPECT_EQ(styles->styleOf(elementById(*doc, "b"))->color, (Color{1, 2, 3, 255}));
+
+    // Something has `inherit` for one of those (by its shorthand): children see them all.
+    auto doc2 = parseHtml(R"(<!doctype html><style>.wide i { display: block; margin: inherit }</style>
+      <div id=wide class=wide><i id=i>i</i></div>)");
+    auto styles2 = std::make_unique<StyledDocument>(*doc2, css::MediaContext{800, 600});
+    const auto again2 = restyler(doc2, styles2);
+    setAttribute(elementById(*doc2, "wide"), "style", "margin-top: 30px");
+    again2("a margin, inherited");
+    EXPECT_EQ(styles2->styleOf(elementById(*doc2, "i"))->margin[0].px, 30);
+    setAttribute(elementById(*doc2, "wide"), "style", "margin-top: 20px");
+    again2("another");
+    EXPECT_EQ(styles2->styleOf(elementById(*doc2, "i"))->margin[0].px, 20);
+}
+
+// With :has() only of the element styled, a change under an anchor restyles the anchor,
+// and its children only when what it matched changed (they inherit from it).
+TEST(Restyle, UnderAHasAnchorOnlyTheAnchorRestyles) {
+    auto doc = parseHtml(R"(<!doctype html><style>
+        [data-k="card"]:has(.flag) { color: rgb(4, 5, 6) }
+        .big { font-size: 30px }
+        .box:has(.flag) i { font-size: 25px }
+      </style>
+      <div id=card data-k=card><section><p id=para>x</p></section><div><span id=deep>y</span></div></div>
+      <div class=box><section><i id=it>i</i></section><b id=b>b</b></div>)");
+    auto styles = std::make_unique<StyledDocument>(*doc, css::MediaContext{800, 600});
+    const auto again = [&](const char* step) {
+        styles = std::make_unique<StyledDocument>(*doc, css::MediaContext{800, 600}, StyledDocument::SheetLoader{},
+                                                  StyledDocument::ChMeasure{}, nullptr, styles.get());
+        expectSameAsFresh(*doc, *styles, step);
+    };
+    again("nothing changed");
+    const ComputedStyle* para = styles->styleOf(elementById(*doc, "para"));
+    setAttribute(elementById(*doc, "deep"), "class", "big");
+    again("a change under the card that it doesn't match on");
+    EXPECT_EQ(styles->styleOf(elementById(*doc, "para")), para);   // kept
+    EXPECT_EQ(styles->styleOf(elementById(*doc, "deep"))->font_size, 30);
+    setAttribute(elementById(*doc, "deep"), "class", "big flag");
+    again("one it does");
+    EXPECT_EQ(styles->styleOf(elementById(*doc, "para"))->color, (Color{4, 5, 6, 255}));
+    setAttribute(elementById(*doc, "deep"), "class", "big");
+    again("and back");
+    EXPECT_NE(styles->styleOf(elementById(*doc, "para"))->color, (Color{4, 5, 6, 255}));
+    // One asked for its descendants: those see what's under it.
+    setAttribute(elementById(*doc, "b"), "class", "flag");
+    again("a flag in the box");
+    EXPECT_EQ(styles->styleOf(elementById(*doc, "it"))->font_size, 25);
+    setAttribute(elementById(*doc, "b"), "class", "");
+    again("gone from the box");
+    EXPECT_NE(styles->styleOf(elementById(*doc, "it"))->font_size, 25);
+}

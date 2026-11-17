@@ -180,6 +180,8 @@ struct Env : Cell {
     Object* global_object = nullptr;
     // A with statement's: its names are this object's properties (it has no vars).
     Object* with_object = nullptr;
+    // A direct eval declared vars in it: names past it may now be found in it.
+    bool eval_vars = false;
 };
 
 struct FunctionData {

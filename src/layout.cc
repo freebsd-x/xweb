@@ -4353,23 +4353,33 @@ private:
 
     // Negative z-index paint, into its places: last place first, so earlier places keep
     // their index; at one place, in the order painted (lower z first).
+    // (In one pass: inserting each into the list moved everything after it, every time,
+    // and a page with hundreds of them, 11st.co.kr's, spent seconds on it.)
     void placeBelowContent() {
+        if (below_content_.empty()) return;
         std::vector<BelowContent*> order;
         for (BelowContent& b : below_content_) order.push_back(&b);
-        std::stable_sort(order.begin(), order.end(), [](const BelowContent* a, const BelowContent* b) {
-            return a->at_ops != b->at_ops ? a->at_ops > b->at_ops : a->order > b->order;
-        });
-        for (BelowContent* b : order) {
-            const size_t at = std::min(b->at_ops, out_->ops.size());
-            out_->ops.insert(out_->ops.begin() + static_cast<ptrdiff_t>(at), std::make_move_iterator(b->ops.begin()), std::make_move_iterator(b->ops.end()));
-        }
-        std::stable_sort(order.begin(), order.end(), [](const BelowContent* a, const BelowContent* b) {
-            return a->at_boxes != b->at_boxes ? a->at_boxes > b->at_boxes : a->order > b->order;
-        });
-        for (BelowContent* b : order) {
-            const size_t at = std::min(b->at_boxes, out_->boxes.size());
-            out_->boxes.insert(out_->boxes.begin() + static_cast<ptrdiff_t>(at), b->boxes.begin(), b->boxes.end());
-        }
+        const auto merge = [&](auto& list, auto place, auto items, bool move) {
+            std::stable_sort(order.begin(), order.end(), [&](const BelowContent* a, const BelowContent* b) {
+                return place(a) != place(b) ? place(a) < place(b) : a->order < b->order;
+            });
+            std::remove_reference_t<decltype(list)> merged;
+            size_t extra = 0;
+            for (BelowContent* b : order) extra += items(b).size();
+            merged.reserve(list.size() + extra);
+            size_t from = 0;
+            for (BelowContent* b : order) {
+                const size_t at = std::min(place(b), list.size());
+                for (; from < at; ++from) merged.push_back(std::move(list[from]));
+                auto& add = items(b);
+                if (move) merged.insert(merged.end(), std::make_move_iterator(add.begin()), std::make_move_iterator(add.end()));
+                else merged.insert(merged.end(), add.begin(), add.end());
+            }
+            for (; from < list.size(); ++from) merged.push_back(std::move(list[from]));
+            list = std::move(merged);
+        };
+        merge(out_->ops, [](const BelowContent* b) { return b->at_ops; }, [](BelowContent* b) -> auto& { return b->ops; }, true);
+        merge(out_->boxes, [](const BelowContent* b) { return b->at_boxes; }, [](BelowContent* b) -> auto& { return b->boxes; }, false);
         below_content_.clear();
     }
 

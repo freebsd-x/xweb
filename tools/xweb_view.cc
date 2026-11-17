@@ -761,15 +761,17 @@ public:
     struct PerfLog {
         bool on = std::getenv("XWEB_DEBUG_PERF") != nullptr;
         std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
-        int paints = 0, layouts = 0;
-        double paint_ms = 0, layout_ms = 0;
+        int paints = 0, layouts = 0, script_restyles = 0, script_layouts = 0;
+        double paint_ms = 0, layout_ms = 0, script_restyle_ms = 0, script_layout_ms = 0;
+        // (Also from a script's questions: a long task paints nothing meanwhile.)
         void report() {
             const auto now = std::chrono::steady_clock::now();
             if (!on || now - since < std::chrono::seconds(5)) return;
-            std::fprintf(stderr, "[perf] 5s: %d paints (%.0f ms), %d layouts (%.0f ms)\n", paints, paint_ms, layouts, layout_ms);
+            std::fprintf(stderr, "[perf] 5s: %d paints (%.0f ms), %d layouts (%.0f ms); for scripts %d restyles (%.0f ms), %d layouts (%.0f ms)\n",
+                         paints, paint_ms, layouts, layout_ms, script_restyles, script_restyle_ms, script_layouts, script_layout_ms);
             since = now;
-            paints = layouts = 0;
-            paint_ms = layout_ms = 0;
+            paints = layouts = script_restyles = script_layouts = 0;
+            paint_ms = layout_ms = script_restyle_ms = script_layout_ms = 0;
         }
     } perf_;
     struct Timed {
@@ -899,6 +901,9 @@ public:
     // out now, and painted at the next frame without being laid out again for it.
     void refreshForScript() {
         if (laid_out_width_ <= 0) return;
+        ++perf_.script_layouts;
+        perf_.report();
+        Timed timed{perf_.on, perf_.script_layout_ms};
         relayout(laid_out_width_, laid_out_height_);
         dirty_ = true;
         fresh_gen_ = change_gen_;
@@ -907,6 +912,9 @@ public:
     // question about a box), with these styles if nothing's changed by then.
     void restyleForScript() {
         if (laid_out_width_ <= 0 || !page_ || !page_->doc) return;
+        ++perf_.script_restyles;
+        perf_.report();
+        Timed timed{perf_.on, perf_.script_restyle_ms};
         std::vector<std::string> missing;
         restyled_ = makeStyles(laid_out_width_, laid_out_height_, missing);
         computed_cache_.clear();
