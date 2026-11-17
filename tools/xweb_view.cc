@@ -150,8 +150,21 @@ Resource loadLocal(const web::Url& url) {
     return r;
 }
 
-// `cookies`: for a page or the page's own site's files (see kFetchCookies).
-Resource load(const std::string& address, bool cookies = false) {
+// What a page's request for one of its files says it came from: as browsers do by
+// default (strict-origin-when-cross-origin), the page's address to its own origin, its
+// origin to another, nothing from https to http. Image hosts refuse requests without one
+// (dcinside.com's thumbnails: 403).
+std::string referrerFor(const std::string& page_url, const std::string& target) {
+    const web::Url from = web::parseUrl(page_url), to = web::parseUrl(target);
+    if ((from.scheme != "http" && from.scheme != "https") || (to.scheme != "http" && to.scheme != "https")) return {};
+    if (from.scheme == "https" && to.scheme == "http") return {};
+    if (from.scheme == to.scheme && from.authority == to.authority) return from.withoutFragment();
+    return from.scheme + "://" + from.authority + "/";
+}
+
+// `cookies`: for a page or the page's own site's files (see kFetchCookies). `referrer`:
+// the Referer it's sent with, if any.
+Resource load(const std::string& address, bool cookies = false, const std::string& referrer = {}) {
     {
         Resource inline_data;
         if (web::decodeDataUrl(address, inline_data.body, inline_data.content_type)) {
@@ -169,7 +182,8 @@ Resource load(const std::string& address, bool cookies = false) {
         return r;
     }
     // A fragment isn't sent to the server.
-    auto got = fetchWebBlocking(url.withoutFragment(), cookies);
+    auto got = referrer.empty() ? fetchWebBlocking(url.withoutFragment(), cookies)
+                                : fbx::xkit::scriptWebBlocking("GET", url.withoutFragment(), {{"Referer", referrer}}, {}, cookies);
     r.http_status = got.http_status;
     switch (got.status) {
         case fbx::shared::FetchStatus::Ok:
@@ -198,7 +212,7 @@ std::vector<Resource> loadAll(const std::vector<std::string>& urls, const std::s
     const auto work = [&] {
         for (size_t i; (i = next.fetch_add(1)) < urls.size();) {
             if (generation.load() != mine) return;
-            out[i] = load(urls[i], web::sameSite(page_url, urls[i]));
+            out[i] = load(urls[i], web::sameSite(page_url, urls[i]), referrerFor(page_url, urls[i]));
         }
     };
     const size_t n = std::min(kFetchWorkers, urls.size());
@@ -373,7 +387,7 @@ void loadScripts(Page& page, const std::atomic<uint64_t>& generation, uint64_t m
             got = std::move(it->second);
             ahead.erase(it);
         } else {
-            got = load(url, web::sameSite(page.url, url));
+            got = load(url, web::sameSite(page.url, url), referrerFor(page.url, url));
         }
         if (!got.ok || got.http_status >= 400 || got.body.size() > kMaxScriptBytes) return nullptr;
         total += got.body.size();
@@ -1908,7 +1922,7 @@ public:
                     std::string url = std::move(queue.front());
                     queue.pop_front();
                     if (!seen.insert(url).second) continue;
-                    Resource got = load(url, web::sameSite(page->url, url));
+                    Resource got = load(url, web::sameSite(page->url, url), referrerFor(page->url, url));
                     const bool ok = got.ok && got.http_status < 400;
                     std::string css = ok ? web::decodeToUtf8(got.body, got.content_type) : std::string{};
                     for (const std::string& ref : web::css::parseStylesheet(css).imports) queue.push_back(web::resolveUrl(url, ref));
@@ -2264,7 +2278,7 @@ private:
         host.fetch_script = [this, weak, page_url, page_charset](const std::string& url, const std::string& charset,
                                                                   std::function<void(std::optional<std::string>)> done) {
             std::thread([this, weak, page_url, page_charset, url, charset, done = std::move(done)] {
-                Resource got = load(url, web::sameSite(page_url, url));
+                Resource got = load(url, web::sameSite(page_url, url), referrerFor(page_url, url));
                 std::optional<std::string> body;
                 // Not saying: as the script element says (jQuery's scriptCharset: Nate's
                 // EUC-KR boxes), else as the page is.
@@ -2419,7 +2433,7 @@ private:
                         url = std::move(work->queue.front());
                         work->queue.pop_front();
                     }
-                    Resource got = load(url, web::sameSite(page->url, url));
+                    Resource got = load(url, web::sameSite(page->url, url), referrerFor(page->url, url));
                     // XWEB_DEBUG_IMAGES=1: what each image came to, for finding why one's missing.
                     static const bool debug = std::getenv("XWEB_DEBUG_IMAGES") != nullptr;
                     // Said to the page's scripts, as an "error" at its <img>s.
@@ -2435,7 +2449,9 @@ private:
                         });
                     };
                     if (!got.ok || got.http_status >= 400) {
-                        if (debug) std::fprintf(stderr, "[image] %s: not loaded (status %d)\n", url.c_str(), got.http_status);
+                        if (debug)
+                            std::fprintf(stderr, "[image] %s: not loaded (status %d, referrer %s)\n", url.c_str(), got.http_status,
+                                         referrerFor(page->url, url).c_str());
                         failed();
                         continue;
                     }
@@ -2496,7 +2512,7 @@ private:
                         work->queue.pop_front();
                     }
                     for (const std::string& url : sources) {
-                        Resource got = load(url, web::sameSite(page->url, url));
+                        Resource got = load(url, web::sameSite(page->url, url), referrerFor(page->url, url));
                         if (!got.ok || got.http_status >= 400) continue;
                         auto bytes = std::make_shared<const std::string>(std::move(got.body));
                         if (!web::webFontUsable(bytes)) continue;
