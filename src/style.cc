@@ -3262,6 +3262,13 @@ private:
     }
 
     static void copyAny(ComputedStyle& to, const ComputedStyle& from, const std::string& p) {
+        // (Tailwind's a { text-decoration: inherit }: without it a link kept the user agent's
+        // underline, weather.go.kr's menu all underlined.)
+        if (p == "text-decoration" || p == "text-decoration-line") {
+            to.underline = from.underline;
+            to.line_through = from.line_through;
+            return;
+        }
         if (p == "grid-template-columns") { to.grid_columns = from.grid_columns; return; }
         if (p == "grid-template-rows") { to.grid_rows = from.grid_rows; return; }
         if (p == "grid-template-areas") { to.grid_areas = from.grid_areas; return; }

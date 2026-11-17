@@ -814,6 +814,15 @@ TEST(Values, RevertIsTheUserAgentsValue) {
     EXPECT_EQ(styles2.styleOf(elementById(*doc2, "s"))->display, Display::None);   // reverted past the unset
 }
 
+TEST(Values, TextDecorationInherits) {
+    // Tailwind's preflight: a { color: inherit; text-decoration: inherit }.
+    auto doc = parseHtml(R"(<!doctype html><style>a { text-decoration: inherit }</style>
+      <div><a id=a href=#>x</a></div><u><a id=b href=#>y</a></u>)");
+    const StyledDocument styles(*doc, css::MediaContext{800, 600});
+    EXPECT_FALSE(styles.styleOf(elementById(*doc, "a"))->underline);
+    EXPECT_TRUE(styles.styleOf(elementById(*doc, "b"))->underline);
+}
+
 // With :has() only of the element styled, a change under an anchor restyles the anchor,
 // and its children only when what it matched changed (they inherit from it).
 TEST(Restyle, UnderAHasAnchorOnlyTheAnchorRestyles) {
