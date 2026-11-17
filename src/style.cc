@@ -3627,7 +3627,20 @@ private:
         if (p == "right") { oneLength(s.offset[Right], true); return; }
         if (p == "bottom") { oneLength(s.offset[Bottom], true); return; }
         if (p == "left") { oneLength(s.offset[Left], true); return; }
-        if (p == "transform") { (void)transformShift(v, i, c, s.transform_shift, s.transform_linear); return; }
+        if (p == "transform") {
+            if (transformShift(v, i, c, s.transform_shift, s.transform_linear)) s.makes_stacking_context = kw != "none";
+            return;
+        }
+        if (p == "will-change") {
+            for (const Token& t : v)
+                if (t.type == TokenType::Ident && (lower(t.text) == "transform" || lower(t.text) == "opacity" || lower(t.text) == "filter"))
+                    s.makes_stacking_context = true;
+            return;
+        }
+        if (p == "isolation") {
+            if (kw == "isolate") s.makes_stacking_context = true;
+            return;
+        }
         if (p == "filter") {
             std::vector<Filter> fs;
             if (filterFrom(v, i, c, fs)) s.filter = fs.empty() ? nullptr : std::make_shared<const std::vector<Filter>>(std::move(fs));
@@ -3688,6 +3701,7 @@ private:
             size_t k = i;
             skipWs(v, k);
             if (k < v.size() && v[k].type == TokenType::Ident && lower(v[k].text) == "none") { s.translate_shift[0] = s.translate_shift[1] = Length{}; return; }
+            s.makes_stacking_context = true;
             Length tx, ty;
             if (!lengthAt(v, k, c, tx, false)) return;
             skipWs(v, k);

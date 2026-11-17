@@ -248,6 +248,11 @@ struct ComputedStyle {
     float rotate_deg = 0;
     float scale_prop[2] = {1, 1};
     Length transform_origin[2] = {Length{false, 0, 50}, Length{false, 0, 50}};
+    // A transform (even one only moving it, or none at all: translate3d(0, 0, 0)), a
+    // will-change of one, or isolation: isolate: it's a stacking context, so its negative
+    // z-index descendants paint over its ancestors' backgrounds (11st.co.kr's banner
+    // images, z-index -1 in a moved carousel list, went under the page's white).
+    bool makes_stacking_context = false;
     [[nodiscard]] bool linearlyTransformed() const noexcept {
         return transform_linear[0] != 1 || transform_linear[1] != 0 || transform_linear[2] != 0 || transform_linear[3] != 1 ||
                rotate_deg != 0 || scale_prop[0] != 1 || scale_prop[1] != 1;

@@ -657,6 +657,25 @@ TEST(Positioned, NegativeZIndexGoesUnderTheContent) {
     EXPECT_EQ(*last->node->attr("id"), "c");
 }
 
+// A transform only moving it (or will-change: transform) makes a stacking context too:
+// a negative z-index image in a carousel list stays over the page's backgrounds.
+TEST(Positioned, NegativeZIndexStaysInAMovedList) {
+    for (const char* list : {"transform:translate3d(-10px,0,0)", "will-change:transform"}) {
+        const auto r = layout(std::string("<div style='background:#fff'><div style='") + list +
+                              "'><div style='position:relative;z-index:-1;height:20px;background:#00f'></div></div></div>");
+        int white = -1, blue = -1;
+        for (size_t i = 0; i < r.page.ops.size(); ++i) {
+            const auto& op = r.page.ops[i];
+            if (op.kind != PaintKind::Rect) continue;
+            if (op.color.r == 255 && op.color.g == 255 && op.color.b == 255 && white < 0) white = static_cast<int>(i);
+            if (op.color.b == 255 && op.color.r == 0) blue = static_cast<int>(i);
+        }
+        ASSERT_GE(white, 0) << list;
+        ASSERT_GE(blue, 0) << list;
+        EXPECT_LT(white, blue) << list;   // over the white
+    }
+}
+
 TEST(Paint, AGradientFadesWithItsBox) {
     const auto r = layout("<div style='opacity:0.5'><div style='width:10px;height:10px;background:linear-gradient(#f00,#00f)'></div></div>");
     const PaintOp* g = nullptr;

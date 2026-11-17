@@ -101,6 +101,16 @@ int main(int argc, char** argv) {
         return 0;
     }
     const PageLayout page = layoutPage(*doc, styles, text, &images, w, h);
+    // XWEB_LAYOUT_OPS=1: the paint ops instead, in order (kind, rectangle, text or source).
+    if (std::getenv("XWEB_LAYOUT_OPS")) {
+        for (const PaintOp& op : page.ops) {
+            std::printf("%d %.1f %.1f %.1f %.1f %s a=%d", static_cast<int>(op.kind), op.x, op.y, op.w, op.h, op.text.substr(0, 60).c_str(), op.color.a);
+            if (op.kind == PaintKind::TransformBegin)
+                std::printf(" [%g %g %g %g %g %g]", op.transform.a, op.transform.b, op.transform.c, op.transform.d, op.transform.e, op.transform.f);
+            std::printf("\n");
+        }
+        return 0;
+    }
     // In document order, whatever order they were painted in.
     std::unordered_map<const Node*, const ElementBox*> by_node;
     for (const ElementBox& b : page.boxes) by_node[b.node] = &b;

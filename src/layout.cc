@@ -4119,7 +4119,7 @@ private:
         // background and under its content.
         const size_t outer_ctx_ops = ctx_ops_, outer_ctx_boxes = ctx_boxes_;
         const bool stacking = &b == root_ || s.position == Position::Fixed || (s.position != Position::Static && s.z_index != 0) ||
-                              s.opacity < 1 || s.linearlyTransformed();
+                              s.opacity < 1 || s.linearlyTransformed() || s.makes_stacking_context;
         if (stacking && !painting_below_) {
             ctx_ops_ = out_->ops.size();
             ctx_boxes_ = out_->boxes.size();

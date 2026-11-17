@@ -1782,6 +1782,21 @@ private:
         });
         if (first || !ok || m0.b != 0 || m0.c != 0 || !(m0.a > 0) || !(m0.d > 0)) return false;
         if (!(r > l && b > t) || !std::isfinite(l) || !std::isfinite(t) || !std::isfinite(r) || !std::isfinite(b)) return true;
+        // Only what can be seen of it (and a margin), in its own coordinates: a carousel's
+        // list of a hundred slides is 70000 px wide, and squeezed into one raster its
+        // slides came out blank (11st.co.kr's banner). Rounded out to 512 px, so a list
+        // moving a little is drawn again only now and then.
+        {
+            const float vl = (-at.x_ - kOffscreenMargin - m0.e) / m0.a, vr = (-at.x_ + size_.width_ + kOffscreenMargin - m0.e) / m0.a;
+            const float vt = (-at.y_ - kOffscreenMargin - m0.f) / m0.d, vb = (-at.y_ + kMaxWindowHeight + kOffscreenMargin - m0.f) / m0.d;
+            const auto down = [](float v) { return std::floor(v / 512) * 512; };
+            const auto up = [](float v) { return std::ceil(v / 512) * 512; };
+            l = std::max(l, down(vl));
+            r = std::min(r, up(vr));
+            t = std::max(t, down(vt));
+            b = std::min(b, up(vb));
+            if (!(r > l && b > t)) return true;
+        }
         l = std::floor(l);
         t = std::floor(t);
         r = std::ceil(r);
