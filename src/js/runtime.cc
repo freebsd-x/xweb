@@ -2,6 +2,7 @@
 // the parser's tree, statement by statement and expression by expression.
 
 #include <algorithm>
+#include <chrono>
 #include <charconv>
 #include <cmath>
 #include <cstring>
@@ -502,7 +503,7 @@ private:
         Object* g = globalObject(env);
         if (name == u"undefined") return Value::undefined();
         std::optional<PropertyKey> made;
-        const PropertyKey& key = name_key ? *name_key : made.emplace(name);
+        const PropertyKey& key = name_key ? *name_key : site ? nameKey(site) : made.emplace(name);
         // The usual case, in one lookup: an ordinary global's own data property is
         // what has() then get() would find first. (A name's hash is its key's.)
         if (g->cls != ObjectClass::Proxy && g->cls != ObjectClass::TypedArray && g->cls != ObjectClass::String && g->elements.empty())
@@ -624,6 +625,11 @@ private:
     const std::shared_ptr<Program>& prog_;
     bool owns_scopes_ = false;
     std::vector<Env*> owned_;
+    struct ReusedScope {
+        Env* env = nullptr;   // one of owned_
+        bool busy = false;
+    };
+    std::unordered_map<const Node*, ReusedScope> block_scopes_;
     friend class Runtime;
 };
 
@@ -1941,9 +1947,23 @@ void Interpreter::bindPattern(Node* p, const Value& value, Env* env, bool strict
     switch (p->kind) {
         case N::Identifier: {
             if (kind == kVar) {
-                assignName(env, p->str, value, strict);
+                assignName(env, p->str, value, strict, p);
             } else {
-                Binding& b = env->vars[p->str];
+                // Where it was last time (each turn of a loop declares it again), checked.
+                const size_t h = nameHash(p);
+                VarMap::Entry* e = p->scope_hops == 0 ? env->vars.at(p->scope_slot, h, p->str) : nullptr;
+                if (!e) {
+                    e = env->vars.find(p->str, h);
+                    if (!e) {
+                        env->vars[p->str];
+                        e = env->vars.find(p->str, h);
+                    }
+                    if (p->scope_hops != -2) {
+                        p->scope_hops = 0;
+                        p->scope_slot = VarMap::posOf(e);
+                    }
+                }
+                Binding& b = e->second;
                 b.value = value;
                 b.initialized = true;
                 b.is_mutable = kind != kConst;
@@ -2143,7 +2163,64 @@ Value Interpreter::callScript(Object* f, const Value& this_value, std::span<cons
     return result;
 }
 
+// XWEB_JS_PROFILE=1: each function's own time (less what it called), the most every 5
+// seconds of running, by the start of its source: for finding what a page's script spends
+// its time on, where a minified script's lines say nothing.
+namespace {
+struct JsProfile {
+    struct Fn {
+        uint64_t calls = 0;
+        double self_ms = 0;
+    };
+    std::unordered_map<const FunctionInfo*, Fn> fns;
+    struct Frame {
+        std::chrono::steady_clock::time_point start;
+        double child_ms = 0;
+    };
+    std::vector<Frame> stack;
+    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+    void report() {
+        std::vector<std::pair<const FunctionInfo*, Fn>> top(fns.begin(), fns.end());
+        std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second.self_ms > b.second.self_ms; });
+        std::fprintf(stderr, "[jsprof] ---\n");
+        for (size_t i = 0; i < top.size() && i < 15; ++i) {
+            std::string text = utf8(std::u16string_view(top[i].first->source).substr(0, 110));
+            for (char& c : text)
+                if (c == '\n') c = ' ';
+            std::fprintf(stderr, "[jsprof] %7.0f ms %8llu calls  %s\n", top[i].second.self_ms, static_cast<unsigned long long>(top[i].second.calls),
+                         text.c_str());
+        }
+        fns.clear();
+    }
+};
+thread_local JsProfile* g_js_profile = std::getenv("XWEB_JS_PROFILE") ? new JsProfile : nullptr;
+
+struct JsProfiled {
+    const FunctionInfo* info;
+    explicit JsProfiled(const FunctionInfo* i) : info(i) {
+        if (g_js_profile) g_js_profile->stack.push_back({std::chrono::steady_clock::now(), 0});
+    }
+    ~JsProfiled() {
+        JsProfile* p = g_js_profile;
+        if (!p || p->stack.empty()) return;
+        const auto now = std::chrono::steady_clock::now();
+        const JsProfile::Frame f = p->stack.back();
+        p->stack.pop_back();
+        const double total = std::chrono::duration<double, std::milli>(now - f.start).count();
+        JsProfile::Fn& fn = p->fns[info];
+        ++fn.calls;
+        fn.self_ms += total - f.child_ms;
+        if (!p->stack.empty()) p->stack.back().child_ms += total;
+        if (now - p->last > std::chrono::seconds(5)) {
+            p->last = now;
+            p->report();
+        }
+    }
+};
+}   // namespace
+
 Value Interpreter::runBody(FunctionInfo* info, Env* env) {
+    const JsProfiled profiled(info);
     if (info->expression_body) return eval(info->body, env, info->strict);
     declareLexical(env, info->body->lexical);
     Completion c = execBlock(info->body->kids, env, info->strict);
@@ -2429,6 +2506,26 @@ Completion Interpreter::exec(Node* n, Env* env, bool strict) {
         case N::Block: {
             if (!n->lexical && std::none_of(n->kids.begin(), n->kids.end(), [](Node* k) { return k->kind == N::FunctionDecl; }))
                 return execBlock(n->kids, env, strict);
+            // A call whose scopes can't be kept (ownsScopes) has no use for a block's once
+            // it's done: the same one again, as for each turn of a loop (a hash's 64 rounds,
+            // each a new scope, were a tenth of their time in allocating them).
+            if (owns_scopes_) {
+                ReusedScope& r = block_scopes_[n];
+                if (!r.busy) {
+                    if (r.env) r.env->outer = env;
+                    else r.env = newEnv(env);
+                    struct Busy {
+                        bool& b;
+                        ~Busy() { b = false; }
+                    } busy{r.busy};
+                    r.busy = true;
+                    Env* block = r.env;
+                    declareLexical(block, n->lexical);
+                    hoistBlockFunctions(n->kids, block);
+                    EnvScope scope(rt_, block);
+                    return execBlock(n->kids, block, strict);
+                }
+            }
             Env* block = newEnv(env);
             declareLexical(block, n->lexical);
             hoistBlockFunctions(n->kids, block);
@@ -2845,7 +2942,7 @@ Value Interpreter::eval(Node* n, Env* env, bool strict) {
         case N::String:
             if (!n->literal) n->literal = std::make_unique<JSString>(std::make_shared<const std::u16string>(n->str));
             return Value::string(*n->literal);
-        case N::Identifier: return lookup(env, n->str, nameHash(n), &nameKey(n), n);
+        case N::Identifier: return lookup(env, n->str, nameHash(n), nullptr, n);   // (its key made if a global's)
         default: break;
     }
     EvalDepth depth(rt_);
@@ -2900,17 +2997,26 @@ Value Interpreter::eval(Node* n, Env* env, bool strict) {
                 const Value r = eval(n->b, env, strict);
                 return binaryOp(n->op, l, r);
             }
-            // A long left-leaning chain (a + b + c + ...) in a loop, not by recursion.
+            // A long left-leaning chain (a + b + c + ...) in a loop, not by recursion. (A
+            // short one's list on the stack: a hash's `x ^ y ^ z` allocated one each time.)
+            Node* small[32];
+            size_t count = 0;
             std::vector<Node*> spine;
             Node* left = n;
-            while (left->kind == N::Binary && spine.size() < 1'000'000) {
-                spine.push_back(left);
+            while (left->kind == N::Binary && count < 1'000'000) {
+                if (count < std::size(small)) small[count] = left;
+                else {
+                    if (spine.empty()) spine.assign(small, small + count);
+                    spine.push_back(left);
+                }
+                ++count;
                 left = left->a;
             }
+            Node* const* chain = spine.empty() ? small : spine.data();
             Value acc = eval(left, env, strict);
-            for (auto it = spine.rbegin(); it != spine.rend(); ++it) {
-                const Value r = eval((*it)->b, env, strict);
-                acc = binaryOp((*it)->op, acc, r);
+            for (size_t i = count; i-- > 0;) {
+                const Value r = eval(chain[i]->b, env, strict);
+                acc = binaryOp(chain[i]->op, acc, r);
             }
             return acc;
         }
@@ -2924,6 +3030,19 @@ Value Interpreter::eval(Node* n, Env* env, bool strict) {
             // base may have run another's (a getter, a proxy's trap).
             here(n);
             if ((n->flags & kOptional) && base.isNullish()) throw ShortCircuit{};
+            // An array's element by a number: not by the number's text, made and read back.
+            if ((n->flags & kComputed) && base.isObject() && base.asObject()->cls == ObjectClass::Array) {
+                const Value k = eval(n->b, env, strict);
+                if (k.isNumber()) {
+                    const Object* o = base.asObject();
+                    const double d = k.asNumber();
+                    if (d >= 0 && d < static_cast<double>(o->elements.size())) {
+                        const auto i = static_cast<size_t>(d);
+                        if (static_cast<double>(i) == d && !o->elements[i].isEmpty()) return o->elements[i];
+                    }
+                }
+                return rt_.get(base, rt_.toPropertyKey(k));
+            }
             return rt_.get(base, memberKey(n, env, strict));
         }
         case N::OptionalChain: {
@@ -3081,6 +3200,24 @@ Value Interpreter::binaryOp(Op op, const Value& l, const Value& r) {
             case Op::Ge: return Value::boolean(x >= y);
             case Op::Eq: case Op::StrictEq: return Value::boolean(x == y);
             case Op::Ne: case Op::StrictNe: return Value::boolean(x != y);
+            case Op::Add: return Value::number(x + y);
+            case Op::Sub: return Value::number(x - y);
+            case Op::Mul: return Value::number(x * y);
+            case Op::Div: return Value::number(x / y);
+            case Op::BitAnd: case Op::BitOr: case Op::BitXor: case Op::Shl: case Op::Shr: case Op::UShr: {
+                // Both within 64-bit integers (all but huge ones): wrapped as ToInt32 does.
+                if (!(x > -9.2e18 && x < 9.2e18 && y > -9.2e18 && y < 9.2e18)) break;
+                const auto a = static_cast<uint32_t>(static_cast<int64_t>(x));
+                const auto b = static_cast<uint32_t>(static_cast<int64_t>(y));
+                switch (op) {
+                    case Op::BitAnd: return Value::number(static_cast<int32_t>(a & b));
+                    case Op::BitOr: return Value::number(static_cast<int32_t>(a | b));
+                    case Op::BitXor: return Value::number(static_cast<int32_t>(a ^ b));
+                    case Op::Shl: return Value::number(static_cast<int32_t>(a << (b & 31)));
+                    case Op::Shr: return Value::number(static_cast<int32_t>(a) >> (b & 31));
+                    default: return Value::number(a >> (b & 31));
+                }
+            }
             default: break;
         }
     }
@@ -3468,6 +3605,28 @@ Value Interpreter::evalAssign(Node* n, Env* env, bool strict) {
         }
         if (t->kind == N::Member) {
             const Value base = t->a->kind == N::Super ? thisValue(env) : eval(t->a, env, strict);
+            // An array's element by a number, there already: set where it is.
+            if ((t->flags & kComputed) && t->a->kind != N::Super && base.isObject() && base.asObject()->cls == ObjectClass::Array) {
+                const Value k = eval(t->b, env, strict);
+                if (k.isNumber()) {
+                    const Value v = eval(n->b, env, strict);
+                    Object* o = base.asObject();
+                    const double d = k.asNumber();
+                    if (o->extensible && d >= 0 && d < static_cast<double>(o->elements.size())) {
+                        const auto i = static_cast<size_t>(d);
+                        if (static_cast<double>(i) == d && !o->elements[i].isEmpty()) {
+                            o->elements[i] = v;
+                            return v;
+                        }
+                    }
+                    rt_.set(base, rt_.toPropertyKey(k), v, strict);
+                    return v;
+                }
+                const PropertyKey key = rt_.toPropertyKey(k);
+                const Value v = eval(n->b, env, strict);
+                rt_.set(base, key, v, strict);
+                return v;
+            }
             const PropertyKey key = memberKey(t, env, strict);
             const Value v = eval(n->b, env, strict);
             if (t->a->kind == N::Super) {

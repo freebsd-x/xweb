@@ -4406,9 +4406,18 @@ private:
     static bool anchorIn(const Node* el, const std::unordered_set<uint32_t>& anchors) {
         if (anchors.empty()) return false;
         if (anchors.count(featureHash('t', lower(el->name)))) return true;
+        // (As featureHash of the lowered name, and of name=value, without making either.)
+        const auto step = [](uint32_t h, char c) { return (h ^ static_cast<uint8_t>(c)) * 16777619u; };
         for (const Attribute& a : el->attrs) {
-            const std::string name = lower(a.name);
-            if (anchors.count(featureHash('a', name)) || anchors.count(featureHash('v', name + '=' + a.value))) return true;
+            uint32_t ha = 2166136261u ^ static_cast<uint8_t>('a'), hv = 2166136261u ^ static_cast<uint8_t>('v');
+            for (const char c : a.name) {
+                const char l = c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c;
+                ha = step(ha, l);
+                hv = step(hv, l);
+            }
+            hv = step(hv, '=');
+            for (const char c : a.value) hv = step(hv, c);
+            if (anchors.count(ha ? ha : 1) || anchors.count(hv ? hv : 1)) return true;
         }
         if (const std::string* id = el->attr("id"); id && anchors.count(featureHash('i', *id))) return true;
         if (const std::string* cls = el->attr("class")) {

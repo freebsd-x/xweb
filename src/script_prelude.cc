@@ -2119,7 +2119,12 @@ const char* const kScriptPrelude = R"JS(
     Date.prototype.toLocaleString = function (l, o = {}) {
       return new DateTimeFormat(l, has(o, dateKeys) || has(o, timeKeys) ? o : { ...o, ...dateDefaults, ...timeDefaults }).format(this);
     };
-    String.prototype.localeCompare = function (that, l, o) { return new Collator(l, o).compare(String(this), that); };
+    // (Without options, one collator for them all: a sort made one a comparison.)
+    let plainCollator = null;
+    String.prototype.localeCompare = function (that, l, o) {
+      const c = o === undefined ? (plainCollator || (plainCollator = new Collator())) : new Collator(l, o);
+      return c.compare(String(this), that);
+    };
   }
 
   // A link's address in parts, as HTMLAnchorElement and HTMLAreaElement have them.

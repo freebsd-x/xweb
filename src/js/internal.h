@@ -82,8 +82,10 @@ public:
     // The name made pos-th, if that's this one (a cached lookup's check).
     [[nodiscard]] Entry* at(uint32_t pos, size_t h, const std::u16string& name) noexcept {
         if (pos >= size()) return nullptr;
+        // (The hash and length: a 64-bit hash of a name at the very place another was is
+        // as good as the name, and this is every cached lookup.)
         Slot* t = slot(pos);
-        return t->h == h && t->e.first == name ? &t->e : nullptr;
+        return t->h == h && t->e.first.size() == name.size() ? &t->e : nullptr;
     }
     // Where an entry find gave is in that order.
     [[nodiscard]] static uint32_t posOf(const Entry* e) noexcept {
