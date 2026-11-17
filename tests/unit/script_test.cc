@@ -997,6 +997,14 @@ TEST(Script, TextStreamsEncodeAndDecode) {
     EXPECT_EQ(p.console, "log:3+3 h\u00e9llo utf-8\n") << p.console;
 }
 
+TEST(Script, TheRootsClientSizeIsTheViewports) {
+    Page p(R"(<body><div style='height:5000px'></div><script>
+        const r = document.documentElement;
+        console.log(r.clientHeight === innerHeight, r.clientWidth === innerWidth);
+        </script>)");
+    EXPECT_EQ(p.console, "log:true true\n") << p.console;
+}
+
 TEST(Script, OnHandlersRunOnce) {
     // Angular's $httpBackend nulls its request in onload: a second call threw.
     Page p(R"(<body><script>

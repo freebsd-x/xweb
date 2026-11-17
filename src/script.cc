@@ -650,8 +650,18 @@ void PageScript::Impl::installElement() {
         const float base = parent && parent != self->doc.body() ? rectOf(self->wrap(const_cast<Node*>(parent))).y : 0;
         return Value::number(std::round(rectOf(t).y - base));
     });
-    accessor(p, u"clientWidth", [rectOf](Runtime&, const Value& t, Args) { return Value::number(std::round(rectOf(t).w)); });
-    accessor(p, u"clientHeight", [rectOf](Runtime&, const Value& t, Args) { return Value::number(std::round(rectOf(t).h)); });
+    // The root element's are the viewport's (documentElement.clientHeight is how scripts
+    // ask how much of the page shows: lazy loaders, sticky headers, infinite scroll).
+    const auto isRoot = [self](const Value& t) {
+        const Node* el = self->thisElement(t);
+        return el && el->parent && el->parent->type == NodeType::Document;
+    };
+    accessor(p, u"clientWidth", [self, rectOf, isRoot](Runtime&, const Value& t, Args) {
+        return Value::number(isRoot(t) ? self->host.viewport_w : std::round(rectOf(t).w));
+    });
+    accessor(p, u"clientHeight", [self, rectOf, isRoot](Runtime&, const Value& t, Args) {
+        return Value::number(isRoot(t) ? self->host.viewport_h : std::round(rectOf(t).h));
+    });
     accessor(p, u"scrollWidth", [rectOf](Runtime&, const Value& t, Args) { return Value::number(std::round(rectOf(t).w)); });
     accessor(p, u"scrollHeight", [rectOf](Runtime&, const Value& t, Args) { return Value::number(std::round(rectOf(t).h)); });
     accessor(p, u"scrollTop", [](Runtime&, const Value&, Args) { return Value::number(0); }, [](Runtime&, const Value&, Args) { return Value::undefined(); });
