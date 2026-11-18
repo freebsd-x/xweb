@@ -1089,6 +1089,15 @@ TEST(Script, SvgInterfacesAndCheckVisibility) {
     EXPECT_EQ(p.console, "log:true true true true true false true\n") << p.console;
 }
 
+TEST(Script, TheBrowsersOwnFunctionsLookNative) {
+    // Libraries tell a built-in from a polyfill by its text (and replace a "polyfill").
+    Page p(R"(<body><script>
+        console.log(/native code/.test(String(fetch)), /native code/.test(String(URL)), /native code/.test(Function.prototype.toString.call(DOMParser)),
+                    String(function mine() { return 1; }));
+        </script>)");
+    EXPECT_EQ(p.console, "log:true true true function mine() { return 1; }\n") << p.console;
+}
+
 TEST(Script, ScopeIsTheElementAskedOf) {
     // jQuery's find('> .x') is querySelectorAll(':scope > .x'); weather.go.kr's tabs.
     Page p(R"(<body><div id=a><p class=x id=p1><span class=x></span></p></div><script>

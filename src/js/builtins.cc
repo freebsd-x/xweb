@@ -1033,7 +1033,10 @@ void Runtime::installBuiltins() {
     method(function_prototype, u"toString", 0, [](Runtime& rt, const Value& t, Args) {
         if (!rt.isCallable(t)) rt.throwError("TypeError", "Function.prototype.toString needs a function");
         Object* f = t.asObject();
-        if (f->code && !f->code->info->source.empty()) return Value::string(f->code->info->source);
+        // The browser's own, written in script (fetch, URL, DOMParser...): native, as a
+        // browser's are, for libraries that tell a built-in from a polyfill by its text.
+        const bool builtin = f->code && f->code->program && f->code->program->url == "prelude";
+        if (f->code && !builtin && !f->code->info->source.empty()) return Value::string(f->code->info->source);
         const Value name = rt.get(t, u"name");
         return Value::string(u"function " + (name.isString() ? name.asString() : std::u16string()) + u"() { [native code] }");
     });
