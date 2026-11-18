@@ -1578,11 +1578,11 @@ void Runtime::collect(bool mid_script) {
                       regexp_prototype, regexp_string_iterator_prototype, regexp_exec, regexp_constructor, promise_prototype,
                       promise_constructor, promise_then, eval_function, array_buffer_prototype, typed_array_prototype, data_view_prototype, generator_prototype, async_generator_prototype, async_iterator_prototype,
                       generator_function_prototype, async_function_prototype, async_generator_function_prototype,
-                      async_from_sync_iterator_prototype})
+                      async_from_sync_iterator_prototype, array_constructor, array_species_getter})
         markCell(o);
     for (auto& [k, o] : error_prototypes) markCell(o);
     for (Object* c : typed_array_constructors) markCell(c);
-    for (Symbol* s : {sym_iterator, sym_to_primitive, sym_to_string_tag, sym_has_instance, sym_match, sym_match_all, sym_replace,
+    for (Symbol* s : {sym_is_concat_spreadable, sym_iterator, sym_to_primitive, sym_to_string_tag, sym_has_instance, sym_match, sym_match_all, sym_replace,
                       sym_search, sym_split, sym_species, sym_async_iterator})
         markCell(s);
     for (auto& [k, s] : symbol_registry) markCell(s);

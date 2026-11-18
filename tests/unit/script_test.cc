@@ -1089,6 +1089,16 @@ TEST(Script, SvgInterfacesAndCheckVisibility) {
     EXPECT_EQ(p.console, "log:true true true true true false true\n") << p.console;
 }
 
+TEST(Script, UrlHostsInPunycodeAndALiveForEach) {
+    // core-js's URL check: it puts in its own (slow) URL where these fail.
+    Page p(R"(<body><script>
+        const u = new URL('b?a=1&b=2&c=3', 'https://a'), seen = [];
+        u.searchParams.forEach((v, k) => { u.searchParams.delete('b'); seen.push(k + v); });
+        console.log(new URL('https://тест').host, new URL('https://münchen.de/x').hostname, new URL('https://a.com').host, seen.join());
+        </script>)");
+    EXPECT_EQ(p.console, "log:xn--e1aybc xn--mnchen-3ya.de a.com a1,c3\n") << p.console;
+}
+
 TEST(Script, ALinkToASheetAlreadyHereLoads) {
     // React's stylesheet resources: a <link> put in for a sheet a preload fetched, and
     // nothing shown until its "load" (toss.im).

@@ -103,6 +103,14 @@ TEST(Js, Classes) {
     EXPECT_EQ(run("class D extends Object { constructor() { this.x = 1; } } new D()"), "throws: ReferenceError: super() must be called before using this");
     EXPECT_EQ(run("class E extends Error { constructor(m) { super(m); this.name = 'E'; } } String(new E('boom'))"), "E: boom");
     EXPECT_EQ(run("class F { static count = 3; } F.count"), "3");
+    // Array methods make their results with the array's species (core-js checks it).
+    EXPECT_EQ(run("const a = [1, 2]; a.constructor = {}; a.constructor[Symbol.species] = function (n) { this.made = n; };"
+                  " const r = a.map(x => x * 2); r.made + ',' + r[1] + ',' + (r instanceof Array)"), "2,4,false");
+    EXPECT_EQ(run("class MyArray extends Array {} const m = MyArray.from([1, 2, 3]);"
+                  " [m.slice(1) instanceof MyArray, m.filter(Boolean) instanceof MyArray, m.concat([4]).length, Array[Symbol.species] === Array].join()"),
+              "true,true,4,true");
+    EXPECT_EQ(run("const o = {length: 2, 0: 'x', 1: 'y', [Symbol.isConcatSpreadable]: true}; const n = [9]; n[Symbol.isConcatSpreadable] = false;"
+                  " JSON.stringify([0].concat(o, n).map(v => Array.isArray(v) ? 'arr' : v))"), "[0,\"x\",\"y\",\"arr\"]");
     // A field's initializer sees the class's scope, not its constructor's parameters
     // (Lenis: `animate = new n` beside a parameter `n`).
     EXPECT_EQ(run("let n = 1; class G { a = n; constructor(n) { this.b = n; } } const g = new G(2); g.a + ',' + g.b"), "1,2");

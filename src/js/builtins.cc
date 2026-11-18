@@ -27,6 +27,45 @@ void checkNewArrayLength(Runtime& rt, uint64_t n) {
     if (n > 100'000'000) rt.throwError("RangeError", "array too long");
 }
 
+// ArraySpeciesCreate: what an array method's result is made with. Null for a plain
+// array (the usual case, checked without calling the getter); else the constructed
+// object, which the method fills with fillSpecies (core-js tests this, and replaces
+// slice, concat, map and filter with its own slow ones where it fails).
+Object* arraySpeciesCreate(Runtime& rt, Object* original, uint64_t length) {
+    if (!rt.isArray(Value::object(original))) return nullptr;
+    Value c = rt.get(Value::object(original), u"constructor");
+    if (c.isObject() && c.asObject() == rt.array_constructor) {
+        const js::Property* p = rt.array_constructor->own(PropertyKey(rt.sym_species));
+        if (p && (p->flags & kAccessor) && p->getter == rt.array_species_getter) return nullptr;
+    }
+    if (c.isObject()) {
+        c = rt.get(c, PropertyKey(rt.sym_species));
+        if (c.isNull()) c = Value::undefined();
+    }
+    if (c.isUndefined() || (c.isObject() && c.asObject() == rt.array_constructor)) return nullptr;
+    if (!rt.isConstructor(c)) rt.throwError("TypeError", "the array's species isn't a constructor");
+    const Value args[1] = {Value::number(static_cast<double>(length))};
+    const Value made = rt.construct(c, args, c.asObject());
+    if (!made.isObject()) rt.throwError("TypeError", "the species constructor didn't make an object");
+    return made.asObject();
+}
+
+// A species result's elements (CreateDataPropertyOrThrow each) and, unless it's map's,
+// its length.
+Value fillSpecies(Runtime& rt, Object* target, const std::vector<Value>& values, bool set_length) {
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (values[i].isEmpty()) continue;
+        Object* d = rt.newObject();
+        rt.put(d, u"value", values[i]);
+        rt.put(d, u"writable", Value::boolean(true));
+        rt.put(d, u"enumerable", Value::boolean(true));
+        rt.put(d, u"configurable", Value::boolean(true));
+        rt.defineOwnProperty(target, PropertyKey(Runtime::numberToString(static_cast<double>(i))), Value::object(d), true);
+    }
+    if (set_length) rt.set(Value::object(target), u"length", Value::number(static_cast<double>(values.size())), true);
+    return Value::object(target);
+}
+
 
 using Args = std::span<const Value>;
 
@@ -150,7 +189,9 @@ void defineFromDescriptor(Runtime& rt, Object* o, const PropertyKey& key, const 
         // find the old value there before the getter.
         const bool plain = !(p.flags & kAccessor) &&
                            (exists ? (p.flags & asked) == asked : (asked == (kWritable | kEnumerable | kConfigurable) && (p.flags & kDefaultFlags) == kDefaultFlags));
-        if (index && plain) {
+        // (One that's special already, in the map, is redefined there: set() would find
+        // it read-only and leave it.)
+        if (index && plain && !o->own(key)) {
             if (present & 16) rt.set(o, key, p.value, Value::object(o));
             else if (!exists && !(present & 16)) rt.set(o, key, Value::undefined(), Value::object(o));
             return;
@@ -1073,7 +1114,8 @@ void Runtime::installBuiltins() {
     put(symbol_ctor, u"asyncIterator", Value::symbol(sym_async_iterator), 0);
     sym_unscopables = newSymbol(u"Symbol.unscopables");
     put(symbol_ctor, u"unscopables", Value::symbol(sym_unscopables), 0);
-    put(symbol_ctor, u"isConcatSpreadable", Value::symbol(newSymbol(u"Symbol.isConcatSpreadable")), 0);
+    sym_is_concat_spreadable = newSymbol(u"Symbol.isConcatSpreadable");
+    put(symbol_ctor, u"isConcatSpreadable", Value::symbol(sym_is_concat_spreadable), 0);
     method(symbol_ctor, u"for", 1, [](Runtime& rt, const Value&, Args a) {
         const std::u16string key = *rt.toString(arg(a, 0));
         auto& s = rt.symbol_registry[key];
@@ -1509,9 +1551,25 @@ void Runtime::installBuiltins() {
         }
         return Value::object(arr);
     }, array_prototype);
+    array_constructor = array_ctor;
+    array_species_getter = newFunction(u"get [Symbol.species]", 0, [](Runtime&, const Value& t, Args) { return t; });
+    array_ctor->define(PropertyKey(sym_species), {Value::undefined(), array_species_getter, nullptr, kConfigurable | kAccessor});
     method(array_ctor, u"isArray", 1, [](Runtime& rt, const Value&, Args a) { return Value::boolean(rt.isArray(arg(a, 0))); });
-    method(array_ctor, u"of", 0, [](Runtime& rt, const Value&, Args a) { return Value::object(rt.newArray(std::vector<Value>(a.begin(), a.end()))); });
-    method(array_ctor, u"from", 1, [](Runtime& rt, const Value&, Args a) {
+    // A subclass's from and of: made with it (`this`), as constructors go.
+    const auto madeBy = [](Runtime& rt, const Value& c, std::optional<uint64_t> length) -> Object* {
+        if (!c.isObject() || c.asObject() == rt.array_constructor || !rt.isConstructor(c)) return nullptr;
+        std::vector<Value> args;
+        if (length) args.push_back(Value::number(static_cast<double>(*length)));
+        const Value made = rt.construct(c, args, c.asObject());
+        if (!made.isObject()) rt.throwError("TypeError", "the constructor didn't make an object");
+        return made.asObject();
+    };
+    method(array_ctor, u"of", 0, [madeBy](Runtime& rt, const Value& t, Args a) {
+        std::vector<Value> items(a.begin(), a.end());
+        if (Object* made = madeBy(rt, t, items.size())) return fillSpecies(rt, made, items, true);
+        return Value::object(rt.newArray(std::move(items)));
+    });
+    method(array_ctor, u"from", 1, [madeBy](Runtime& rt, const Value& t, Args a) {
         const Value src = arg(a, 0);
         const Value fn = arg(a, 1);
         if (!fn.isUndefined()) callback(rt, fn);
@@ -1536,6 +1594,10 @@ void Runtime::installBuiltins() {
             const uint64_t n = rt.lengthOf(o);
             if (n > 100'000'000) rt.throwError("RangeError", "array too long");
             for (uint64_t i = 0; i < n; ++i) add(elementAt(rt, o, i));
+        }
+        if (Object* made = madeBy(rt, t, iter.isNullish() ? std::optional<uint64_t>(items.size()) : std::nullopt)) {
+            TempRoots keep(rt, items);
+            return fillSpecies(rt, made, items, true);
         }
         return Value::object(rt.newArray(std::move(items)));
     });
@@ -1592,8 +1654,10 @@ void Runtime::installBuiltins() {
         const uint64_t len = rt.lengthOf(o);
         const uint64_t b = relative(rt, arg(a, 0), len, 0), e = relative(rt, arg(a, 1), len, len);
         if (e > b) checkNewArrayLength(rt, e - b);
+        Object* species = arraySpeciesCreate(rt, o, e > b ? e - b : 0);
         std::vector<Value> out;
         for (uint64_t i = b; i < e; ++i) out.push_back(hasElement(rt, o, i) ? elementAt(rt, o, i) : Value::empty());
+        if (species) return fillSpecies(rt, species, out, true);
         return Value::object(rt.newArray(std::move(out)));
     });
     method(array_prototype, u"splice", 2, [](Runtime& rt, const Value& t, Args a) {
@@ -1626,22 +1690,41 @@ void Runtime::installBuiltins() {
             }
             for (uint64_t k = 0; k < items; ++k) setElement(rt, o, start + k, a[2 + k]);
             setLength(rt, o, len - count + items);
-            return Value::object(rt.newArray(std::move(removed)));
+            return Value::object(rt.newArray(std::move(removed)));   // (not an array: no species)
         }
         const uint64_t len = o->elements.size();
         const uint64_t start = relative(rt, arg(a, 0), len, 0);
         uint64_t count = 0;
         if (a.size() == 1) count = len - start;
         else if (a.size() > 1) count = static_cast<uint64_t>(std::clamp(rt.toIntegerOrInfinity(a[1]), 0.0, static_cast<double>(len - start)));
+        if (Object* species = arraySpeciesCreate(rt, o, count)) {
+            std::vector<Value> removed;
+            for (uint64_t k = 0; k < count && start + k < o->elements.size(); ++k) removed.push_back(o->elements[start + k]);
+            fillSpecies(rt, species, removed, true);
+            // (the species may have changed the array: by index, the spec's way)
+            const uint64_t now = std::min<uint64_t>(o->elements.size(), len);
+            const uint64_t from = std::min(start, now), upto = std::min(start + count, now);
+            o->elements.erase(o->elements.begin() + static_cast<std::ptrdiff_t>(from), o->elements.begin() + static_cast<std::ptrdiff_t>(upto));
+            if (a.size() > 2) o->elements.insert(o->elements.begin() + static_cast<std::ptrdiff_t>(from), a.begin() + 2, a.end());
+            return Value::object(species);
+        }
         std::vector<Value> removed(o->elements.begin() + static_cast<std::ptrdiff_t>(start), o->elements.begin() + static_cast<std::ptrdiff_t>(start + count));
         o->elements.erase(o->elements.begin() + static_cast<std::ptrdiff_t>(start), o->elements.begin() + static_cast<std::ptrdiff_t>(start + count));
         if (a.size() > 2) o->elements.insert(o->elements.begin() + static_cast<std::ptrdiff_t>(start), a.begin() + 2, a.end());
         return Value::object(rt.newArray(std::move(removed)));
     });
     method(array_prototype, u"concat", 1, [](Runtime& rt, const Value& t, Args a) {
+        Object* self = thisObject(rt, t);
+        Object* species = arraySpeciesCreate(rt, self, 0);
         std::vector<Value> out;
+        const auto spreadable = [&](const Value& v) {
+            if (!v.isObject()) return false;
+            const Value s = rt.get(v, PropertyKey(rt.sym_is_concat_spreadable));
+            if (!s.isUndefined()) return rt.toBoolean(s);
+            return rt.isArray(v);
+        };
         const auto add = [&](const Value& v) {
-            if (rt.isArray(v)) {
+            if (spreadable(v)) {
                 Object* o = v.asObject();
                 const uint64_t n = rt.lengthOf(o);
                 for (uint64_t i = 0; i < n; ++i) out.push_back(hasElement(rt, o, i) ? elementAt(rt, o, i) : Value::empty());
@@ -1650,8 +1733,9 @@ void Runtime::installBuiltins() {
             }
             if (out.size() > 100'000'000) rt.throwError("RangeError", "array too long");
         };
-        add(Value::object(thisObject(rt, t)));
+        add(Value::object(self));
         for (const Value& v : a) add(v);
+        if (species) return fillSpecies(rt, species, out, true);
         return Value::object(rt.newArray(std::move(out)));
     });
     method(array_prototype, u"join", 1, [](Runtime& rt, const Value& t, Args a) {
@@ -1717,8 +1801,11 @@ void Runtime::installBuiltins() {
             const uint64_t len = rt.lengthOf(o);
             const Value fn = callback(rt, arg(a, 0));
             const Value self = arg(a, 1);
+            Object* species = (kind == Each::Map || kind == Each::Filter) ? arraySpeciesCreate(rt, o, kind == Each::Map ? len : 0) : nullptr;
             std::vector<Value> out;
             TempRoots roots(rt, out);   // results so far, while the callback runs
+            std::vector<Value> held{species ? Value::object(species) : Value::undefined()};
+            TempRoots keep(rt, held);
             if (kind == Each::Map) {
                 checkNewArrayLength(rt, len);
                 out.assign(len, Value::empty());
@@ -1740,6 +1827,9 @@ void Runtime::installBuiltins() {
                     case Each::FindIndex: case Each::FindLastIndex: if (rt.toBoolean(r)) return Value::number(static_cast<double>(i)); break;
                     default: break;
                 }
+            }
+            if (species && (kind == Each::Map || kind == Each::Filter)) {
+                return fillSpecies(rt, species, out, kind == Each::Filter);
             }
             switch (kind) {
                 case Each::Map: case Each::Filter: return Value::object(rt.newArray(std::move(out)));
@@ -2147,8 +2237,8 @@ void Runtime::installBuiltins() {
             return Value::object(m);
         }, proto);
     };
-    collectionCtor(u"Map", map_prototype, ObjectClass::Map);
-    collectionCtor(u"Set", set_prototype, ObjectClass::Set);
+    for (Object* c : {collectionCtor(u"Map", map_prototype, ObjectClass::Map), collectionCtor(u"Set", set_prototype, ObjectClass::Set)})
+        c->define(PropertyKey(sym_species), {Value::undefined(), newFunction(u"get [Symbol.species]", 0, [](Runtime&, const Value& t, Args) { return t; }), nullptr, kConfigurable | kAccessor});
     const auto thisCollection = [](Runtime& rt, const Value& t, ObjectClass cls) {
         if (!t.isObject() || t.asObject()->cls != cls) rt.throwError("TypeError", cls == ObjectClass::Map ? "not a Map" : "not a Set");
         return t.asObject();

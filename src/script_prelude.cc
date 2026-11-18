@@ -41,6 +41,56 @@ const char* const kScriptPrelude = R"JS(
     return out;
   }
 
+  // A host's non-ASCII labels as the DNS has them: Punycode (RFC 3492), "xn--…"
+  // (core-js checks new URL('https://тест').host, and puts in its own URL if not).
+  function punycodeLabel(label) {
+    const cps = Array.from(label, (c) => c.codePointAt(0));
+    if (cps.every((c) => c < 0x80)) return label;
+    const base = 36, tMin = 1, tMax = 26, skew = 38, damp = 700;
+    const digit = (d) => String.fromCharCode(d < 26 ? d + 97 : d + 22);
+    const adapt = (delta, n, first) => {
+      delta = first ? Math.floor(delta / damp) : delta >> 1;
+      delta += Math.floor(delta / n);
+      let k = 0;
+      for (; delta > ((base - tMin) * tMax) >> 1; k += base) delta = Math.floor(delta / (base - tMin));
+      return k + Math.floor(((base - tMin + 1) * delta) / (delta + skew));
+    };
+    let out = cps.filter((c) => c < 0x80).map((c) => String.fromCharCode(c)).join('');
+    const b = out.length;
+    let h = b;
+    if (b > 0) out += '-';
+    let n = 0x80, delta = 0, bias = 72;
+    while (h < cps.length) {
+      let m = Infinity;
+      for (const c of cps) if (c >= n && c < m) m = c;
+      delta += (m - n) * (h + 1);
+      n = m;
+      for (const c of cps) {
+        if (c < n) ++delta;
+        if (c === n) {
+          let q = delta;
+          for (let k = base; ; k += base) {
+            const t = k <= bias ? tMin : k >= bias + tMax ? tMax : k - bias;
+            if (q < t) break;
+            out += digit(t + ((q - t) % (base - t)));
+            q = Math.floor((q - t) / (base - t));
+          }
+          out += digit(q);
+          bias = adapt(delta, h + 1, h === b);
+          delta = 0;
+          ++h;
+        }
+      }
+      ++delta;
+      ++n;
+    }
+    return 'xn--' + out;
+  }
+  function asciiHost(host) {
+    if (!/[^\x00-\x7f]/.test(host) || host.startsWith('[')) return host;
+    return host.normalize('NFC').split(/[.\u3002\uff0e\uff61]/).map(punycodeLabel).join('.');
+  }
+
   function splitAuthority(auth, rec) {
     let host = auth;
     const at = host.lastIndexOf('@');
@@ -55,7 +105,7 @@ const char* const kScriptPrelude = R"JS(
     let port = '';
     const m = /^(\[[^\]]*\]|[^:]*)(?::(\d*))?$/.exec(host);
     if (!m) throw new TypeError('Invalid URL');
-    host = m[1].toLowerCase();
+    host = asciiHost(m[1].toLowerCase());
     port = m[2] || '';
     if (/[\s<>^|]/.test(host)) throw new TypeError('Invalid URL');
     if (port !== '') { port = String(parseInt(port, 10)); if (+port > 65535) throw new TypeError('Invalid URL'); }
@@ -175,7 +225,10 @@ const char* const kScriptPrelude = R"JS(
       this._update();
     }
     sort() { this[params] = this[params].map((p, i) => [p, i]).sort((a, b) => a[0][0] < b[0][0] ? -1 : a[0][0] > b[0][0] ? 1 : a[1] - b[1]).map(x => x[0]); this._update(); }
-    forEach(fn, thisArg) { for (const [k, v] of this[params]) fn.call(thisArg, v, k, this); }
+    forEach(fn, thisArg) {
+      // The live list: one the callback deletes from goes on from where it is now.
+      for (let i = 0; i < this[params].length; ++i) { const [k, v] = this[params][i]; fn.call(thisArg, v, k, this); }
+    }
     keys() { return this[params].map(p => p[0])[Symbol.iterator](); }
     values() { return this[params].map(p => p[1])[Symbol.iterator](); }
     entries() { return this[params].map(p => [p[0], p[1]])[Symbol.iterator](); }

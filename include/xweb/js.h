@@ -438,6 +438,8 @@ public:
     Object* object_prototype = nullptr;
     Object* function_prototype = nullptr;
     Object* array_prototype = nullptr;
+    Object* array_constructor = nullptr;      // the intrinsic Array, and its [Symbol.species] getter:
+    Object* array_species_getter = nullptr;   // a plain array's species, quickly
     Object* string_prototype = nullptr;
     Object* number_prototype = nullptr;
     Object* boolean_prototype = nullptr;
@@ -478,6 +480,7 @@ public:
     Symbol* sym_search = nullptr;
     Symbol* sym_split = nullptr;
     Symbol* sym_species = nullptr;
+    Symbol* sym_is_concat_spreadable = nullptr;
     Symbol* sym_async_iterator = nullptr;
     Symbol* sym_unscopables = nullptr;
     std::unordered_map<std::u16string, Symbol*> symbol_registry;
