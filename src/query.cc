@@ -70,6 +70,11 @@ bool nth(int a, int b, int index) {
 
 class Matcher {
 public:
+    // :scope's element: the one querySelectorAll was called on (the root element for a
+    // document's), or the element matches() is asked of. jQuery's find('> .x') is
+    // querySelectorAll(':scope > .x').
+    const Node* scope = nullptr;
+    void refuel() { fuel_ = 1'000'000; }
     bool complex(const Node* el, const ComplexSelector& sel) { return !sel.parts.empty() && from(el, sel, sel.parts.size() - 1); }
 
 private:
@@ -140,7 +145,7 @@ private:
         if (n == "root") return el->parent && el->parent->type == NodeType::Document;
         if (n == "defined") return !(el->ns == Namespace::Html && el->name.find('-') != std::string::npos && el->custom_state != 2);
         if (n == "host") return false;   // from outside a shadow tree, nothing is its host
-        if (n == "scope") return false;
+        if (n == "scope") return el == scope;
         // :nth-child(An+B of S): it matches S, and it's that place among its siblings that do.
         if ((n == "nth-child" || n == "nth-last-child") && !s.args.empty()) {
             const auto inS = [&](const Node* x) {
@@ -242,6 +247,7 @@ std::optional<std::vector<css::ComplexSelector>> parseSelectors(std::string_view
 bool matchesSelectors(const Node* el, const std::vector<css::ComplexSelector>& selectors) {
     if (!el || !el->isElement()) return false;
     Matcher m;
+    m.scope = el;
     for (const auto& s : selectors)
         if (m.complex(el, s)) return true;
     return false;
@@ -249,11 +255,22 @@ bool matchesSelectors(const Node* el, const std::vector<css::ComplexSelector>& s
 
 std::vector<Node*> querySelectorAll(Node* root, const std::vector<css::ComplexSelector>& selectors, bool first) {
     std::vector<Node*> out;
+    Matcher m;
+    m.scope = root;
+    if (!root->isElement())
+        for (const Node* c : root->children)
+            if (c->isElement()) { m.scope = c; break; }
+    const auto hit = [&](const Node* n) {
+        m.refuel();
+        for (const auto& sel : selectors)
+            if (m.complex(n, sel)) return true;
+        return false;
+    };
     std::vector<Node*> todo(root->children.rbegin(), root->children.rend());
     while (!todo.empty()) {
         Node* n = todo.back();
         todo.pop_back();
-        if (n->isElement() && matchesSelectors(n, selectors)) {
+        if (n->isElement() && hit(n)) {
             out.push_back(n);
             if (first) break;
         }

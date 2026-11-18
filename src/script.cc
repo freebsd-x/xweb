@@ -662,6 +662,9 @@ void PageScript::Impl::installElement() {
         return Value::object(o);
     });
     method(p, u"getClientRects", 0, [self](Runtime& rt, const Value& t, Args) {
+        // None for an element without a box (display:none, or in one): jQuery's :hidden.
+        Node* el = self->thisElement(t);
+        if (!self->hasBox(el)) return Value::object(rt.newArray({}));
         const Value r = rt.call(rt.get(t, u"getBoundingClientRect"), t, {});
         return Value::object(rt.newArray({r}));
     });
@@ -672,6 +675,7 @@ void PageScript::Impl::installElement() {
     // are from it, so summing them up the chain lands on the page position.
     const auto offsetParentOf = [self](Node* el) -> Node* {
         if (!el || !self->inDocument(el) || el == self->doc.body() || el->isHtml("html")) return nullptr;
+        if (!self->hasBox(el)) return nullptr;   // no box: display:none
         const auto position = [self](const Node* n) -> std::string {
             if (self->host.computed_value) return self->host.computed_value(n, "position").value_or("static");
             if (!self->host.computed_style) return "static";

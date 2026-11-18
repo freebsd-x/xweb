@@ -372,6 +372,17 @@ struct PageScript::Impl {
     // ── Tree changes ──
 
     // Connected: in the document, or in a shadow tree whose host is (shadow-including).
+    // Whether an element is drawn at all: in the page, and neither it nor an ancestor
+    // display:none (nor it display:contents). getClientRects and offsetParent by it.
+    bool hasBox(const Node* el) const {
+        if (!el || !inDocument(el)) return false;
+        if (!host.computed_value) return true;
+        for (const Node* x = el; x && x->isElement(); x = x->parent) {
+            const std::optional<std::string> d = host.computed_value(x, "display");
+            if (d && (*d == "none" || (x == el && *d == "contents"))) return false;
+        }
+        return true;
+    }
     bool inDocument(const Node* n) const {
         for (int hops = 0; hops < 10'000; ++hops) {
             while (n->parent) n = n->parent;

@@ -1089,6 +1089,16 @@ TEST(Script, SvgInterfacesAndCheckVisibility) {
     EXPECT_EQ(p.console, "log:true true true true true false true\n") << p.console;
 }
 
+TEST(Script, ScopeIsTheElementAskedOf) {
+    // jQuery's find('> .x') is querySelectorAll(':scope > .x'); weather.go.kr's tabs.
+    Page p(R"(<body><div id=a><p class=x id=p1><span class=x></span></p></div><script>
+        const a = document.getElementById('a');
+        console.log(a.querySelectorAll(':scope > .x').length, a.querySelectorAll(':scope .x').length, document.querySelectorAll(':scope').length,
+                    document.querySelector(':scope').nodeName, a.matches(':scope'), document.getElementById('p1').matches(':scope > p'));
+        </script>)");
+    EXPECT_EQ(p.console, "log:1 2 1 HTML true false\n") << p.console;
+}
+
 TEST(Script, DomParserReadsXmlInItsNamespaces) {
     // OpenLayers' WMTS capabilities: elements by namespace and local name.
     Page p(R"(<body><script>
