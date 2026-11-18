@@ -766,6 +766,7 @@ private:
             if (s.border_box) h -= b.frameHeight();
             own_height = std::max(0.0f, h);
         }
+        if (!own_height && s.height.is_auto) own_height = ratioHeight(b);
 
         // Percentages of a height need a definite one above; only here is it known.
         b.percent_min_h = s.min_height.hasPercent() && cb_height ? s.min_height.resolve(*cb_height) : 0;
@@ -971,6 +972,8 @@ private:
         } else if (cb_height && !replaced && !s.offset[Top].is_auto && !s.offset[Bottom].is_auto) {
             // Both edges given: as tall as they leave.
             own = std::max(0.0f, base_h - s.offset[Top].resolve(base_h) - s.offset[Bottom].resolve(base_h) - k.frameHeight() - k.margin[Top] - k.margin[Bottom]);
+        } else if (!replaced && s.height.is_auto) {
+            own = ratioHeight(k);
         }
         k.laid_out_for = {base, cb_height.value_or(-1)};
         layoutContents(k, own, Flow{});
@@ -1007,6 +1010,8 @@ private:
             float h = s.height.px;
             if (s.border_box) h -= k.frameHeight();
             own = std::max(0.0f, h);
+        } else if (s.height.is_auto) {
+            own = ratioHeight(k);
         }
         layoutContents(k, own, Flow{});
     }
@@ -1171,10 +1176,14 @@ private:
         }
         b.width = clampWidth(b, std::max(0.0f, width), cb_width);
         std::optional<float> own;
-        if (!s.height.is_auto && !s.height.hasPercent()) {
-            float h = s.height.px;
+        if (!s.height.is_auto && (!s.height.hasPercent() || b.cb_height_hint >= 0)) {
+            // (A percentage of its block's height, when that's definite: an inline-flex
+            // `height: 100%` in an absolutely placed figure, musinsa.com's banners.)
+            float h = s.height.resolve(std::max(0.0f, b.cb_height_hint));
             if (s.border_box) h -= b.frameHeight();
             own = std::max(0.0f, h);
+        } else if (s.height.is_auto) {
+            own = ratioHeight(b);
         }
         layoutContents(b, own, Flow{});
     }
@@ -1316,8 +1325,14 @@ private:
         }
         // Only pictures keep their shape: a text field made wider doesn't get taller.
         const bool has_ratio = !(n->isHtml("input") || n->isHtml("textarea") || n->isHtml("select") || n->isHtml("progress") || n->isHtml("meter"));
-        const float ratio = !has_ratio ? 0 : shape > 0 && !(n->attr("width") && n->attr("height")) ? shape
-                                            : (natural_w > 0 && natural_h > 0) ? natural_w / natural_h : 0;
+        float ratio = !has_ratio ? 0 : shape > 0 && !(n->attr("width") && n->attr("height")) ? shape
+                                      : (natural_w > 0 && natural_h > 0) ? natural_w / natural_h : 0;
+        // aspect-ratio: the page's shape instead (under `auto`, only for one with none of
+        // its own yet: an image still coming).
+        if (s.aspect_ratio > 0 && !(s.aspect_auto && have_natural && ratio > 0)) {
+            ratio = s.aspect_ratio;
+            if (!has_w && !has_h) h = w / ratio;
+        }
         if (has_w && !has_h && ratio > 0) h = w / ratio;
         if (has_h && !has_w && ratio > 0) w = h * ratio;
         const float auto_w = w;
@@ -1637,7 +1652,17 @@ private:
     // Lays out a flex item at a given content width, and height if it's fixed.
     void layoutItem(Box& k, float width, std::optional<float> height) {
         k.width = std::max(0.0f, width);
+        if (!height && k.style->height.is_auto) height = ratioHeight(k);
         layoutContents(k, height, Flow{});
+    }
+
+    // aspect-ratio: an auto height from the width, in the box box-sizing names. (Not a
+    // picture's: one with a size of its own keeps it under `auto <ratio>`.)
+    std::optional<float> ratioHeight(const Box& b) const {
+        const ComputedStyle& s = *b.style;
+        if (s.aspect_ratio <= 0 || b.kind == BoxKind::Replaced) return std::nullopt;
+        if (s.border_box) return std::max(0.0f, (b.width + b.frameWidth()) / s.aspect_ratio - b.frameHeight());
+        return std::max(0.0f, b.width / s.aspect_ratio);
     }
 
     std::optional<float> specifiedHeight(const Box& k, std::optional<float> cb_height) const {
@@ -3746,7 +3771,15 @@ private:
     void paintReplaced(const Box& b, float x, float y, float opacity) {
         const ComputedStyle& s = *b.style;
         paintFrame(b, x, y, opacity);
-        if (s.hidden) return;
+        if (s.hidden) {
+            // Not shown, but fetched all the same, as browsers do: a page that hides each
+            // picture until its load event (musinsa.com's banners) would wait forever.
+            if (b.node->isHtml("img") && images_ && out_->images_wanted.size() < 512)
+                if (const std::optional<std::string> src = imageSourceOf(b.node, {vw_, vh_}); src && !src->empty() && !images_->imageSize(*src) &&
+                                                                                        std::find(out_->images_wanted.begin(), out_->images_wanted.end(), *src) == out_->images_wanted.end())
+                    out_->images_wanted.push_back(*src);
+            return;
+        }
         const float cx = x + b.border[Left] + b.padding[Left];
         const float cy = y + b.border[Top] + b.padding[Top];
         const Node* n = b.node;

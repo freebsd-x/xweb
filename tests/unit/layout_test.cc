@@ -784,6 +784,38 @@ TEST(Replaced, AnImageLoadingShowsNoAltText) {
     EXPECT_EQ(texts, "Broken|");
 }
 
+TEST(Replaced, AHiddenImageIsStillFetched) {
+    // musinsa.com: each banner picture visibility:hidden until its load event.
+    struct None : ImageSizes {
+        std::optional<std::pair<float, float>> imageSize(const std::string&) override { return std::nullopt; }
+    } images;
+    auto doc = parseHtml("<img src=hidden.png style='visibility:hidden'><img src=shown.png>");
+    StyledDocument styles(*doc, css::MediaContext{400, 300});
+    FixedText measurer;
+    const PageLayout r = layoutPage(*doc, styles, measurer, &images, 400, 300);
+    EXPECT_NE(std::find(r.images_wanted.begin(), r.images_wanted.end(), "hidden.png"), r.images_wanted.end());
+    EXPECT_NE(std::find(r.images_wanted.begin(), r.images_wanted.end(), "shown.png"), r.images_wanted.end());
+}
+
+TEST(Block, AspectRatioGivesAnAutoHeight) {
+    const auto r = layout("<div id=a style='width:200px;aspect-ratio:4/3'></div><div id=b style='width:100px;aspect-ratio:2'></div>"
+                          "<div id=c style='width:100px;height:30px;aspect-ratio:1'></div>"
+                          "<div id=d style='width:100px;aspect-ratio:1;padding:10px;border:5px solid;box-sizing:border-box'></div>"
+                          "<div style='display:flex;width:90px'><div id=f style='flex:1;aspect-ratio:3'></div></div>");
+    EXPECT_FLOAT_EQ(r.box("a").h, 150);
+    EXPECT_FLOAT_EQ(r.box("b").h, 50);
+    EXPECT_FLOAT_EQ(r.box("c").h, 30);    // a height of its own wins
+    EXPECT_FLOAT_EQ(r.box("d").h, 100);   // the border box is square
+    EXPECT_FLOAT_EQ(r.box("f").h, 30);
+}
+
+TEST(Inline, AnInlineBlocksPercentHeightOfADefiniteBlock) {
+    // musinsa.com's banner: an inline-flex height:100% in an absolutely placed figure.
+    const auto r = layout("<div style='position:relative;width:100px;height:80px'><div style='position:absolute;inset:0'>"
+                          "<div id=i style='display:inline-flex;width:100%;height:100%'></div></div></div>");
+    EXPECT_FLOAT_EQ(r.box("i").h, 80);
+}
+
 TEST(Paint, AnAbsoluteBoxEscapesClipsBetweenItAndItsContainingBlock) {
     // YouTube: ytd-app absolute (in the viewport) inside a body with overflow:hidden and no
     // height. Clipped by its containing block's overflow (and outer ones), not by others.

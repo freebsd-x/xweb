@@ -3319,6 +3319,7 @@ private:
         else if (p == "opacity") to.opacity = from.opacity;
         else if (p == "box-sizing") to.border_box = from.border_box;
         else if (p == "object-fit") to.object_fit = from.object_fit;
+        else if (p == "aspect-ratio") { to.aspect_ratio = from.aspect_ratio; to.aspect_auto = from.aspect_auto; }
         else if (p == "object-position") { to.object_x = from.object_x; to.object_y = from.object_y; }
         else if (p == "box-shadow") to.box_shadow = from.box_shadow;
         else if (p == "z-index") to.z_index = from.z_index;
@@ -3611,6 +3612,23 @@ private:
             if (applyGrid(s, p, v, kw, c)) return;
         }
         if (p == "flex") { setFlexShorthand(s, v, c); return; }
+        if (p == "aspect-ratio") {
+            // auto | <ratio> | auto <ratio>; a ratio is <number> [/ <number>].
+            s.aspect_ratio = 0;
+            s.aspect_auto = false;
+            std::vector<double> nums;
+            bool slash = false;
+            for (size_t k = i; k < v.size(); ++k) {
+                const Token& t = v[k];
+                if (t.type == TokenType::Whitespace) continue;
+                if (t.type == TokenType::Ident && lower(t.text) == "auto") s.aspect_auto = true;
+                else if (t.type == TokenType::Number) nums.push_back(t.number);
+                else if (t.type == TokenType::Delim && t.text == "/") slash = true;
+            }
+            if (nums.size() == 1 && !slash && nums[0] > 0) s.aspect_ratio = static_cast<float>(nums[0]);
+            else if (nums.size() == 2 && nums[0] > 0 && nums[1] > 0) s.aspect_ratio = static_cast<float>(nums[0] / nums[1]);
+            return;
+        }
         if (p == "flex-grow") { if (i < v.size() && v[i].type == TokenType::Number) s.flex_grow = std::max(0.0f, static_cast<float>(v[i].number)); return; }
         if (p == "flex-shrink") { if (i < v.size() && v[i].type == TokenType::Number) s.flex_shrink = std::max(0.0f, static_cast<float>(v[i].number)); return; }
         if (p == "flex-basis") { oneLength(s.flex_basis, true); return; }
@@ -4605,7 +4623,7 @@ private:
         "padding-bottom", "padding-left", "top", "right", "bottom", "left", "inset", "transform", "transform-origin",
         "translate", "rotate", "scale", "transition", "transition-duration", "transition-delay", "transition-property",
         "transition-timing-function", "will-change", "z-index", "opacity", "flex", "flex-basis", "flex-grow", "flex-shrink",
-        "order"};
+        "order", "aspect-ratio"};
 
     // What an element a :has() is asked of must have (a tag, ID or class of the compound
     // the :has() is in), into has_anchors_; or, with nothing to tell, has_any_anchor_.

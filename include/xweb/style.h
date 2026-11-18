@@ -280,6 +280,9 @@ struct ComputedStyle {
     FlexAlign justify_content = FlexAlign::Auto, align_items = FlexAlign::Stretch;
     FlexAlign align_self = FlexAlign::Auto, align_content = FlexAlign::Stretch;
     float flex_grow = 0, flex_shrink = 1;
+    // aspect-ratio: width over height, 0 for none; `auto <ratio>`: a picture's own first.
+    float aspect_ratio = 0;
+    bool aspect_auto = false;
     Length flex_basis = Length::autoLength();
     int order = 0;
     float row_gap = 0, column_gap = 0;
