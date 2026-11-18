@@ -701,6 +701,19 @@ TEST(Float, AFormattingContextGoesBelowFloatsInAClippingParent) {
     EXPECT_FLOAT_EQ(r.box("x").y, 67);
 }
 
+TEST(Positioned, APositionedPictureMovesByItsOffsetsOnce) {
+    // dcinside's login checkbox and every absolutely placed <img>: the picture inside the
+    // element's block isn't positioned (or floated) a second time.
+    const auto r = layout("<div style='position:relative;height:40px'><img id=i style='position:absolute;left:30px;top:5px;width:10px;height:10px'>"
+                          "<input id=c type=checkbox style='position:absolute;left:60px;top:5px;margin:0;width:17px;height:17px'></div>"
+                          "<fieldset id=f style='border:0;margin:0;padding:0'><div style='float:left;width:50px;height:30px'></div></fieldset>");
+    EXPECT_FLOAT_EQ(r.box("i").x, 30);
+    EXPECT_FLOAT_EQ(r.box("i").y, 5);
+    EXPECT_FLOAT_EQ(r.box("c").x, 60);
+    EXPECT_FLOAT_EQ(r.box("c").w, 17);
+    EXPECT_FLOAT_EQ(r.box("f").h, 30);   // a fieldset holds its floats
+}
+
 TEST(Inline, WordBreakKeepAllAndBreakAll) {
     // Korean pages' body { word-break: keep-all }: a narrow box doesn't split a word.
     const auto keep = layout("<div id=d style='width:10px;word-break:keep-all'>\xEC\x8A\xA4\xED\x8F\xAC\xEC\xB8\xA0</div>");

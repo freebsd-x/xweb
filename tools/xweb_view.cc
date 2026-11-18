@@ -729,6 +729,13 @@ public:
     // Told after a layout what images its styles call for that haven't been asked for.
     void onImagesWanted(std::function<void(const std::shared_ptr<Page>&, std::vector<std::string>)> f) { on_images_ = std::move(f); }
     void onSheetsWanted(std::function<void(const std::shared_ptr<Page>&, std::vector<std::string>)> f) { on_sheets_ = std::move(f); }
+    // An <iframe>'s page wanted: (the page, the iframe, its absolute URL).
+    void onFrameWanted(std::function<void(const std::shared_ptr<Page>&, const web::Node*, std::string)> f) { on_frame_ = std::move(f); }
+    // An <iframe>'s page, fetched with its stylesheets (not its scripts): drawn in its area.
+    void setFrame(const web::Node* iframe, std::shared_ptr<Page> frame) {
+        frames_[iframe].page = std::move(frame);
+        invalidate();
+    }
 
     void show(std::shared_ptr<Page> page) {
         popup_ = nullptr;
@@ -1326,6 +1333,7 @@ private:
             if (on_fonts_) on_fonts_(page_, web::wantedWebFonts(*page.doc, styles));
         }
         layout_ = web::layoutPage(*page.doc, styles, measurer_, &images_, width, height, &page_->forms);
+        spliceFrames();
         ++layout_gen_;
         computed_cache_.clear();
         computed_values_.clear();
@@ -1880,6 +1888,74 @@ private:
     std::function<void(const std::shared_ptr<Page>&, std::vector<web::WebFontFace>)> on_fonts_;
     std::function<void(const std::shared_ptr<Page>&, std::vector<std::string>)> on_images_;
     std::function<void(const std::shared_ptr<Page>&, std::vector<std::string>)> on_sheets_;
+    std::function<void(const std::shared_ptr<Page>&, const web::Node*, std::string)> on_frame_;
+    struct Frame {
+        std::string url;                 // what was asked for
+        std::shared_ptr<Page> page;      // once it's here
+    };
+    std::map<const web::Node*, Frame> frames_;
+
+    // Each <iframe>'s area: its page laid out at that size and drawn there, clipped to it
+    // (a frame's own scripts don't run: static frames show, a logo banner, a widget's
+    // markup). A frame not asked for yet is asked for.
+    void spliceFrames() {
+        if (!page_ || !page_->doc) return;
+        static const bool off = std::getenv("XWEB_NO_FRAMES") != nullptr;   // for telling what a frame did
+        if (off) return;
+        bool any = false;
+        for (const web::PaintOp& op : layout_.ops)
+            if (op.kind == web::PaintKind::Image && op.text == web::kFrameSource) { any = true; break; }
+        if (!any) return;
+        std::vector<web::PaintOp> out;
+        out.reserve(layout_.ops.size());
+        size_t frames_drawn = 0;
+        for (web::PaintOp& op : layout_.ops) {
+            if (!(op.kind == web::PaintKind::Image && op.text == web::kFrameSource && op.node)) {
+                out.push_back(std::move(op));
+                continue;
+            }
+            const std::string* src = op.node->attr("src");
+            const std::string url = src && !src->empty() ? web::resolveUrl(page_->base, *src) : std::string{};
+            if (url.empty() || !(url.starts_with("http://") || url.starts_with("https://"))) continue;
+            Frame& f = frames_[op.node];
+            if (f.url != url) {
+                f.url = url;
+                f.page.reset();
+                if (on_frame_ && frames_.size() <= 32) on_frame_(page_, op.node, url);
+                continue;
+            }
+            if (!f.page || !f.page->doc || ++frames_drawn > 16) continue;
+            Page& child = *f.page;
+            std::vector<std::string> missing;
+            const auto loader = [&child](const std::string& href) {
+                const auto it = child.sheets.find(web::resolveUrl(child.base, href));
+                return it == child.sheets.end() ? std::string{} : it->second;
+            };
+            web::StyledDocument styles(*child.doc, web::css::MediaContext{op.w, op.h}, loader,
+                                       [this](const web::ComputedStyle& st) { return web::chWidth(measurer_, st); }, &child.forms);
+            web::PageLayout inner = web::layoutPage(*child.doc, styles, measurer_, &images_, op.w, op.h, &child.forms);
+            for (const std::string& want : inner.images_wanted) layout_.images_wanted.push_back(web::resolveUrl(child.base, want));
+            const float dx = op.x, dy = op.y;
+            web::PaintOp clip;
+            clip.kind = web::PaintKind::ClipBegin;
+            clip.x = dx;
+            clip.y = dy;
+            clip.w = op.w;
+            clip.h = op.h;
+            out.push_back(clip);
+            for (web::PaintOp& k : inner.ops) {
+                k.x += dx;
+                k.y += dy;
+                if (k.kind == web::PaintKind::TransformBegin)
+                    k.transform = web::Matrix::translate(dx, dy).after(k.transform.after(web::Matrix::translate(-dx, -dy)));
+                out.push_back(std::move(k));
+            }
+            web::PaintOp end;
+            end.kind = web::PaintKind::ClipEnd;
+            out.push_back(end);
+        }
+        layout_.ops = std::move(out);
+    }
     std::unique_ptr<web::StyledDocument> styles_;   // the last layout's, which inline SVG is drawn with
     // Styles made for a script since that layout (getComputedStyle), and what they found
     // missing; used by the next layout if nothing's changed (change_gen_) since.
@@ -1920,6 +1996,55 @@ public:
         node_->onImagesWanted([this](const std::shared_ptr<Page>& page, std::vector<std::string> urls) {
             // Not from inside layout: next turn of the loop.
             XApplication::post([this, page, urls = std::move(urls)]() mutable { loadImages(page, std::move(urls), generation_.load()); });
+        });
+        node_->onFrameWanted([this](const std::shared_ptr<Page>& page, const web::Node* iframe, std::string url) {
+            const uint64_t mine = generation_.load();
+            std::thread([this, page, iframe, url = std::move(url), mine] {
+                Resource got = load(url, web::sameSite(page->url, url), referrerFor(page->url, url));
+                if (!got.ok || got.http_status >= 400 || generation_.load() != mine) return;
+                if (!got.content_type.empty() && got.content_type.find("html") == std::string::npos) return;
+                auto child = std::make_shared<Page>();
+                child->url = got.final_url.empty() ? url : got.final_url;
+                child->doc = web::parseHtml(htmlFor(got, child->url));
+                child->base = findBase(*child->doc, child->url);
+                // Its pictures by absolute URL: they're looked up as the outer page's are.
+                std::vector<web::Node*> todo{child->doc->root()};
+                while (!todo.empty()) {
+                    web::Node* n = todo.back();
+                    todo.pop_back();
+                    if (n->isHtml("img") || n->isHtml("source"))
+                        for (web::Attribute& a : n->attrs) {
+                            if (a.name == "src") a.value = web::resolveUrl(child->base, a.value);
+                            else if (a.name == "srcset") {
+                                std::string out;
+                                std::vector<std::string> parts;
+                                for (size_t at = 0, comma; at <= a.value.size(); at = comma + 1) {
+                                    comma = a.value.find(',', at);
+                                    if (comma == std::string::npos) comma = a.value.size();
+                                    parts.push_back(a.value.substr(at, comma - at));
+                                }
+                                for (const std::string& part : parts) {
+                                    std::string p = part;
+                                    const size_t b = p.find_first_not_of(" \t\n");
+                                    if (b == std::string::npos) continue;
+                                    p = p.substr(b);
+                                    const size_t sp = p.find_first_of(" \t\n");
+                                    const std::string u = sp == std::string::npos ? p : p.substr(0, sp);
+                                    if (!out.empty()) out += ", ";
+                                    out += web::resolveUrl(child->base, u) + (sp == std::string::npos ? "" : p.substr(sp));
+                                }
+                                a.value = out;
+                            }
+                        }
+                    todo.insert(todo.end(), n->children.rbegin(), n->children.rend());
+                }
+                loadSheets(*child, generation_, mine);
+                XApplication::post([this, page, iframe, child, mine] {
+                    if (generation_.load() != mine || node_->page() != page.get()) return;
+                    node_->setFrame(iframe, child);
+                    relayout_wanted_ = true;
+                });
+            }).detach();
         });
         node_->onSheetsWanted([this](const std::shared_ptr<Page>& page, std::vector<std::string> urls) {
             const uint64_t mine = generation_.load();

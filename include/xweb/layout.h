@@ -58,6 +58,9 @@ enum class PaintKind {
 
 // An Image op's source when it's a <canvas> (op.node): its pixels are the page script's.
 inline constexpr const char* kCanvasSource = "xweb:canvas";
+// An Image op that is an <iframe>'s area: whoever draws the page puts the frame's own
+// page there (op.node is the iframe).
+inline constexpr const char* kFrameSource = "xweb:frame";
 
 struct PaintOp {
     PaintKind kind = PaintKind::Rect;

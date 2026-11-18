@@ -18,4 +18,7 @@ body{margin:0;font:14px/18px monospace}
 <div style="width:60px;height:30px;margin:20px;background:#a37;transform:scale(1.5,.5) skewX(10deg)"></div>
 <div style="width:40px;height:20px;margin:20px;background:linear-gradient(90deg,red,blue);transform-origin:0 0;rotate:90deg"></div>
 <div style="width:30px;height:30px;margin:20px;transform:rotate(180deg)"><div style="width:10px;height:10px;background:#333"></div></div>
+<!-- Positioned pictures and controls: their offsets once (the picture inside their block isn't positioned again). -->
+<div style="position:relative;height:40px;background:#eee"><img src="images/star.svg" style="position:absolute;left:30px;top:5px;width:10px;height:10px"><input type=checkbox style="position:absolute;left:60px;top:5px;margin:0;width:17px;height:17px"><input type=text style="position:absolute;left:100px;top:5px;margin:0;width:40px"></div>
+<fieldset style="border:0;margin:0;padding:0"><div style="float:left;width:50px;height:30px;background:#9cf"></div></fieldset><div style="height:5px;background:#f99"></div>
 </body></html>

@@ -54,6 +54,8 @@ struct Box {
     const Box* deco_parent = nullptr;   // an inline with a background or border: the next such out
     float inline_extent = 0;       // how far its widest line reaches, closing padding included
     bool synthetic = false;        // a pseudo-element's image: its node is the layout's own, not the page's
+    bool picture_inside = false;   // the picture inside a positioned or floated replaced element's block:
+                                   // its style is the element's, but it's in flow in that block
     uint32_t tree_index = 0;       // where it comes in the box tree, depth first (paint order's tie-break)
     float cb_height_hint = -1;     // its containing block's definite content height, if known: for a
                                    // picture's percentage height (an SVG at height: 100% of a 26px box)
@@ -76,11 +78,11 @@ struct Box {
 
     // (Text and line breaks share their element's style: its float or position isn't theirs.)
     [[nodiscard]] bool outOfFlow() const noexcept {
-        return style && kind != BoxKind::Text && kind != BoxKind::LineBreak &&
+        return style && kind != BoxKind::Text && kind != BoxKind::LineBreak && !picture_inside &&
                (style->position == Position::Absolute || style->position == Position::Fixed);
     }
     [[nodiscard]] bool floating() const noexcept {
-        return style && kind != BoxKind::Text && kind != BoxKind::LineBreak && style->float_side != Float::None;
+        return style && kind != BoxKind::Text && kind != BoxKind::LineBreak && !picture_inside && style->float_side != Float::None;
     }
     [[nodiscard]] bool blockLevel() const noexcept { return kind == BoxKind::Block; }
     [[nodiscard]] bool inFlowBlock() const noexcept { return blockLevel() && !outOfFlow() && !floating(); }
@@ -505,7 +507,8 @@ private:
         }
         if (el->isHtml("input")) {
             const std::string* ty = el->attr("type");
-            if (ty && (*ty == "checkbox" || *ty == "radio")) {
+            // (Positioned or floated, it's a block holding the picture, as the others are.)
+            if (ty && (*ty == "checkbox" || *ty == "radio") && box->kind != BoxKind::Block) {
                 box->kind = BoxKind::Replaced;
                 return box;
             }
@@ -519,6 +522,7 @@ private:
                 inner->node = el;
                 inner->style = &style;
                 inner->kind = BoxKind::Replaced;
+                inner->picture_inside = true;
                 inner->alt = box->alt;
                 box->kids.push_back(std::move(inner));
             }
@@ -715,7 +719,9 @@ private:
 
     [[nodiscard]] bool establishesBfc(const Box& b) const {
         const Display d = b.display();
+        // (A <fieldset> is one too, as browsers make it: dcinside's login box floats inside.)
         return &b == root_ || b.kind == BoxKind::InlineBlock || b.outOfFlow() || b.floating() || b.flex_item ||
+               (b.node && b.kind == BoxKind::Block && b.node->isHtml("fieldset")) ||
                b.style->overflow_clip || d == Display::FlowRoot || d == Display::TableCell || d == Display::TableCaption ||
                d == Display::Flex || d == Display::InlineFlex || d == Display::Grid || d == Display::InlineGrid;
     }
@@ -3805,6 +3811,21 @@ private:
         const float cx = x + b.border[Left] + b.padding[Left];
         const float cy = y + b.border[Top] + b.padding[Top];
         const Node* n = b.node;
+        // An <iframe>: its area, for its page to be drawn in.
+        if (n->isHtml("iframe")) {
+            if (b.width <= 0 || b.height <= 0) return;
+            PaintOp op;
+            op.kind = PaintKind::Image;
+            op.text = kFrameSource;
+            op.node = n;
+            op.x = cx;
+            op.y = cy;
+            op.w = b.width;
+            op.h = b.height;
+            op.color = faded(Color{255, 255, 255, 255}, opacity);
+            out_->ops.push_back(std::move(op));
+            return;
+        }
         // A <canvas>: what its scripts drew, which whoever draws the page asks them for.
         if (n->isHtml("canvas")) {
             if (b.width <= 0 || b.height <= 0) return;
