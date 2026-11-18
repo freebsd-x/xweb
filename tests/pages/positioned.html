@@ -21,4 +21,6 @@ body{margin:0;font:14px/18px monospace}
 <!-- Positioned pictures and controls: their offsets once (the picture inside their block isn't positioned again). -->
 <div style="position:relative;height:40px;background:#eee"><img src="images/star.svg" style="position:absolute;left:30px;top:5px;width:10px;height:10px"><input type=checkbox style="position:absolute;left:60px;top:5px;margin:0;width:17px;height:17px"><input type=text style="position:absolute;left:100px;top:5px;margin:0;width:40px"></div>
 <fieldset style="border:0;margin:0;padding:0"><div style="float:left;width:50px;height:30px;background:#9cf"></div></fieldset><div style="height:5px;background:#f99"></div>
+<!-- A picture height:100% placed absolutely in a padding-top ratio box (velog's thumbnails). -->
+<div style="width:120px"><div style="position:relative;padding-top:52%"><img src="images/checker.png" style="position:absolute;height:100%;width:100%;left:0;top:0"></div><p style="margin:0;height:10px;background:#f99"></p></div>
 </body></html>

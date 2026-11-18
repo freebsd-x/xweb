@@ -2590,8 +2590,8 @@ private:
                     };
                     if (!got.ok || got.http_status >= 400) {
                         if (debug)
-                            std::fprintf(stderr, "[image] %s: not loaded (status %d, referrer %s)\n", url.c_str(), got.http_status,
-                                         referrerFor(page->url, url).c_str());
+                            std::fprintf(stderr, "[image] %s: not loaded (status %d, referrer %s: %s)\n", url.c_str(), got.http_status,
+                                         referrerFor(page->url, url).c_str(), got.error.c_str());
                         failed();
                         continue;
                     }

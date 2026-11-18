@@ -259,20 +259,26 @@ class CalcParser {
 public:
     CalcParser(const Tokens& v, size_t pos, const LengthContext& c) : v_(v), i_(pos), c_(c) {}
 
-    bool sum(Length& out, int depth) {
+    // `unitless`: whether it came to a plain number (calc(3 - 1)), which a product may
+    // multiply or divide by (velog's 32px * var(--spacer) / var(--card-count)).
+    bool sum(Length& out, int depth, bool* unitless = nullptr) {
         if (depth > 32) return false;
-        if (!product(out, depth)) return false;
+        bool all_numbers = false;
+        if (!product(out, depth, all_numbers)) return false;
         while (true) {
             skipWs();
             if (i_ < v_.size() && v_[i_].type == TokenType::Delim && (v_[i_].text == "+" || v_[i_].text == "-")) {
                 const bool minus = v_[i_].text == "-";
                 ++i_;
                 Length rhs;
-                if (!product(rhs, depth)) return false;
+                bool rhs_number = false;
+                if (!product(rhs, depth, rhs_number)) return false;
+                all_numbers = all_numbers && rhs_number;
                 out.px += minus ? -rhs.px : rhs.px;
                 out.percent += minus ? -rhs.percent : rhs.percent;
                 continue;
             }
+            if (unitless) *unitless = all_numbers;
             return true;
         }
     }
@@ -291,7 +297,7 @@ private:
         while (i_ < v_.size() && v_[i_].type == TokenType::Whitespace) ++i_;
     }
 
-    bool product(Length& out, int depth) {
+    bool product(Length& out, int depth, bool& unitless) {
         bool is_number = false;
         double number = 0;
         if (!value(out, is_number, number, depth)) return false;
@@ -323,6 +329,7 @@ private:
             break;
         }
         if (is_number) out.px = static_cast<float>(number);
+        unitless = is_number;
         return true;
     }
 
@@ -348,7 +355,14 @@ private:
         }
         if (t.type == TokenType::LeftParen || (t.type == TokenType::Function && t.text == "calc")) {
             ++i_;
-            return sum(out, depth + 1) && closeParen();
+            bool unitless = false;
+            if (!sum(out, depth + 1, &unitless) || !closeParen()) return false;
+            if (unitless) {
+                is_number = true;
+                number = out.px;
+                out = Length{};
+            }
+            return true;
         }
         if (t.type == TokenType::Function && (t.text == "min" || t.text == "max" || t.text == "clamp")) {
             const std::string fn = t.text;
@@ -624,7 +638,10 @@ bool gridSizeAt(const Tokens& v, size_t& i, const LengthContext& c, GridSize& ou
         return true;
     }
     Length l;
-    if (!lengthAt(v, i, c, l, false) || l.px < 0 || l.percent < 0) return false;
+    // (A calc()'s parts may be negative, calc(33.33% - 21px), as velog's columns are; a
+    // plain negative length is no size.)
+    const bool computed = t.type == TokenType::Function;
+    if (!lengthAt(v, i, c, l, false) || (!computed && (l.px < 0 || l.percent < 0))) return false;
     out.kind = GridSize::Fixed;
     out.length = l;
     return true;

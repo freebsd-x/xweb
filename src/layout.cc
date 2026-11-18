@@ -54,6 +54,7 @@ struct Box {
     const Box* deco_parent = nullptr;   // an inline with a background or border: the next such out
     float inline_extent = 0;       // how far its widest line reaches, closing padding included
     bool synthetic = false;        // a pseudo-element's image: its node is the layout's own, not the page's
+    float own_height = -1;          // the definite height layoutContents was given, if any
     bool picture_inside = false;   // the picture inside a positioned or floated replaced element's block:
                                    // its style is the element's, but it's in flow in that block
     uint32_t tree_index = 0;       // where it comes in the box tree, depth first (paint order's tie-break)
@@ -788,6 +789,7 @@ private:
         const ComputedStyle& s = *b.style;
         // Before anything measures them: what a percentage height of theirs is of.
         for (auto& k : b.kids) k->cb_height_hint = own_height ? *own_height : -1;
+        b.own_height = own_height ? *own_height : -1;
         const bool isolated = establishesBfc(b);
         b.collapses_through = false;
         if (b.isTable()) {
@@ -1752,7 +1754,10 @@ private:
                 it.min_main = std::max(0.0f, min_size.resolve(base_for_percent) - box_extra);
             } else if (row && !ks.overflow_clip) {
                 it.min_main = minContentWidth(k);
-                if (!main_size.is_auto && !main_size.hasPercent()) it.min_main = std::min(it.min_main, std::max(0.0f, main_size.px - box_extra));
+                // No more than the size it gives itself, a percentage too when there's a
+                // width for it (velog's width:100% wrapper round a grid of % columns).
+                if (!main_size.is_auto && (!main_size.hasPercent() || main_avail))
+                    it.min_main = std::min(it.min_main, std::max(0.0f, main_size.resolve(base_for_percent) - box_extra));
             } else if (!row && !ks.overflow_clip) {
                 // Its content height, whatever its basis (flex: 1 on a page's <main> mustn't
                 // squash it to nothing); no more than a height it gives itself.
@@ -2971,6 +2976,9 @@ private:
             // A width the wrapper resolved (it has the same style) is the picture's too.
             const bool fills = !widthIsAuto(*b.style, b.width);
             layoutReplaced(r, b.width, fills ? &b.width : nullptr);
+            // A positioned one's height came from its own containing block (a picture
+            // height:100% in a padding-top ratio box: velog's thumbnails): the picture's too.
+            if (b.outOfFlow() && b.own_height >= 0 && !b.style->height.is_auto) r.height = b.own_height;
             r.x = r.y = 0;
             for (int i = 0; i < 4; ++i) r.margin[i] = r.padding[i] = r.border[i] = 0;
             Box::Fragment f;
