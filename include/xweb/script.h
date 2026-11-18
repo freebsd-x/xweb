@@ -54,6 +54,10 @@ public:
             uint32_t width = 0, height = 0;
         };
         std::function<ImageState(const std::string& url)> image_state;
+        // A stylesheet by its absolute URL: nullopt while it isn't here (its "load" comes
+        // with sheetLoaded), else whether it loaded. One a script links again, already
+        // fetched, has its "load" all the same.
+        std::function<std::optional<bool>(const std::string& url)> sheet_state;
         // Shared: the same element's asked about again and again (a script's
         // getComputedStyle in a loop), so the host keeps it until styles change.
         std::function<std::shared_ptr<const std::unordered_map<std::string, std::string>>(const Node*)> computed_style;

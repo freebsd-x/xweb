@@ -103,6 +103,11 @@ TEST(Js, Classes) {
     EXPECT_EQ(run("class D extends Object { constructor() { this.x = 1; } } new D()"), "throws: ReferenceError: super() must be called before using this");
     EXPECT_EQ(run("class E extends Error { constructor(m) { super(m); this.name = 'E'; } } String(new E('boom'))"), "E: boom");
     EXPECT_EQ(run("class F { static count = 3; } F.count"), "3");
+    // A field's initializer sees the class's scope, not its constructor's parameters
+    // (Lenis: `animate = new n` beside a parameter `n`).
+    EXPECT_EQ(run("let n = 1; class G { a = n; constructor(n) { this.b = n; } } const g = new G(2); g.a + ',' + g.b"), "1,2");
+    EXPECT_EQ(run("let n = 1; class H extends Object { a = n; constructor(n) { super(); this.b = n; } } const h = new H(2); h.a + ',' + h.b"), "1,2");
+    EXPECT_EQ(run("class I { a = 5; b = this.a + 1; c = () => this.b; } new I().c()"), "6");
 }
 
 TEST(Js, ControlFlow) {

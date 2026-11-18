@@ -48,6 +48,11 @@ struct Page {
             return std::shared_ptr<const std::unordered_map<std::string, std::string>>(m);
         };
         host.activate = [this](const Node* n) { activated.push_back(n); };
+        // A stylesheet already fetched: here.css.
+        host.sheet_state = [](const std::string& url) -> std::optional<bool> {
+            if (url == "https://example.org/here.css") return true;
+            return std::nullopt;
+        };
         // Canvas text in a pretend font: 5px a character, 8 above the baseline, 2 below, solid.
         host.canvas_text = [](const std::string& text, const std::string&, float scale, bool render) {
             PageScript::Host::CanvasText t;
@@ -1082,6 +1087,27 @@ TEST(Script, SvgInterfacesAndCheckVisibility) {
                     document.getElementById('b').checkVisibility(), document.getElementById('i').checkVisibility());
         </script>)");
     EXPECT_EQ(p.console, "log:true true true true true false true\n") << p.console;
+}
+
+TEST(Script, ALinkToASheetAlreadyHereLoads) {
+    // React's stylesheet resources: a <link> put in for a sheet a preload fetched, and
+    // nothing shown until its "load" (toss.im).
+    Page p(R"(<head></head><body><script>
+        const l = document.createElement('link');
+        l.rel = 'stylesheet'; l.href = 'https://example.org/here.css';
+        l.onload = () => console.log('here');
+        const m = document.createElement('link');
+        m.rel = 'stylesheet'; m.href = 'https://example.org/away.css';
+        m.onload = () => console.log('away');
+        document.head.append(l, m);
+        console.log('appended');
+        </script>)");
+    EXPECT_EQ(p.console, "log:appended\n") << p.console;   // a task later, not inside append
+    EXPECT_TRUE(p.script->busy());
+    p.script->tick();
+    EXPECT_EQ(p.console, "log:appended\nlog:here\n") << p.console;
+    p.script->sheetLoaded("https://example.org/away.css", true);   // one still coming: when it comes
+    EXPECT_EQ(p.console, "log:appended\nlog:here\nlog:away\n") << p.console;
 }
 
 TEST(Script, AStylePreloadHearsItsSheetCome) {

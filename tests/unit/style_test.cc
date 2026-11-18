@@ -215,6 +215,18 @@ TEST(Sheets, LinksImportsAndMedia) {
     EXPECT_EQ(s.of("d").color, (Color{0, 0, 0, 255}));
 }
 
+TEST(Sheets, AStylePreloadIsAskedForButNotApplied) {
+    // Fetched for its "load" (a script's preload: React's), its rules not the page's yet.
+    std::vector<std::string> asked;
+    const auto loader = [&asked](const std::string& href) -> std::string {
+        asked.push_back(href);
+        return "#a{color:red}";
+    };
+    const auto s = style("<link rel=preload as=style href=p.css><link rel=preload as=font href=f.woff2><div id=a></div>", loader);
+    EXPECT_EQ(asked, std::vector<std::string>{"p.css"});
+    EXPECT_EQ(s.of("a").color, (Color{0, 0, 0, 255}));
+}
+
 TEST(Display, UaSheetAndNone) {
     const auto s = style("<div id=d><span id=sp></span><li id=li></li><p id=hid hidden></p></div><div style=display:none><b id=under></b></div>");
     EXPECT_EQ(s.of("d").display, Display::Block);

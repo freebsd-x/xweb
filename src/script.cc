@@ -1766,8 +1766,13 @@ void PageScript::run(const std::function<std::optional<std::string>(const std::s
             quoted += c;
         }
         quoted += "\"";
-        (void)s.rt.evaluate("setTimeout(function () { try { console.log('probe: ' + String((0, eval)(" + quoted +
-                                "))); } catch (e) { console.log('probe threw: ' + e); } }, 15000);",
+        // (Straight to stderr: a page may have made console.log nothing.)
+        s.rt.method(s.rt.global(), u"__xwebProbe", 1, [](Runtime& rt, const Value&, Args a) {
+            std::fprintf(stderr, "[page log] probe: %s\n", js::utf8(*rt.toString(arg(a, 0))).c_str());
+            return Value::undefined();
+        });
+        (void)s.rt.evaluate("setTimeout(function () { try { __xwebProbe('probe: ' + String((0, eval)(" + quoted +
+                                "))); } catch (e) { __xwebProbe('probe threw: ' + e); } }, 15000);",
                             "probe");
     }
     s.collect();
@@ -1851,6 +1856,8 @@ void PageScript::sheetLoaded(const std::string& url, bool ok) {
             }
         todo.insert(todo.end(), n->children.rbegin(), n->children.rend());
     }
+    // (Each once: not again from a cache's queue.)
+    std::erase_if(s.sheet_events, [&](const auto& e) { return std::find(links.begin(), links.end(), e.first) != links.end(); });
     for (Node* n : links) s.fire(n, ok ? u"load" : u"error", false, false);
     s.drainMicrotasks();
 }
@@ -1886,6 +1893,12 @@ void PageScript::tick() {
             std::fprintf(stderr, "[perf] %s %.0f ms: %s\n", what, ms, text.substr(0, 200).c_str());
         }
     };
+    if (!s.sheet_events.empty()) {
+        std::vector<std::pair<Node*, bool>> events;
+        events.swap(s.sheet_events);
+        for (const auto& [n, ok] : events) s.fire(n, ok ? u"load" : u"error", false, false);
+        s.drainMicrotasks();
+    }
     // Due timers, earliest first; at most so many a tick (and for so long), so the page
     // can't starve the window.
     for (int ran = 0; ran < 200 && (ran == 0 || s.now() - now < 30); ++ran) {
@@ -1914,7 +1927,7 @@ void PageScript::tick() {
     s.collect();
 }
 
-bool PageScript::busy() const { return !impl_->timers.empty() || !impl_->frames.empty(); }
+bool PageScript::busy() const { return !impl_->timers.empty() || !impl_->frames.empty() || !impl_->sheet_events.empty(); }
 
 bool PageScript::dirty() const { return impl_->dirty; }
 

@@ -2071,6 +2071,12 @@ private:
                         addSheet(loader_(*href), Origin::Author, 0, *href);
                         for (const std::string& css : n->adopted_css) addSheet(css, Origin::Author, 0, *href);
                     }
+                } else if (rel && href && hasWord(lower(*rel), "preload")) {
+                    // A style preloaded, not yet applied: fetched all the same, for its
+                    // "load" (React waits on a script's preload before it shows a part
+                    // that needs it: toss.im).
+                    const std::string* as = n->attr("as");
+                    if (as && lower(*as) == "style") (void)loader_(*href);
                 }
             }
             if (n->shadow_root) hosts_.push_back(n);   // its scope made next (collectShadowScopes)

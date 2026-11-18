@@ -360,6 +360,9 @@ public:
             ctx.new_target = true;
             ctx.super_property = f->home != nullptr;
             ctx.super_call = f->function->derived && f->function->code && f->function->code->info->is_class_constructor;
+        } else if (f && f->field_init) {
+            ctx.new_target = true;
+            ctx.super_property = f->home != nullptr;
         }
         return ctx;
     }
@@ -647,6 +650,7 @@ private:
 
   public:
     Env* prepareCall(Object* f, const Value& this_value, std::span<const Value> args, Object* new_target);
+    Env* fieldEnv(Object* ctor, const Value& this_value);
     Value runBody(FunctionInfo* info, Env* env);
     Value runInEnv(FunctionInfo* info, Env* env) {
         EnvScope scope(rt_, env);
@@ -2365,6 +2369,18 @@ Value runFunctionBody(Runtime& rt, Object* f, Env* env) {
     return interp.runInEnv(f->code->info, env);
 }
 
+// Where a class's instance field initializer runs: the class's scope, not its
+// constructor's (whose parameters it mustn't see: Lenis's `animate = new n` with a
+// parameter `n`), with `this` the new object and `super` the prototype's.
+Env* Interpreter::fieldEnv(Object* ctor, const Value& this_value) {
+    Env* e = newEnv(ctor->code->closure);
+    e->is_function = true;
+    e->this_value = this_value;
+    e->home = ctor->code->home;
+    e->field_init = true;
+    return e;
+}
+
 Env* Interpreter::prepareCall(Object* f, const Value& this_value, std::span<const Value> args, Object* new_target) {
     FunctionData& code = *f->code;
     FunctionInfo* info = code.info;
@@ -2445,8 +2461,8 @@ Env* Interpreter::prepareCall(Object* f, const Value& this_value, std::span<cons
     if (new_target && info->is_class_constructor && !info->derived) {
         Object* obj = env->this_value.asObject();
         for (Node* field : info->fields) {
-            Env* fenv = newEnv(env);
-            const PropertyKey key = (field->flags & kComputed) ? rt_.toPropertyKey(eval(field->a, env, true)) : PropertyKey(field->str);
+            Env* fenv = fieldEnv(env->function, env->this_value);
+            const PropertyKey key = (field->flags & kComputed) ? rt_.toPropertyKey(eval(field->a, fenv, true)) : PropertyKey(field->str);
             const Value v = field->b ? eval(field->b, fenv, true) : Value::undefined();
             obj->define(key, {v});
         }
@@ -2949,6 +2965,7 @@ Object* Interpreter::classDefinition(Node* n, Env* env) {
         fenv->is_function = true;
         fenv->this_value = Value::object(ctor);
         fenv->home = ctor;
+        fenv->field_init = true;
         const Value v = m->b ? eval(m->b, fenv, true) : Value::undefined();
         ctor->define(key, {v});
     }
@@ -3498,8 +3515,8 @@ Value Interpreter::evalCall(Node* n, Env* env, bool strict) {
         FunctionInfo* info = f->function->code->info;
         Object* obj = result.asObject();
         for (Node* field : info->fields) {
-            Env* fenv = newEnv(f);
-            const PropertyKey key = (field->flags & kComputed) ? rt_.toPropertyKey(eval(field->a, f, true)) : PropertyKey(field->str);
+            Env* fenv = fieldEnv(f->function, result);
+            const PropertyKey key = (field->flags & kComputed) ? rt_.toPropertyKey(eval(field->a, fenv, true)) : PropertyKey(field->str);
             const Value v = field->b ? eval(field->b, fenv, true) : Value::undefined();
             obj->define(key, {v});
         }

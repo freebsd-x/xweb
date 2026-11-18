@@ -2243,6 +2243,11 @@ private:
             while (n && !n->isElement()) n = n->parent;
             return n;
         };
+        host.sheet_state = [page = page.get()](const std::string& url) -> std::optional<bool> {
+            const auto it = page->sheets.find(url);
+            if (it == page->sheets.end()) return std::nullopt;
+            return true;   // (one that failed is kept empty: a stylesheet with nothing in it)
+        };
         host.image_state = [page = page.get()](const std::string& url) {
             web::PageScript::Host::ImageState st;
             if (const auto it = page->images.find(url); it != page->images.end()) {

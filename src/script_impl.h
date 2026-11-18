@@ -790,9 +790,23 @@ struct PageScript::Impl {
             Node* n = todo.back();
             todo.pop_back();
             if (n->isHtml("script")) found.push_back(n);
+            else if (n->isHtml("link")) linkInserted(n);
             todo.insert(todo.end(), n->children.rbegin(), n->children.rend());
         }
         for (Node* s : found) runScript(s);
+    }
+    // A stylesheet's <link> (or a style's preload) put in the page for a sheet that's
+    // here already: its "load" as a task, as from a cache (React waits on it).
+    std::vector<std::pair<Node*, bool>> sheet_events;
+    void linkInserted(Node* n) {
+        if (!host.sheet_state || sheet_events.size() > 10000) return;
+        const std::string* href = n->attr("href");
+        const std::string* rel = n->attr("rel");
+        if (!href || !rel) return;
+        const std::string r = lower(*rel);
+        const std::string* as = n->attr("as");
+        if (r.find("stylesheet") == std::string::npos && !(r.find("preload") != std::string::npos && as && lower(*as) == "style")) return;
+        if (const std::optional<bool> st = host.sheet_state(resolveUrl(host.base, *href))) sheet_events.emplace_back(n, *st);
     }
 
     // ── Setting up ──

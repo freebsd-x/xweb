@@ -184,6 +184,8 @@ struct Env : Cell {
     Object* with_object = nullptr;
     // A direct eval declared vars in it: names past it may now be found in it.
     bool eval_vars = false;
+    // A class field's initializer: new.target (undefined) and super.x for an eval in it.
+    bool field_init = false;
 };
 
 struct FunctionData {
