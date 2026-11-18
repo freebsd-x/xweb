@@ -1089,6 +1089,34 @@ TEST(Script, SvgInterfacesAndCheckVisibility) {
     EXPECT_EQ(p.console, "log:true true true true true false true\n") << p.console;
 }
 
+TEST(Script, DomParserReadsXmlInItsNamespaces) {
+    // OpenLayers' WMTS capabilities: elements by namespace and local name.
+    Page p(R"(<body><script>
+        const x = '<?xml version="1.0"?><Capabilities xmlns="http://www.opengis.net/wmts/1.0" xmlns:ows="http://www.opengis.net/ows/1.1">' +
+                  '<ows:Title>T &amp; U</ows:Title><Contents><Layer a="1"/><![CDATA[<raw>]]></Contents></Capabilities>';
+        const d = new DOMParser().parseFromString(x, 'application/xml');
+        const r = d.documentElement, t = r.firstElementChild;
+        console.log(r.nodeName, r.localName, r.namespaceURI, t.nodeName, t.localName, t.prefix, t.namespaceURI, t.textContent,
+                    d.getElementsByTagNameNS('http://www.opengis.net/wmts/1.0', 'Layer').length, d.getElementsByTagName('ows:Title').length,
+                    r.lastElementChild.textContent,
+                    new DOMParser().parseFromString('<a><b></a>', 'text/xml').documentElement.nodeName);
+        </script>)");
+    EXPECT_EQ(p.console, "log:Capabilities Capabilities http://www.opengis.net/wmts/1.0 ows:Title Title ows http://www.opengis.net/ows/1.1 T & U 1 1 <raw> parsererror\n")
+        << p.console;
+}
+
+TEST(Script, AnImagesSizeAndDecode) {
+    // drawImage(img, 0, 0, img.width, img.height, ...): its own size when not in the page.
+    Page p(R"(<body><img id=a width=40><script>
+        const i = new Image();
+        console.log(i.width, i.height, document.getElementById('a').width);
+        i.width = 7;
+        console.log(i.getAttribute('width'));
+        new Image().decode().then(() => console.log('wrong'), e => console.log('no src:', e.name));
+        </script>)");
+    EXPECT_EQ(p.console, "log:0 0 300\nlog:7\nlog:no src: EncodingError\n") << p.console;   // (the test host's rects are 300 wide)
+}
+
 TEST(Script, UrlHostsInPunycodeAndALiveForEach) {
     // core-js's URL check: it puts in its own (slow) URL where these fail.
     Page p(R"(<body><script>

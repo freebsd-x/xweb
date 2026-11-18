@@ -844,7 +844,9 @@ private:
                 const auto own_margin = [&](const Box& x) { return x.style->margin[Top].is_auto ? 0.0f : x.style->margin[Top].resolve(b.width); };
                 const auto topFor = [&](float margin) {
                     if (first && top_open) return 0.0f;
-                    return pos + (first ? margin : collapse(pending, margin));
+                    // (Still "first" after boxes that collapsed through: their margins are
+                    // pending and join this one's.)
+                    return pos + collapse(pending, margin);
                 };
 
                 // Clearance: down past the floats it has to clear.
@@ -856,8 +858,26 @@ private:
                 // A box with its own formatting context doesn't go under floats: it fits
                 // beside them.
                 if (establishesBfc(k) && !flow.bfc->floats.empty()) {
+                    // Where there's room for it (its width, or the least its content takes):
+                    // below a float too wide to go beside (CSS 2.1 9.5; weather.go.kr's
+                    // full-width floated tabs).
+                    const float frame = k.frameWidth() + std::max(0.0f, k.style->margin[Left].resolve(b.width)) +
+                                        std::max(0.0f, k.style->margin[Right].resolve(b.width));
+                    const float needs = !widthIsAuto(*k.style, b.width) ? k.style->width.resolve(b.width) + (k.style->border_box ? 0 : frame)
+                                                                       : minContentWidth(k) + frame;
+                    // (A first child's margins still to collapse with ours: the floats are
+                    // placed with them already.)
+                    float at = (first && top_open) ? collapse(through_top, own_margin(k)) : est;
                     float left = flow.ox, right = flow.ox + b.width;
-                    flow.bfc->freeSpan(flow.oy + est, 1, left, right);
+                    flow.bfc->freeSpan(flow.oy + at, 1, left, right);
+                    for (int tries = 0; tries < 64 && right - left < needs - 0.01f && right - left < b.width - 0.01f; ++tries) {
+                        const float next = flow.bfc->nextBottom(flow.oy + at) - flow.oy;
+                        if (next <= at) break;
+                        at = est = next;
+                        clear_to = std::max(clear_to, est);   // (it's moved: no collapsing above it)
+                        left = flow.ox, right = flow.ox + b.width;
+                        flow.bfc->freeSpan(flow.oy + at, 1, left, right);
+                    }
                     shift = left - flow.ox;
                     cb_w = std::max(0.0f, right - left);
                 }
@@ -893,8 +913,10 @@ private:
                         through_top = collapse(through_top, k.margin_top_outer);
                         k.y = 0;
                     } else {
+                        // Where its top would be with a border: the margins before it and
+                        // its own top one (not its bottom one, which collapses on).
+                        k.y = pos + collapse(pending, k.margin[Top]);
                         pending = collapse(pending, k.margin_top_outer);
-                        k.y = pos + pending;
                     }
                     continue;
                 }

@@ -428,6 +428,7 @@ struct PageScript::Impl {
         n->name = src->name;
         n->data = src->data;
         n->attrs = src->attrs;
+        n->xml = src->xml;
         if (deep && depth < kMaxCloneDepth) {
             for (const Node* c : src->children) n->append(clone(c, true, depth + 1));
             // A <template>'s contents are copied with it (the loaders of web-component

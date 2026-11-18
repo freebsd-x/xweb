@@ -11,4 +11,6 @@ body{margin:10px;font:16px/20px monospace}
 <center><table width="85%" style="background:#f60"><tr><td>centered table</td></tr></table><div style="width:100px;height:10px;background:red"></div></center>
 <div align=center><div style="width:50px;height:10px;background:blue"></div></div><div align=right><table><tr><td>r</td></tr></table></div>
 <div style="text-align:-webkit-center"><div style="width:60px;height:5px;background:green;margin-left:10px"></div><div style="text-align:left"><div style="width:30px;height:5px;background:#000"></div></div></div>
+<!-- An empty box's margin collapses through into the next box's, inside a box whose own top doesn't collapse. -->
+<div style="overflow:hidden;width:200px;background:#eee"><div style="margin-top:17px"></div><div style="display:flex;background:#9cf;height:10px"></div><div style="margin:5px 0 12px"></div><div style="margin-top:3px;height:10px;background:#f99"></div></div>
 </body></html>

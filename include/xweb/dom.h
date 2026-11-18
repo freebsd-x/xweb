@@ -11,7 +11,13 @@
 namespace fbx::xweb {
 
 enum class NodeType { Document, Doctype, Element, Text, Comment, Fragment };
-enum class Namespace { Html, Svg, MathMl };
+enum class Namespace { Html, Svg, MathMl, Other };
+
+// An element or attribute read as XML (DOMParser's application/xml): its namespace, by
+// URI, and the prefix and local part of its name (`name` keeps the qualified one).
+struct XmlName {
+    std::string uri, prefix, local;
+};
 
 struct Attribute {
     std::string name;
@@ -39,6 +45,7 @@ public:
     // A custom element's state: 0 none (or not yet looked at), 1 undefined (a custom
     // element name waiting for its definition), 2 custom (upgraded), 3 failed.
     uint8_t custom_state = 0;
+    std::shared_ptr<const XmlName> xml;   // an element of an XML document
 
     [[nodiscard]] bool isElement() const noexcept { return type == NodeType::Element; }
     [[nodiscard]] bool isHtml(std::string_view tag) const noexcept {

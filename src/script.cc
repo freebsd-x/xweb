@@ -4,6 +4,7 @@
 
 #include "xweb/picture.h"
 #include "xweb/script.h"
+#include "xweb/xml_parser.h"
 
 #include "script_impl.h"
 
@@ -107,7 +108,7 @@ void PageScript::Impl::installNode() {
     accessor(p, u"nodeName", [self](Runtime&, const Value& t, Args) {
         const Node* n = self->thisNode(t);
         switch (n->type) {
-            case NodeType::Element: return str(n->ns == Namespace::Html ? upper(n->name) : n->name);
+            case NodeType::Element: return str(n->ns == Namespace::Html && !n->xml ? upper(n->name) : n->name);
             case NodeType::Text: return str("#text");
             case NodeType::Comment: return str("#comment");
             case NodeType::Document: return str("#document");
@@ -372,7 +373,25 @@ void PageScript::Impl::installNode() {
                 return self->list(out);
             };
         };
-        method(o, u"getElementsByTagName", 1, byWalk([](const Node* n, const std::string& w) { return w == "*" || n->name == lower(w); }));
+        method(o, u"getElementsByTagName", 1, byWalk([](const Node* n, const std::string& w) { return w == "*" || n->name == (n->xml ? w : lower(w)); }));
+        method(o, u"getElementsByTagNameNS", 2, [self](Runtime& rt, const Value& t, Args a) {
+            const Value nsv = arg(a, 0);
+            const std::string ns = nsv.isNullish() ? std::string() : js::utf8(rt.toStringValue(nsv));
+            const std::string local = js::utf8(rt.toStringValue(arg(a, 1)));
+            const auto uriOf = [](const Node* n) -> std::string {
+                if (n->xml) return n->xml->uri;
+                return n->ns == Namespace::Svg ? "http://www.w3.org/2000/svg" : n->ns == Namespace::MathMl ? "http://www.w3.org/1998/Math/MathML" : "http://www.w3.org/1999/xhtml";
+            };
+            std::vector<Node*> out;
+            std::vector<Node*> todo(self->thisNode(t)->children.rbegin(), self->thisNode(t)->children.rend());
+            while (!todo.empty()) {
+                Node* n = todo.back();
+                todo.pop_back();
+                if (n->isElement() && (ns == "*" || uriOf(n) == ns) && (local == "*" || (n->xml ? n->xml->local : n->name) == local)) out.push_back(n);
+                todo.insert(todo.end(), n->children.rbegin(), n->children.rend());
+            }
+            return self->list(out);
+        });
         method(o, u"getElementsByClassName", 1, byWalk([](const Node* n, const std::string& w) {
             const std::string* c = n->attr("class");
             if (!c) return false;
@@ -399,17 +418,25 @@ void PageScript::Impl::installElement() {
     Object* p = proto_element;
     accessor(p, u"tagName", [self](Runtime&, const Value& t, Args) {
         const Node* n = self->thisElement(t);
-        return str(n->ns == Namespace::Html ? upper(n->name) : n->name);
+        return str(n->ns == Namespace::Html && !n->xml ? upper(n->name) : n->name);
     });
-    accessor(p, u"localName", [self](Runtime&, const Value& t, Args) { return str(self->thisElement(t)->name); });
+    accessor(p, u"localName", [self](Runtime&, const Value& t, Args) {
+        const Node* n = self->thisElement(t);
+        return str(n->xml ? n->xml->local : n->name);
+    });
     accessor(p, u"namespaceURI", [self](Runtime&, const Value& t, Args) {
-        switch (self->thisElement(t)->ns) {
+        const Node* n = self->thisElement(t);
+        if (n->xml) return n->xml->uri.empty() ? Value::null() : str(n->xml->uri);
+        switch (n->ns) {
             case Namespace::Svg: return str("http://www.w3.org/2000/svg");
             case Namespace::MathMl: return str("http://www.w3.org/1998/Math/MathML");
             default: return str("http://www.w3.org/1999/xhtml");
         }
     });
-    accessor(p, u"prefix", [](Runtime&, const Value&, Args) { return Value::null(); });
+    accessor(p, u"prefix", [self](Runtime&, const Value& t, Args) {
+        const Node* n = self->thisElement(t);
+        return n->xml && !n->xml->prefix.empty() ? str(n->xml->prefix) : Value::null();
+    });
     // Attributes reflected as properties.
     for (const char16_t* name : {u"id", u"title", u"lang", u"dir", u"name", u"placeholder", u"alt", u"rel", u"target", u"role", u"slot"}) {
         const std::string a = js::utf8(name);
@@ -471,7 +498,34 @@ void PageScript::Impl::installElement() {
     }
     // An attribute name as the element has it: lower-cased on HTML elements only (an SVG's
     // viewBox stays viewBox: YouTube's icons were given a second, lower-case one).
-    const auto attrName = [](const Node* el, std::string name) { return el->ns == Namespace::Html ? lower(name) : name; };
+    const auto attrName = [](const Node* el, std::string name) { return el->ns == Namespace::Html && !el->xml ? lower(name) : name; };
+    // The *NS forms: by the local part of the name (the namespace a prefix stands for isn't
+    // kept on attributes; xlink:href and plain href are told apart by name).
+    const auto byLocal = [](const Node* el, const std::string& local) -> const Attribute* {
+        for (const Attribute& at : el->attrs)
+            if (at.name == local || (at.name.size() > local.size() && at.name.ends_with(local) && at.name[at.name.size() - local.size() - 1] == ':')) return &at;
+        return nullptr;
+    };
+    method(p, u"getAttributeNS", 2, [self, byLocal](Runtime& rt, const Value& t, Args a) {
+        const Attribute* at = byLocal(self->thisElement(t), js::utf8(rt.toStringValue(arg(a, 1))));
+        return at ? str(at->value) : Value::null();
+    });
+    method(p, u"hasAttributeNS", 2, [self, byLocal](Runtime& rt, const Value& t, Args a) {
+        return Value::boolean(byLocal(self->thisElement(t), js::utf8(rt.toStringValue(arg(a, 1)))) != nullptr);
+    });
+    method(p, u"setAttributeNS", 3, [self, byLocal](Runtime& rt, const Value& t, Args a) {
+        Node* el = self->thisElement(t);
+        const std::string qname = js::utf8(rt.toStringValue(arg(a, 1)));
+        const size_t colon = qname.find(':');
+        const Attribute* old = byLocal(el, colon == std::string::npos ? qname : qname.substr(colon + 1));
+        self->setAttr(el, old ? old->name : qname, js::utf8(rt.toStringValue(arg(a, 2))));
+        return Value::undefined();
+    });
+    method(p, u"removeAttributeNS", 2, [self, byLocal](Runtime& rt, const Value& t, Args a) {
+        Node* el = self->thisElement(t);
+        if (const Attribute* at = byLocal(el, js::utf8(rt.toStringValue(arg(a, 1))))) self->removeAttr(el, std::string(at->name));
+        return Value::undefined();
+    });
     method(p, u"getAttribute", 1, [self, attrName](Runtime& rt, const Value& t, Args a) {
         const Node* el = self->thisElement(t);
         const std::string* v = el->attr(attrName(el, js::utf8(rt.toStringValue(arg(a, 0)))));
@@ -992,10 +1046,33 @@ void PageScript::Impl::installDocument() {
     {
         Object* impl = rt.newObject();
         // DOMParser's work: a whole document from text, apart from the page (its scripts
-        // don't run). XML types are read as HTML, which serves the SVG and markup pages pass.
-        rt.method(impl, u"__parseDocument", 1, [self](Runtime& r, const Value&, Args a) {
+        // don't run). XML types as XML, in their namespaces (OpenLayers reads its map's
+        // WMTS capabilities so); one that isn't well-formed is a <parsererror>, as browsers
+        // give.
+        rt.method(impl, u"__parseDocument", 2, [self](Runtime& r, const Value&, Args a) {
             const std::string text = js::utf8(r.toStringValue(arg(a, 0)));
             if (text.size() > (32u << 20)) r.throwError("RangeError", "too much text to parse");
+            const std::string type = arg(a, 1).isString() ? js::utf8(r.toStringValue(arg(a, 1))) : std::string("text/html");
+            if (type != "text/html") {
+                std::unique_ptr<Document> xml = parseXml(text);
+                if (!xml) {
+                    xml = std::make_unique<Document>();
+                    Node* e = xml->make(NodeType::Element);
+                    e->ns = Namespace::Other;
+                    e->name = "parsererror";
+                    auto x = std::make_shared<XmlName>();
+                    x->uri = "http://www.mozilla.org/newlayout/xml/parsererror.xml";
+                    x->local = "parsererror";
+                    e->xml = std::move(x);
+                    Node* msg = xml->make(NodeType::Text);
+                    msg->data = "XML Parsing Error: not well-formed";
+                    e->append(msg);
+                    xml->root()->append(e);
+                }
+                Node* d = self->doc.make(NodeType::Document);
+                for (const Node* c : xml->root()->children) d->append(self->clone(c, true));
+                return self->wrap(d);
+            }
             const auto parsed = parseHtml(text);
             Node* d = self->doc.make(NodeType::Document);
             for (const Node* c : parsed->root()->children) d->append(self->clone(c, true));

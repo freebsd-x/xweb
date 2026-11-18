@@ -2257,7 +2257,7 @@ const char* const kScriptPrelude = R"JS(
         const t = String(type);
         if (!['text/html', 'text/xml', 'application/xml', 'application/xhtml+xml', 'image/svg+xml'].includes(t))
           throw new TypeError("DOMParser can't parse " + t);
-        return parse.call(impl, String(text));
+        return parse.call(impl, String(text), t);
       }
     }
     class XMLSerializer {
@@ -2556,6 +2556,27 @@ const char* const kScriptPrelude = R"JS(
       return img;
     };
     global.Image.prototype = HTMLImageElement.prototype;
+    // decode(): when the picture is here (or can't be). OpenLayers draws a map tile
+    // when it resolves; resolving at once drew nothing, and never again.
+    Object.defineProperty(HTMLImageElement.prototype, 'decode', {
+      configurable: true, writable: true,
+      value: function decode() {
+        const img = this;
+        return new Promise((resolve, reject) => {
+          const broken = () => reject(new global.DOMException('The source image cannot be decoded.', 'EncodingError'));
+          if (!img.getAttribute('src') && !img.getAttribute('srcset')) return broken();
+          if (img.complete) return img.naturalWidth > 0 ? resolve() : broken();
+          const done = (ok) => () => {
+            img.removeEventListener('load', onLoad);
+            img.removeEventListener('error', onError);
+            ok ? resolve() : broken();
+          };
+          const onLoad = done(true), onError = done(false);
+          img.addEventListener('load', onLoad);
+          img.addEventListener('error', onError);
+        });
+      },
+    });
   }
   if (typeof HTMLAudioElement === 'function' && !global.Audio) {
     global.Audio = function Audio(src) {

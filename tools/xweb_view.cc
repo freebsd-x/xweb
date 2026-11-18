@@ -1732,6 +1732,13 @@ private:
                     str(op.text);
                     const bool here = images_.find(op.text) != nullptr;
                     mix(&here, sizeof here);
+                    // A <canvas>: what its scripts have drawn so far (a map's tiles drawn into
+                    // a scaled canvas stayed the empty first picture of it).
+                    if (op.text == web::kCanvasSource && page_ && page_->script && op.node) {
+                        uint64_t version = 0;
+                        (void)page_->script->canvasImage(op.node, version);
+                        mix(&version, sizeof version);
+                    }
                     if (op.filter)
                         for (const web::Filter& f : *op.filter) {   // (field by field: no padding bytes)
                             mix(&f.kind, sizeof f.kind);

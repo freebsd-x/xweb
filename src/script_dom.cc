@@ -627,7 +627,7 @@ void PageScript::Impl::installDom() {
     // node: pages tell text from elements by asking for querySelectorAll (Reddit does).
     for (const char16_t* name : {u"children", u"childElementCount", u"firstElementChild", u"lastElementChild", u"append",
                                  u"prepend", u"replaceChildren", u"querySelector", u"querySelectorAll",
-                                 u"getElementsByTagName", u"getElementsByClassName"}) {
+                                 u"getElementsByTagName", u"getElementsByTagNameNS", u"getElementsByClassName"}) {
         const js::Property* own = proto_node->own(PropertyKey(name));
         if (!own) continue;
         const js::Property kept = *own;
@@ -674,6 +674,26 @@ void PageScript::Impl::installDom() {
         accessor(img, u"complete", [state](Runtime&, const Value& t, Args) { return Value::boolean(state(t).done); });
         accessor(img, u"naturalWidth", [state](Runtime&, const Value& t, Args) { return Value::number(state(t).width); });
         accessor(img, u"naturalHeight", [state](Runtime&, const Value& t, Args) { return Value::number(state(t).height); });
+        // width and height: as drawn when it's in the page, else its attribute, else its
+        // own size (OpenLayers draws a tile with drawImage(img, 0, 0, img.width, ...)).
+        for (const bool horizontal : {true, false}) {
+            const char* name = horizontal ? "width" : "height";
+            accessor(img, horizontal ? u"width" : u"height", [self, state, horizontal, name](Runtime&, const Value& t, Args) {
+                Node* n = self->thisElement(t);
+                if (self->inDocument(n) && self->host.rect)
+                    if (const auto r = self->host.rect(n); r && (horizontal ? r->w : r->h) > 0) return Value::number(std::round(horizontal ? r->w : r->h));
+                if (const std::string* v = n->attr(name)) {
+                    char* end = nullptr;
+                    const long x = std::strtol(v->c_str(), &end, 10);
+                    if (end != v->c_str() && x >= 0) return Value::number(static_cast<double>(x));
+                }
+                const auto st = state(t);
+                return Value::number(horizontal ? st.width : st.height);
+            }, [self, name](Runtime& rt, const Value& t, Args v) {
+                self->setAttr(self->thisElement(t), name, std::to_string(static_cast<long long>(std::max(0.0, rt.toIntegerOrInfinity(arg(v, 0))))));
+                return Value::undefined();
+            });
+        }
         accessor(img, u"currentSrc", [self](Runtime&, const Value& t, Args) {
             const std::optional<std::string> v = imageSourceOf(self->thisElement(t), {self->host.viewport_w, self->host.viewport_h});
             return str(v ? resolveUrl(self->host.base, *v) : std::string{});

@@ -685,6 +685,22 @@ TEST(Float, AClearfixAfterAFloatKeepsItsWidth) {
     EXPECT_FLOAT_EQ(r.box("outer").w, 80);
 }
 
+TEST(Float, AFormattingContextGoesBelowAFloatTooWideToBeBeside) {
+    // weather.go.kr: tabs float:left;width:100% in a box whose margin collapses through,
+    // then a display:flex row: below the tabs, not over them.
+    const auto r = layout("<div style=width:300px><div id=p style='margin-top:17px;position:relative'><div id=f style='float:left;width:100%;height:50px'></div></div>"
+                          "<div id=x style='display:flex;height:10px'><span style='width:40px'></span></div></div>");
+    EXPECT_FLOAT_EQ(r.box("f").y, 17);
+    EXPECT_FLOAT_EQ(r.box("x").y, 67);
+}
+TEST(Float, AFormattingContextGoesBelowFloatsInAClippingParent) {
+    const auto r = layout("<div style='width:300px;overflow:hidden;position:relative'><div style='display:none'></div><div style='position:absolute'></div>"
+                          "<div style='margin-top:17px;position:relative'><div style='position:absolute'></div><div><div id=f style='float:left;width:100%;height:50px'></div><div style='float:left;width:100%'></div></div></div>"
+                          "<div id=x style='display:flex;padding:10px'><a style='width:40px'>t</a></div></div>");
+    EXPECT_FLOAT_EQ(r.box("f").y, 17);
+    EXPECT_FLOAT_EQ(r.box("x").y, 67);
+}
+
 TEST(Inline, WordBreakKeepAllAndBreakAll) {
     // Korean pages' body { word-break: keep-all }: a narrow box doesn't split a word.
     const auto keep = layout("<div id=d style='width:10px;word-break:keep-all'>\xEC\x8A\xA4\xED\x8F\xAC\xEC\xB8\xA0</div>");
