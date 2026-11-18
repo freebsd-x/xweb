@@ -1,5 +1,8 @@
 #pragma once
 
+#include <cxxabi.h>
+#include <typeinfo>
+
 // A page's script world, shared by the files that bind it (script.cc: Node, Element,
 // Document, window; script_dom.cc: element interfaces, custom elements, shadow roots,
 // observers). Internal to xweb.
@@ -283,7 +286,15 @@ struct PageScript::Impl {
             // through (it may be how a coroutine is being unwound); the outermost stops it
             // here, so one page's script can't take the browser down with it.
             if (!outermost) throw;
-            report("Script stopped: an internal error in the script engine");
+            std::string what;
+            try {
+                throw;
+            } catch (const std::exception& e) {
+                what = std::string(" (") + typeid(e).name() + ": " + e.what() + ")";
+            } catch (...) {
+                if (const std::type_info* t = abi::__cxa_current_exception_type()) what = std::string(" (") + t->name() + ")";
+            }
+            report("Script stopped: an internal error in the script engine" + what);
         }
         rt.env_stack.resize(envs);
         rt.call_depth = calls;
@@ -595,7 +606,12 @@ struct PageScript::Impl {
         rt.put(event, u"currentTarget", Value::object(target), js::kEnumerable | js::kWritable);
         rt.put(event, u"eventPhase", Value::number(phase), js::kEnumerable | js::kWritable);
         if (Object* l = listenerList(target, false)) {
-            const std::vector<Value> snapshot = l->elements;
+            // A copy, as the list was when dispatch reached here: rooted, since a listener
+            // removed meanwhile is held by nothing else (a collection mid-dispatch freed
+            // it, and the next turn of the loop read freed memory: tistory.com).
+            std::vector<Value> snapshot = l->elements;
+            rt.temp_lists.push_back(&snapshot);
+            struct Unroot { Runtime& rt; ~Unroot() { rt.temp_lists.pop_back(); } } unroot{rt};
             for (const Value& e : snapshot) {
                 if (!e.isObject() || rt.toStringValue(rt.get(e, u"type")) != type) continue;
                 const bool capture = rt.toBoolean(rt.get(e, u"capture"));

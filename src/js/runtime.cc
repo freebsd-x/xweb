@@ -26,6 +26,16 @@ inline bool stackExhausted(const char* sp) {
     return sp < g_engine_stack_limit && sp > g_engine_stack_bottom;
 }
 
+// Too deep to go on, by the stack sp is really on: a coroutine's own, or the engine's.
+// (Not by current_co alone: microtasks run on the engine stack while a coroutine is
+// current, and were checked against the coroutine's limit, a stack they weren't on;
+// recursion there ran into the engine stack's guard page: tistory.com.)
+inline bool stackTooDeep(const Runtime& rt, const char* sp) {
+    for (const Coroutine* co = rt.current_co; co; co = co->resumer)
+        if (co->mem && sp >= co->mem && sp < co->mem + co->mem_size) return sp < co->stack_limit;
+    return stackExhausted(sp);
+}
+
 
 // ── Strings ───────────────────────────────────────────────────────────────────
 
@@ -398,6 +408,8 @@ private:
     // its scope, so a constructor with fields keeps its scopes. (A collection only runs
     // between tasks, never while a call is on the stack.)
     static bool ownsScopes(const FunctionInfo* info) {
+        static const bool off = std::getenv("XWEB_NO_OWNED_SCOPES") != nullptr;
+        if (off) return false;
         return !info->scope_escapes && !info->is_async && !info->is_generator && info->fields.empty();
     }
 
@@ -1334,8 +1346,7 @@ Value Runtime::call(const Value& fnv, const Value& this_value, std::span<const V
     }
     if (!isCallable(fnv)) throwError("TypeError", "not a function");
     Object* f = fnv.asObject();
-    if (call_depth >= kMaxCallDepth || (current_co ? static_cast<char*>(__builtin_frame_address(0)) < current_co->stack_limit
-                                                   : stackExhausted(static_cast<char*>(__builtin_frame_address(0)))))
+    if (call_depth >= kMaxCallDepth || stackTooDeep(*this, static_cast<char*>(__builtin_frame_address(0))))
         throwError("RangeError", "too much recursion");
     ++call_depth;
     struct Down { size_t& d; ~Down() { --d; } } down{call_depth};
@@ -1380,8 +1391,7 @@ Value Runtime::construct(const Value& fnv, std::span<const Value> args, Object* 
     if (!isConstructor(fnv)) throwError("TypeError", "not a constructor");
     Object* f = fnv.asObject();
     if (!new_target) new_target = f;
-    if (call_depth >= kMaxCallDepth || (current_co ? static_cast<char*>(__builtin_frame_address(0)) < current_co->stack_limit
-                                                   : stackExhausted(static_cast<char*>(__builtin_frame_address(0)))))
+    if (call_depth >= kMaxCallDepth || stackTooDeep(*this, static_cast<char*>(__builtin_frame_address(0))))
         throwError("RangeError", "too much recursion");
     ++call_depth;
     struct Down { size_t& d; ~Down() { --d; } } down{call_depth};
@@ -1507,6 +1517,18 @@ void Runtime::collectMidScript() {
 
 void Runtime::collect(bool mid_script) {
     std::vector<Cell*> todo;
+    static const bool check = std::getenv("XWEB_GC_CHECK") != nullptr;
+    std::unordered_set<const Cell*> known;
+    if (check) {
+        known.insert(cells_.begin(), cells_.end());
+        for (const auto* list : owned_scopes) known.insert(list->begin(), list->end());   // off the heap, but live
+    }
+    size_t checked = 0;
+    const auto checkpoint = [&](const char* label) {
+        if (!check) return;
+        for (; checked < todo.size(); ++checked)
+            if (!known.count(todo[checked])) std::fprintf(stderr, "[gc-root] bad cell %p from %s\n", static_cast<void*>(todo[checked]), label);
+    };
     // Every cell by address, for the conservative scans of machine stacks.
     std::vector<Cell*> sorted;
     const auto sortCells = [&] {
@@ -1540,19 +1562,24 @@ void Runtime::collect(bool mid_script) {
     markCell(global_);
     markCell(global_env_);
     for (Env* e : env_stack) markCell(e);
+    checkpoint("env_stack");
     for (const Value& v : extra_roots) markValue(v);
+    checkpoint("extra_roots");
     if (host_roots) {
         std::vector<Value> host;
         host_roots(host);
         for (const Value& v : host) markValue(v);
     }
+    checkpoint("host_roots");
     for (const CallRoots& r : call_roots) {
         if (r.fn) markValue(*r.fn);
         if (r.self) markValue(*r.self);
         for (size_t i = 0; i < r.count; ++i) markValue(r.args[i]);
     }
+    checkpoint("call_roots");
     for (const auto* list : owned_scopes)
         for (Env* e : *list) markCell(e);
+    checkpoint("owned_scopes");
     // The coroutines running now, each resumed by the next: their holders, what they
     // run, and the state they swapped out (their resumer's scopes and buffers).
     for (Coroutine* c = current_co; c; c = c->resumer) {
@@ -1567,12 +1594,18 @@ void Runtime::collect(bool mid_script) {
         for (const auto* list : c->temp_lists)
             for (const Value& v : *list) markValue(v);
     }
+    checkpoint("coroutines");
     for (const auto* list : temp_lists)
         for (const Value& v : *list) markValue(v);
+    checkpoint("temp_lists");
     for (const Job& j : jobs_) { markValue(j.a); markValue(j.b); markValue(j.c); }
+    checkpoint("jobs");
     for (Object* p : pending_rejections) markCell(p);
+    checkpoint("pending");
     for (auto& [site, strings] : template_objects) markCell(strings);
+    checkpoint("templates");
     markModules(todo);
+    checkpoint("modules");
     for (Object* o : {object_prototype, function_prototype, array_prototype, string_prototype, number_prototype, boolean_prototype,
                       symbol_prototype, error_prototype, iterator_prototype, array_iterator_prototype, map_prototype, set_prototype, array_values_,
                       regexp_prototype, regexp_string_iterator_prototype, regexp_exec, regexp_constructor, promise_prototype,
@@ -1586,6 +1619,7 @@ void Runtime::collect(bool mid_script) {
                       sym_search, sym_split, sym_species, sym_async_iterator})
         markCell(s);
     for (auto& [k, s] : symbol_registry) markCell(s);
+    checkpoint("registry");
     // Suspended coroutines' stacks are scanned for anything that looks like a cell.
     std::vector<Object*> weak_collections, weak_refs;
     const auto markCoroutine = [&](Coroutine& co) {
@@ -1604,10 +1638,54 @@ void Runtime::collect(bool mid_script) {
         scanCoroutineStack(co, markWord);
         if (co.module) markModule(co.module, todo);
     };
+    const char* from = "root";
+    const Cell* from_cell = nullptr;
     const auto drain = [&] {
     while (!todo.empty()) {
         Cell* c = todo.back();
         todo.pop_back();
+        if (check && !known.count(c)) {
+            std::string what;
+            if (auto* e = dynamic_cast<Env*>(const_cast<Cell*>(from_cell))) {
+                if (e->outer == c) what += " outer";
+                if (e->function == c) what += " function";
+                if (e->home == c) what += " home";
+                if (e->new_target == c) what += " new_target";
+                if (e->this_value.isObject() && e->this_value.asObject() == c) what += " this";
+                if (e->global_object == c) what += " global";
+                if (e->with_object == c) what += " with";
+                for (auto& en : e->vars) {
+                    if (en.second.value.isObject() && en.second.value.asObject() == c) what += " var=" + utf8(en.first);
+                    if (en.second.import_env == c) what += " import_env=" + utf8(en.first);
+                }
+                what += " vars=" + std::to_string(e->vars.size()) + (e->is_function ? " fn" : "") + (e->field_init ? " field" : "");
+            }
+            if (const auto* o = dynamic_cast<const Object*>(from_cell)) {
+                if (o->code && o->code->closure == c) what += " closure";
+                if (o->code && o->code->home == c) what += " codehome";
+                if (o->bound_target == c) what += " bound_target";
+                if (o->target == c) what += " target";
+                for (const auto& k : o->ownKeys())
+                    if (const Property* p = o->own(k); p && (p->getter == c || p->setter == c)) what += " accessor=" + utf8(k.isSymbol() ? std::u16string(u"<sym>") : k.name);
+                what = " cls=" + std::to_string(static_cast<int>(o->cls)) + " host_kind=" + std::to_string(static_cast<int>(o->host_kind)) +
+                       " keys=" + std::to_string(o->ownKeys().size()) + " elements=" + std::to_string(o->elements.size()) +
+                       " slots=" + std::to_string(o->slots.size()) + " entries=" + std::to_string(o->entries.size());
+                for (const auto& k : o->ownKeys()) {
+                    if (const Property* p = o->own(k); p && p->value.isObject() && p->value.asObject() == c) what += " key=" + utf8(k.isSymbol() ? std::u16string(u"<sym>") : k.name);
+                }
+                for (size_t i = 0; i < o->elements.size(); ++i)
+                    if (o->elements[i].isObject() && o->elements[i].asObject() == c) { what += " element=" + std::to_string(i); break; }
+                for (size_t i = 0; i < o->slots.size(); ++i)
+                    if (o->slots[i].isObject() && o->slots[i].asObject() == c) { what += " slot=" + std::to_string(i); break; }
+                for (const auto& [k, v] : o->entries)
+                    if ((v.isObject() && v.asObject() == c) || (k.isObject() && k.asObject() == c)) { what += " entry"; break; }
+                if (o->prototype == c) what += " proto";
+                if (const Property* n = o->own(PropertyKey(u"name")); n && n->value.isString()) what += " name=" + utf8(n->value.asString());
+            }
+            std::fprintf(stderr, "[gc-check] not a cell: %p (pushed while marking %s %p%s)\n", static_cast<void*>(c), from, static_cast<const void*>(from_cell), what.c_str());
+            continue;
+        }
+        if (check) { from_cell = c; from = dynamic_cast<Env*>(c) ? "env" : dynamic_cast<Object*>(c) ? "object" : "cell"; }
         if (c->marked) continue;
         c->marked = true;
         if (auto* e = dynamic_cast<Env*>(c)) {
@@ -2479,7 +2557,7 @@ struct EvalDepth {
     Runtime& rt;
     explicit EvalDepth(Runtime& r) : rt(r) {
         const char* sp = static_cast<char*>(__builtin_frame_address(0));
-        if (++rt.eval_depth > kMaxEvalDepth || (rt.current_co ? sp < rt.current_co->stack_limit : stackExhausted(sp))) {
+        if (++rt.eval_depth > kMaxEvalDepth || stackTooDeep(rt, sp)) {
             --rt.eval_depth;
             rt.throwError("RangeError", "too much recursion");
         }
