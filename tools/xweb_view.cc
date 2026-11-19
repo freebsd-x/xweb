@@ -2553,6 +2553,8 @@ private:
     }
 
     void loadImages(const std::shared_ptr<Page>& page, std::vector<std::string> sources, uint64_t mine) {
+        static const bool no_images = std::getenv("XWEB_NO_IMAGES") != nullptr;   // for telling what images do
+        if (no_images) return;
         std::erase_if(sources, [&](const std::string& url) {
             return page->requested.size() >= kMaxImages || !page->requested.insert(url).second;
         });
