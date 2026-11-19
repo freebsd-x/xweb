@@ -212,7 +212,12 @@ std::vector<Resource> loadAll(const std::vector<std::string>& urls, const std::s
     const auto work = [&] {
         for (size_t i; (i = next.fetch_add(1)) < urls.size();) {
             if (generation.load() != mine) return;
+            const auto t0 = std::chrono::steady_clock::now();
             out[i] = load(urls[i], web::sameSite(page_url, urls[i]), referrerFor(page_url, urls[i]));
+            static const bool perf = std::getenv("XWEB_DEBUG_PERF") != nullptr;
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (perf && ms > 1000)
+                std::fprintf(stderr, "[perf] slow fetch %.0f ms (%s, %d): %s\n", ms, out[i].ok ? "ok" : "failed", out[i].http_status, urls[i].c_str());
         }
     };
     const size_t n = std::min(kFetchWorkers, urls.size());

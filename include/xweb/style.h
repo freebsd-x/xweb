@@ -7,6 +7,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -178,6 +179,23 @@ enum SvgSetBits : uint32_t {
     kSetDashOffset = 2048, kSetVisibility = 4096,
 };
 
+// An element's custom properties (--x), in layers: what it set over what it has from
+// its parent, shared, rather than all of them copied for each element that sets one
+// (theverge.com: 1900 on :root, and each ::before setting one more).
+struct CustomProperties {
+    std::shared_ptr<const CustomProperties> base;
+    // Set here, or (nullopt) made the guaranteed-invalid value here.
+    std::map<std::string, std::optional<std::vector<css::Token>>> own;
+    uint32_t depth = 0;   // layers below this one
+    [[nodiscard]] const std::vector<css::Token>* find(const std::string& name) const {
+        for (const CustomProperties* p = this; p; p = p->base.get()) {
+            const auto it = p->own.find(name);
+            if (it != p->own.end()) return it->second ? &*it->second : nullptr;
+        }
+        return nullptr;
+    }
+};
+
 struct ComputedStyle {
     Display display = Display::Inline;
     Position position = Position::Static;
@@ -209,7 +227,7 @@ struct ComputedStyle {
     WhiteSpace white_space = WhiteSpace::Normal;
     ListStyle list_style = ListStyle::Disc;
     Length text_indent;
-    std::shared_ptr<const std::map<std::string, std::vector<css::Token>>> custom;
+    std::shared_ptr<const CustomProperties> custom;
     float border_spacing = 0;
     bool border_collapse = false;
     // SVG, inherited

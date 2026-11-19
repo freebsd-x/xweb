@@ -156,6 +156,26 @@ TEST(CustomProperties, ResolveAndInherit) {
     EXPECT_EQ(s.of("b").color, kBlue);
 }
 
+TEST(CustomProperties, LayersThroughDeepNestingAndResets) {
+    // Each level sets one more over what it has (layered, flattened past a few levels);
+    // initial clears a name for the subtree, inherit brings the parent's back.
+    std::string html = "<style>:root{--w:1px;--h:2px}";
+    for (int i = 0; i < 20; ++i) html += ".l" + std::to_string(i) + "{--v" + std::to_string(i) + ":" + std::to_string(i + 3) + "px}";
+    html += ".l12{--w:7px}.l15{--h:initial}#t{width:var(--w);height:var(--h,9px);margin-left:var(--v0);margin-right:var(--v19)}"
+            "#u{--w:inherit;width:var(--w)}#s{--q:3px}#s::before{content:'';--w:4px}</style>";
+    for (int i = 0; i < 20; ++i) html += "<div class=l" + std::to_string(i) + ">";
+    html += "<div id=t><div id=u></div></div>";
+    for (int i = 0; i < 20; ++i) html += "</div>";
+    html += "<div id=s style='width:var(--w)'></div>";
+    const auto s = style(html);
+    EXPECT_FLOAT_EQ(s.of("t").width.px, 7);
+    EXPECT_FLOAT_EQ(s.of("t").height.px, 9);
+    EXPECT_FLOAT_EQ(s.of("t").margin[Left].px, 3);
+    EXPECT_FLOAT_EQ(s.of("t").margin[Right].px, 22);
+    EXPECT_FLOAT_EQ(s.of("u").width.px, 7);
+    EXPECT_FLOAT_EQ(s.of("s").width.px, 1);   // its ::before's --w is its own
+}
+
 TEST(CustomProperties, CyclesAndExpansionBombsAreHarmless) {
     std::string css = "<style>:root{--a:var(--b);--b:var(--a);--x0:1px";
     for (int i = 1; i < 40; ++i)

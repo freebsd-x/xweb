@@ -2599,14 +2599,14 @@ private:
             while (comma < j && in[comma].type != TokenType::Comma) ++comma;
             bool done = false;
             if (s.custom) {
-                const auto it = s.custom->find(name);
-                if (it != s.custom->end()) {
+                const Tokens* found = s.custom->find(name);
+                if (found) {
                     // A variable whose own references fail is invalid: the fallback applies.
                     // (Too deep, or a cycle, is invalid too.)
                     auto known = memo->find(name);
                     if (known == memo->end()) {
                         Tokens value;
-                        const bool ok = substitute(it->second, s, value, depth + 1, budget, memo);
+                        const bool ok = substitute(*found, s, value, depth + 1, budget, memo);
                         known = memo->emplace(name, ok ? std::optional<Tokens>(std::move(value)) : std::nullopt).first;
                     } else if (known->second) {
                         // Used again: its tokens count again.
@@ -4275,29 +4275,66 @@ private:
         s.ua_margin_bottom = !setByPage("margin-bottom");
 
         // Custom properties first, everything can refer to them.
-        std::map<std::string, Tokens> custom;
-        bool has_custom = false;
+        // Most declare what the element has from its parent already: Tailwind's
+        // `*, ::before, ::after { --tw-…: … }` sets the same forty on every element, and
+        // copying the whole inherited map for each (hundreds of names on theverge.com's
+        // :root) was nearly all of styling that page. Shared, then, unless one differs.
+        const auto sameTokens = [](const Tokens& a, const Tokens& b) {
+            if (a.size() != b.size()) return false;
+            for (size_t i = 0; i < a.size(); ++i)
+                if (a[i].type != b[i].type || a[i].text != b[i].text || a[i].number != b[i].number || a[i].is_integer != b[i].is_integer ||
+                    a[i].is_id != b[i].is_id)
+                    return false;
+            return true;
+        };
+        bool custom_changes = false;
         for (const MatchedDecl& m : matched) {
-            if (m.decl->name.starts_with("--")) {
-                if (!has_custom) {
-                    if (s.custom) custom = *s.custom;
-                    has_custom = true;
-                }
+            if (!m.decl->name.starts_with("--")) continue;
+            const Tokens* now = s.custom ? s.custom->find(m.decl->name) : nullptr;
+            const std::string kw = keyword(m.decl->value);
+            const Tokens* want = nullptr;
+            if (kw == "initial") want = nullptr;
+            else if (kw == "inherit" || kw == "unset") want = parent.custom ? parent.custom->find(m.decl->name) : nullptr;
+            else want = &m.decl->value;
+            if ((now == nullptr) != (want == nullptr) || (now && !sameTokens(*now, *want))) {
+                custom_changes = true;
+                break;
+            }
+        }
+        if (custom_changes) {
+            // A layer over what it has, or, past a few layers, all of them in one again
+            // (lookups walk the layers).
+            constexpr uint32_t kMaxLayers = 8;
+            auto layer = std::make_shared<CustomProperties>();
+            if (s.custom && s.custom->depth + 1 < kMaxLayers) {
+                layer->base = s.custom;
+                layer->depth = s.custom->depth + 1;
+            } else if (s.custom) {
+                std::vector<const CustomProperties*> chain;
+                for (const CustomProperties* p = s.custom.get(); p; p = p->base.get()) chain.push_back(p);
+                for (auto it = chain.rbegin(); it != chain.rend(); ++it)
+                    for (const auto& [name, value] : (*it)->own) {
+                        if (value) layer->own[name] = value;
+                        else layer->own.erase(name);
+                    }
+            }
+            for (const MatchedDecl& m : matched) {
+                if (!m.decl->name.starts_with("--")) continue;
                 // initial is the guaranteed-invalid value, as if never set; inherit and
                 // unset take the parent's.
                 const std::string kw = keyword(m.decl->value);
                 if (kw == "initial") {
-                    custom.erase(m.decl->name);
+                    layer->own[m.decl->name] = std::nullopt;
                 } else if (kw == "inherit" || kw == "unset") {
-                    const auto it = parent.custom ? parent.custom->find(m.decl->name) : decltype(parent.custom->end()){};
-                    if (parent.custom && it != parent.custom->end()) custom[m.decl->name] = it->second;
-                    else custom.erase(m.decl->name);
+                    const Tokens* p = parent.custom ? parent.custom->find(m.decl->name) : nullptr;
+                    if (p) layer->own[m.decl->name] = *p;
+                    else layer->own[m.decl->name] = std::nullopt;
                 } else {
-                    custom[m.decl->name] = m.decl->value;
+                    layer->own[m.decl->name] = m.decl->value;
                 }
             }
+            s.custom = std::move(layer);
         }
-        if (has_custom) s.custom = std::make_shared<const std::map<std::string, Tokens>>(std::move(custom));
 
         // Then what other values are computed from: the font size and the colour.
         const auto first = [](const std::string& p) {
