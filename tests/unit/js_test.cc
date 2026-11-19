@@ -809,3 +809,16 @@ TEST(Js, FunctionArgumentsWhileItRuns) {
         f(1, 'x', 3) + ' ' + (f.arguments === null) + ' ' + g();
     )"), "3:x true false");
 }
+
+TEST(Js, FastPathsKeepTheirSemantics) {
+    // Top-level vars (the global object's) append in place too; a second holder keeps its copy.
+    EXPECT_EQ(run("var h = ''; for (var i = 0; i < 500; i++) h += 'ab'; var c = h; h += 'x'; [h.length, c.length, h.slice(-2)].join()"), "1001,1000,bx");
+    // ++ and -- on a number found where it was last time; on a const, still an error.
+    EXPECT_EQ(run("function f() { var n = 0, m = 10; for (var i = 0; i < 5; i++) { n++; --m; } return [n, m, i].join(); } f()"), "5,5,5");
+    EXPECT_EQ(run("function f() { const k = 1; try { k++; } catch (e) { return e.name; } } f()"), "TypeError");
+    // An array element's compound assignment in place; the right side may shrink the array.
+    EXPECT_EQ(run("var a = [1, 2, 3]; a[1] += 10; a[0] |= 8; var b = [1, 2]; b[1] += (b.length = 1, 5); [a.join(), b.length, b[1]].join(';')"), "9,12,3;2;7");
+    // A frozen array's elements stay as they were.
+    EXPECT_EQ(run("var f = Object.freeze([1, 2]); f[0] = 9; f[1] += 5; f.join()"), "1,2");
+    EXPECT_EQ(run("'use strict'; var g = Object.freeze([1]); var r; try { g[0] = 2; } catch (e) { r = e.name; } r"), "TypeError");
+}

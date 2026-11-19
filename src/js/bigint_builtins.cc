@@ -11,7 +11,7 @@ using Args = std::span<const Value>;
 
 Value arg(Args a, size_t i) { return i < a.size() ? a[i] : Value::undefined(); }
 
-Value bigValue(const bigint::Big& b) { return Value::bigint(std::make_shared<const std::u16string>(bigint::encode(b))); }
+Value bigValue(const bigint::Big& b) { return Value::bigint(JSString::make(bigint::encode(b))); }
 
 bigint::Big toBig(Runtime& rt, const Value& v) {
     const Value p = rt.toPrimitive(v, "number");

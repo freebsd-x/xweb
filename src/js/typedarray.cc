@@ -26,7 +26,7 @@ const size_t kSizes[kKinds] = {1, 1, 1, 2, 2, 4, 4, 4, 8, 8, 8};
 
 bool isBigKind(uint8_t kind) { return kind == BigInt64 || kind == BigUint64; }
 
-Value bigValue(const bigint::Big& b) { return Value::bigint(std::make_shared<const std::u16string>(bigint::encode(b))); }
+Value bigValue(const bigint::Big& b) { return Value::bigint(JSString::make(bigint::encode(b))); }
 
 // ToBigInt.
 Value toBigInt(Runtime& rt, const Value& v) {

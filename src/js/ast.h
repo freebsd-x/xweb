@@ -168,6 +168,7 @@ struct FunctionInfo {
     bool simple_params = true;
     int length = 0;                   // parameters before the first default or rest
     std::vector<std::u16string> var_names;   // `var` and parameter-free hoisting
+    std::vector<size_t> var_hashes;          // their hashes, worked out at the first call
     std::vector<Node*> function_decls;       // hoisted with their values
     std::vector<Node*> fields;               // a class constructor's instance fields
     std::u16string source;                   // its text, for toString

@@ -98,6 +98,21 @@ public:
         if (Entry* e = find(name, h)) return e->second;
         return add(name, h).second;
     }
+    // The same, the name's hash known.
+    Binding& bind(const std::u16string& name, size_t h) {
+        if (Entry* e = find(name, h)) return e->second;
+        return add(name, h).second;
+    }
+    // Empty again, its reserved block kept for the next scope made in it.
+    void recycle() {
+        for (uint32_t i = 0; i < chunk_used_; ++i) {
+            chunk_[i].e.first.clear();
+            chunk_[i].e.second = Binding{};
+        }
+        chunk_used_ = 0;
+        extra_.clear();
+        index_.clear();
+    }
 
     [[nodiscard]] size_t size() const noexcept { return chunk_used_ + extra_.size(); }
     // Room for n names in one block, made before the first: a call's scope is one
@@ -168,6 +183,17 @@ private:
 
 struct Env : Cell {
     explicit Env(Env* o) : outer(o) {}
+    // As new, to be made again (an owned scope's, from Runtime::env_pool): its names'
+    // block kept.
+    void reuse(Env* o) {
+        outer = o;
+        vars.recycle();
+        is_function = false;
+        this_value = Value();
+        this_initialized = true;
+        function = home = new_target = global_object = with_object = nullptr;
+        eval_vars = field_init = false;
+    }
     [[nodiscard]] size_t cellSize() const noexcept override { return sizeof(Env); }
     Env* outer;
     VarMap vars;

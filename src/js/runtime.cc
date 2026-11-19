@@ -90,7 +90,7 @@ std::string utf8(std::u16string_view s) {
     return out;
 }
 
-Value Value::string(std::u16string s) { return string(std::make_shared<const std::u16string>(std::move(s))); }
+Value Value::string(std::u16string s) { return string(JSString::make(std::move(s))); }
 
 size_t ValueHash::operator()(const Value& v) const noexcept {
     switch (v.type()) {
@@ -289,9 +289,20 @@ public:
     // code, a local, a parameter), and a call shouldn't pay for a refcount round trip.
     explicit Interpreter(Runtime& rt, const std::shared_ptr<Program>& prog) : rt_(rt), prog_(prog) {}
     ~Interpreter() {
-        if (owns_scopes_) rt_.owned_scopes.pop_back();
-        for (Env* e : owned_) delete e;
+        if (!owns_scopes_) return;
+        auto& stack = rt_.owned_stack;
+        while (stack.size() > owned_base_) {
+            Env* e = stack.back();
+            stack.pop_back();
+            if (rt_.env_pool.size() < kEnvPoolMax) {
+                e->reuse(nullptr);
+                rt_.env_pool.push_back(e);
+            } else {
+                delete e;
+            }
+        }
     }
+    static constexpr size_t kEnvPoolMax = 512;
     Interpreter(const Interpreter&) = delete;
     Interpreter& operator=(const Interpreter&) = delete;
 
@@ -399,8 +410,16 @@ private:
     // heap: they're freed when the call's Interpreter goes, not at the next collection.
     Env* newEnv(Env* outer) {
         if (!owns_scopes_) return rt_.allocate<Env>(outer);
-        owned_.push_back(new Env(outer));
-        return owned_.back();
+        Env* e;
+        if (!rt_.env_pool.empty()) {
+            e = rt_.env_pool.back();
+            rt_.env_pool.pop_back();
+            e->outer = outer;
+        } else {
+            e = new Env(outer);
+        }
+        rt_.owned_stack.push_back(e);
+        return e;
     }
     // Nothing in the function can capture its scope: no nested function, class or
     // method, no direct eval, and no coroutine to keep it after a suspension. A class
@@ -419,6 +438,24 @@ private:
     }
 
     // ── Names ──
+
+    // The binding an identifier found last time, if it is surely that one still: the
+    // common case of findBinding, small enough to be inlined where names are read and
+    // written. (Nothing found: findBinding decides, searching if it must.)
+    Binding* cachedBinding(Env* env, Node* site) {
+        const int32_t hops = site->scope_hops;
+        const uint32_t slot = site->scope_slot;
+        if (hops < 0 || slot >= kGlobalPos || !site->name_hash) return nullptr;
+        Env* e = env;
+        for (int32_t k = hops; k > 0; --k) {
+            if (e->eval_vars) return nullptr;
+            e = e->outer;
+            if (!e) return nullptr;
+        }
+        if (e->with_object) return nullptr;
+        VarMap::Entry* it = e->vars.at(slot, site->name_hash, site->str);
+        return it && !it->second.import_env ? &it->second : nullptr;
+    }
 
     // The binding a name means here. An import is followed to the exporting module's
     // binding (`imported` says it was one: those can't be assigned).
@@ -548,6 +585,11 @@ private:
     }
 
     void assignName(Env* env, const std::u16string& name, const Value& v, bool strict, Node* site = nullptr) {
+        if (site)
+            if (Binding* b = cachedBinding(env, site); b && b->initialized && b->is_mutable) {
+                b->value = v;
+                return;
+            }
         bool imported = false;
         Object* with = nullptr;
         Binding* b = site ? findBinding(env, name, nullptr, &imported, &with, nameHash(site), site) : findBinding(env, name, nullptr, &imported, &with);
@@ -619,7 +661,18 @@ private:
 
     // ── Expressions ──
 
-    Value eval(Node* n, Env* env, bool strict);
+    // The leaves here, where every evaluation comes: the rest (evalNode) has a big
+    // function's prologue and stack frame, which numbers and names needn't pay.
+    Value eval(Node* n, Env* env, bool strict) {
+        switch (n->kind) {
+            case N::Number: return Value::number(n->number);
+            case N::Identifier:
+                if (Binding* b = cachedBinding(env, n); b && b->initialized) return b->value;
+                return lookup(env, n->str, nameHash(n), nullptr, n);   // (its key made if a global's)
+            default: return evalNode(n, env, strict);
+        }
+    }
+    Value evalNode(Node* n, Env* env, bool strict);
     Value evalCall(Node* n, Env* env, bool strict);
     Value evalNew(Node* n, Env* env, bool strict);
     Value evalAssign(Node* n, Env* env, bool strict);
@@ -669,14 +722,47 @@ private:
         return runBody(info, env);
     }
   private:
-    Value binaryOp(Op op, const Value& l, const Value& r);
+    // Two numbers, inline (a loop's condition, arithmetic, a hash's bit twiddling);
+    // anything else, binaryOpSlow.
+    Value binaryOp(Op op, const Value& l, const Value& r) {
+        if (l.isNumber() && r.isNumber()) {
+            const double x = l.asNumber(), y = r.asNumber();
+            switch (op) {
+                case Op::Lt: return Value::boolean(x < y);
+                case Op::Gt: return Value::boolean(x > y);
+                case Op::Le: return Value::boolean(x <= y);
+                case Op::Ge: return Value::boolean(x >= y);
+                case Op::Eq: case Op::StrictEq: return Value::boolean(x == y);
+                case Op::Ne: case Op::StrictNe: return Value::boolean(x != y);
+                case Op::Add: return Value::number(x + y);
+                case Op::Sub: return Value::number(x - y);
+                case Op::Mul: return Value::number(x * y);
+                case Op::BitAnd: case Op::BitOr: case Op::BitXor: case Op::Shl: case Op::Shr: case Op::UShr: {
+                    if (!(x > -9.2e18 && x < 9.2e18 && y > -9.2e18 && y < 9.2e18)) break;
+                    const auto a = static_cast<uint32_t>(static_cast<int64_t>(x));
+                    const auto b = static_cast<uint32_t>(static_cast<int64_t>(y));
+                    switch (op) {
+                        case Op::BitAnd: return Value::number(static_cast<int32_t>(a & b));
+                        case Op::BitOr: return Value::number(static_cast<int32_t>(a | b));
+                        case Op::BitXor: return Value::number(static_cast<int32_t>(a ^ b));
+                        case Op::Shl: return Value::number(static_cast<int32_t>(a << (b & 31)));
+                        case Op::Shr: return Value::number(static_cast<int32_t>(a) >> (b & 31));
+                        default: return Value::number(a >> (b & 31));
+                    }
+                }
+                default: break;
+            }
+        }
+        return binaryOpSlow(op, l, r);
+    }
+    Value binaryOpSlow(Op op, const Value& l, const Value& r);
 
     Runtime& rt_;
     const std::shared_ptr<Program>& prog_;
     bool owns_scopes_ = false;
-    std::vector<Env*> owned_;
+    size_t owned_base_ = 0;   // where this call's own scopes start in rt_.owned_stack
     struct ReusedScope {
-        Env* env = nullptr;   // one of owned_
+        Env* env = nullptr;   // one of this call's owned scopes
         bool busy = false;
     };
     std::unordered_map<const Node*, ReusedScope> block_scopes_;
@@ -690,6 +776,7 @@ Runtime::~Runtime() {
     for (size_t i = 0; i < cells_.size(); ++i)
         if (auto* o = dynamic_cast<Object*>(cells_[i]); o && o->co) unwindCoroutine(*o->co);
     for (Cell* c : cells_) delete c;
+    for (Env* e : env_pool) delete e;
 }
 
 Object* Runtime::newObject(Object* proto) { return allocate<Object>(proto ? proto : object_prototype); }
@@ -936,6 +1023,8 @@ bool Runtime::set(Object* o, const PropertyKey& key, const Value& v, const Value
         if (i >= 0 && o->length_readonly && static_cast<size_t>(i) >= o->elements.size()) return false;
         if (i >= 0 && !o->own(key)) {
             if (!o->extensible && static_cast<size_t>(i) >= o->elements.size()) return false;
+            // A frozen array's elements are read-only (its dense part has no flags of its own).
+            if (!o->extensible && !o->elements[static_cast<size_t>(i)].isEmpty() && o->own(u"__frozen")) return false;
             if (static_cast<size_t>(i) >= o->elements.size()) {
                 if (i > 100'000'000) throwError("RangeError", "array too long");
                 o->elements.resize(static_cast<size_t>(i) + 1, Value::empty());
@@ -1213,14 +1302,14 @@ uint32_t Runtime::toUint32(const Value& v) {
 JSString Runtime::toString(const Value& v) {
     switch (v.type()) {
         case Value::Type::String: return v.stringRef();
-        case Value::Type::Number: return std::make_shared<const std::u16string>(numberToString(v.asNumber()));
-        case Value::Type::Undefined: return std::make_shared<const std::u16string>(u"undefined");
-        case Value::Type::Null: return std::make_shared<const std::u16string>(u"null");
-        case Value::Type::Boolean: return std::make_shared<const std::u16string>(v.asBoolean() ? u"true" : u"false");
+        case Value::Type::Number: return JSString::make(numberToString(v.asNumber()));
+        case Value::Type::Undefined: return JSString::make(u"undefined");
+        case Value::Type::Null: return JSString::make(u"null");
+        case Value::Type::Boolean: return JSString::make(v.asBoolean() ? u"true" : u"false");
         case Value::Type::Symbol: throwError("TypeError", "can't convert a symbol to a string");
-        case Value::Type::BigInt: return std::make_shared<const std::u16string>(bigint::toString(bigint::decode(v.bigintDigits())));
+        case Value::Type::BigInt: return JSString::make(bigint::toString(bigint::decode(v.bigintDigits())));
         case Value::Type::Object: return toString(toPrimitive(v, "string"));
-        default: return std::make_shared<const std::u16string>();
+        default: return JSString::make();
     }
 }
 
@@ -1521,7 +1610,7 @@ void Runtime::collect(bool mid_script) {
     std::unordered_set<const Cell*> known;
     if (check) {
         known.insert(cells_.begin(), cells_.end());
-        for (const auto* list : owned_scopes) known.insert(list->begin(), list->end());   // off the heap, but live
+        known.insert(owned_stack.begin(), owned_stack.end());   // off the heap, but live
     }
     size_t checked = 0;
     const auto checkpoint = [&](const char* label) {
@@ -1577,8 +1666,7 @@ void Runtime::collect(bool mid_script) {
         for (size_t i = 0; i < r.count; ++i) markValue(r.args[i]);
     }
     checkpoint("call_roots");
-    for (const auto* list : owned_scopes)
-        for (Env* e : *list) markCell(e);
+    for (Env* e : owned_stack) markCell(e);
     checkpoint("owned_scopes");
     // The coroutines running now, each resumed by the next: their holders, what they
     // run, and the state they swapped out (their resumer's scopes and buffers).
@@ -1783,8 +1871,7 @@ void Runtime::collect(bool mid_script) {
     }
     cells_.swap(live);
     // The scopes calls keep off the heap aren't swept, so their marks are cleared here.
-    for (const auto* list : owned_scopes)
-        for (Env* e : *list) e->marked = false;
+    for (Env* e : owned_stack) e->marked = false;
     allocations_ = cells_.size();
     gc_next_ = std::max(cells_.size() * 2, cells_.size() + gc_min_growth);
 }
@@ -2259,7 +2346,7 @@ Value Interpreter::callScript(Object* f, const Value& this_value, std::span<cons
         return startCoroutineFunction(rt_, f, env);
     }
     owns_scopes_ = ownsScopes(info);
-    if (owns_scopes_) rt_.owned_scopes.push_back(&owned_);   // roots while the call runs
+    owned_base_ = rt_.owned_stack.size();   // (its scopes there are roots while the call runs)
     // On the call stack an error's stack lists. (Put back to its depth on the way out,
     // however we leave.)
     struct Frame {
@@ -2490,7 +2577,10 @@ Env* Interpreter::prepareCall(Object* f, const Value& this_value, std::span<cons
     EnvScope scope(rt_, env);   // while the parameters' defaults run
     // Parameters.
     if (info->simple_params) {
-        for (size_t i = 0; i < info->params.size(); ++i) env->vars[info->params[i]->str] = Binding{i < args.size() ? args[i] : Value::undefined()};
+        for (size_t i = 0; i < info->params.size(); ++i) {
+            Node* p = info->params[i];
+            env->vars.bind(p->str, nameHash(p)) = Binding{i < args.size() ? args[i] : Value::undefined()};
+        }
     }
     if (info->uses_arguments && !info->arrow) {
         Object* a = rt_.allocate<Object>(rt_.object_prototype, ObjectClass::Arguments);
@@ -2533,8 +2623,14 @@ Env* Interpreter::prepareCall(Object* f, const Value& this_value, std::span<cons
         }
     }
     // Hoisting: var names (not over parameters), then function declarations.
-    for (const auto& name : info->var_names)
-        if (!env->vars.count(name)) env->vars[name] = Binding{};
+    if (info->var_hashes.size() != info->var_names.size()) {
+        info->var_hashes.clear();
+        for (const auto& name : info->var_names) info->var_hashes.push_back(VarMap::hashOf(name));
+    }
+    for (size_t i = 0; i < info->var_names.size(); ++i) {
+        const std::u16string& name = info->var_names[i];
+        if (!env->vars.find(name, info->var_hashes[i])) env->vars.bind(name, info->var_hashes[i]) = Binding{};
+    }
     for (Node* d : info->function_decls) env->vars[d->str] = Binding{Value::object(makeFunction(d->fn, env, nullptr))};
     if (new_target && info->is_class_constructor && !info->derived) {
         Object* obj = env->this_value.asObject();
@@ -3084,14 +3180,12 @@ std::vector<Value> Interpreter::evalArgs(const std::vector<Node*>& args, Env* en
     return out;
 }
 
-Value Interpreter::eval(Node* n, Env* env, bool strict) {
+Value Interpreter::evalNode(Node* n, Env* env, bool strict) {
     // Leaves first: nothing in them recurses but through a call, which checks its own depth.
     switch (n->kind) {
-        case N::Number: return Value::number(n->number);
         case N::String:
-            if (!n->literal) n->literal = std::make_unique<JSString>(std::make_shared<const std::u16string>(n->str));
+            if (!n->literal) n->literal = std::make_unique<JSString>(JSString::make(n->str));
             return Value::string(*n->literal);
-        case N::Identifier: return lookup(env, n->str, nameHash(n), nullptr, n);   // (its key made if a global's)
         default: break;
     }
     EvalDepth depth(rt_);
@@ -3100,7 +3194,7 @@ Value Interpreter::eval(Node* n, Env* env, bool strict) {
         case N::BigInt: {
             const auto b = bigint::parseLiteral(n->str);
             if (!b) rt_.throwError("SyntaxError", "invalid BigInt literal");
-            return Value::bigint(std::make_shared<const std::u16string>(bigint::encode(*b)));
+            return Value::bigint(JSString::make(bigint::encode(*b)));
         }
         case N::String: return Value::string(n->str);
         case N::Boolean: return Value::boolean((n->flags & 1) != 0);   // other bits: parenthesized
@@ -3326,7 +3420,7 @@ Value bigintOp(Runtime& rt, Op op, const Value& a, const Value& b) {
         default: rt.throwError("TypeError", "not an operator for BigInts");
     }
     if (bitLength(out) > kMaxBits) rt.throwError("RangeError", "Maximum BigInt size exceeded");
-    return Value::bigint(std::make_shared<const std::u16string>(encode(out)));
+    return Value::bigint(JSString::make(encode(out)));
 }
 
 double jsPow(double x, double y) {
@@ -3338,7 +3432,7 @@ double jsPow(double x, double y) {
 
 }  // namespace
 
-Value Interpreter::binaryOp(Op op, const Value& l, const Value& r) {
+Value Interpreter::binaryOpSlow(Op op, const Value& l, const Value& r) {
     // Two numbers compared: the loop condition, each time round.
     if (l.isNumber() && r.isNumber()) {
         const double x = l.asNumber(), y = r.asNumber();
@@ -3620,6 +3714,8 @@ Value Interpreter::evalCall(Node* n, Env* env, bool strict) {
         } catch (const ShortCircuit&) {
             return Value::undefined();
         }
+    } else if (callee->kind == N::Identifier && !(callee->flags & kParenthesized) && cachedBinding(env, callee)) {
+        fn = eval(callee, env, strict);   // where it was last time: no with statement's
     } else if (callee->kind == N::Identifier && !(callee->flags & kParenthesized)) {
         // A name a with statement's object supplies: called as its method.
         Object* with = nullptr;
@@ -3706,7 +3802,7 @@ Value Interpreter::evalUnary(Node* n, Env* env, bool strict) {
             if (!v.isNumber()) v = rt_.toPrimitive(v, "number");
             if (v.isBigInt()) {
                 const bigint::Big x = bigint::decode(v.bigintDigits());
-                return Value::bigint(std::make_shared<const std::u16string>(bigint::encode(n->op == Op::Neg ? bigint::negate(x) : bigint::bitNot(x))));
+                return Value::bigint(JSString::make(bigint::encode(n->op == Op::Neg ? bigint::negate(x) : bigint::bitNot(x))));
             }
             if (n->op == Op::Neg) return Value::number(-rt_.toNumber(v));
             return Value::number(~rt_.toInt32(v));
@@ -3725,13 +3821,19 @@ Value Interpreter::evalUpdate(Node* n, Env* env, bool strict) {
         if (v.isBigInt()) {
             old_numeric = v;
             const bigint::Big x = bigint::decode(v.bigintDigits());
-            return Value::bigint(std::make_shared<const std::u16string>(bigint::encode(bigint::add(x, bigint::fromInt64(n->op == Op::Inc ? 1 : -1)))));
+            return Value::bigint(JSString::make(bigint::encode(bigint::add(x, bigint::fromInt64(n->op == Op::Inc ? 1 : -1)))));
         }
         old_numeric = Value::number(rt_.toNumber(v));
         return Value::number(old_numeric.asNumber() + delta);
     };
     Value old;
     if (t->kind == N::Identifier) {
+        // A number variable found where it was last time: stepped where it is.
+        if (Binding* b = cachedBinding(env, t); b && b->initialized && b->is_mutable && b->value.isNumber()) {
+            const double was = b->value.asNumber();
+            b->value = Value::number(was + delta);
+            return Value::number((n->flags & kPrefix) ? was + delta : was);
+        }
         const Value now = step(lookup(env, t->str, nameHash(t), &nameKey(t), t), old);
         assignName(env, t->str, now, strict, t);
         return (n->flags & kPrefix) ? now : old;
@@ -3800,11 +3902,11 @@ Value Interpreter::evalAssign(Node* n, Env* env, bool strict) {
             Value old = b->value;   // read before the right side is (it may change the variable)
             const Value r = eval(n->b, env, strict);
             // (Evaluating the right side can't have moved the binding: entries never move.)
-            if (r.isString() && b->value.isString() && b->value.stringRef() == old.stringRef()) {
+            if (r.isString() && b->value.isString() && b->value.sameString(old)) {
                 old = Value();
-                if (b->value.stringRef().use_count() == 1) {
+                if (b->value.stringUnshared()) {
                     const std::u16string& add = r.asString();
-                    auto& mine = const_cast<std::u16string&>(*b->value.stringRef());
+                    std::u16string& mine = b->value.mutableString();
                     if (mine.size() + add.size() > (1u << 29)) rt_.throwError("RangeError", "string too long");
                     if (&mine == &add) mine += std::u16string(add);   // s += s
                     else mine += add;
@@ -3816,6 +3918,39 @@ Value Interpreter::evalAssign(Node* n, Env* env, bool strict) {
             assignName(env, t->str, v, strict, t);
             return v;
         }
+        // A script's top-level var: the global object's property, appended to the same
+        // way (`html += row` in a loop at the top of a page's script copied all of html
+        // each time round: quadratic). Found again after the right side, which may have
+        // made globals and moved the properties.
+        if (!b && !with) {
+            Object* g = globalObject(env);
+            const PropertyKey& key = nameKey(t);
+            const auto appendable = [&]() -> Property* {
+                if (g->cls == ObjectClass::Proxy || g->cls == ObjectClass::TypedArray || g->cls == ObjectClass::String) return nullptr;
+                Property* p = g->own(key);
+                return p && !(p->flags & kAccessor) && (p->flags & kWritable) && p->value.isString() ? p : nullptr;
+            };
+            if (Property* p = appendable()) {
+                Value old = p->value;
+                const Value r = eval(n->b, env, strict);
+                Property* q = appendable();
+                if (r.isString() && q && q->value.sameString(old)) {
+                    old = Value();
+                    if (q->value.stringUnshared()) {
+                        const std::u16string& add = r.asString();
+                        std::u16string& mine = q->value.mutableString();
+                        if (mine.size() + add.size() > (1u << 29)) rt_.throwError("RangeError", "string too long");
+                        if (&mine == &add) mine += std::u16string(add);
+                        else mine += add;
+                        return q->value;
+                    }
+                    old = q->value;
+                }
+                const Value v = binaryOp(Op::Add, old, r);
+                assignName(env, t->str, v, strict, t);
+                return v;
+            }
+        }
     }
     // Compound: read, operate, write. &&=, ||= and ??= only write when they must.
     Value base;
@@ -3823,6 +3958,30 @@ Value Interpreter::evalAssign(Node* n, Env* env, bool strict) {
     Value old;
     if (t->kind == N::Identifier) {
         old = lookup(env, t->str, nameHash(t), &nameKey(t), t);
+    } else if ((t->flags & kComputed) && t->a->kind != N::Super) {
+        base = eval(t->a, env, strict);
+        const Value k = eval(t->b, env, strict);
+        // An array's element by a number, there already (a hash's `w[i] ^= x`): read and
+        // written where it is, not by a key made of the number's digits.
+        const bool logical = n->op == Op::And || n->op == Op::Or || n->op == Op::Nullish;
+        if (!logical && k.isNumber() && base.isObject() && base.asObject()->cls == ObjectClass::Array) {
+            Object* o = base.asObject();
+            const double d = k.asNumber();
+            if (d >= 0 && d < static_cast<double>(o->elements.size())) {
+                const auto i = static_cast<size_t>(d);
+                if (static_cast<double>(i) == d && !o->elements[i].isEmpty()) {
+                    const Value was = o->elements[i];
+                    const Value r = eval(n->b, env, strict);
+                    const Value v = binaryOp(n->op, was, r);
+                    // (The right side may have shrunk the array, or frozen it.)
+                    if (o->extensible && i < o->elements.size() && !o->elements[i].isEmpty()) o->elements[i] = v;
+                    else rt_.set(base, rt_.toPropertyKey(k), v, strict);
+                    return v;
+                }
+            }
+        }
+        key = rt_.toPropertyKey(k);
+        old = rt_.get(base, key);
     } else {
         base = eval(t->a, env, strict);
         key = memberKey(t, env, strict);

@@ -26,23 +26,89 @@ struct Env;
 struct Coroutine;
 namespace regex { struct Program; }
 
-using JSString = std::shared_ptr<const std::u16string>;
+// A string value's characters, shared by every value holding them. Counted, not
+// collected, and not atomically: a page's script values never leave its thread.
+// (Was a std::shared_ptr: 16 bytes in every Value and its copies, numbers' too.)
+class JSString {
+public:
+    JSString() noexcept = default;
+    JSString(std::nullptr_t) noexcept {}
+    JSString(const JSString& o) noexcept : r_(o.r_) { if (r_) ++r_->refs; }
+    JSString(JSString&& o) noexcept : r_(o.r_) { o.r_ = nullptr; }
+    JSString& operator=(const JSString& o) noexcept {
+        if (o.r_) ++o.r_->refs;
+        release();
+        r_ = o.r_;
+        return *this;
+    }
+    JSString& operator=(JSString&& o) noexcept {
+        if (this != &o) {
+            release();
+            r_ = o.r_;
+            o.r_ = nullptr;
+        }
+        return *this;
+    }
+    ~JSString() { release(); }
+
+    static JSString make(std::u16string s) { JSString j; j.r_ = new Rep{1, std::move(s)}; return j; }
+    static JSString make() { return make(std::u16string{}); }
+
+    [[nodiscard]] const std::u16string& operator*() const noexcept { return r_->s; }
+    [[nodiscard]] const std::u16string* operator->() const noexcept { return &r_->s; }
+    [[nodiscard]] const std::u16string* get() const noexcept { return r_ ? &r_->s : nullptr; }
+    explicit operator bool() const noexcept { return r_ != nullptr; }
+    [[nodiscard]] long use_count() const noexcept { return r_ ? static_cast<long>(r_->refs) : 0; }
+    bool operator==(const JSString& o) const noexcept { return r_ == o.r_; }
+    bool operator!=(const JSString& o) const noexcept { return r_ != o.r_; }
+
+private:
+    friend class Value;
+    struct Rep {
+        uint32_t refs;
+        std::u16string s;
+    };
+    void release() noexcept {
+        if (r_ && --r_->refs == 0) delete r_;
+        r_ = nullptr;
+    }
+    Rep* r_ = nullptr;
+};
 
 // A JavaScript value.
 class Value {
 public:
     enum class Type : uint8_t { Undefined, Null, Boolean, Number, String, Symbol, Object, Empty, BigInt };
 
-    Value() = default;
+    Value() noexcept = default;
+    Value(const Value& o) noexcept : type_(o.type_), bits_(o.bits_) { if (counted()) ++s_->refs; }
+    Value(Value&& o) noexcept : type_(o.type_), bits_(o.bits_) { o.type_ = Type::Undefined; }
+    Value& operator=(const Value& o) noexcept {
+        if (o.counted()) ++o.s_->refs;
+        release();
+        type_ = o.type_;
+        bits_ = o.bits_;
+        return *this;
+    }
+    Value& operator=(Value&& o) noexcept {
+        if (this != &o) {
+            release();
+            type_ = o.type_;
+            bits_ = o.bits_;
+            o.type_ = Type::Undefined;
+        }
+        return *this;
+    }
+    ~Value() { release(); }
     static Value undefined() { return {}; }
     static Value null() { Value v; v.type_ = Type::Null; return v; }
     static Value empty() { Value v; v.type_ = Type::Empty; return v; }   // an array's hole
     static Value boolean(bool b) { Value v; v.type_ = Type::Boolean; v.b_ = b; return v; }
     static Value number(double d) { Value v; v.type_ = Type::Number; v.n_ = d; return v; }
-    static Value string(JSString s) { Value v; v.type_ = Type::String; v.s_ = std::move(s); return v; }
+    static Value string(JSString s) { Value v; v.type_ = Type::String; v.s_ = s.r_; s.r_ = nullptr; return v; }
     static Value string(std::u16string s);
     // A BigInt, its digits encoded (bigint.h) in the string slot.
-    static Value bigint(JSString digits) { Value v; v.type_ = Type::BigInt; v.s_ = std::move(digits); return v; }
+    static Value bigint(JSString digits) { Value v; v.type_ = Type::BigInt; v.s_ = digits.r_; digits.r_ = nullptr; return v; }
     static Value object(Object* o) { Value v; v.type_ = o ? Type::Object : Type::Null; v.o_ = o; return v; }
     static Value symbol(Symbol* s) { Value v; v.type_ = Type::Symbol; v.sym_ = s; return v; }
 
@@ -57,25 +123,37 @@ public:
     [[nodiscard]] bool isObject() const noexcept { return type_ == Type::Object; }
     [[nodiscard]] bool isEmpty() const noexcept { return type_ == Type::Empty; }
     [[nodiscard]] bool isBigInt() const noexcept { return type_ == Type::BigInt; }
-    [[nodiscard]] const std::u16string& bigintDigits() const noexcept { return *s_; }
+    [[nodiscard]] const std::u16string& bigintDigits() const noexcept { return s_->s; }
 
     [[nodiscard]] bool asBoolean() const noexcept { return b_; }
     [[nodiscard]] double asNumber() const noexcept { return n_; }
-    [[nodiscard]] const std::u16string& asString() const noexcept { return *s_; }
-    [[nodiscard]] const JSString& stringRef() const noexcept { return s_; }
+    [[nodiscard]] const std::u16string& asString() const noexcept { return s_->s; }
+    // The characters, shared (another holder of them, counted).
+    [[nodiscard]] JSString stringRef() const noexcept { JSString j; j.r_ = s_; if (s_) ++s_->refs; return j; }
+    // Whether these are its characters' only holder (they may be changed in place).
+    [[nodiscard]] bool stringUnshared() const noexcept { return s_ && s_->refs == 1; }
+    [[nodiscard]] bool sameString(const Value& o) const noexcept { return s_ == o.s_; }
+    [[nodiscard]] std::u16string& mutableString() noexcept { return s_->s; }
     [[nodiscard]] Object* asObject() const noexcept { return o_; }
     [[nodiscard]] Symbol* asSymbol() const noexcept { return sym_; }
 
 private:
+    [[nodiscard]] bool counted() const noexcept { return (type_ == Type::String || type_ == Type::BigInt) && s_; }
+    void release() noexcept {
+        if (counted() && --s_->refs == 0) delete s_;
+        type_ = Type::Undefined;
+    }
     Type type_ = Type::Undefined;
     union {
         double n_ = 0;
         bool b_;
         Object* o_;
         Symbol* sym_;
+        JSString::Rep* s_;   // a String's or BigInt's
+        uint64_t bits_;      // any of them, for copying
     };
-    JSString s_;
 };
+static_assert(sizeof(Value) == 16);
 
 // A property's name: a string, or a symbol.
 struct PropertyKey {
@@ -534,7 +612,11 @@ public:
     };
     std::vector<CallRoots> call_roots;
     // Scopes a call keeps off the collected heap (they die with it): roots while it runs.
-    std::vector<std::vector<Env*>*> owned_scopes;
+    // Calls nest, so their owned scopes are one stack: each call's on top of its caller's.
+    std::vector<Env*> owned_stack;
+    // Owned scopes done with, kept to be made again: a call made two or three heap
+    // allocations for its scope alone, freed as it returned.
+    std::vector<Env*> env_pool;
 
     // The interpreter's own (runtime.cc).
     void step();
