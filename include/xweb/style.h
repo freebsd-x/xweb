@@ -284,6 +284,7 @@ struct ComputedStyle {
     Clear clear = Clear::None;
     bool overflow_clip = false;        // overflow other than visible; we don't draw scrollbars
     bool text_overflow_ellipsis = false;
+    bool pointer_events_none = false;   // pointer-events: none (inherited): clicks go through it
     // -webkit-line-clamp: so many lines, the last ending in an ellipsis; only in a
     // display: -webkit-box (or -inline-box) with -webkit-box-orient: vertical, as Chrome.
     uint16_t line_clamp = 0;

@@ -1814,6 +1814,10 @@ private:
                 // width for it (velog's width:100% wrapper round a grid of % columns).
                 if (!main_size.is_auto && (!main_size.hasPercent() || main_avail))
                     it.min_main = std::min(it.min_main, std::max(0.0f, main_size.resolve(base_for_percent) - box_extra));
+                // Nor more than its max-width (chosun.com's max-width: 100% columns round a
+                // slider's long row were the row's width, and the page three times as wide).
+                if (!max_size.is_auto && (!max_size.hasPercent() || main_avail))
+                    it.min_main = std::min(it.min_main, std::max(0.0f, max_size.resolve(base_for_percent) - box_extra));
             } else if (!row && !ks.overflow_clip) {
                 // Its content height, whatever its basis (flex: 1 on a page's <main> mustn't
                 // squash it to nothing); no more than a height it gives itself.
@@ -1824,6 +1828,7 @@ private:
                 }
                 it.min_main = content;
                 if (!main_size.is_auto && !main_size.hasPercent()) it.min_main = std::min(it.min_main, std::max(0.0f, main_size.px - box_extra));
+                if (!max_size.is_auto && !max_size.hasPercent()) it.min_main = std::min(it.min_main, std::max(0.0f, max_size.px - box_extra));
             }
             if (!max_size.is_auto) it.max_main = std::max(0.0f, max_size.resolve(base_for_percent) - box_extra);
             if (it.max_main < it.min_main) it.max_main = it.min_main;

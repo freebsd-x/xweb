@@ -122,8 +122,14 @@ int main(int argc, char** argv) {
         if (it != by_node.end()) {
             // XWEB_LAYOUT_IDS=1 names elements with ids as tag#id, for finding them.
             const std::string* id = std::getenv("XWEB_LAYOUT_IDS") ? n->attr("id") : nullptr;
-            std::printf("%s%s%s %.2f %.2f %.2f %.2f", n->name.c_str(), id ? "#" : "", id ? id->c_str() : "", it->second->x, it->second->y,
-                        it->second->w, it->second->h);
+            // XWEB_LAYOUT_CLASS=1: and .class, and its depth in the tree (for reading one).
+            const std::string* cls = std::getenv("XWEB_LAYOUT_CLASS") ? n->attr("class") : nullptr;
+            int depth = 0;
+            if (cls || std::getenv("XWEB_LAYOUT_CLASS"))
+                for (const Node* p = n->parent; p; p = p->parent) ++depth;
+            if (std::getenv("XWEB_LAYOUT_CLASS")) std::printf("%*s", depth, "");
+            std::printf("%s%s%s%s%s %.2f %.2f %.2f %.2f", n->name.c_str(), id ? "#" : "", id ? id->c_str() : "", cls ? "." : "",
+                        cls ? cls->substr(0, 50).c_str() : "", it->second->x, it->second->y, it->second->w, it->second->h);
             if (const ComputedStyle* s = fonts ? styles.styleOf(n) : nullptr) {
                 FontSpec f;
                 f.size = s->font_size;

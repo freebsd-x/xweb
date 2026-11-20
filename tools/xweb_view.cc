@@ -901,8 +901,13 @@ public:
     // The element a click at this point is on: the innermost box, or the link inside it.
     [[nodiscard]] web::Node* nodeAt(float page_x, float page_y) const {
         const web::Node* hit = nullptr;
+        // Not what's hidden, or lets the pointer through (chosun.com's closed side menu,
+        // visibility: hidden over the whole page, took every click).
+        const web::StyledDocument* styles = restyled_ ? restyled_.get() : styles_.get();
         for (auto it = layout_.boxes.rbegin(); it != layout_.boxes.rend(); ++it)
             if (page_x >= it->x && page_x < it->x + it->w && page_y >= it->y && page_y < it->y + it->h) {
+                if (styles)
+                    if (const web::ComputedStyle* s = styles->styleOf(it->node); s && (s->hidden || s->pointer_events_none)) continue;
                 hit = it->node;
                 break;
             }
@@ -1024,6 +1029,7 @@ public:
         const auto idx = static_cast<size_t>(s->display);
         if (want("display")) out["display"] = idx < std::size(kDisplay) ? kDisplay[idx] : "block";
         if (want("visibility")) out["visibility"] = s->hidden ? "hidden" : "visible";
+        if (want("pointer-events")) out["pointer-events"] = s->pointer_events_none ? "none" : "auto";
         static const char* kPosition[] = {"static", "relative", "absolute", "fixed"};
         if (want("position")) out["position"] = kPosition[static_cast<size_t>(s->position)];
         const auto rgb = [](web::Color c) {

@@ -3274,6 +3274,7 @@ private:
         else if (p == "word-break") to.word_break = from.word_break;
         else if (p == "white-space") to.white_space = from.white_space;
         else if (p == "text-overflow") to.text_overflow_ellipsis = from.text_overflow_ellipsis;
+        else if (p == "pointer-events") to.pointer_events_none = from.pointer_events_none;
         else if (p == "-webkit-line-clamp" || p == "line-clamp") to.line_clamp = from.line_clamp;
         else if (p == "-webkit-box-orient" || p == "box-orient") to.box_orient_vertical = from.box_orient_vertical;
         else if (p == "list-style-type" || p == "list-style") to.list_style = from.list_style;
@@ -3998,6 +3999,10 @@ private:
             else if (kw == "capitalize") s.text_transform = TextTransform::Capitalize;
             return;
         }
+        if (p == "pointer-events") {
+            if (!kw.empty()) s.pointer_events_none = kw == "none";
+            return;
+        }
         if (p == "-webkit-line-clamp" || p == "line-clamp") {
             size_t k = 0;
             skipWs(v, k);
@@ -4079,6 +4084,7 @@ private:
         s.list_style = parent.list_style;
         s.text_indent = parent.text_indent;
         s.hidden = parent.hidden;
+        s.pointer_events_none = parent.pointer_events_none;
         s.custom = parent.custom;
         s.border_spacing = parent.border_spacing;
         s.border_collapse = parent.border_collapse;
