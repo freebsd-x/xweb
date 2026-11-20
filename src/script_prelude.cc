@@ -31,14 +31,13 @@ const char* const kScriptPrelude = R"JS(
     return r;
   }
 
+  // What must be percent-encoded: by a regular expression, not a character at a time in
+  // script (theverge.com made 10000 URLs: a second).
+  const kNeedsEncoding = /[^\x21-\x7e]|["<>`{}]/u;
+  const kEncodeEach = /[^\x21-\x7e]|["<>`{}]/gu;
   function encodePart(s, keep) {
-    let out = '';
-    for (const ch of s) {
-      const c = ch.codePointAt(0);
-      if (c < 0x21 || c > 0x7e || keep.indexOf(ch) < 0 && '"<>`{}'.indexOf(ch) >= 0 || ch === ' ') out += encodeURIComponent(ch);
-      else out += ch;
-    }
-    return out;
+    if (!kNeedsEncoding.test(s)) return s;
+    return s.replace(kEncodeEach, (ch) => (ch.length === 1 && ch > ' ' && ch <= '~' && keep.indexOf(ch) >= 0 ? ch : encodeURIComponent(ch)));
   }
 
   // A host's non-ASCII labels as the DNS has them: Punycode (RFC 3492), "xn--…"

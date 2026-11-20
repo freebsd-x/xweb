@@ -280,7 +280,7 @@ TEST(Js, RegExpErrorsAndLimits) {
     EXPECT_EQ(run("try { /\\p{L}/u.test('x') && new RegExp('\\\\p{', 'u') } catch (e) { e.name }"), "SyntaxError");
     EXPECT_EQ(run("try { 'x'.matchAll(/x/) } catch (e) { e.name }"), "TypeError");
     // Catastrophic backtracking stops at the step budget, not never.
-    EXPECT_NE(run("/(a+)+b/.test('a'.repeat(40))").find("ran too long"), std::string::npos);
+    EXPECT_NE(run("/(a+)+b/.test('a'.repeat(40) + 'cb')").find("ran too long"), std::string::npos);
     // A long text is fine: simple repeats don't stack a frame per character.
     EXPECT_EQ(run("const s = 'x'.repeat(1 << 20) + 'y'; [/x*y/.exec(s)[0].length, /(?:x|z)*?y/.test(s), s.split(/x/).length].join()"),
               "1048577,true,1048577");
@@ -839,4 +839,11 @@ TEST(Js, LongParenthesizedGroupsParseOnce) {
     arrows += "2), b = (c, d) => c + d) => a + b(3, 4); f()";
     EXPECT_EQ(run(arrows), "9");
     EXPECT_EQ(run("var k = ((p) => (q) => p * q)(6)(7); k"), "42");
+}
+
+TEST(Js, RegExpsWithARequiredLiteralFailFastAndStillMatch) {
+    // No "@" or "%40" anywhere: no match, without backtracking through every start.
+    EXPECT_EQ(run("var s = 'x'.repeat(20000) + ' ' + 'y'.repeat(5000); /\\S+(@|%40)\\S+\\.\\S+/.test(s)"), "false");
+    EXPECT_EQ(run("[/\\S+(@|%40)\\S+\\.\\S+/.test('mail: a@b.com'), /\\S+(@|%40)\\S+\\.\\S+/.test('a%40b.org'), /AB(c|d)/i.test('abD'),"
+                  " 'xoaob zob'.replace(/o(a|b)/g, '#')].join()"), "true,true,true,x## z#");
 }

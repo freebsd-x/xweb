@@ -406,6 +406,10 @@ struct Program {
     uint32_t regs = 0;
     int first_char = -1;   // a literal every match starts with, to skip ahead to
     bool anchored = false; // starts with ^ outside multiline mode
+    // Every match has one of these in it (none: can't tell): an input with none can't
+    // match, which is known without trying it at each place (/\S+(@|%40)\S+\.\S+/ on a
+    // long string without "@" took a page 50 ms a call, backtracking).
+    std::vector<std::u16string> required;
 };
 
 namespace {
@@ -1399,6 +1403,79 @@ std::u16string flagsString(const Flags& f) {
     return s;
 }
 
+namespace {
+
+// The literal strings a node matches, if it only ever matches one of a few of them.
+bool literalsOf(const Node* n, std::vector<std::u16string>& out) {
+    constexpr size_t kMaxAlternatives = 8;
+    switch (n->kind) {
+        case Node::Char:
+            if (n->c >= 0xD800) return false;
+            out = {std::u16string(1, static_cast<char16_t>(n->c))};
+            return true;
+        case Node::Group:
+            if (n->kids.size() != 1) return false;
+            return literalsOf(n->kids[0].get(), out);
+        case Node::Seq: {
+            std::vector<std::u16string> acc{u""};
+            for (const auto& k : n->kids) {
+                std::vector<std::u16string> part;
+                if (!literalsOf(k.get(), part)) return false;
+                std::vector<std::u16string> next;
+                for (const auto& a : acc)
+                    for (const auto& b : part) next.push_back(a + b);
+                if (next.size() > kMaxAlternatives) return false;
+                acc = std::move(next);
+            }
+            out = std::move(acc);
+            return true;
+        }
+        case Node::Alt: {
+            std::vector<std::u16string> all;
+            for (const auto& k : n->kids) {
+                std::vector<std::u16string> part;
+                if (!literalsOf(k.get(), part)) return false;
+                all.insert(all.end(), part.begin(), part.end());
+                if (all.size() > kMaxAlternatives) return false;
+            }
+            out = std::move(all);
+            return true;
+        }
+        default: return false;
+    }
+}
+
+// Literal strings one of which every match of the pattern contains: from a part of its
+// top-level sequence that is always there (the longest such, as the best filter).
+std::vector<std::u16string> requiredLiterals(const Node* root) {
+    std::vector<std::u16string> best;
+    size_t best_len = 0;
+    const auto consider = [&](const Node* k) {
+        const Node* n = k;
+        if (n->kind == Node::Repeat) {
+            if (n->min < 1 || n->kids.size() != 1) return;
+            n = n->kids[0].get();
+        }
+        std::vector<std::u16string> lits;
+        if (!literalsOf(n, lits) || lits.empty()) return;
+        size_t shortest = SIZE_MAX;
+        for (const auto& l : lits) shortest = std::min(shortest, l.size());
+        if (shortest == 0) return;
+        if (shortest > best_len) {
+            best_len = shortest;
+            best = std::move(lits);
+        }
+    };
+    if (root->kind == Node::Seq) {
+        for (const auto& k : root->kids) consider(k.get());
+    } else {
+        consider(root);
+    }
+    return best;
+}
+
+}  // namespace
+
 std::shared_ptr<const Program> compile(std::u16string_view pattern, const Flags& flags, std::string& error) {
     if (pattern.size() > kMaxPatternLength) {
         error = "regular expression too large";
@@ -1423,6 +1500,7 @@ std::shared_ptr<const Program> compile(std::u16string_view pattern, const Flags&
         const Inst& f = p->code[first];
         if (f.op == Op::Char && !flags.ignore_case && f.c < 0xD800) p->first_char = static_cast<int>(f.c);
         if (f.op == Op::Bol && !flags.multiline) p->anchored = true;
+        if (!flags.ignore_case) p->required = requiredLiterals(tree.get());
         return p;
     } catch (const ParseError& e) {
         error = e.what;
@@ -1437,6 +1515,11 @@ const Flags& flagsOf(const Program& p) { return p.flags; }
 bool exec(Runtime& rt, const Program& p, std::u16string_view input, size_t start, bool sticky, std::vector<int>& caps) {
     caps.assign(2 * (p.groups + 1), -1);
     if (start > input.size() || input.size() > static_cast<size_t>(INT32_MAX) - 2) return false;
+    // (From the start only: a global search's later calls would each scan for a literal
+    // that isn't there to the end, again.)
+    if (start == 0 && !p.required.empty() &&
+        std::none_of(p.required.begin(), p.required.end(), [&](const std::u16string& lit) { return input.find(lit) != std::u16string_view::npos; }))
+        return false;
     Matcher m(rt, p, input, caps);
     const bool unicode = p.flags.unicode || p.flags.unicode_sets;
     size_t pos = start;

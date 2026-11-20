@@ -1146,6 +1146,18 @@ TEST(Script, UrlHostsInPunycodeAndALiveForEach) {
     EXPECT_EQ(p.console, "log:xn--e1aybc xn--mnchen-3ya.de a.com a1,c3\n") << p.console;
 }
 
+TEST(Script, UrlPartsPercentEncodedAsChromeDoes) {
+    Page p(R"(<body><script>
+        const u = new URL('https://a.com/p a/"q"/{x}/한/😀?s t=ü&k="v"#f g`');
+        console.log(u.pathname, u.search, u.hash);
+        const v = new URL('https://a.com/plain/path?x=1#y');
+        v.pathname = '/new path'; v.hash = 'h h';
+        console.log(v.href);
+        </script>)");
+    EXPECT_EQ(p.console, "log:/p%20a/%22q%22/%7Bx%7D/%ED%95%9C/%F0%9F%98%80 ?s%20t=%C3%BC&k=%22v%22 #f%20g%60\n"
+                         "log:https://a.com/new%20path?x=1#h%20h\n") << p.console;
+}
+
 TEST(Script, ALinkToASheetAlreadyHereLoads) {
     // React's stylesheet resources: a <link> put in for a sheet a preload fetched, and
     // nothing shown until its "load" (toss.im).
