@@ -20,4 +20,14 @@ body{margin:8px;font:14px/20px monospace}table{margin-bottom:12px}td,th{padding:
 <table class=b style=margin:0px auto><tr><td>centered</td></tr></table>
 <p>a <span style=display:inline-table>inline table</span> b</p><table class=b><tr><td><table class=b><tr><td>nested</td></tr></table></td></tr></table>
 <table border="0" cellpadding="0" cellspacing="0" width="600" style="padding:2px;background:#f60"><tr><td style="width:18px;padding-right:4px"><div style="width:18px;height:18px;border:1px solid white"></div></td><td><b>Hacker News</b> new | past</td><td style="text-align:right">login</td></tr></table>
+
+<!-- Percent columns capped at 100% and giving way to the others' least; a width is
+     what a column would like, not its least (clien.net's ad box). -->
+<style>.ct{display:table;margin:4px 0;background:#eee}.ct>*{display:table-cell;background:#cde}</style>
+<div class=ct style="width:300px"><b style="width:200px">a</b><b style="width:200px">b</b></div>
+<div class=ct style="width:300px"><i>xx xxxxxxxxxx xxxxxxxx xxxxxxx xxxx</i><b style="width:200px">b</b></div>
+<div class=ct><i style="width:100%">x</i><b style="width:200px">y</b></div>
+<div class=ct style="width:300px"><i style="width:30%">x</i><b style="width:200px">y</b></div>
+<div class=ct style="width:300px"><i style="width:70%">x</i><i style="width:70%">y</i><u>z</u></div>
+<div style="position:relative;width:374px;height:300px"><div class=ct style="position:absolute;bottom:20px;width:calc(100% - 1em);height:250px"><span style="width:336px"></span></div></div>
 </body></html>

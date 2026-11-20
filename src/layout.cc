@@ -1127,6 +1127,27 @@ private:
             columnWidths(grid, mins, maxes);
             float total = 0;
             for (const float v : (max_content ? maxes : mins)) total += v;
+            if (max_content) {
+                // Percent columns want the table wide enough for their share: a 100% one
+                // beside others, as wide as it can be.
+                std::vector<float> pct(grid.columns, 0);
+                for (const TableCell& c : grid.cells)
+                    if (c.colspan == 1 && c.box->style->width.hasPercent()) pct[c.col] = std::max(pct[c.col], c.box->style->width.percent);
+                float pct_total = 0, other_max = 0;
+                for (size_t k = 0; k < grid.columns; ++k) {
+                    if (pct[k] > 0) {
+                        pct[k] = std::min(pct[k], 100 - pct_total);
+                        pct_total += pct[k];
+                        if (pct[k] > 0) total = std::max(total, maxes[k] * 100 / pct[k]);
+                    } else {
+                        other_max += maxes[k];
+                    }
+                }
+                if (pct_total > 0) {
+                    if (pct_total >= 100 && other_max > 0) total = std::max(total, 1e6f);
+                    else if (pct_total < 100) total = std::max(total, other_max * 100 / (100 - pct_total));
+                }
+            }
             return total + tableSpacing(b) * static_cast<float>(mins.size() + 1);
         }
         if (b.isFlex()) {
@@ -1460,9 +1481,10 @@ private:
                 const ComputedStyle& s = *box.style;
                 float min_w = minContentWidth(box) + frame;
                 float max_w = preferredWidth(box) + frame;
+                // A width is what the column would like, not its least: squeezed, it goes
+                // down to its content's width (Chrome, standards and quirks alike).
                 if (!s.width.is_auto && !s.width.hasPercent()) {
                     const float spec = s.width.px + (s.border_box ? 0 : frame);
-                    min_w = std::max(min_w, spec);
                     max_w = std::max(min_w, spec);
                 }
                 max_w = std::max(max_w, min_w);
@@ -1502,6 +1524,12 @@ private:
             if (c.colspan == 1 && c.box->style->width.hasPercent())
                 percent[c.col] = std::max(percent[c.col], c.box->style->width.percent);
 
+        // At most 100% between them, the first ones first.
+        float pct_left = 100;
+        for (size_t k = 0; k < grid.columns; ++k) {
+            percent[k] = std::min(percent[k], pct_left);
+            pct_left -= percent[k];
+        }
         float sum_min = 0, sum_max = 0, reserved = 0;
         for (size_t k = 0; k < grid.columns; ++k) {
             if (percent[k] > 0) {
@@ -1511,6 +1539,22 @@ private:
                 sum_min += mins[k];
                 sum_max += maxes[k];
             }
+        }
+        // The other columns at their least still fit: percent columns give way, by their
+        // percentages (a 100% cell beside a fixed one: the fixed one at its content's width).
+        if (!grid.fixed && reserved > 0 && reserved + sum_min > inner) {
+            float excess = reserved + sum_min - inner;
+            float give_total = 0;
+            for (size_t k = 0; k < grid.columns; ++k)
+                if (percent[k] > 0) give_total += percent[k];
+            for (size_t k = 0; k < grid.columns && give_total > 0; ++k) {
+                if (percent[k] <= 0) continue;
+                const float cut = std::min(widths[k] - mins[k], excess * percent[k] / give_total);
+                widths[k] -= std::max(0.0f, cut);
+            }
+            reserved = 0;
+            for (size_t k = 0; k < grid.columns; ++k)
+                if (percent[k] > 0) reserved += widths[k];
         }
         const float rest = std::max(0.0f, inner - reserved);
         if (grid.fixed) {
@@ -1558,8 +1602,19 @@ private:
                     const float share = sum_max > 0 ? maxes[k] / sum_max : 1.0f / static_cast<float>(grid.columns);
                     widths[k] = maxes[k] + share * (rest - sum_max);
                 } else if (rest > sum_min) {
-                    const float span = sum_max - sum_min;
-                    widths[k] = mins[k] + (span > 0 ? (maxes[k] - mins[k]) * (rest - sum_min) / span : 0);
+                    // Each at its least, then the fixed ones toward their widths, then
+                    // what's left to the auto ones (Chrome: a long text beside a 200px
+                    // cell gives way to it).
+                    float fixed_want = 0, auto_want = 0;
+                    for (size_t j = 0; j < grid.columns; ++j) {
+                        if (percent[j] > 0) continue;
+                        (fixed_col[j] ? fixed_want : auto_want) += maxes[j] - mins[j];
+                    }
+                    const float spare = rest - sum_min;
+                    const float to_fixed = std::min(spare, fixed_want);
+                    const float to_auto = std::min(spare - to_fixed, auto_want);
+                    if (fixed_col[k]) widths[k] = mins[k] + (fixed_want > 0 ? (maxes[k] - mins[k]) * to_fixed / fixed_want : 0);
+                    else widths[k] = mins[k] + (auto_want > 0 ? (maxes[k] - mins[k]) * to_auto / auto_want : 0);
                 } else {
                     widths[k] = mins[k];
                 }
