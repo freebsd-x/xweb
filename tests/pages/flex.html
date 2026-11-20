@@ -32,4 +32,11 @@ body{margin:8px;font:14px/20px monospace}.f{display:flex;margin-bottom:10px}.i{w
      max-width:100% column round a long row made the page three times as wide). -->
 <div style="display:flex;width:300px;background:#eee"><div style="flex:0 1 100%;max-width:100%;background:#cde"><div style="white-space:nowrap">a long row of words that is much wider than its column ever could be</div></div></div>
 <div style="display:flex;width:300px;background:#eee"><div style="flex:0 1 auto;max-width:150px;background:#dce"><div style="width:600px;height:10px"></div></div></div>
+
+<!-- A replaced element with display flex or grid is still its picture (inven.co.kr's
+     menu icons were empty flex containers). -->
+<a style="display:flex;align-items:center;gap:4px" href="#"><img src="images/checker.png" style="display:flex;width:20px"> <span>icon</span></a>
+<a style="display:flex;align-items:center" href="#"><img src="images/checker.png" style="display:flex"> <span>natural</span></a>
+<div><img src="images/checker.png" style="display:grid"></div>
+<div><img src="images/checker.png" style="display:inline-flex"> after</div>
 </body></html>

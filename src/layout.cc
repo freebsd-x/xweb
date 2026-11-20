@@ -87,7 +87,20 @@ struct Box {
     }
     [[nodiscard]] bool blockLevel() const noexcept { return kind == BoxKind::Block; }
     [[nodiscard]] bool inFlowBlock() const noexcept { return blockLevel() && !outOfFlow() && !floating(); }
-    [[nodiscard]] Display display() const noexcept { return style ? style->display : Display::Block; }
+    [[nodiscard]] Display display() const noexcept {
+        if (!style) return Display::Block;
+        // A replaced element's box holding its picture: display flex, grid or table
+        // only places it (inven.co.kr's display:flex icons were empty flex containers).
+        if (replaced_outer) {
+            switch (style->display) {
+                case Display::Flex: case Display::Grid: case Display::Table: return Display::Block;
+                case Display::InlineFlex: case Display::InlineGrid: case Display::InlineTable: return Display::InlineBlock;
+                default: break;
+            }
+        }
+        return style->display;
+    }
+    bool replaced_outer = false;   // a replaced element's box (its picture the one kid inside)
     [[nodiscard]] bool isTable() const noexcept { return display() == Display::Table || display() == Display::InlineTable; }
     [[nodiscard]] bool isFlex() const noexcept { return display() == Display::Flex || display() == Display::InlineFlex; }
     [[nodiscard]] bool isGrid() const noexcept { return display() == Display::Grid || display() == Display::InlineGrid; }
@@ -515,6 +528,7 @@ private:
             }
         }
         if (isReplaced(el)) {
+            box->replaced_outer = true;
             const bool was_block = box->kind == BoxKind::Block;
             box->kind = was_block ? BoxKind::Block : BoxKind::Replaced;
             if (const std::string* alt = el->attr("alt")) box->alt = *alt;
