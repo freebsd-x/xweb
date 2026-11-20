@@ -2896,8 +2896,18 @@ private:
             {"table-row", Display::TableRow}, {"table-cell", Display::TableCell}, {"table-column", Display::TableColumn},
             {"table-column-group", Display::TableColumn}, {"flex", Display::Flex},
         };
+        // The old flexbox's -webkit-box: a block here (line-clamped titles are what it's
+        // still used for; a row of them is usually display: flex after it).
+        if (k == "-webkit-box" || k == "-webkit-inline-box") {
+            s.display = k == "-webkit-box" ? Display::Block : Display::InlineBlock;
+            s.webkit_box = true;
+            return;
+        }
         const auto it = kDisplays.find(k);
-        if (it != kDisplays.end()) s.display = it->second;
+        if (it != kDisplays.end()) {
+            s.display = it->second;
+            s.webkit_box = false;
+        }
     }
 
     static FlexAlign flexAlign(const std::string& k, FlexAlign keep) {
@@ -3264,6 +3274,8 @@ private:
         else if (p == "word-break") to.word_break = from.word_break;
         else if (p == "white-space") to.white_space = from.white_space;
         else if (p == "text-overflow") to.text_overflow_ellipsis = from.text_overflow_ellipsis;
+        else if (p == "-webkit-line-clamp" || p == "line-clamp") to.line_clamp = from.line_clamp;
+        else if (p == "-webkit-box-orient" || p == "box-orient") to.box_orient_vertical = from.box_orient_vertical;
         else if (p == "list-style-type" || p == "list-style") to.list_style = from.list_style;
         else if (p == "text-indent") to.text_indent = from.text_indent;
         else if (p == "visibility") to.hidden = from.hidden;
@@ -3315,7 +3327,10 @@ private:
         };
         sides(to.margin, from.margin, "margin");
         sides(to.padding, from.padding, "padding");
-        if (p == "display") to.display = from.display;
+        if (p == "display") {
+            to.display = from.display;
+            to.webkit_box = from.webkit_box;
+        }
         else if (p == "vertical-align") to.vertical_align = from.vertical_align;
         else if (p == "float") to.float_side = from.float_side;
         else if (p == "clear") to.clear = from.clear;
@@ -3981,6 +3996,19 @@ private:
             else if (kw == "uppercase") s.text_transform = TextTransform::Uppercase;
             else if (kw == "lowercase") s.text_transform = TextTransform::Lowercase;
             else if (kw == "capitalize") s.text_transform = TextTransform::Capitalize;
+            return;
+        }
+        if (p == "-webkit-line-clamp" || p == "line-clamp") {
+            size_t k = 0;
+            skipWs(v, k);
+            if (kw == "none") s.line_clamp = 0;
+            else if (k < v.size() && v[k].type == TokenType::Number && v[k].is_integer && v[k].number >= 1)
+                s.line_clamp = static_cast<uint16_t>(std::min(v[k].number, 1000.0));
+            return;
+        }
+        if (p == "-webkit-box-orient" || p == "box-orient") {
+            if (kw == "vertical" || kw == "block-axis") s.box_orient_vertical = true;
+            else if (kw == "horizontal" || kw == "inline-axis") s.box_orient_vertical = false;
             return;
         }
         if (p == "text-overflow") {

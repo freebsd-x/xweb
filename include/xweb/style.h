@@ -284,6 +284,12 @@ struct ComputedStyle {
     Clear clear = Clear::None;
     bool overflow_clip = false;        // overflow other than visible; we don't draw scrollbars
     bool text_overflow_ellipsis = false;
+    // -webkit-line-clamp: so many lines, the last ending in an ellipsis; only in a
+    // display: -webkit-box (or -inline-box) with -webkit-box-orient: vertical, as Chrome.
+    uint16_t line_clamp = 0;
+    bool webkit_box = false;
+    bool box_orient_vertical = false;
+    [[nodiscard]] bool clampsLines() const noexcept { return line_clamp > 0 && webkit_box && box_orient_vertical; }
     // Absolutely positioned, and inline-level before that made it a block: its static
     // position is where it would have been on its line, not the start of the next one.
     bool inline_level_origin = false;   // text-overflow: ellipsis (with overflow_clip, on a line too long)

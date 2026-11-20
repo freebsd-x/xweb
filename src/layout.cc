@@ -826,6 +826,7 @@ private:
         if (inline_content) {
             content_h = layoutInline(b, flow);
             applyEllipsis(b);
+            if (s.clampsLines()) content_h = applyLineClamp(b, content_h);
             if (content_h == 0 && can_collapse_through) {
                 b.collapses_through = true;
                 mt = collapse(mt, mb);
@@ -3013,6 +3014,81 @@ private:
             i = end;
         }
         b.fragments = std::move(out);
+    }
+
+    // -webkit-line-clamp: only its first so many lines, the last ending in "…" (its text
+    // cut to make room), and the box as tall as they are. Returns the new height.
+    float applyLineClamp(Box& b, float content_h) {
+        const ComputedStyle& s = *b.style;
+        const uint32_t keep = s.line_clamp;
+        uint32_t lines = 0;
+        for (const Box::Fragment& f : b.fragments) lines = std::max(lines, f.line + 1);
+        if (lines <= keep) return content_h;
+        std::vector<Box::Fragment> out;
+        // As tall as the lines kept: where the first one dropped would have started, less
+        // where the first one did (each the same way down its line).
+        float first_y = -1, dropped_y = -1;
+        for (const Box::Fragment& f : b.fragments) {
+            if (f.line == 0 && first_y < 0) first_y = f.y;
+            if (f.line == keep && dropped_y < 0) dropped_y = f.y;
+            if (f.line < keep) out.push_back(f);
+        }
+        const float bottom = first_y >= 0 && dropped_y >= 0 ? dropped_y - first_y : content_h;
+        static const std::string kEllipsis = "\u2026";
+        const float ellipsis_w = text_.width(kEllipsis, fontOf(s));
+        const float avail = b.width - ellipsis_w;
+        // The last kept line: what fits before the ellipsis.
+        std::vector<Box::Fragment> last_line;
+        std::erase_if(out, [&](const Box::Fragment& f) {
+            if (f.line + 1 != keep) return false;
+            last_line.push_back(f);
+            return true;
+        });
+        out.reserve(out.size() + last_line.size() + 1);   // (last points into it)
+        const Box::Fragment* last = nullptr;
+        float at = 0;
+        for (Box::Fragment f : last_line) {
+            if (f.x + f.w <= avail) {
+                out.push_back(std::move(f));
+                last = &out.back();
+                at = last->x + last->w;
+                continue;
+            }
+            if (f.atomic || f.x >= avail) break;
+            const FontSpec font = fontOf(*f.style);
+            std::string kept;
+            for (size_t c = 0; c < f.text.size();) {
+                size_t n = 1;
+                const auto lead = static_cast<unsigned char>(f.text[c]);
+                if (lead >= 0xF0) n = 4;
+                else if (lead >= 0xE0) n = 3;
+                else if (lead >= 0xC0) n = 2;
+                const std::string next = kept + f.text.substr(c, n);
+                if (f.x + text_.width(next, font) > avail) break;
+                kept = next;
+                c += n;
+            }
+            if (!kept.empty()) {
+                f.text = kept;
+                f.w = text_.width(kept, font);
+                out.push_back(std::move(f));
+                last = &out.back();
+                at = last->x + last->w;
+            }
+            break;
+        }
+        if (!last_line.empty()) {
+            Box::Fragment e = last ? *last : last_line.front();
+            e.x = last ? at : 0;
+            e.w = ellipsis_w;
+            e.text = kEllipsis;
+            e.style = last ? last->style : &s;
+            e.atomic = nullptr;
+            e.background = Color{0, 0, 0, 0};
+            out.push_back(std::move(e));
+        }
+        b.fragments = std::move(out);
+        return std::min(content_h, bottom);
     }
 
     // Returns the height of the lines; fills b.fragments.

@@ -19,4 +19,13 @@ collapses spaces</p>
 <span style="border:2px solid #c00;background:#fee;padding:2px 6px">a bordered span that wraps over more than one line here</span> ok,
 <span style="background:#cdf;padding:4px">outer <i style="background:#fc9;border-radius:3px">inner</i> tail</span>.</p>
 <div><span style="display:inline-block;background:#eee"><a style="font-size:10.56px;padding:0 4.224px;border:1px solid #cc0;margin-left:2.64px">email</a></span> <span style="display:inline-block;background:#eee"><span style="padding-right:12px">trailing pad</span></span></div>
+
+<!-- -webkit-line-clamp in a vertical -webkit-box: so many lines, as tall as they are
+     (ppomppu.co.kr's titles ran over what's under them). -->
+<style>.lc{width:154px;font:13px/23px sans-serif;overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:1;background:#eef;margin:6px}.lc2{-webkit-line-clamp:2}.lcn{-webkit-box-orient:horizontal;display:block}</style>
+<div class=lc>Lorem ipsum dolor sit amet, consectetur</div>
+<div class="lc lc2">Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor</div>
+<div class="lc lc2">Short title</div>
+<div class="lc lcn">Not clamped because orient is horizontal so all lines show</div>
+<div class=lc>Next <b>bold words</b> and <i>more words in italics</i></div>
 </body></html>
