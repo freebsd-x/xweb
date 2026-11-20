@@ -1798,6 +1798,9 @@ public:
         // generations of kept storage: then everything's styled afresh, and let go).
         out_.index_id_ = index_kept_.get();
         out_.index_kept_ = index_kept_;
+        // (A :has() with nothing to tell its subject by would make every element an
+        // anchor, keyed by all that's under its parent: any change restyles all of it
+        // anyway, the keys costing a fifth more. So nothing kept for such a page.)
         out_.reusable_ = !has_any_anchor_;
         constexpr size_t kMaxKeptGenerations = 8;
         // XWEB_NO_STYLE_REUSE=1: everything styled afresh, for telling whether a wrong
@@ -4718,10 +4721,29 @@ private:
     // `subject`: the selector is (in) what a rule's subject must match, so a :has() in its
     // last compound is asked of the element being styled only. One anywhere else (`.a:has(.b)
     // .c`) is asked of an ancestor or a sibling for it: has_context_.
-    void noteHasAnchors(const ComplexSelector& sel, bool subject = true) {
+    // `outer`: the anchors of the compound this selector is an argument of, for one of
+    // :is(), :not() and the like, which are asked of that same element: a :has() whose own
+    // compound has nothing to tell it by has those (cnn.com's `.header__right:not(:has(…))`
+    // turned keeping styles off for the page, and each of its scripts' questions restyled
+    // all 3400 elements).
+    void noteHasAnchors(const ComplexSelector& sel, bool subject = true, const std::vector<uint64_t>* outer = nullptr) {
         for (size_t i = 0; i < sel.parts.size(); ++i) {
             const CompoundSelector& c = sel.parts[i];
             const bool is_subject = subject && i + 1 == sel.parts.size();
+            // This compound's own anchors (what any :has() in it, or in an :is() of it, can use).
+            std::vector<uint64_t> own;
+            for (const SimpleSelector& y : c.simple) {
+                if (y.kind == SimpleKind::Type) own.push_back(featureHash('t', y.name));
+                else if (y.kind == SimpleKind::Id) own.push_back(featureHash('i', y.name));
+                else if (y.kind == SimpleKind::Class) own.push_back(featureHash('c', y.name));
+                else if (y.kind == SimpleKind::Attribute && y.op == AttrOp::Equals && !y.case_insensitive)
+                    own.push_back(featureHash('v', lower(y.name) + '=' + y.value));
+                else if (y.kind == SimpleKind::Attribute) own.push_back(featureHash('a', lower(y.name)));
+                else continue;
+                break;
+            }
+            const bool last = i + 1 == sel.parts.size();
+            if (own.empty() && last && outer && !outer->empty()) own = *outer;
             for (const SimpleSelector& x : c.simple) {
                 if (x.kind == SimpleKind::PseudoClass && x.name == "has") {
                     uses_has_ = true;
@@ -4732,20 +4754,14 @@ private:
                     for (const bool context : {false, true}) {
                         if (context && is_subject) break;
                         auto& anchors = context ? has_context_anchors_ : has_anchors_;
+                        // A tag, ID, class or attribute it must have ([data-type=X]:has(...),
+                        // 11st.co.kr's: with nothing to tell its subject by, keeping styles
+                        // was off for the page, and each of its scripts' questions restyled
+                        // all 8800 elements), its own or its :is()'s compound's.
                         bool noted = false;
-                        for (const SimpleSelector& y : c.simple) {
-                            if (y.kind == SimpleKind::Type) anchors.insert(featureHash('t', y.name));
-                            else if (y.kind == SimpleKind::Id) anchors.insert(featureHash('i', y.name));
-                            else if (y.kind == SimpleKind::Class) anchors.insert(featureHash('c', y.name));
-                            // An attribute it must have ([data-type=X]:has(...), 11st.co.kr's): with
-                            // nothing to tell its subject by, keeping styles was off for the page,
-                            // and each of its scripts' questions restyled all 8800 elements.
-                            else if (y.kind == SimpleKind::Attribute && y.op == AttrOp::Equals && !y.case_insensitive)
-                                anchors.insert(featureHash('v', lower(y.name) + '=' + y.value));   // that value, only those
-                            else if (y.kind == SimpleKind::Attribute) anchors.insert(featureHash('a', lower(y.name)));
-                            else continue;
+                        if (!own.empty()) {
+                            anchors.insert(own.front());
                             noted = true;
-                            break;
                         }
                         if (!noted) (context ? has_context_ : has_any_anchor_) = true;
                     }
@@ -4755,7 +4771,8 @@ private:
                 const bool same = x.kind == SimpleKind::PseudoClass &&
                                   (x.name == "has" || x.name == "is" || x.name == "where" || x.name == "not" || x.name == "matches" ||
                                    x.name == "-webkit-any" || x.name == "-moz-any");
-                for (const ComplexSelector& a : x.args) noteHasAnchors(a, is_subject && same);
+                const bool same_element = same && x.name != "has";
+                for (const ComplexSelector& a : x.args) noteHasAnchors(a, is_subject && same, same_element ? &own : nullptr);
             }
         }
     }
