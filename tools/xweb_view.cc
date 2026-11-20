@@ -1596,7 +1596,31 @@ private:
         const auto [pw, ph] = rasterSize(op.w, op.h);
         char ptr[32];
         std::snprintf(ptr, sizeof ptr, "%p", static_cast<const void*>(op.node));
-        const std::string key = std::string("s:") + ptr + ":" + keyNum(pw) + "x" + keyNum(ph) + ":" + colorKey(op.color);
+        // What it is now, not only which element: a script changing it (a path's d, a
+        // class) was drawn as it had been. One with a <use> draws what it points to,
+        // anywhere in the page: drawn again whenever the page changes (donga.com's logo
+        // and icons, <use>s of a sprite its scripts put in later, never came).
+        uint64_t h = 1469598103934665603ull;
+        const auto mix = [&h](std::string_view v) {
+            for (const char c : v) h = (h ^ static_cast<unsigned char>(c)) * 1099511628211ull;
+            h = (h ^ 0xff) * 1099511628211ull;
+        };
+        bool uses = false;
+        std::vector<const web::Node*> todo{op.node};
+        while (!todo.empty()) {
+            const web::Node* n = todo.back();
+            todo.pop_back();
+            mix(n->name);
+            mix(n->data);
+            for (const auto& a : n->attrs) {
+                mix(a.name);
+                mix(a.value);
+            }
+            if (n->name == "use") uses = true;
+            todo.insert(todo.end(), n->children.begin(), n->children.end());
+        }
+        if (uses) h ^= change_gen_ * 0x9E3779B97F4A7C15ull;
+        const std::string key = std::string("s:") + ptr + ":" + keyNum(pw) + "x" + keyNum(ph) + ":" + colorKey(op.color) + ":" + std::to_string(h);
         const web::Node* node = op.node;
         const web::StyledDocument* styles = styles_.get();
         const web::Color color = op.color;
