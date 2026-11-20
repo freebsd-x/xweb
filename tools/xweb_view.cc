@@ -66,7 +66,7 @@ constexpr float kMaxWindowHeight = 8192;
 constexpr float kToolbarHeight = 44;
 constexpr float kChromiumButtonWidth = 136;
 constexpr size_t kMaxSheets = 256;          // stylesheets one page can make us fetch (theverge.com has 66)
-constexpr size_t kMaxImages = 256;
+constexpr size_t kMaxImages = 2048;          // (inven.co.kr: 256 thumbnails first, then no logo; memory is kMaxPagePixels's)
 constexpr size_t kImageWorkers = 4;
 constexpr uint64_t kMaxImagePixels = 40'000'000;     // one image
 constexpr uint64_t kMaxPagePixels = 120'000'000;     // all of a page's, about 480 MB
@@ -1042,6 +1042,26 @@ public:
         if (want("font-size")) out["font-size"] = px(s->font_size);
         if (want("font-weight")) out["font-weight"] = std::to_string(s->font_weight);
         if (want("font-family")) out["font-family"] = s->font_family;
+        if (want("background-image")) {
+            // Its layers as CSS says them (a page tests `!== "none"`, or reads the URL).
+            std::string v;
+            if (s->background_layers)
+                for (const web::BackgroundImage& i : s->background_layers->images) {
+                    if (!v.empty()) v += ", ";
+                    if (i.gradient) {
+                        std::string g = i.gradient->repeating ? "repeating-" : "";
+                        g += i.gradient->kind == web::Gradient::Kind::Radial ? "radial" : i.gradient->kind == web::Gradient::Kind::Conic ? "conic" : "linear";
+                        g += "-gradient(";
+                        for (size_t k = 0; k < i.gradient->stops.size(); ++k) g += (k ? ", " : "") + rgb(i.gradient->stops[k].color);
+                        v += g + ")";
+                    } else if (!i.url.empty()) {
+                        v += "url(\"" + i.url + "\")";
+                    } else {
+                        v += "none";
+                    }
+                }
+            out["background-image"] = v.empty() ? "none" : v;
+        }
         if (want("opacity")) out["opacity"] = std::to_string(s->opacity).substr(0, 4);
         if (want("z-index")) out["z-index"] = std::to_string(s->z_index);
         // Lengths as specified: px, or the percentage when that's what was said.
