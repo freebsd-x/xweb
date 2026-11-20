@@ -58,6 +58,8 @@ public:
         // with sheetLoaded), else whether it loaded. One a script links again, already
         // fetched, has its "load" all the same.
         std::function<std::optional<bool>(const std::string& url)> sheet_state;
+        // A fetched stylesheet's text by its absolute URL (a <link>'s sheet's cssRules).
+        std::function<std::optional<std::string>(const std::string& url)> sheet_text;
         // Shared: the same element's asked about again and again (a script's
         // getComputedStyle in a loop), so the host keeps it until styles change.
         std::function<std::shared_ptr<const std::unordered_map<std::string, std::string>>(const Node*)> computed_style;

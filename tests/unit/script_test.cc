@@ -1353,3 +1353,14 @@ TEST(Script, NoModuleSaysModulesRun) {
         </script>)");
     EXPECT_EQ(p.console, "log:true false false\nlog:true\n") << p.console;
 }
+
+TEST(Script, StyleSheetsListTheirRules) {
+    // A <style>'s sheet has its rules, as text; a sheet a script fills has those.
+    Page p(R"(<head><style>a { color: red } @media (min-width: 1px) { b { color: blue } } i{}</style><style id=e></style></head><body><script>
+        const s = document.styleSheets[0];
+        const e = document.getElementById('e').sheet;
+        e.insertRule('p { margin: 0 }', 0);
+        console.log(s.cssRules.length, s.cssRules[0].cssText, s.href, e.cssRules.length, e.cssRules[0].cssText);
+        </script>)");
+    EXPECT_EQ(p.console, "log:3 a { color: red } null 1 p { margin: 0 }\n") << p.console;
+}

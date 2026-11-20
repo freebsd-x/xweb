@@ -1049,7 +1049,12 @@ void PageScript::Impl::installDom() {
         self->dirty = true;
         return Value::undefined();
     });
-    accessor(sheet_proto, u"cssRules", [owner](Runtime& rt, const Value& t, Args) {
+    accessor(sheet_proto, u"href", [self, owner](Runtime&, const Value& t, Args) {
+        Node* n = owner(t);
+        const std::string* href = n && n->isHtml("link") ? n->attr("href") : nullptr;
+        return href ? Value::string(js::utf16(resolveUrl(self->host.base, *href))) : Value::null();
+    });
+    accessor(sheet_proto, u"cssRules", [self, owner](Runtime& rt, const Value& t, Args) {
         std::vector<Value> rules;
         const auto add = [&](std::u16string_view text) {
             while (!text.empty() && (text.front() == u' ' || text.front() == u'\n' || text.front() == u'\t' || text.front() == u'\r')) text.remove_prefix(1);
@@ -1058,12 +1063,9 @@ void PageScript::Impl::installDom() {
             rt.put(r, u"cssText", Value::string(std::u16string(text)), js::kEnumerable);
             rules.push_back(Value::object(r));
         };
-        if (Node* n = owner(t)) {
-            for (const std::string& css : n->adopted_css) add(js::utf16(css));
-        } else if (t.isObject() && t.asObject()->primitive.isString()) {
-            // A constructed sheet's text, rule by rule: split where a top-level block or
-            // statement ends (strings and comments don't count).
-            const std::u16string& css = t.asObject()->primitive.asString();
+        // A sheet's text, rule by rule: split where a top-level block or statement ends
+        // (strings and comments don't count).
+        const auto split = [&](const std::u16string& css) {
             size_t start = 0;
             int depth = 0;
             char16_t quote = 0;
@@ -1086,6 +1088,19 @@ void PageScript::Impl::installDom() {
                 else if (c == u'}' && depth > 0 && --depth == 0) { add(std::u16string_view(css).substr(start, i + 1 - start)); start = i + 1; }
                 else if (c == u';' && depth == 0) { add(std::u16string_view(css).substr(start, i + 1 - start)); start = i + 1; }
             }
+        };
+        if (Node* n = owner(t)) {
+            // Rules a script put in; else the <style>'s own text, or the <link>'s sheet's
+            // (no rules at all was each page's sheets to a script reading them).
+            if (!n->adopted_css.empty()) {
+                for (const std::string& css : n->adopted_css) add(js::utf16(css));
+            } else if (n->isHtml("style")) {
+                split(js::utf16(n->textContent()));
+            } else if (const std::string* href = n->isHtml("link") ? n->attr("href") : nullptr; href && self->host.sheet_text) {
+                if (const auto text = self->host.sheet_text(resolveUrl(self->host.base, *href))) split(js::utf16(*text));
+            }
+        } else if (t.isObject() && t.asObject()->primitive.isString()) {
+            split(t.asObject()->primitive.asString());
         }
         return Value::object(rt.newArray(std::move(rules)));
     });

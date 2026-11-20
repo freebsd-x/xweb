@@ -2438,6 +2438,11 @@ private:
             if (it == page->sheets.end()) return std::nullopt;
             return true;   // (one that failed is kept empty: a stylesheet with nothing in it)
         };
+        host.sheet_text = [page = page.get()](const std::string& url) -> std::optional<std::string> {
+            const auto it = page->sheets.find(url);
+            if (it == page->sheets.end()) return std::nullopt;
+            return it->second;
+        };
         host.image_state = [page = page.get()](const std::string& url) {
             web::PageScript::Host::ImageState st;
             if (const auto it = page->images.find(url); it != page->images.end()) {
