@@ -1433,21 +1433,51 @@ private:
     // the parentheses, or no "=>" after the ")"), true when it may. Trying each "(" as
     // parameters, throwing when it wasn't, was a third of loading YouTube (C++ exceptions
     // unwinding the parser's stack). Leaves the lexer where it was.
+    // (Past the first 256 tokens it scans on to the ")", noting which "(" inside are
+    // surely not parameters either, so that each is looked at once: minified code's long
+    // `(a=…,b=…,c=f(…))` groups were each tried as parameters, failing late, and the
+    // groups inside them again for each try: theverge.com's ad script hung the browser.)
     bool mayBeArrowParams() {
+        if (const auto it = not_arrow_.find(cur_.begin); it != not_arrow_.end()) return false;
         const size_t pos = lex_.pos();
         const uint32_t line = lex_.line();
         const std::string saved_error = lex_.error;
         constexpr int kLook = 256;
+        constexpr int kScanMax = 4'000'000;
         int depth = 1;
         bool in_default = false;   // after a parameter's "=": any expression, up to its ","
         bool answer = true;        // (can't tell: may be)
-        for (int n = 0; n < kLook; ++n) {
+        std::vector<int64_t> opens;   // the "(" (their offsets) and other brackets (-1) open inside
+        int64_t closed = -1;          // a "(" inside just closed: is "=>" next?
+        for (int n = 0; n < kScanMax; ++n) {
             const Token t = lex_.next(false);
             if (!lex_.error.empty() || t.type == Tok::Eof || t.type == Tok::Template || t.type == Tok::Regex) break;
             const std::u16string& v = t.value;
             const bool punct = t.type == Tok::Punct;
+            if (closed >= 0) {
+                if (!(punct && v == u"=>" && !t.newline_before)) not_arrow_.insert(static_cast<uint32_t>(closed));
+                closed = -1;
+            }
             if (punct && v == u"/") break;   // division or a regex: lexed without knowing which
             if (punct && v == u"/=") break;
+            if (n >= kLook) {
+                // Only the brackets, now, to the ")".
+                if (punct && (v == u"(" || v == u"[" || v == u"{")) {
+                    ++depth;
+                    opens.push_back(v == u"(" ? static_cast<int64_t>(t.begin) : -1);
+                } else if (punct && (v == u")" || v == u"]" || v == u"}")) {
+                    if (--depth == 0) {
+                        const Token after = lex_.next(false);
+                        answer = lex_.error.empty() && after.type == Tok::Punct && after.value == u"=>" && !after.newline_before;
+                        break;
+                    }
+                    if (!opens.empty()) {
+                        closed = opens.back();
+                        opens.pop_back();
+                    }
+                }
+                continue;
+            }
             if (depth == 1 && !in_default) {
                 // Straight inside: names, patterns, rest, defaults, commas.
                 const bool ok = t.type == Tok::Identifier || (punct && (v == u"," || v == u"..." || v == u"[" || v == u"{" || v == u"=" || v == u")"));
@@ -1458,11 +1488,16 @@ private:
             }
             if (punct && (v == u"(" || v == u"[" || v == u"{")) {
                 ++depth;
+                opens.push_back(v == u"(" ? static_cast<int64_t>(t.begin) : -1);
             } else if (punct && (v == u")" || v == u"]" || v == u"}")) {
                 if (--depth == 0) {
                     const Token after = lex_.next(false);
                     answer = lex_.error.empty() && after.type == Tok::Punct && after.value == u"=>" && !after.newline_before;
                     break;
+                }
+                if (!opens.empty()) {
+                    closed = opens.back();
+                    opens.pop_back();
                 }
             } else if (depth == 1 && punct && v == u"=") {
                 in_default = true;
@@ -2228,6 +2263,7 @@ private:
     bool static_await_ = false;        // ...and not in an arrow's body: no await as a name
     FunctionInfo* static_block_fn_ = nullptr;   // that block's own function: return isn't allowed in it
     bool in_params_ = false;           // in a function's parameters (no yield or await expressions)
+    std::unordered_set<uint32_t> not_arrow_;   // "("s (their offsets) no "=>" follows (mayBeArrowParams)
     int loop_depth_ = 0;
     int breakable_depth_ = 0;
     std::vector<std::u16string> labels_;

@@ -1837,8 +1837,8 @@ void PageScript::run(const std::function<std::optional<std::string>(const std::s
     s.ready_state = "complete";
     s.fire(s.doc.root(), u"readystatechange", false, false);
     s.fire(nullptr, u"load", false, false);
-    // XWEB_PROBE=<expression>: for finding what a page is up to, its value 15 seconds on,
-    // as a console line.
+    // XWEB_PROBE=<expression>: for finding what a page is up to, its value 15 seconds on
+    // (XWEB_PROBE_MS: so many milliseconds), as a console line.
     if (const char* probe = std::getenv("XWEB_PROBE")) {
         std::string quoted = "\"";
         for (const char c : std::string(probe)) {
@@ -1853,7 +1853,8 @@ void PageScript::run(const std::function<std::optional<std::string>(const std::s
             return Value::undefined();
         });
         (void)s.rt.evaluate("setTimeout(function () { try { __xwebProbe('probe: ' + String((0, eval)(" + quoted +
-                                "))); } catch (e) { __xwebProbe('probe threw: ' + e); } }, 15000);",
+                                "))); } catch (e) { __xwebProbe('probe threw: ' + e); } }, " +
+                                std::string(std::getenv("XWEB_PROBE_MS") ? std::getenv("XWEB_PROBE_MS") : "15000") + ");",
                             "probe");
     }
     s.collect();

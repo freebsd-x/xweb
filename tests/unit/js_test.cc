@@ -822,3 +822,21 @@ TEST(Js, FastPathsKeepTheirSemantics) {
     EXPECT_EQ(run("var f = Object.freeze([1, 2]); f[0] = 9; f[1] += 5; f.join()"), "1,2");
     EXPECT_EQ(run("'use strict'; var g = Object.freeze([1]); var r; try { g[0] = 2; } catch (e) { r = e.name; } r"), "TypeError");
 }
+
+TEST(Js, LongParenthesizedGroupsParseOnce) {
+    // Groups past the arrow look-ahead's first 256 tokens, nested: each was tried as arrow
+    // parameters, and the ones inside again for each try (exponential: a hang).
+    std::string g = "0";
+    for (int d = 0; d < 25; ++d) {
+        std::string group = "(x=1,";
+        for (int i = 0; i < 140; ++i) group += "y=2,";
+        g = group + "z=" + g + ")";
+    }
+    EXPECT_EQ(run("var x, y, z; var r = " + g + "; r"), "0");
+    // Arrows still found inside and after such groups.
+    std::string arrows = "var f = (a = (";
+    for (int i = 0; i < 300; ++i) arrows += "1,";
+    arrows += "2), b = (c, d) => c + d) => a + b(3, 4); f()";
+    EXPECT_EQ(run(arrows), "9");
+    EXPECT_EQ(run("var k = ((p) => (q) => p * q)(6)(7); k"), "42");
+}
