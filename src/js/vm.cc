@@ -111,6 +111,9 @@ enum Opc : uint32_t {
     OpIterClose,     // it                  : closed, if it isn't done
     OpIterCloseFin,  // it kind             : at a finally: closed, its errors dropped if one is on its way
     OpObjRest,       // d s used            : s's own enumerable properties but the keys in the array `used`
+    OpPushEnv,       // i                   : a block's scope (block_envs[i]'s names), for what closures see of it
+    OpPopEnv,        //                     : back out of it
+    OpCopyEnv,       //                     : a for (let ...) loop's next turn: a copy of this turn's
     OpCount,
 };
 
@@ -126,6 +129,7 @@ struct VmCode {
     std::vector<Node*> nodes;
     struct Handler {
         uint32_t start, end, target, reg;
+        uint32_t env_depth = 0;   // how many block scopes deep its target is
     };
     std::vector<Handler> handlers;   // innermost first
     std::vector<uint32_t> stubs;     // where a finally's jumps out go on
@@ -140,6 +144,7 @@ struct VmCode {
         bool is_const;
     };
     std::vector<EnvName> env_names;
+    std::vector<std::vector<EnvName>> block_envs;
 };
 
 namespace {
@@ -167,6 +172,7 @@ public:
         if (direct_eval_) fail("direct eval");
         code_->needs_env = makes_functions_;
         scopes_.emplace_back();
+        scope_env_.push_back(-1);
         if (!f.simple_params) {
             params();
         } else {
@@ -182,7 +188,7 @@ public:
             Local& l = scopes_.back()[f.params[i]->str];
             if (l.reg != i || !captured(f.params[i]->str)) continue;   // (a repeated name's earlier one)
             l.slot = envSlot(f.params[i]->str, false, false);
-            emit(OpInitCap, {static_cast<uint32_t>(l.slot), static_cast<uint32_t>(i)});
+            emit(OpInitCap, {capArg(l), static_cast<uint32_t>(i)});
         }
         }
         // arguments (not an arrow's: that's its enclosing function's, found by name).
@@ -191,7 +197,7 @@ public:
             if (l.slot >= 0) {
                 const uint32_t t = temp();
                 emit(OpArguments, {t});
-                emit(OpInitCap, {static_cast<uint32_t>(l.slot), t});
+                emit(OpInitCap, {capArg(l), t});
                 next_ = floor_;
             } else {
                 emit(OpArguments, {l.reg});
@@ -204,7 +210,7 @@ public:
             Local& l = scopes_.back().count(d->str) ? scopes_.back()[d->str] : declareVar(d->str);
             const uint32_t t = temp();
             emit(OpClosure, {t, node(d)});
-            if (l.slot >= 0) emit(OpInitCap, {static_cast<uint32_t>(l.slot), t});
+            if (l.slot >= 0) emit(OpInitCap, {capArg(l), t});
             else emit(OpMov, {l.reg, t});
             next_ = floor_;
         }
@@ -226,6 +232,7 @@ public:
         // A finally's jumps out, each on to the next finally or to where it was going.
         for (const Stub& s : stubs_) {
             code_->stubs.push_back(here());
+            for (uint32_t i = 0; i < s.pops; ++i) emit(OpPopEnv, {});
             if (s.next_finally) {
                 emit(OpInt, {s.next_kind_reg, static_cast<uint32_t>(s.next_kind)});
                 if (s.next_finally->start == kNone) fail("finally not placed");
@@ -246,8 +253,20 @@ private:
         uint32_t reg;
         bool lexical;   // let, const: has a dead zone
         bool is_const;
-        int slot = -1;  // kept in the function's scope (a nested function may see it): its place there
+        int slot = -1;  // kept in a scope (a nested function may see it): its place there
+        uint32_t env_depth = 0;   // which scope: the function's (0), or a block's that deep
     };
+    // A scope variable's operand: how many scopes out from where it's used, and its place.
+    uint32_t capArg(const Local& l) const {
+        const uint32_t hops = env_depth_ - l.env_depth;
+        if (hops > 255 || l.slot > 0xFFFFFF) throw Unsupported{"scopes too deep"};
+        return (hops << 24) | static_cast<uint32_t>(l.slot);
+    }
+    // Leaving block scopes down to depth `to`, on a jump away (the code after it is still
+    // at this depth).
+    void popEnvsKeep(uint32_t to) {
+        for (uint32_t d = env_depth_; d > to; --d) emit(OpPopEnv, {});
+    }
 
     // Parameters with patterns, defaults or a rest: argument i in register i, then each
     // bound in turn to its names, which are in their dead zone until then (`(a = b, b)`
@@ -348,6 +367,7 @@ private:
     struct Finally;
     // A jump out through finally blocks: from a finally to the next, or to its target.
     struct Stub {
+        uint32_t pops = 0;   // block scopes to leave on the way
         Finally* next_finally = nullptr;
         uint32_t next_kind_reg = 0;
         int next_kind = 0;
@@ -355,6 +375,7 @@ private:
     };
     struct Finally {
         uint32_t kind_reg, val_reg;
+        uint32_t env_depth = 0;
         std::vector<uint32_t> starts;   // jumps to its start, filled in when it's placed
         uint32_t start = kNone;
     };
@@ -367,6 +388,8 @@ private:
         Label* cont = nullptr;
         size_t finally_depth = 0;
         size_t cont_depth = SIZE_MAX;   // a continue's, when it's inside a finally of the loop's own (for-of)
+        uint32_t env_depth = 0;          // block scopes at its break target
+        uint32_t cont_env_depth = 0;     // and at its continue target
     };
 
     [[noreturn]] void fail(const char* why) { throw Unsupported{why}; }
@@ -434,9 +457,11 @@ private:
     }
 
     // A block's let, const (and their dead zones): registers of their own, below any temp.
-    void enterLexical(const std::vector<std::u16string>* names, const std::vector<Node*>& stmts, bool top = false) {
+    // Returns the block scope it made (an index in block_envs; it's entered now), or -1.
+    int enterLexical(const std::vector<std::u16string>* names, const std::vector<Node*>& stmts, bool top = false) {
         scopes_.emplace_back();
-        if (!names) return;
+        scope_env_.push_back(-1);
+        if (!names) return -1;
         std::unordered_set<std::u16string> consts;
         for (Node* s : stmts)
             if (s && s->kind == N::VarDecl && (s->flags & kConst))
@@ -451,17 +476,41 @@ private:
             floor_ = next_;
             Local l{r, true, consts.count(name) != 0};
             if (captured(name)) {
-                // (A block's, seen by a closure: each pass through the block, or each turn
-                // of a loop, would need a scope of its own. Not yet.)
-                if (!top) fail("a block's let or const seen by a nested function");
-                l.slot = envSlot(name, true, l.is_const);   // in its dead zone from the start
+                if (top) {
+                    l.slot = envSlot(name, true, l.is_const);   // in its dead zone from the start
+                } else {
+                    // A block's, seen by a closure: a scope of the block's own, made each
+                    // time it's entered.
+                    if (scope_env_.back() < 0) {
+                        code_->needs_env = true;
+                        code_->block_envs.emplace_back();
+                        scope_env_.back() = static_cast<int>(code_->block_envs.size() - 1);
+                    }
+                    auto& list = code_->block_envs[static_cast<size_t>(scope_env_.back())];
+                    l.slot = static_cast<int>(list.size());
+                    l.env_depth = env_depth_ + 1;
+                    list.push_back({name, true, l.is_const});
+                }
             } else {
                 emit(OpEmpty, {r});
             }
             scopes_.back()[name] = l;
         }
+        if (scope_env_.back() >= 0) {
+            emit(OpPushEnv, {static_cast<uint32_t>(scope_env_.back())});
+            ++env_depth_;
+        }
+        return scope_env_.back();
     }
-    void leaveLexical() { scopes_.pop_back(); }
+    // `popped`: its block scope was left already (a for-in/of's, entered each turn).
+    void leaveLexical(bool popped = false) {
+        if (scope_env_.back() >= 0 && !popped) {
+            emit(OpPopEnv, {});
+            --env_depth_;
+        }
+        scopes_.pop_back();
+        scope_env_.pop_back();
+    }
     // A for-in/of head's const names.
     void markConst(Node* n) {
         if (!(n->flags & kConst)) return;
@@ -572,7 +621,7 @@ private:
 
     // A declaration's value into its variable (out of its dead zone, for a let or const).
     void initLocal(const Local& l, uint32_t v) {
-        if (l.slot >= 0) emit(OpInitCap, {static_cast<uint32_t>(l.slot), v});
+        if (l.slot >= 0) emit(OpInitCap, {capArg(l), v});
         else if (l.reg != v) emit(OpMov, {l.reg, v});
     }
 
@@ -595,8 +644,8 @@ private:
                 const uint32_t t = temp();
                 if (d->b) expr(d->b, t);
                 else emit(OpUndef, {t});
-                if (lexical) emit(OpInitCap, {static_cast<uint32_t>(l->slot), t});
-                else emit(OpStoreCap, {static_cast<uint32_t>(l->slot), t, node(d->a)});
+                if (lexical) emit(OpInitCap, {capArg(*l), t});
+                else emit(OpStoreCap, {capArg(*l), t, node(d->a)});
                 continue;
             }
             if (d->b) {
@@ -615,6 +664,7 @@ private:
         t.brk = newLabel();
         t.cont = t.loop ? newLabel() : nullptr;
         t.finally_depth = finallies_.size();
+        t.env_depth = t.cont_env_depth = env_depth_;
         switch (n->kind) {
             case N::While: {
                 site(n);
@@ -646,12 +696,16 @@ private:
             }
             case N::For: {
                 site(n);
-                enterLexical(n->lexical, {n->a});
+                const bool own = enterLexical(n->lexical, {n->a}) >= 0;
+                t.env_depth = t.cont_env_depth = env_depth_;
                 if (n->a) {
                     TempMark m(*this);
                     if (n->a->kind == N::VarDecl) declare(n->a);
                     else (void)value(n->a, true);
                 }
+                // Each turn its own copy of the loop's scope (closures made in one turn
+                // keep that turn's values).
+                if (own) emit(OpCopyEnv, {});
                 Label* top = newLabel();
                 place(top);
                 if (n->b) {
@@ -664,6 +718,7 @@ private:
                 targets_.pop_back();
                 place(t.cont);
                 emit(OpLoop, {});
+                if (own) emit(OpCopyEnv, {});
                 if (n->c) {
                     TempMark m(*this);
                     (void)value(n->c, true);
@@ -681,7 +736,7 @@ private:
                     fail("for-in target");
                 // Its own scope for a let or const name, in its dead zone while the
                 // subject is worked out.
-                enterLexical(n->lexical, {});
+                const int own = enterLexical(n->lexical, {});
                 markConst(n);
                 const uint32_t it = temp();
                 floor_ = std::max(floor_, next_);   // (lives for the whole loop)
@@ -689,35 +744,54 @@ private:
                     TempMark m(*this);
                     emit(OpForInPrep, {it, value(n->b)});
                 }
+                // (Its scope, if it has one: the dead zone's while the subject was worked
+                // out; then a new one each turn.)
+                if (own >= 0) {
+                    emit(OpPopEnv, {});
+                    --env_depth_;
+                }
                 Label* top = newLabel();
                 place(top);
                 {
                     TempMark m(*this);
                     const uint32_t key = temp();
                     patchTo(jumpFwd(OpForInNext, {it, key}), t.brk);
+                    if (own >= 0) {
+                        emit(OpPushEnv, {static_cast<uint32_t>(own)});
+                        ++env_depth_;
+                    }
+                    t.cont_env_depth = env_depth_;
                     bindPattern(n->a, key, (decl & (kLet | kConst)) ? Bind::Let : decl ? Bind::Var : Bind::Assign);
                 }
                 targets_.push_back(t);
                 stmt(n->c);
                 targets_.pop_back();
                 place(t.cont);
+                if (own >= 0) {
+                    emit(OpPopEnv, {});
+                    --env_depth_;
+                }
                 emit(OpLoop, {});
                 patchTo(jumpFwd(OpJump), top);
                 place(t.brk);
-                leaveLexical();
+                leaveLexical(true);
                 return;
             }
             case N::ForOf: {
                 site(n);
                 if (n->flags & kAwait) fail("for await");
                 const uint32_t decl = n->flags & (kVar | kLet | kConst);
-                enterLexical(n->lexical, {});
+                const int own = enterLexical(n->lexical, {});
                 markConst(n);
                 const uint32_t it = temp();
                 floor_ = std::max(floor_, next_);
                 {
                     TempMark m(*this);
                     emit(OpIterGet, {it, value(n->b)});
+                }
+                if (own >= 0) {
+                    emit(OpPopEnv, {});
+                    --env_depth_;
                 }
                 // The loop inside a finally that closes the iterator when it's left early
                 // (a break, a return, a throw); a break's target is past the finally.
@@ -732,19 +806,28 @@ private:
                     TempMark m(*this);
                     const uint32_t v = temp();
                     patchTo(jumpFwd(OpIterNext, {it, v}), exhausted);
+                    if (own >= 0) {
+                        emit(OpPushEnv, {static_cast<uint32_t>(own)});
+                        ++env_depth_;
+                    }
+                    t.cont_env_depth = env_depth_;
                     bindPattern(n->a, v, (decl & (kLet | kConst)) ? Bind::Let : decl ? Bind::Var : Bind::Assign);
                 }
                 targets_.push_back(t);
                 stmt(n->c);
                 targets_.pop_back();
                 place(t.cont);
+                if (own >= 0) {
+                    emit(OpPopEnv, {});
+                    --env_depth_;
+                }
                 emit(OpLoop, {});
                 patchTo(jumpFwd(OpJump), top);
                 place(exhausted);
                 const uint32_t end = here();
                 finishFinally(fin, start, end, [&] { emit(OpIterCloseFin, {it, fin->kind_reg}); });
                 place(t.brk);
-                leaveLexical();
+                leaveLexical(true);
                 return;
             }
             case N::Switch: {
@@ -755,6 +838,7 @@ private:
                 std::vector<Node*> all;
                 for (Node* c : n->kids) all.insert(all.end(), c->kids.begin(), c->kids.end());
                 enterLexical(n->lexical, all);
+                t.env_depth = env_depth_;   // (its break target is inside its scope, left after)
                 std::vector<Label*> bodies;
                 for (size_t i = 0; i < n->kids.size(); ++i) bodies.push_back(newLabel());
                 for (size_t i = 0; i < n->kids.size(); ++i) {
@@ -776,8 +860,8 @@ private:
                     for (Node* s : n->kids[i]->kids) stmt(s);
                 }
                 targets_.pop_back();
-                leaveLexical();
                 place(t.brk);
+                leaveLexical();
                 return;
             }
             default: fail("loop");
@@ -804,7 +888,9 @@ private:
         if (!t) fail("break or continue target");
         Label* dest = is_break ? t->brk : t->cont;
         const size_t depth = !is_break && t->cont_depth != SIZE_MAX ? t->cont_depth : t->finally_depth;
+        const uint32_t dest_env = is_break ? t->env_depth : t->cont_env_depth;
         if (finallies_.size() == depth) {
+            popEnvsKeep(dest_env);
             patchTo(jumpFwd(OpJump), dest);
             return;
         }
@@ -818,14 +904,17 @@ private:
                 s.next_finally = next_f;
                 s.next_kind_reg = next_f->kind_reg;
                 s.next_kind = next_kind;
+                s.pops = f->env_depth - next_f->env_depth;
             } else {
                 s.target_label = dest;
+                s.pops = f->env_depth - dest_env;
             }
             stubs_.push_back(s);
             next_kind = kFinJumps + static_cast<int>(stubs_.size() - 1);
             next_f = f;
         }
         // next_f is now the innermost finally, next_kind its kind.
+        popEnvsKeep(next_f->env_depth);
         emit(OpInt, {next_f->kind_reg, static_cast<uint32_t>(next_kind)});
         next_f->starts.push_back(jumpFwd(OpJump));
     }
@@ -836,6 +925,7 @@ private:
             return;
         }
         Finally* f = finallies_.back();
+        popEnvsKeep(f->env_depth);
         emit(OpMov, {f->val_reg, r});
         emit(OpInt, {f->kind_reg, kFinReturn});
         f->starts.push_back(jumpFwd(OpJump));
@@ -846,6 +936,7 @@ private:
         owned_finallies_.emplace_back(fin);
         fin->kind_reg = temp();
         fin->val_reg = temp();
+        fin->env_depth = env_depth_;
         floor_ = std::max(floor_, next_);
         finallies_.push_back(fin);
         return fin;
@@ -861,7 +952,7 @@ private:
         // A throw in the region: kept, through the finally, thrown again.
         const uint32_t throw_entry = here();
         emit(OpInt, {fin->kind_reg, kFinThrow});
-        code_->handlers.push_back({start, end, throw_entry, fin->val_reg});
+        code_->handlers.push_back({start, end, throw_entry, fin->val_reg, fin->env_depth});
         patchHere(to_fin);
         fin->start = here();
         for (uint32_t s : fin->starts) code_->ops[s] = fin->start;
@@ -874,8 +965,9 @@ private:
             emit(OpEndFinally, {fin->kind_reg, fin->val_reg, outer->kind_reg, outer->val_reg});
             outer->starts.push_back(here());
             code_->ops.push_back(kNone);
+            code_->ops.push_back(fin->env_depth - outer->env_depth);
         } else {
-            emit(OpEndFinally, {fin->kind_reg, fin->val_reg, kNone, kNone, kNone});
+            emit(OpEndFinally, {fin->kind_reg, fin->val_reg, kNone, kNone, kNone, 0});
         }
     }
 
@@ -890,20 +982,21 @@ private:
             const uint32_t exc = temp();
             floor_ = std::max(floor_, next_);
             const uint32_t handler = here();
-            if (n->b && n->b->kind == N::Identifier) {
-                if (captured(n->b->str)) fail("a catch name seen by a nested function");
+            if (n->b && n->b->kind == N::Identifier && !captured(n->b->str)) {
                 scopes_.emplace_back();
+                scope_env_.push_back(-1);
                 scopes_.back()[n->b->str] = Local{exc, false, false};
             } else if (n->b) {
-                // A pattern: its names, a scope of their own, bound from the exception.
+                // A pattern, or a name a closure sees: its names in a scope of their own,
+                // bound from the exception.
                 std::vector<std::u16string> names;
                 patternNames(n->b, names);
                 enterLexical(&names, {});
                 bindPattern(n->b, exc, Bind::Let);
             }
             stmt(n->c);
-            if (n->b) scopes_.pop_back();
-            code_->handlers.push_back({try_start, try_end, handler, exc});
+            if (n->b) leaveLexical();
+            code_->handlers.push_back({try_start, try_end, handler, exc, env_depth_});
             catch_end = here();
         }
         patchHere(to_after);
@@ -1007,7 +1100,7 @@ private:
                 const uint32_t handler = here();
                 emit(OpIterCloseFin, {it, kNone});
                 emit(OpThrow, {exc});
-                code_->handlers.push_back({start, end, handler, exc});
+                code_->handlers.push_back({start, end, handler, exc, env_depth_});
                 patchHere(past);
                 return;
             }
@@ -1269,7 +1362,7 @@ private:
 
     void loadName(Node* n, uint32_t dst) {
         if (const Local* l = findLocal(n->str)) {
-            if (l->slot >= 0) emit(OpLoadCap, {dst, static_cast<uint32_t>(l->slot), node(n)});
+            if (l->slot >= 0) emit(OpLoadCap, {dst, capArg(*l), node(n)});
             else if (l->lexical) emit(OpLoadLex, {dst, l->reg, node(n)});
             else if (l->reg != dst) emit(OpMov, {dst, l->reg});
             return;
@@ -1300,11 +1393,11 @@ private:
             if (l->slot >= 0) {
                 if (l->is_const) {
                     const uint32_t x = temp();
-                    emit(OpLoadCap, {x, static_cast<uint32_t>(l->slot), node(t)});   // (its dead zone first)
+                    emit(OpLoadCap, {x, capArg(*l), node(t)});   // (its dead zone first)
                     emit(OpThrowConst, {node(t)});
                     return;
                 }
-                emit(OpStoreCap, {static_cast<uint32_t>(l->slot), v, node(t)});
+                emit(OpStoreCap, {capArg(*l), v, node(t)});
                 return;
             }
             if (l->is_const) {
@@ -1354,9 +1447,9 @@ private:
             const Local* l = findLocal(t->str);
             if (l && l->slot >= 0 && !l->is_const && n->op == Op::Add) {
                 const uint32_t old = temp();
-                emit(OpLoadCap, {old, static_cast<uint32_t>(l->slot), node(t)});
+                emit(OpLoadCap, {old, capArg(*l), node(t)});
                 const uint32_t r = value(n->b);
-                emit(OpAppendCap, {dst, static_cast<uint32_t>(l->slot), old, r});
+                emit(OpAppendCap, {dst, capArg(*l), old, r});
                 return;
             }
             if (l && !l->lexical && l->slot < 0 && !logical) {
@@ -1639,6 +1732,8 @@ private:
     std::vector<Target> targets_;
     Label* short_ = nullptr;
     std::unordered_set<std::u16string> seen_inside_;
+    std::vector<int> scope_env_;   // each scope's block scope (block_envs), or -1
+    uint32_t env_depth_ = 0;
     bool makes_functions_ = false;
     bool direct_eval_ = false;
     int survey_depth_ = 0;
@@ -1750,7 +1845,17 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
         }
         rt_.env_stack.back() = env;   // (the closure is reachable from it)
     }
-    const auto cap = [&](uint32_t slot) -> Binding& { return env->vars.entryAt(slot)->second; };
+    uint32_t edepth = 0;   // block scopes entered (env is that many in from the function's)
+    // A scope variable: so many scopes out, at its place there.
+    const auto cap = [&](uint32_t arg) -> Binding& {
+        Env* e = env;
+        for (uint32_t hops = arg >> 24; hops > 0; --hops) e = e->outer;
+        return e->vars.entryAt(arg & 0xFFFFFF)->second;
+    };
+    const auto setEnv = [&](Env* e) {
+        env = e;
+        rt_.env_stack.back() = e;
+    };
     // An iterator record, kept in a register as an internal object: the iterator and its
     // next method and a string's characters in its slots, an array read directly in
     // `target`, the place in `cursor`, done/async/wrapped in iter_kind's bits.
@@ -2156,7 +2261,7 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                     case OpEndFinally: {
                         const int kind = static_cast<int>(r[o[1]].asNumber());
                         if (kind == kFinNormal) {
-                            pc += 6;
+                            pc += 7;
                             break;
                         }
                         if (kind == kFinThrow) throw Thrown{r[o[2]]};
@@ -2167,6 +2272,10 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                             }
                             r[o[4]] = r[o[2]];
                             r[o[3]] = Value::number(kFinReturn);
+                            for (uint32_t i = 0; i < o[6]; ++i) {
+                                setEnv(env->outer);
+                                --edepth;
+                            }
                             pc = o[5];
                             break;
                         }
@@ -2229,7 +2338,7 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                         Binding& b = cap(o[2]);
                         Value& old = r[o[3]];
                         const Value& rhs = r[o[4]];
-                        if (!b.initialized) rt_.throwError("ReferenceError", "can't use '" + utf8(code.env_names[o[2]].name) + "' before it's declared");
+                        if (!b.initialized) rt_.throwError("ReferenceError", "can't use a variable before it's declared");
                         if (rhs.isString() && b.value.isString() && b.value.sameString(old)) {
                             old = Value();
                             if (b.value.stringUnshared()) {
@@ -2285,6 +2394,25 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                             obj->define(key, {Value::object(fn)});
                         }
                         pc += 4;
+                        break;
+                    }
+                    case OpPushEnv: {
+                        Env* b = rt_.allocate<Env>(env);
+                        const auto& names = code.block_envs[o[1]];
+                        b->vars.reserve(names.size());
+                        for (const VmCode::EnvName& e : names)
+                            b->vars.bind(e.name, VarMap::hashOf(e.name)) = Binding{Value::undefined(), !e.is_const, false};
+                        setEnv(b);
+                        ++edepth;
+                        pc += 2;
+                        break;
+                    }
+                    case OpPopEnv: setEnv(env->outer); --edepth; pc += 1; break;
+                    case OpCopyEnv: {
+                        Env* c = rt_.allocate<Env>(env->outer);
+                        c->vars = env->vars;
+                        setEnv(c);
+                        pc += 1;
                         break;
                     }
                     case OpRestArgs: {
@@ -2414,6 +2542,11 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
             pc = h->target;
             caught = true;
             r[h->reg] = exception;
+            // Out of the block scopes entered since.
+            while (edepth > h->env_depth) {
+                setEnv(env->outer);
+                --edepth;
+            }
         }
         (void)caught;
     }
