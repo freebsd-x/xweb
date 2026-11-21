@@ -114,6 +114,10 @@ enum Opc : uint32_t {
     OpPushEnv,       // i                   : a block's scope (block_envs[i]'s names), for what closures see of it
     OpPopEnv,        //                     : back out of it
     OpCopyEnv,       //                     : a for (let ...) loop's next turn: a copy of this turn's
+    OpSuperGet,      // d n k               : super.name (k none) or super[k], with this as receiver
+    OpSuperSet,      // n k v
+    OpSuperCall,     // d start argc arr    : super(...) in a derived constructor (arr: a spread's array, or none)
+    OpNewTarget,     // d
     OpCount,
 };
 
@@ -161,7 +165,6 @@ public:
         FunctionInfo& f = *info_;
         if (f.is_async || f.is_generator) fail("async or generator");
         if (f.own_arguments) fail("f.arguments");
-        if (f.is_class_constructor || f.derived || !f.fields.empty()) fail("class constructor");
         if (f.params.size() > 255) fail("too many parameters");
         // What nested functions and classes may see of this one's variables: every name
         // used anywhere inside them (more than they need, never less).
@@ -1288,8 +1291,13 @@ private:
                 return;
             }
             case N::Member: {
-                if (n->a->kind == N::Super) fail("super");
                 TempMark m(*this);
+                if (n->a->kind == N::Super) {
+                    if (n->flags & kComputed) emit(OpLoadThis, {temp()});   // (this first: super[super()] throws)
+                    const uint32_t k = (n->flags & kComputed) ? value(n->b) : kNone;
+                    emit(OpSuperGet, {dst, node(n), k});
+                    return;
+                }
                 const uint32_t o = value(n->a, false, {n->b});
                 if (n->flags & kOptional) shortIfNullish(o);
                 if (n->flags & kComputed) {
@@ -1327,7 +1335,8 @@ private:
             case N::FunctionExpr: case N::Arrow: emit(OpClosure, {dst, node(n)}); return;
             case N::ClassExpr: emit(OpClass, {dst, node(n)}); return;
             case N::TaggedTemplate: fail("tagged template");
-            case N::Super: case N::NewTarget: fail("super or new.target");
+            case N::NewTarget: emit(OpNewTarget, {dst}); return;
+            case N::Super: fail("super");
             case N::Yield: case N::Await: fail("yield or await");
             case N::ImportCall: case N::ImportMeta: fail("import");
             default: fail("an expression the VM doesn't know");
@@ -1378,8 +1387,12 @@ private:
             return;
         }
         if (t->kind == N::Member) {
-            if (t->a->kind == N::Super) fail("super");
             TempMark m(*this);
+            if (t->a->kind == N::Super) {
+                const uint32_t k = (t->flags & kComputed) ? value(t->b) : kNone;
+                emit(OpSuperSet, {node(t), k, v});
+                return;
+            }
             const uint32_t o = value(t->a);
             if (t->flags & kComputed) emit(OpSetElem, {o, value(t->b), v});
             else emit(OpSetNamed, {o, node(t), v});
@@ -1423,7 +1436,16 @@ private:
             return;
         }
         if (t->kind != N::Identifier && t->kind != N::Member) fail("assignment pattern");
-        if (t->kind == N::Member && t->a->kind == N::Super) fail("super");
+        if (t->kind == N::Member && t->a->kind == N::Super) {
+            if (n->op != Op::None) fail("compound assignment to super.x");
+            TempMark m(*this);
+            if (t->flags & kComputed) emit(OpLoadThis, {temp()});   // (this first: super[super()] = 0 throws)
+            const uint32_t k = (t->flags & kComputed) ? value(t->b, false, {n->b}) : kNone;
+            const uint32_t kk = k != kNone && assigns(n->b) ? copyOf(k) : k;
+            expr(n->b, dst);
+            emit(OpSuperSet, {node(t), kk, dst});
+            return;
+        }
         TempMark m(*this);
         if (n->op == Op::None) {
             if (t->kind == N::Identifier) {
@@ -1606,7 +1628,25 @@ private:
 
     void call(Node* n, uint32_t dst) {
         Node* callee = n->a;
-        if (callee->kind == N::Super) fail("super()");
+        if (callee->kind == N::Super) {
+            TempMark m(*this);
+            if (hasSpread(n->kids)) {
+                const uint32_t arr = temp();
+                emit(OpArrayNew, {arr});
+                for (Node* k : n->kids) {
+                    TempMark e(*this);
+                    if (k->kind == N::Spread) emit(OpArraySpread, {arr, value(k->a)});
+                    else emit(OpArrayPush, {arr, value(k)});
+                }
+                emit(OpSuperCall, {dst, 0, 0, arr});
+            } else {
+                const uint32_t start = next_;
+                for (size_t i = 0; i < n->kids.size(); ++i) (void)temp();
+                for (size_t i = 0; i < n->kids.size(); ++i) expr(n->kids[i], start + static_cast<uint32_t>(i));
+                emit(OpSuperCall, {dst, start, static_cast<uint32_t>(n->kids.size()), kNone});
+            }
+            return;
+        }
         TempMark m(*this);
         const uint32_t fn = temp();
         const uint32_t self = temp();
@@ -1614,7 +1654,13 @@ private:
         Label* chain = nullptr;
         if (callee->kind == N::Member || (callee->kind == N::OptionalChain && callee->a->kind == N::Member && !(callee->flags & kParenthesized))) {
             Node* mem = callee->kind == N::Member ? callee : callee->a;
-            if (mem->a->kind == N::Super) fail("super.f()");
+            if (mem->a->kind == N::Super) {
+                // super.m(...): found on the home object's prototype, called on this.
+                emit(OpLoadThis, {self});
+                TempMark k(*this);
+                const uint32_t key = (mem->flags & kComputed) ? value(mem->b) : kNone;
+                emit(OpSuperGet, {fn, node(mem), key});
+            } else {
             if (callee->kind == N::OptionalChain) {
                 chain = newLabel();
                 short_ = chain;
@@ -1626,6 +1672,7 @@ private:
                 emit(OpGetElem, {fn, self, value(mem->b)});
             } else {
                 emit(OpGetNamed, {fn, self, node(mem)});
+            }
             }
         } else if (callee->kind == N::Identifier && !(callee->flags & kParenthesized) && !findLocal(callee->str)) {
             if (callee->str == u"arguments" && !info_->arrow) fail("arguments");
@@ -1808,23 +1855,43 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
     const size_t na = std::min<size_t>(args.size(), code.nparams);
     for (size_t i = 0; i < na; ++i) r[i] = args[i];
 
-    // this: worked out the first time it's asked for.
+    // this: worked out the first time it's asked for. A derived class's constructor has
+    // none until super() (which an arrow in it may call: then it's in the function's
+    // scope, `fenv`, where the arrow sets it).
     Value this_value;
     bool this_ready = false;
-    const auto thisOf = [&]() -> const Value& {
+    const bool derived_ctor = new_target && info->derived;
+    bool this_init = !derived_ctor;
+    Env* fenv = nullptr;
+    const auto thisOf = [&]() -> Value {
+        if (info->arrow) return thisValue(closure);   // (not kept: a super() may come yet)
+        if (derived_ctor) {
+            if (!(fenv ? fenv->this_initialized : this_init)) rt_.throwError("ReferenceError", "super() must be called before using this");
+            return fenv ? fenv->this_value : this_value;
+        }
         if (this_ready) return this_value;
         this_ready = true;
-        if (info->arrow) this_value = thisValue(closure);
-        else if (strict) this_value = this_in;
+        if (strict) this_value = this_in;
         else if (this_in.isNullish() || this_in.isEmpty()) this_value = Value::object(rt_.global());
         else this_value = Value::object(rt_.toObject(this_in));
         return this_value;
     };
-    if (new_target) {
+    if (new_target && !derived_ctor) {
         const Value proto = rt_.get(Value::object(new_target), u"prototype");
         this_value = Value::object(rt_.newObject(proto.isObject() ? proto.asObject() : rt_.object_prototype));
         this_ready = true;
     }
+    // A class's instance fields, on its new object (now, or at super() in a derived one).
+    const auto initFields = [&](const Value& obj_value) {
+        Object* obj = obj_value.asObject();
+        for (Node* field : info->fields) {
+            Env* fe = fieldEnv(f, obj_value);
+            const PropertyKey key = (field->flags & kComputed) ? rt_.toPropertyKey(eval(field->a, fe, true)) : PropertyKey(field->str);
+            const Value v = field->b ? eval(field->b, fe, true) : Value::undefined();
+            obj->define(key, {v});
+        }
+    };
+    if (new_target && !derived_ctor && info->is_class_constructor) initFields(this_value);
     // Its own scope, when nested functions may see into it: what they see of `this`,
     // new.target and super (as the tree-walker's function scope), and the variables they
     // may read, in their dead zone if they're let or const.
@@ -1836,7 +1903,9 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
             env->function = f;
             env->home = fd.home;
             env->new_target = new_target;
-            env->this_value = thisOf();
+            if (derived_ctor) env->this_initialized = false;
+            else env->this_value = thisOf();
+            fenv = env;
         }
         env->vars.reserve(code.env_names.size());
         for (const VmCode::EnvName& e : code.env_names) {
@@ -2415,6 +2484,77 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                         pc += 1;
                         break;
                     }
+                    case OpSuperGet: case OpSuperSet: {
+                        const bool get = o[0] == OpSuperGet;
+                        Node* m = nodes[get ? o[2] : o[1]];
+                        const uint32_t kreg = get ? o[3] : o[2];
+                        Object* base;
+                        if (info->arrow) base = superObject(closure);
+                        else {
+                            if (!fd.home) rt_.throwError("SyntaxError", "super isn't allowed here");
+                            base = fd.home->prototype;
+                            if (!base) rt_.throwError("TypeError", "super has no prototype here");
+                        }
+                        const Value self = thisOf();
+                        const PropertyKey key = kreg != kNone ? rt_.toPropertyKey(r[kreg]) : PropertyKey(m->str);
+                        if (get) r[o[1]] = rt_.get(base, key, self);
+                        else rt_.set(base, key, r[o[3]], self);
+                        pc += 4;
+                        break;
+                    }
+                    case OpSuperCall: {
+                        // The parent constructor makes this; then this class's fields go on it.
+                        Env* fe = nullptr;
+                        Object* ctor = f;
+                        Object* nt = new_target;
+                        if (info->arrow) {
+                            fe = functionEnv(closure);
+                            while (fe && !fe->function && fe->outer) fe = functionEnv(fe->outer);
+                            if (!fe || !fe->function || !fe->function->derived) rt_.throwError("SyntaxError", "super() is only allowed in a derived class's constructor");
+                            ctor = fe->function;
+                            nt = fe->new_target;
+                        } else {
+                            if (!derived_ctor) rt_.throwError("SyntaxError", "super() is only allowed in a derived class's constructor");
+                            fe = fenv;
+                        }
+                        if (fe ? fe->this_initialized : this_init) rt_.throwError("ReferenceError", "super() was already called");
+                        Value result;
+                        if (o[4] != kNone) {
+                            const std::vector<Value> list = r[o[4]].asObject()->elements;
+                            result = rt_.construct(Value::object(ctor->prototype), list, nt);
+                        } else {
+                            result = rt_.construct(Value::object(ctor->prototype), std::span<const Value>(r + o[2], o[3]), nt);
+                        }
+                        if (fe) {
+                            fe->this_value = result;
+                            fe->this_initialized = true;
+                        } else {
+                            this_value = result;
+                            this_init = true;
+                        }
+                        // This class's own fields, now there's an object for them.
+                        FunctionInfo* cinfo = ctor->code->info;
+                        Object* obj = result.asObject();
+                        for (Node* field : cinfo->fields) {
+                            Env* fe2 = fieldEnv(ctor, result);
+                            const PropertyKey key = (field->flags & kComputed) ? rt_.toPropertyKey(eval(field->a, fe2, true)) : PropertyKey(field->str);
+                            const Value v = field->b ? eval(field->b, fe2, true) : Value::undefined();
+                            obj->define(key, {v});
+                        }
+                        r[o[1]] = result;
+                        pc += 5;
+                        break;
+                    }
+                    case OpNewTarget: {
+                        if (info->arrow) {
+                            Env* fe = functionEnv(closure);
+                            r[o[1]] = fe && fe->new_target ? Value::object(fe->new_target) : Value::undefined();
+                        } else {
+                            r[o[1]] = new_target ? Value::object(new_target) : Value::undefined();
+                        }
+                        pc += 2;
+                        break;
+                    }
                     case OpRestArgs: {
                         std::vector<Value> rest;
                         for (size_t i = o[2]; i < args.size(); ++i) rest.push_back(args[i]);
@@ -2553,6 +2693,11 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
 done:
     if (new_target) {
         if (result.isObject()) return result;
+        if (info->derived && !result.isUndefined()) rt_.throwError("TypeError", "a derived constructor may only return an object or undefined");
+        if (derived_ctor) {
+            if (!(fenv ? fenv->this_initialized : this_init)) rt_.throwError("ReferenceError", "a derived constructor must call super()");
+            return fenv ? fenv->this_value : this_value;
+        }
         return this_value;
     }
     return result;
