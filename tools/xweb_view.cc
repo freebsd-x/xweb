@@ -1540,13 +1540,19 @@ private:
         if (!op.gradient || op.w <= 0 || op.h <= 0) return;
         const auto [pw, ph] = rasterSize(op.w, op.h);
         OpMemo* memo = memoFor(op);
-        if (memo && memo->key.empty()) memo->key = "g:" + gradientKey(*op.gradient) + ":" + keyNum(op.w) + "x" + keyNum(op.h);
+        const std::string corners = op.radius > 0 ? ":r" + keyNum(op.radius) + "," + keyNum(op.radius_y) : std::string();
+        if (memo && memo->key.empty()) memo->key = "g:" + gradientKey(*op.gradient) + ":" + keyNum(op.w) + "x" + keyNum(op.h) + corners;
         std::string fallback;   // (no copy of the memo's key: a ?: would make one)
-        if (!memo) fallback = "g:" + gradientKey(*op.gradient) + ":" + keyNum(op.w) + "x" + keyNum(op.h);
+        if (!memo) fallback = "g:" + gradientKey(*op.gradient) + ":" + keyNum(op.w) + "x" + keyNum(op.h) + corners;
         const std::string& key = memo ? memo->key : fallback;
         const web::Gradient& g = *op.gradient;
-        const float w = op.w, h = op.h;
-        if (const CachedRaster* r = cached(key, [&, pw = pw, ph = ph] { return web::renderGradient(g, w, h, pw, ph); })) drawRaster(dl, *r, x, y, op.w, op.h);
+        const float w = op.w, h = op.h, rx = op.radius, ry = op.radius_y;
+        if (const CachedRaster* r = cached(key, [&, pw = pw, ph = ph] {
+                web::Raster out = web::renderGradient(g, w, h, pw, ph);
+                if (rx > 0 && out.width > 0) web::roundCorners(out, rx * static_cast<float>(out.width) / w, ry * static_cast<float>(out.height) / h);
+                return out;
+            }))
+            drawRaster(dl, *r, x, y, op.w, op.h);
     }
 
     static std::string boxKey(const web::BoxPaint& b) {

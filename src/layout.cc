@@ -54,6 +54,7 @@ struct Box {
     const Box* deco_parent = nullptr;   // an inline with a background or border: the next such out
     float inline_extent = 0;       // how far its widest line reaches, closing padding included
     bool synthetic = false;        // a pseudo-element's image: its node is the layout's own, not the page's
+    bool deferred_inline = false;   // a positioned inline's text with a z-index, painted in its layer
     float own_height = -1;          // the definite height layoutContents was given, if any
     bool picture_inside = false;   // the picture inside a positioned or floated replaced element's block:
                                    // its style is the element's, but it's in flow in that block
@@ -3729,6 +3730,26 @@ private:
                     if (image.gradient) {
                         op.kind = PaintKind::Gradient;
                         op.gradient = image.gradient;
+                        // Filling a box with rounded corners, all alike: drawn rounded (the
+                        // clip is a rectangle; naver.com's pill buttons were squares).
+                        if (tx == clip.x && ty == clip.y && tw == clip.w && th == clip.h && !use_canvas) {
+                            const ComputedStyle& bs = *b.style;
+                            float radii[4][2];
+                            for (int c = 0; c < 4; ++c) {
+                                radii[c][0] = std::max(0.0f, bs.radius[c][0].resolve(w));
+                                radii[c][1] = std::max(0.0f, bs.radius[c][1].resolve(h));
+                            }
+                            fitRadii(radii, w, h);
+                            const bool uniform = std::all_of(std::begin(radii), std::end(radii), [&](const float* r) {
+                                return r[0] == radii[0][0] && r[1] == radii[0][1];
+                            });
+                            const float inset_x = clip.x - x, inset_y = clip.y - y;   // a padding or content box's
+                            const float rx = radii[0][0] - inset_x, ry = radii[0][1] - inset_y;
+                            if (uniform && rx > 0 && ry > 0) {
+                                op.radius = rx;
+                                op.radius_y = ry;
+                            }
+                        }
                         if (opacity < 1) {
                             // Its colours faded: what draws it goes by the stops alone.
                             auto copy = std::make_shared<Gradient>(*image.gradient);
@@ -4232,7 +4253,37 @@ private:
 
     void paintFragments(const Box& b, float cx, float cy, const Rect& cb, float opacity) {
         paintInlineDecorations(b, cx, cy, opacity);
+        // A relatively positioned inline with a positive z-index: its text takes its turn
+        // among the positioned, not under them with the rest of the line (naver.com's "AI"
+        // label went under the z-index:1 pill it sits on).
+        const auto lifted = [&](const Box::Fragment& f) {
+            return !b.deferred_inline && !f.atomic && f.style && f.style->position == Position::Relative && f.style->z_index > 0 &&
+                   transforms_.empty();
+        };
+        if (std::any_of(b.fragments.begin(), b.fragments.end(), lifted) && deferred_boxes_.size() < 10000) {
+            std::vector<std::pair<const ComputedStyle*, Box*>> made;
+            for (const auto& f : b.fragments) {
+                if (!lifted(f)) continue;
+                const auto it = std::find_if(made.begin(), made.end(), [&](const auto& e) { return e.first == f.style; });
+                Box* box = it != made.end() ? it->second : nullptr;
+                if (!box) {
+                    box = &deferred_boxes_.emplace_back();
+                    box->kind = BoxKind::Block;
+                    box->style = f.style;
+                    box->synthetic = true;
+                    box->deferred_inline = true;
+                    made.emplace_back(f.style, box);
+                }
+                box->fragments.push_back(f);
+            }
+            for (const auto& [style, box] : made) {
+                Positioned later{box, cx, cy, cb, opacity, order_++, clip_stack_, ctx_ops_, ctx_boxes_};
+                later.in_flow = true;
+                positioned_.push_back(std::move(later));
+            }
+        }
         for (const auto& f : b.fragments) {
+            if (lifted(f)) continue;
             const float fx = cx + f.x;
             if (f.atomic) {
                 float ax = cx + f.atomic->x, ay = cy + f.atomic->y;
@@ -4626,6 +4677,7 @@ private:
         below_content_.clear();
     }
 
+    std::deque<Box> deferred_boxes_;   // (see paintFragments)
     struct Positioned {
         const Box* box;
         float static_x, static_y;
