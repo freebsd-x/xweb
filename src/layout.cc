@@ -4452,7 +4452,7 @@ private:
         // A stacking context: its negative z-index descendants go in here, over its own
         // background and under its content.
         const size_t outer_ctx_ops = ctx_ops_, outer_ctx_boxes = ctx_boxes_;
-        const bool stacking = &b == root_ || s.position == Position::Fixed || (s.position != Position::Static && s.z_index != 0) ||
+        const bool stacking = &b == root_ || s.position == Position::Fixed || ((s.position != Position::Static || b.flex_item) && s.z_index != 0) ||
                               s.opacity < 1 || s.linearlyTransformed() || s.makes_stacking_context;
         if (stacking && !painting_below_) {
             ctx_ops_ = out_->ops.size();
@@ -4485,7 +4485,10 @@ private:
             // boxes around it, so it waits its turn with them (Ruliweb's z-index:1 main went
             // under an absolute ad of its z-index:auto neighbour). Not inside a rotation or
             // scale, which the later turn wouldn't be inside.
-            if (k.style->position == Position::Relative && k.style->z_index != 0 && transforms_.empty()) {
+            // (So does a flex or grid item's, positioned or not: netflix.com's static flex
+            // item of z-index 3 holding its whole hero went under its z-index:2 shade.)
+            if ((k.style->position == Position::Relative || (k.flex_item && k.style->position == Position::Static)) &&
+                k.style->z_index != 0 && transforms_.empty()) {
                 Positioned later{&k, cx, cy, cb, opacity, order_++, clip_stack_, ctx_ops_, ctx_boxes_};
                 later.in_flow = true;
                 positioned_.push_back(std::move(later));
@@ -4584,6 +4587,20 @@ private:
             std::pop_heap(positioned_.begin(), positioned_.end(), later);
             const Positioned p = std::move(positioned_.back());
             positioned_.pop_back();
+            // One that's a stacking context of its own paints its positioned descendants
+            // inside it, whatever their z-index: all of it at its own level (netflix.com's
+            // z-index:1 hero, with a z-index:3 box in it, went over the z-index:2 header).
+            // One with z-index auto lets them take their turn among the rest (below).
+            const ComputedStyle& ps = *p.box->style;
+            const bool own_context = ps.z_index != 0 || ps.opacity < 1 || ps.linearlyTransformed() || ps.makes_stacking_context ||
+                                     ps.position == Position::Fixed;
+            std::vector<Positioned> outer;
+            if (own_context) outer.swap(positioned_);
+            const auto flushOwn = [&] {
+                if (!own_context) return;
+                flushPositioned();
+                positioned_.swap(outer);   // the rest, a heap still
+            };
             const size_t before = positioned_.size();
             {
                 const Box& k = *p.box;
@@ -4621,6 +4638,7 @@ private:
                         batch.swap(pending_floats_);
                         for (const PendingFloat& f : batch) paint(*f.box, f.cx, f.cy, f.cb, f.opacity);
                     }
+                    flushOwn();
                     clip_stack_ = saved;
                     cb_clip_depth_ = saved_depth;
                     for (size_t i = 0; i < p.clips.size(); ++i) {
@@ -4636,7 +4654,8 @@ private:
                         ctx_ops_ = saved_ctx_ops;
                         ctx_boxes_ = saved_ctx_boxes;
                     }
-                    for (size_t i = before; i < positioned_.size(); ++i) std::push_heap(positioned_.begin(), positioned_.begin() + static_cast<ptrdiff_t>(i) + 1, later);
+                    if (!own_context)
+                        for (size_t i = before; i < positioned_.size(); ++i) std::push_heap(positioned_.begin(), positioned_.begin() + static_cast<ptrdiff_t>(i) + 1, later);
                     continue;
                 }
                 const Rect cb = s.position == Position::Fixed ? Rect{0, 0, vw_, vh_} : p.cb;
@@ -4664,6 +4683,7 @@ private:
                 const size_t saved_depth = cb_clip_depth_;
                 cb_clip_depth_ = clip_stack_.size();
                 paintContents(k, x, y, cb, p.opacity);
+                flushOwn();
                 clip_stack_ = saved;
                 cb_clip_depth_ = saved_depth;
                 for (size_t i = 0; i < p.clips.size(); ++i) {
@@ -4681,7 +4701,8 @@ private:
                     ctx_boxes_ = saved_ctx_boxes;
                 }
             }
-            for (size_t i = before; i < positioned_.size(); ++i) std::push_heap(positioned_.begin(), positioned_.begin() + static_cast<ptrdiff_t>(i) + 1, later);
+            if (!own_context)
+                for (size_t i = before; i < positioned_.size(); ++i) std::push_heap(positioned_.begin(), positioned_.begin() + static_cast<ptrdiff_t>(i) + 1, later);
         }
     }
 
