@@ -39,4 +39,12 @@ body{margin:8px;font:14px/20px monospace}.f{display:flex;margin-bottom:10px}.i{w
 <a style="display:flex;align-items:center" href="#"><img src="images/checker.png" style="display:flex"> <span>natural</span></a>
 <div><img src="images/checker.png" style="display:grid"></div>
 <div><img src="images/checker.png" style="display:inline-flex"> after</div>
+
+<!-- An absolutely positioned child's static position: as the only item, by
+     justify-content and align-items (naver.com's search button art). -->
+<style>.afc{position:relative;display:inline-flex;height:40px;padding:0 15px 0 12px;justify-content:center;align-items:center;background:#eef;margin:10px}.afa{position:absolute;width:71px;height:40px;background:rgba(255,0,0,.5)}</style>
+<div class=afc><div class=afa></div></div><br>
+<div class=afc style="width:200px"><div class=afa></div></div><br>
+<div class=afc style="display:flex;width:200px;justify-content:flex-end;align-items:flex-start;height:80px"><div class=afa style="height:20px"></div></div>
+<div style="display:flex;flex-direction:column;width:300px;height:100px;justify-content:flex-end;align-items:center;position:relative;background:#efe"><span>x</span><div class=afa></div></div>
 </body></html>

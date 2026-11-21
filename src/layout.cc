@@ -815,6 +815,7 @@ private:
         }
         if (b.isFlex()) {
             layoutFlex(b, own_height);
+            alignAbsoluteInFlex(b);
             b.margin_top_outer = b.margin[Top];
             b.margin_bottom_outer = b.margin[Bottom];
             return;
@@ -985,6 +986,32 @@ private:
 
     // Laid out first against its parent's width; once painting knows the real containing
     // block, again if what it measures by turns out different (layoutForContainingBlock).
+    // An absolutely positioned child of a flex container, its offsets auto: where it would
+    // be as the only item, by justify-content and align-self (naver.com's search button
+    // art, centred in Chrome, was at the start).
+    void alignAbsoluteInFlex(Box& c) {
+        const ComputedStyle& cs = *c.style;
+        const bool row = !cs.flex_column;
+        const auto factor = [](FlexAlign a) {
+            switch (a) {
+                case FlexAlign::Center: case FlexAlign::SpaceAround: case FlexAlign::SpaceEvenly: return 0.5f;
+                case FlexAlign::End: return 1.0f;
+                default: return 0.0f;
+            }
+        };
+        for (auto& kp : c.kids) {
+            Box& k = *kp;
+            if (!k.outOfFlow() || k.style->position != Position::Absolute) continue;
+            float main_f = factor(cs.justify_content);
+            if (cs.flex_reverse) main_f = 1 - main_f;
+            const float cross_f = factor(k.style->align_self != FlexAlign::Auto ? k.style->align_self : cs.align_items);
+            const float free_w = c.width - k.outerWidth() - k.margin[Left] - k.margin[Right];
+            const float free_h = c.height - k.outerHeight() - k.margin[Top] - k.margin[Bottom];
+            k.static_x = free_w * (row ? main_f : cross_f);
+            k.static_y = free_h * (row ? cross_f : main_f);
+        }
+    }
+
     void layoutOutOfFlow(Box& k, float cb_width, std::optional<float> cb_height = std::nullopt) {
         const ComputedStyle& s = *k.style;
         const float base = s.position == Position::Fixed ? vw_ : cb_width;
@@ -4257,8 +4284,8 @@ private:
         // among the positioned, not under them with the rest of the line (naver.com's "AI"
         // label went under the z-index:1 pill it sits on).
         const auto lifted = [&](const Box::Fragment& f) {
-            return !b.deferred_inline && !f.atomic && f.style && f.style->position == Position::Relative && f.style->z_index > 0 &&
-                   transforms_.empty();
+            return !b.deferred_inline && !f.atomic && f.style && f.style != b.style && f.style->display == Display::Inline &&
+                   f.style->position == Position::Relative && f.style->z_index > 0 && transforms_.empty();
         };
         if (std::any_of(b.fragments.begin(), b.fragments.end(), lifted) && deferred_boxes_.size() < 10000) {
             std::vector<std::pair<const ComputedStyle*, Box*>> made;
@@ -4272,6 +4299,7 @@ private:
                     box->style = f.style;
                     box->synthetic = true;
                     box->deferred_inline = true;
+                    box->tree_index = b.tree_index;   // (its turn by its block's place in the tree)
                     made.emplace_back(f.style, box);
                 }
                 box->fragments.push_back(f);
@@ -4282,8 +4310,20 @@ private:
                 positioned_.push_back(std::move(later));
             }
         }
+        // An inline-block (or -flex, -grid) positioned with a positive z-index likewise.
+        const auto lifted_atomic = [&](const Box::Fragment& f) {
+            return !b.deferred_inline && f.atomic && f.atomic->node != b.node && f.atomic->kind != BoxKind::Replaced && f.atomic->style &&
+                   f.atomic->style->position == Position::Relative && f.atomic->style->z_index > 0 && transforms_.empty();
+        };
         for (const auto& f : b.fragments) {
             if (lifted(f)) continue;
+            if (lifted_atomic(f)) {
+                if (f.link) out_->links.push_back({cx + f.atomic->x, cy + f.atomic->y, f.atomic->outerWidth(), f.atomic->outerHeight(), *f.link});
+                Positioned later{f.atomic, cx, cy, cb, opacity, order_++, clip_stack_, ctx_ops_, ctx_boxes_};
+                later.in_flow = true;
+                positioned_.push_back(std::move(later));
+                continue;
+            }
             const float fx = cx + f.x;
             if (f.atomic) {
                 float ax = cx + f.atomic->x, ay = cy + f.atomic->y;
