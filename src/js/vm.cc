@@ -101,6 +101,16 @@ enum Opc : uint32_t {
     OpClass,         // d n
     OpDefineMethod,  // o n k               : a method, getter or setter (k a computed key, or none)
     OpArguments,     // d
+    OpRestArgs,      // d from              : the arguments from `from` on, as an array
+    OpJumpIfNotUndef,// s t
+    OpCheckObjectCoercible, // s           : destructuring null or undefined is a TypeError
+    OpIterGet,       // d s                 : an iterator record for s (as for-of and [a, b] = s)
+    OpIterValue,     // d it                : its next value, or undefined when it's done
+    OpIterNext,      // it d t              : its next value, or to t when it's done
+    OpIterRest,      // d it                : what's left of it, as an array
+    OpIterClose,     // it                  : closed, if it isn't done
+    OpIterCloseFin,  // it kind             : at a finally: closed, its errors dropped if one is on its way
+    OpObjRest,       // d s used            : s's own enumerable properties but the keys in the array `used`
     OpCount,
 };
 
@@ -145,18 +155,21 @@ public:
     std::shared_ptr<VmCode> run() {
         FunctionInfo& f = *info_;
         if (f.is_async || f.is_generator) fail("async or generator");
-        if (!f.simple_params) fail("parameter patterns or defaults");
         if (f.own_arguments) fail("f.arguments");
         if (f.is_class_constructor || f.derived || !f.fields.empty()) fail("class constructor");
         if (f.params.size() > 255) fail("too many parameters");
         // What nested functions and classes may see of this one's variables: every name
         // used anywhere inside them (more than they need, never less).
+        for (Node* p : f.params) survey(p, false);
         if (f.expression_body) survey(f.body, false);
         else
             for (Node* k : f.body->kids) survey(k, false);
         if (direct_eval_) fail("direct eval");
         code_->needs_env = makes_functions_;
         scopes_.emplace_back();
+        if (!f.simple_params) {
+            params();
+        } else {
         // Parameters first: argument i is register i. (A repeated name: the last one.)
         for (Node* p : f.params) {
             if (p->kind != N::Identifier) fail("parameter pattern");
@@ -170,6 +183,7 @@ public:
             if (l.reg != i || !captured(f.params[i]->str)) continue;   // (a repeated name's earlier one)
             l.slot = envSlot(f.params[i]->str, false, false);
             emit(OpInitCap, {static_cast<uint32_t>(l.slot), static_cast<uint32_t>(i)});
+        }
         }
         // arguments (not an arrow's: that's its enclosing function's, found by name).
         if (f.uses_arguments && !f.arrow && !scopes_.back().count(u"arguments")) {
@@ -234,6 +248,47 @@ private:
         bool is_const;
         int slot = -1;  // kept in the function's scope (a nested function may see it): its place there
     };
+
+    // Parameters with patterns, defaults or a rest: argument i in register i, then each
+    // bound in turn to its names, which are in their dead zone until then (`(a = b, b)`
+    // throws).
+    void params() {
+        FunctionInfo& f = *info_;
+        size_t positional = f.params.size();
+        if (!f.params.empty() && f.params.back()->kind == N::Rest) --positional;
+        next_ = static_cast<uint32_t>(positional);
+        code_->nparams = next_;
+        max_ = std::max(max_, next_);
+        floor_ = next_;
+        std::vector<std::u16string> names;
+        for (Node* p : f.params) patternNames(p, names);
+        Scope& sc = scopes_.back();
+        for (const auto& name : names) {
+            if (sc.count(name)) continue;
+            Local l{next_++, true, false};
+            if (captured(name)) {
+                l.slot = envSlot(name, true, false);
+            } else {
+                emit(OpEmpty, {l.reg});
+            }
+            sc[name] = l;
+        }
+        floor_ = next_;
+        max_ = std::max(max_, next_);
+        for (size_t i = 0; i < f.params.size(); ++i) {
+            Node* p = f.params[i];
+            TempMark m(*this);
+            if (p->kind == N::Rest) {
+                const uint32_t x = temp();
+                emit(OpRestArgs, {x, static_cast<uint32_t>(i)});
+                bindPattern(p->a, x, Bind::Let);
+                break;
+            }
+            bindPattern(p, static_cast<uint32_t>(i), Bind::Let);
+        }
+        // Bound: no dead zone from here on (a var of the same name shares it).
+        for (auto& [name, l] : sc) l.lexical = false;
+    }
 
     // ── What nested functions see ──
 
@@ -311,6 +366,7 @@ private:
         Label* brk = nullptr;
         Label* cont = nullptr;
         size_t finally_depth = 0;
+        size_t cont_depth = SIZE_MAX;   // a continue's, when it's inside a finally of the loop's own (for-of)
     };
 
     [[noreturn]] void fail(const char* why) { throw Unsupported{why}; }
@@ -384,8 +440,11 @@ private:
         std::unordered_set<std::u16string> consts;
         for (Node* s : stmts)
             if (s && s->kind == N::VarDecl && (s->flags & kConst))
-                for (Node* d : s->kids)
-                    if (d->a && d->a->kind == N::Identifier) consts.insert(d->a->str);
+                for (Node* d : s->kids) {
+                    std::vector<std::u16string> names;
+                    patternNames(d->a, names);
+                    consts.insert(names.begin(), names.end());
+                }
         for (const auto& name : *names) {
             const uint32_t r = next_++;
             max_ = std::max(max_, next_);
@@ -403,6 +462,14 @@ private:
         }
     }
     void leaveLexical() { scopes_.pop_back(); }
+    // A for-in/of head's const names.
+    void markConst(Node* n) {
+        if (!(n->flags & kConst)) return;
+        std::vector<std::u16string> names;
+        patternNames(n->a, names);
+        for (const auto& nm : names)
+            if (auto it = scopes_.back().find(nm); it != scopes_.back().end()) it->second.is_const = true;
+    }
 
     // ── Statements ──
 
@@ -456,7 +523,7 @@ private:
                 emit(OpThrow, {value(n->a)});
                 return;
             }
-            case N::While: case N::DoWhile: case N::For: case N::ForIn: case N::Switch: loopLike(n, {}); return;
+            case N::While: case N::DoWhile: case N::For: case N::ForIn: case N::ForOf: case N::Switch: loopLike(n, {}); return;
             case N::Labeled: {
                 std::vector<std::u16string> labels{n->str};
                 Node* body = n->a;
@@ -464,11 +531,11 @@ private:
                     labels.push_back(body->str);
                     body = body->a;
                 }
-                if (body->kind == N::While || body->kind == N::DoWhile || body->kind == N::For || body->kind == N::ForIn || body->kind == N::Switch) {
+                if (body->kind == N::While || body->kind == N::DoWhile || body->kind == N::For || body->kind == N::ForIn || body->kind == N::ForOf ||
+                    body->kind == N::Switch) {
                     loopLike(body, labels);
                     return;
                 }
-                if (body->kind == N::ForOf) fail("for-of");
                 Target t;
                 t.labels = labels;
                 t.breakable = false;
@@ -482,7 +549,6 @@ private:
             }
             case N::Break: case N::Continue: site(n); jumpOut(n); return;
             case N::Try: tryStatement(n); return;
-            case N::ForOf: fail("for-of");
             case N::With: fail("with");
             case N::FunctionDecl: fail("a function declared in a block");
             case N::ClassDecl: {
@@ -513,7 +579,14 @@ private:
     void declare(Node* n) {
         const bool lexical = (n->flags & (kLet | kConst)) != 0;
         for (Node* d : n->kids) {
-            if (!d->a || d->a->kind != N::Identifier) fail("declaration pattern");
+            if (!d->a) fail("declaration");
+            if (d->a->kind != N::Identifier) {
+                if (!d->b) fail("pattern without a value");
+                TempMark m(*this);
+                const uint32_t v = valueTemp(d->b);
+                bindPattern(d->a, v, lexical ? Bind::Let : Bind::Var);
+                continue;
+            }
             const Local* l = findLocal(d->a->str);
             if (!l) fail("declared name not found");
             TempMark m(*this);
@@ -603,12 +676,13 @@ private:
             case N::ForIn: {
                 site(n);
                 const uint32_t decl = n->flags & (kVar | kLet | kConst);
-                if (n->a->kind != N::Identifier && !(decl == 0 && n->a->kind == N::Member)) fail("for-in pattern");
+                if (n->a->kind != N::Identifier && decl == 0 && n->a->kind != N::Member && n->a->kind != N::ArrayPattern &&
+                    n->a->kind != N::ObjectPattern)
+                    fail("for-in target");
                 // Its own scope for a let or const name, in its dead zone while the
                 // subject is worked out.
                 enterLexical(n->lexical, {});
-                if ((decl & kConst) && n->a->kind == N::Identifier)
-                    if (auto it = scopes_.back().find(n->a->str); it != scopes_.back().end()) it->second.is_const = true;
+                markConst(n);
                 const uint32_t it = temp();
                 floor_ = std::max(floor_, next_);   // (lives for the whole loop)
                 {
@@ -621,13 +695,7 @@ private:
                     TempMark m(*this);
                     const uint32_t key = temp();
                     patchTo(jumpFwd(OpForInNext, {it, key}), t.brk);
-                    if (decl & (kLet | kConst)) {
-                        const Local* l = findLocal(n->a->str);
-                        if (!l) fail("for-in name");
-                        emit(OpMov, {l->reg, key});   // its declaration: out of its dead zone
-                    } else {
-                        assignTo(n->a, key);
-                    }
+                    bindPattern(n->a, key, (decl & (kLet | kConst)) ? Bind::Let : decl ? Bind::Var : Bind::Assign);
                 }
                 targets_.push_back(t);
                 stmt(n->c);
@@ -635,6 +703,46 @@ private:
                 place(t.cont);
                 emit(OpLoop, {});
                 patchTo(jumpFwd(OpJump), top);
+                place(t.brk);
+                leaveLexical();
+                return;
+            }
+            case N::ForOf: {
+                site(n);
+                if (n->flags & kAwait) fail("for await");
+                const uint32_t decl = n->flags & (kVar | kLet | kConst);
+                enterLexical(n->lexical, {});
+                markConst(n);
+                const uint32_t it = temp();
+                floor_ = std::max(floor_, next_);
+                {
+                    TempMark m(*this);
+                    emit(OpIterGet, {it, value(n->b)});
+                }
+                // The loop inside a finally that closes the iterator when it's left early
+                // (a break, a return, a throw); a break's target is past the finally.
+                t.finally_depth = finallies_.size();
+                t.cont_depth = t.finally_depth + 1;
+                Finally* fin = beginFinally();
+                const uint32_t start = here();
+                Label* exhausted = newLabel();
+                Label* top = newLabel();
+                place(top);
+                {
+                    TempMark m(*this);
+                    const uint32_t v = temp();
+                    patchTo(jumpFwd(OpIterNext, {it, v}), exhausted);
+                    bindPattern(n->a, v, (decl & (kLet | kConst)) ? Bind::Let : decl ? Bind::Var : Bind::Assign);
+                }
+                targets_.push_back(t);
+                stmt(n->c);
+                targets_.pop_back();
+                place(t.cont);
+                emit(OpLoop, {});
+                patchTo(jumpFwd(OpJump), top);
+                place(exhausted);
+                const uint32_t end = here();
+                finishFinally(fin, start, end, [&] { emit(OpIterCloseFin, {it, fin->kind_reg}); });
                 place(t.brk);
                 leaveLexical();
                 return;
@@ -695,14 +803,15 @@ private:
         }
         if (!t) fail("break or continue target");
         Label* dest = is_break ? t->brk : t->cont;
-        if (finallies_.size() == t->finally_depth) {
+        const size_t depth = !is_break && t->cont_depth != SIZE_MAX ? t->cont_depth : t->finally_depth;
+        if (finallies_.size() == depth) {
             patchTo(jumpFwd(OpJump), dest);
             return;
         }
         // The chain from the outermost crossed finally inward: each stub hands on to the next.
         int next_kind = -1;
         Finally* next_f = nullptr;
-        for (size_t i = t->finally_depth; i < finallies_.size(); ++i) {
+        for (size_t i = depth; i < finallies_.size(); ++i) {
             Finally* f = finallies_[i];
             Stub s;
             if (next_f) {
@@ -732,16 +841,46 @@ private:
         f->starts.push_back(jumpFwd(OpJump));
     }
 
-    void tryStatement(Node* n) {
-        Finally* fin = nullptr;
-        if (n->d) {
-            fin = new Finally;
-            owned_finallies_.emplace_back(fin);
-            fin->kind_reg = temp();
-            fin->val_reg = temp();
-            floor_ = std::max(floor_, next_);
-            finallies_.push_back(fin);
+    Finally* beginFinally() {
+        Finally* fin = new Finally;
+        owned_finallies_.emplace_back(fin);
+        fin->kind_reg = temp();
+        fin->val_reg = temp();
+        floor_ = std::max(floor_, next_);
+        finallies_.push_back(fin);
+        return fin;
+    }
+    // The finally's code after the region it guards [start, end): reached normally (the
+    // code falls through to here), by a throw in the region, or by a jump to its start.
+    template <typename Body>
+    void finishFinally(Finally* fin, uint32_t start, uint32_t end, Body&& body) {
+        finallies_.pop_back();
+        // Leaving normally: through the finally with nothing pending.
+        emit(OpInt, {fin->kind_reg, kFinNormal});
+        const uint32_t to_fin = jumpFwd(OpJump);
+        // A throw in the region: kept, through the finally, thrown again.
+        const uint32_t throw_entry = here();
+        emit(OpInt, {fin->kind_reg, kFinThrow});
+        code_->handlers.push_back({start, end, throw_entry, fin->val_reg});
+        patchHere(to_fin);
+        fin->start = here();
+        for (uint32_t s : fin->starts) code_->ops[s] = fin->start;
+        fin->starts.clear();
+        body();
+        // Then on: as it was leaving. A return or jump out goes on through any outer
+        // finally (the stubs for jumps were made with that one in mind).
+        Finally* outer = finallies_.empty() ? nullptr : finallies_.back();
+        if (outer) {
+            emit(OpEndFinally, {fin->kind_reg, fin->val_reg, outer->kind_reg, outer->val_reg});
+            outer->starts.push_back(here());
+            code_->ops.push_back(kNone);
+        } else {
+            emit(OpEndFinally, {fin->kind_reg, fin->val_reg, kNone, kNone, kNone});
         }
+    }
+
+    void tryStatement(Node* n) {
+        Finally* fin = n->d ? beginFinally() : nullptr;
         const uint32_t try_start = here();
         stmt(n->a);
         uint32_t to_after = jumpFwd(OpJump);   // past the catch
@@ -751,11 +890,16 @@ private:
             const uint32_t exc = temp();
             floor_ = std::max(floor_, next_);
             const uint32_t handler = here();
-            if (n->b) {
-                if (n->b->kind != N::Identifier) fail("catch pattern");
+            if (n->b && n->b->kind == N::Identifier) {
                 if (captured(n->b->str)) fail("a catch name seen by a nested function");
                 scopes_.emplace_back();
                 scopes_.back()[n->b->str] = Local{exc, false, false};
+            } else if (n->b) {
+                // A pattern: its names, a scope of their own, bound from the exception.
+                std::vector<std::u16string> names;
+                patternNames(n->b, names);
+                enterLexical(&names, {});
+                bindPattern(n->b, exc, Bind::Let);
             }
             stmt(n->c);
             if (n->b) scopes_.pop_back();
@@ -763,31 +907,161 @@ private:
             catch_end = here();
         }
         patchHere(to_after);
-        if (fin) {
-            finallies_.pop_back();
-            // Leaving normally: through the finally with nothing pending.
-            emit(OpInt, {fin->kind_reg, kFinNormal});
-            const uint32_t to_fin = jumpFwd(OpJump);
-            // A throw in the try or the catch: kept, through the finally, thrown again.
-            const uint32_t throw_entry = here();
-            emit(OpInt, {fin->kind_reg, kFinThrow});
-            code_->handlers.push_back({try_start, catch_end, throw_entry, fin->val_reg});
-            patchHere(to_fin);
-            fin->start = here();
-            for (uint32_t s : fin->starts) code_->ops[s] = fin->start;
-            fin->starts.clear();
-            stmt(n->d);
-            // Then on: as it was leaving. A return or jump out goes on through any outer
-            // finally (the stubs for jumps were made with that one in mind).
-            Finally* outer = finallies_.empty() ? nullptr : finallies_.back();
-            if (outer) {
-                emit(OpEndFinally, {fin->kind_reg, fin->val_reg, outer->kind_reg, outer->val_reg});
-                outer->starts.push_back(here());
-                code_->ops.push_back(kNone);
-            } else {
-                emit(OpEndFinally, {fin->kind_reg, fin->val_reg, kNone, kNone, kNone});
-            }
+        if (fin) finishFinally(fin, try_start, catch_end, [&] { stmt(n->d); });
+    }
+
+    // ── Patterns ──
+
+    enum class Bind { Let, Var, Assign };   // a let/const/param declaration, a var, an assignment
+
+    static void patternNames(Node* p, std::vector<std::u16string>& out) {
+        if (!p) return;
+        switch (p->kind) {
+            case N::Identifier: out.push_back(p->str); return;
+            case N::AssignPattern: case N::Rest: patternNames(p->a, out); return;
+            case N::ArrayPattern: for (Node* k : p->kids) patternNames(k, out); return;
+            case N::ObjectPattern:
+                for (Node* k : p->kids) patternNames(k->kind == N::PatternProperty ? k->b : k->a, out);
+                return;
+            default: return;
         }
+    }
+
+    // A value (in register v) into a pattern's names, as a declaration or an assignment.
+    void bindPattern(Node* p, uint32_t v, Bind mode) {
+        if (++depth_ > 400) fail("nested too deeply");
+        struct Out {
+            int& d;
+            ~Out() { --d; }
+        } out{depth_};
+        TempMark m(*this);
+        switch (p->kind) {
+            case N::Identifier: {
+                if (mode == Bind::Let) {
+                    const Local* l = findLocal(p->str);
+                    if (!l) fail("pattern name");
+                    initLocal(*l, v);
+                } else {
+                    storeName(p, v);
+                }
+                return;
+            }
+            case N::Member: {
+                if (mode != Bind::Assign) fail("member in a declaration pattern");
+                assignTo(p, v);
+                return;
+            }
+            case N::AssignPattern: {
+                const uint32_t x = temp();
+                emit(OpMov, {x, v});
+                const uint32_t skip = jumpFwd(OpJumpIfNotUndef, {x});
+                expr(p->b, x);
+                patchHere(skip);
+                bindPattern(p->a, x, mode);
+                return;
+            }
+            case N::ArrayPattern: {
+                const uint32_t it = temp();
+                floor_ = std::max(floor_, next_);   // (lives through the pattern)
+                emit(OpIterGet, {it, v});
+                // An error while it's being read: closed (its own errors dropped), thrown on.
+                const uint32_t start = here();
+                for (Node* k : p->kids) {
+                    TempMark e(*this);
+                    if (k && k->kind == N::Rest) {
+                        Node* target = k->a;
+                        uint32_t base = kNone, key = kNone;
+                        if (mode == Bind::Assign && target->kind == N::Member) memberRef(target, base, key);
+                        const uint32_t x = temp();
+                        emit(OpIterRest, {x, it});
+                        if (base != kNone) setMember(target, base, key, x);
+                        else bindPattern(target, x, mode);
+                        break;
+                    }
+                    Node* target = k;
+                    Node* dflt = nullptr;
+                    if (k && k->kind == N::AssignPattern) {
+                        target = k->a;
+                        dflt = k->b;
+                    }
+                    // An assignment's member target: its reference before the value (as the
+                    // tree-walker orders it).
+                    uint32_t base = kNone, key = kNone;
+                    if (mode == Bind::Assign && target && target->kind == N::Member) memberRef(target, base, key);
+                    const uint32_t x = temp();
+                    emit(OpIterValue, {x, it});
+                    if (!target) continue;
+                    if (dflt) {
+                        const uint32_t skip = jumpFwd(OpJumpIfNotUndef, {x});
+                        expr(dflt, x);
+                        patchHere(skip);
+                    }
+                    if (base != kNone) setMember(target, base, key, x);
+                    else bindPattern(target, x, mode);
+                }
+                const uint32_t end = here();
+                emit(OpIterClose, {it});
+                const uint32_t past = jumpFwd(OpJump);
+                const uint32_t exc = temp();
+                floor_ = std::max(floor_, next_);
+                const uint32_t handler = here();
+                emit(OpIterCloseFin, {it, kNone});
+                emit(OpThrow, {exc});
+                code_->handlers.push_back({start, end, handler, exc});
+                patchHere(past);
+                return;
+            }
+            case N::ObjectPattern: {
+                emit(OpCheckObjectCoercible, {v});
+                uint32_t used = kNone;
+                for (Node* k : p->kids)
+                    if (k->kind == N::Rest) {
+                        used = temp();
+                        emit(OpArrayNew, {used});
+                    }
+                for (Node* k : p->kids) {
+                    TempMark e(*this);
+                    if (k->kind == N::Rest) {
+                        const uint32_t x = temp();
+                        emit(OpObjRest, {x, v, used});
+                        bindPattern(k->a, x, mode);
+                        break;
+                    }
+                    if (k->kind != N::PatternProperty) fail("object pattern part");
+                    const uint32_t x = temp();
+                    if (k->flags & kComputed) {
+                        const uint32_t key = temp();
+                        expr(k->a, key);
+                        if (used != kNone) emit(OpArrayPush, {used, key});
+                        emit(OpGetElem, {x, v, key});
+                    } else {
+                        if (used != kNone) {
+                            const uint32_t key = temp();
+                            emit(OpConst, {key, constant(Value::string(k->str))});
+                            emit(OpArrayPush, {used, key});
+                        }
+                        emit(OpGetNamed, {x, v, node(k)});
+                    }
+                    bindPattern(k->b, x, mode);
+                }
+                return;
+            }
+            default: fail("pattern");
+        }
+    }
+    // A member target's object and key (computed), worked out now.
+    void memberRef(Node* t, uint32_t& base, uint32_t& key) {
+        if (t->a->kind == N::Super) fail("super");
+        base = temp();
+        expr(t->a, base);
+        if (t->flags & kComputed) {
+            key = temp();
+            expr(t->b, key);
+        }
+    }
+    void setMember(Node* t, uint32_t base, uint32_t key, uint32_t v) {
+        if (key != kNone) emit(OpSetElem, {base, key, v});
+        else emit(OpSetNamed, {base, node(t), v});
     }
 
     // ── Expressions ──
@@ -1048,6 +1322,13 @@ private:
 
     void assign(Node* n, uint32_t dst) {
         Node* t = n->a;
+        if (n->op == Op::None && (t->kind == N::ArrayPattern || t->kind == N::ObjectPattern)) {
+            TempMark m(*this);
+            const uint32_t v = valueTemp(n->b);
+            bindPattern(t, v, Bind::Assign);
+            emit(OpMov, {dst, v});
+            return;
+        }
         if (t->kind != N::Identifier && t->kind != N::Member) fail("assignment pattern");
         if (t->kind == N::Member && t->a->kind == N::Super) fail("super");
         TempMark m(*this);
@@ -1470,6 +1751,30 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
         rt_.env_stack.back() = env;   // (the closure is reachable from it)
     }
     const auto cap = [&](uint32_t slot) -> Binding& { return env->vars.entryAt(slot)->second; };
+    // An iterator record, kept in a register as an internal object: the iterator and its
+    // next method and a string's characters in its slots, an array read directly in
+    // `target`, the place in `cursor`, done/async/wrapped in iter_kind's bits.
+    const auto packIter = [&](Object* o, const IterRec& it) {
+        o->slots.resize(3);
+        o->slots[0] = it.iterator;
+        o->slots[1] = it.next;
+        o->slots[2] = it.string;
+        o->target = it.array;
+        o->cursor = it.index;
+        o->iter_kind = static_cast<uint8_t>((it.done ? 1 : 0) | (it.async ? 2 : 0) | (it.sync_wrapped ? 4 : 0));
+    };
+    const auto unpackIter = [&](const Object* o) {
+        IterRec it;
+        it.iterator = o->slots[0];
+        it.next = o->slots[1];
+        it.string = o->slots[2];
+        it.array = o->target;
+        it.index = o->cursor;
+        it.done = o->iter_kind & 1;
+        it.async = o->iter_kind & 2;
+        it.sync_wrapped = o->iter_kind & 4;
+        return it;
+    };
 
     const uint32_t* const ops = code.ops.data();
     Node* const* const nodes = code.nodes.data();
@@ -1979,6 +2284,103 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                         } else {
                             obj->define(key, {Value::object(fn)});
                         }
+                        pc += 4;
+                        break;
+                    }
+                    case OpRestArgs: {
+                        std::vector<Value> rest;
+                        for (size_t i = o[2]; i < args.size(); ++i) rest.push_back(args[i]);
+                        r[o[1]] = Value::object(rt_.newArray(std::move(rest)));
+                        pc += 3;
+                        break;
+                    }
+                    case OpJumpIfNotUndef: pc = r[o[1]].isUndefined() ? pc + 3 : o[2]; break;
+                    case OpCheckObjectCoercible: {
+                        const Value& v = r[o[1]];
+                        if (v.isNullish()) rt_.throwError("TypeError", "can't destructure " + std::string(v.isNull() ? "null" : "undefined"));
+                        pc += 2;
+                        break;
+                    }
+                    case OpIterGet: {
+                        const IterRec it = getIterator(r[o[2]], false);
+                        Object* h = rt_.allocate<Object>(nullptr, ObjectClass::Internal);
+                        packIter(h, it);
+                        r[o[1]] = Value::object(h);
+                        pc += 3;
+                        break;
+                    }
+                    case OpIterValue: case OpIterNext: {
+                        const bool value_op = o[0] == OpIterValue;
+                        Object* h = r[value_op ? o[2] : o[1]].asObject();
+                        IterRec it = unpackIter(h);
+                        Value got;
+                        bool ok;
+                        try {
+                            ok = iterStep(it, got);
+                        } catch (...) {
+                            packIter(h, it);   // (left done by a failing next())
+                            throw;
+                        }
+                        packIter(h, it);
+                        if (value_op) {
+                            r[o[1]] = ok ? std::move(got) : Value::undefined();
+                            pc += 3;
+                        } else if (ok) {
+                            r[o[2]] = std::move(got);
+                            pc += 4;
+                        } else {
+                            pc = o[3];
+                        }
+                        break;
+                    }
+                    case OpIterRest: {
+                        Object* h = r[o[2]].asObject();
+                        IterRec it = unpackIter(h);
+                        std::vector<Value> items;
+                        {
+                            TempRoots roots(rt_, items);
+                            Value x;
+                            try {
+                                while (iterStep(it, x)) items.push_back(x);
+                            } catch (...) {
+                                packIter(h, it);
+                                throw;
+                            }
+                        }
+                        packIter(h, it);
+                        r[o[1]] = Value::object(rt_.newArray(std::move(items)));
+                        pc += 3;
+                        break;
+                    }
+                    case OpIterClose: case OpIterCloseFin: {
+                        Object* h = r[o[1]].asObject();
+                        bool suppress = false;
+                        if (o[0] == OpIterCloseFin) suppress = o[2] == kNone || static_cast<int>(r[o[2]].asNumber()) == kFinThrow;
+                        IterRec it = unpackIter(h);
+                        try {
+                            iterClose(it, suppress);
+                        } catch (...) {
+                            packIter(h, it);
+                            throw;
+                        }
+                        packIter(h, it);
+                        pc += o[0] == OpIterClose ? 2 : 3;
+                        break;
+                    }
+                    case OpObjRest: {
+                        const Value& value = r[o[2]];
+                        const Object* used = r[o[3]].asObject();
+                        std::vector<PropertyKey> keys;
+                        for (const Value& k : used->elements) keys.push_back(rt_.toPropertyKey(k));
+                        Object* rest = rt_.newObject();
+                        Object* src = rt_.toObject(value);
+                        for (const PropertyKey& key : rt_.ownPropertyKeys(src)) {
+                            if (std::find(keys.begin(), keys.end(), key) != keys.end()) continue;
+                            Property prop;
+                            if (!rt_.getOwnProperty(src, key, prop) || !(prop.flags & kEnumerable)) continue;
+                            rt_.put(rest, key, rt_.get(src, key, value), kDefaultFlags);
+                        }
+                        r[o[1]] = Value::object(rest);
                         pc += 4;
                         break;
                     }
