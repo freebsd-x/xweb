@@ -62,6 +62,7 @@ enum class Op : uint8_t {
 };
 
 struct FunctionInfo;
+struct VmCode;   // a function compiled for the bytecode VM (vm.cc)
 
 // A string most nodes don't have (a template part's raw text, a regex's flags, an
 // import's local name): held out of line, so a node is 16 bytes smaller (a page's
@@ -172,6 +173,10 @@ struct FunctionInfo {
     std::vector<Node*> function_decls;       // hoisted with their values
     std::vector<Node*> fields;               // a class constructor's instance fields
     std::u16string source;                   // its text, for toString
+    // Its bytecode, once compiled (vm.cc): vm_state 0 not tried yet, 1 compiled, 2 not
+    // something the VM runs (the tree-walker does).
+    std::shared_ptr<VmCode> vm;
+    uint8_t vm_state = 0;
 };
 
 // Where the statement running now is: its script's URL and line, for an error's stack.

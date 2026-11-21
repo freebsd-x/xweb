@@ -87,6 +87,9 @@ public:
         Slot* t = slot(pos);
         return t->h == h && t->e.first.size() == name.size() ? &t->e : nullptr;
     }
+    // The name made pos-th, unchecked: a compiled function's own scope, whose names it
+    // made itself in a known order (vm.cc).
+    [[nodiscard]] Entry* entryAt(uint32_t pos) noexcept { return &slot(pos)->e; }
     // Where an entry find gave is in that order.
     [[nodiscard]] static uint32_t posOf(const Entry* e) noexcept {
         return reinterpret_cast<const Slot*>(reinterpret_cast<const char*>(e) - offsetof(Slot, e))->pos;
