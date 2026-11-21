@@ -217,6 +217,13 @@ Property& Object::define(const PropertyKey& key, Property p) {
     return props_.back().second;
 }
 
+Property& Object::defineNew(const PropertyKey& key, Property p) {
+    props_.emplace_back(key, std::move(p));
+    if (props_.size() > kScanMax && index_.size() < props_.size() * 2) reindex();
+    else if (!index_.empty()) place(static_cast<uint32_t>(props_.size() - 1));
+    return props_.back().second;
+}
+
 bool Object::remove(const PropertyKey& key) {
     const ptrdiff_t at = find(key);
     if (at < 0) return false;
@@ -1479,6 +1486,10 @@ std::string describeValue(Runtime& rt, const Value& thrown) {
 // ── The interpreter proper ────────────────────────────────────────────────────
 
 Object* Interpreter::makeFunction(FunctionInfo* info, Env* env, Object* home) {
+    // (Keys made once; a new function's properties added straight, room for them made
+    // first: a page makes closures by the hundred thousand.)
+    static const PropertyKey k_length(u"length"), k_name(u"name"), k_caller(u"caller"), k_arguments(u"arguments"),
+        k_prototype(u"prototype"), k_constructor(u"constructor");
     Object* f = rt_.allocate<Object>(rt_.function_prototype, ObjectClass::Function);
     f->code = std::make_shared<FunctionData>();
     f->code->info = info;
@@ -1486,21 +1497,25 @@ Object* Interpreter::makeFunction(FunctionInfo* info, Env* env, Object* home) {
     f->code->home = home;
     f->code->program = prog_;
     f->constructor = !info->arrow && !info->is_method && !info->is_async && !info->is_generator;
-    f->define(u"length", {Value::number(info->length), nullptr, nullptr, kConfigurable});
-    f->define(u"name", {Value::string(info->name), nullptr, nullptr, kConfigurable});
+    const bool sloppy_own = !info->strict && !info->arrow && !info->is_method && !info->is_async && !info->is_generator;
+    f->reserveProps(2 + (sloppy_own ? 2 : 0) + (f->constructor || info->is_generator ? 1 : 0));
+    f->defineNew(k_length, {Value::number(info->length), nullptr, nullptr, kConfigurable});
+    if (!info->name_value) info->name_value = JSString::make(info->name);
+    f->defineNew(k_name, {Value::string(info->name_value), nullptr, nullptr, kConfigurable});
     // A sloppy function's own caller and arguments: null, as browsers have them.
-    if (!info->strict && !info->arrow && !info->is_method && !info->is_async && !info->is_generator) {
-        f->define(u"caller", {Value::null(), nullptr, nullptr, 0});
-        f->define(u"arguments", {Value::null(), nullptr, nullptr, 0});
+    if (sloppy_own) {
+        f->defineNew(k_caller, {Value::null(), nullptr, nullptr, 0});
+        f->defineNew(k_arguments, {Value::null(), nullptr, nullptr, 0});
     }
     if (f->constructor) {
         Object* proto = rt_.newObject();
-        proto->define(u"constructor", {Value::object(f), nullptr, nullptr, kWritable | kConfigurable});
-        f->define(u"prototype", {Value::object(proto), nullptr, nullptr, kWritable});
+        proto->reserveProps(1);
+        proto->defineNew(k_constructor, {Value::object(f), nullptr, nullptr, kWritable | kConfigurable});
+        f->defineNew(k_prototype, {Value::object(proto), nullptr, nullptr, kWritable});
     } else if (info->is_generator) {
         f->prototype = info->is_async ? rt_.async_generator_function_prototype : rt_.generator_function_prototype;
         Object* proto = rt_.newObject(info->is_async ? rt_.async_generator_prototype : rt_.generator_prototype);
-        f->define(u"prototype", {Value::object(proto), nullptr, nullptr, kWritable});
+        f->defineNew(k_prototype, {Value::object(proto), nullptr, nullptr, kWritable});
     } else if (info->is_async) {
         f->prototype = rt_.async_function_prototype;
     }
@@ -1988,7 +2003,10 @@ Value evalCode(Runtime& rt, const std::u16string& source, Env* env, bool strict,
         var_env = rt.global_env_;
         var_object = rt.global();
     }
-    if (direct) var_env->eval_vars = true;   // a cached place a name was found is checked past it
+    if (direct) {
+        var_env->eval_vars = true;
+        ++rt.scope_gen;
+    }   // a cached place a name was found is checked past it
     return interp.runEval(lex, var_env, var_object, false);
 }
 

@@ -149,6 +149,13 @@ struct VmCode {
     };
     std::vector<EnvName> env_names;
     std::vector<std::vector<EnvName>> block_envs;
+    // Per node: where a name found on the global object was (its place there, and the
+    // scope generation it was found in).
+    struct GlobalCache {
+        uint64_t gen = 0;
+        uint32_t pos = 0;
+    };
+    std::vector<GlobalCache> globals;
 };
 
 namespace {
@@ -246,6 +253,7 @@ public:
         }
         for (Label* l : labels_owned_) resolve(*l);
         if (max_ > 2000) fail("too many registers");
+        code_->globals.resize(code_->nodes.size());
         code_->nregs = std::max(max_, next_);
         if (code_->nregs == 0) code_->nregs = 1;
         return code_;
@@ -1732,7 +1740,7 @@ private:
     void objectLiteral(Node* n, uint32_t dst) {
         TempMark m(*this);
         const uint32_t o = temp();
-        emit(OpNewObject, {o});
+        emit(OpNewObject, {o, static_cast<uint32_t>(n->kids.size())});
         for (Node* p : n->kids) {
             TempMark e(*this);
             if (p->flags & kSpreadProp) {
@@ -1819,6 +1827,40 @@ VmCode* vmCodeFor(FunctionInfo* info) {
 }
 
 // ── Running ──
+
+namespace {
+bool vmProfiling() {
+    static const bool on = std::getenv("XWEB_JS_PROFILE") != nullptr;
+    return on;
+}
+}  // namespace
+
+// A call from compiled code to compiled code, without Runtime::call's way round: no
+// dispatch on the kind of function, no roots to register (the arguments are the
+// caller's registers, on the stack), its frame on the call stack all the same.
+Value Interpreter::callCompiled(Object* f, VmCode& code, const Value& this_value, std::span<const Value> args) {
+    if (rt_.call_depth >= Runtime::kMaxCallDepth) rt_.throwError("RangeError", "too much recursion");
+    ++rt_.call_depth;
+    struct Down {
+        size_t& d;
+        ~Down() { --d; }
+    } down{rt_.call_depth};
+    Interpreter callee(rt_, f->code->program);
+    FunctionInfo* info = f->code->info;
+    callee.owns_scopes_ = ownsScopes(info);
+    callee.owned_base_ = rt_.owned_stack.size();
+    struct Frame {
+        size_t depth;
+        explicit Frame(const std::u16string* name) : depth(t_call_frames.size()) {
+            if (depth < 4096) t_call_frames.push_back({throwSite(), name});
+        }
+        ~Frame() {
+            if (t_call_frames.size() > depth) t_call_frames.resize(depth);
+        }
+    } frame(&info->name);
+    rt_.safePoint();
+    return callee.runVm(f, code, this_value, args, nullptr);
+}
 
 Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::span<const Value> args, Object* new_target) {
     // As deep as the tree-walker lets calls go, and no deeper than the stack.
@@ -1921,6 +1963,32 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
         for (uint32_t hops = arg >> 24; hops > 0; --hops) e = e->outer;
         return e->vars.entryAt(arg & 0xFFFFFF)->second;
     };
+    // A name from outside, as lookup finds it; and if that was a data property of the
+    // global object, with nothing in the way, where it was (cachedGlobal reads it from
+    // there while no new declaration could have come in between).
+    Object* const global = rt_.global();
+    const bool plain_global = global->cls == ObjectClass::Ordinary || global->cls == ObjectClass::Function;
+    const auto cachedGlobal = [&](uint32_t ni) -> const Value* {
+        VmCode::GlobalCache& c = code.globals[ni];
+        if (c.gen != rt_.scope_gen || !plain_global || !global->elements.empty()) return nullptr;
+        Node* nm = code.nodes[ni];
+        const Property* p = global->ownAt(c.pos, nameKey(nm), nameHash(nm));
+        return p && !(p->flags & kAccessor) ? &p->value : nullptr;
+    };
+    const auto findGlobal = [&](uint32_t ni) -> Value {
+        Node* nm = code.nodes[ni];
+        Object* with = nullptr;
+        if (plain_global && global->elements.empty() && !findBinding(closure, nm->str, nullptr, nullptr, &with, nameHash(nm), nm) && !with &&
+            globalObject(closure) == global) {
+            const ptrdiff_t at = global->ownPos(nameKey(nm), nameHash(nm));
+            if (at >= 0)
+                if (const Property* p = global->ownAt(static_cast<size_t>(at), nameKey(nm), nameHash(nm)); p && !(p->flags & kAccessor)) {
+                    code.globals[ni] = {rt_.scope_gen, static_cast<uint32_t>(at)};
+                    return p->value;
+                }
+        }
+        return lookup(closure, nm->str, nameHash(nm), nullptr, nm);
+    };
     const auto setEnv = [&](Env* e) {
         env = e;
         rt_.env_stack.back() = e;
@@ -2002,14 +2070,18 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                     case OpThrowConst: rt_.throwError("TypeError", "assignment to constant '" + utf8(nodes[o[1]]->str) + "'"); pc += 2; break;
                     case OpLoadFree: {
                         Node* nm = nodes[o[2]];
-                        if (Binding* b = cachedBinding(closure, nm); b && b->initialized) r[o[1]] = b->value;
-                        else r[o[1]] = lookup(closure, nm->str, nameHash(nm), nullptr, nm);
+                        if (const Value* g = cachedGlobal(o[2])) r[o[1]] = *g;
+                        else if (Binding* b = cachedBinding(closure, nm); b && b->initialized) r[o[1]] = b->value;
+                        else r[o[1]] = findGlobal(o[2]);
                         pc += 3;
                         break;
                     }
                     case OpLoadCallee: {
                         Node* nm = nodes[o[3]];
-                        if (Binding* b = cachedBinding(closure, nm); b && b->initialized) {
+                        if (const Value* g = cachedGlobal(o[3])) {
+                            r[o[1]] = *g;
+                            r[o[2]] = Value::undefined();
+                        } else if (Binding* b = cachedBinding(closure, nm); b && b->initialized) {
                             r[o[1]] = b->value;
                             r[o[2]] = Value::undefined();
                         } else {
@@ -2019,7 +2091,7 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                                 r[o[1]] = rt_.get(r[o[2]], PropertyKey(nm->str));
                             } else {
                                 r[o[2]] = Value::undefined();
-                                r[o[1]] = lookup(closure, nm->str, nameHash(nm), nullptr, nm);
+                                r[o[1]] = findGlobal(o[3]);
                             }
                         }
                         pc += 4;
@@ -2214,6 +2286,20 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                         Node* call = nodes[o[6]];
                         here(call);
                         const Value& fn = r[o[2]];
+                        // Another compiled function: straight into it.
+                        if (fn.isObject()) {
+                            Object* fo = fn.asObject();
+                            if (fo->cls == ObjectClass::Function && fo->code && !fo->native && !fo->bound_target && !fo->class_constructor && !vmProfiling()) {
+                                FunctionInfo* ci = fo->code->info;
+                                if (!ci->is_async && !ci->is_generator)
+                                    if (VmCode* cc = vmCodeFor(ci)) {
+                                        Value v = callCompiled(fo, *cc, r[o[3]], std::span<const Value>(r + o[4], o[5]));
+                                        r[o[1]] = std::move(v);
+                                        pc += 7;
+                                        break;
+                                    }
+                            }
+                        }
                         if (!rt_.isCallable(fn)) rt_.throwError("TypeError", calleeName(call) + " is not a function");
                         Value v = rt_.call(fn, r[o[3]], std::span<const Value>(r + o[4], o[5]));
                         r[o[1]] = std::move(v);
@@ -2262,7 +2348,13 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                         pc += 3;
                         break;
                     }
-                    case OpNewObject: r[o[1]] = Value::object(rt_.newObject()); pc += 2; break;
+                    case OpNewObject: {
+                        Object* obj = rt_.newObject();
+                        obj->reserveProps(o[2]);
+                        r[o[1]] = Value::object(obj);
+                        pc += 3;
+                        break;
+                    }
                     case OpDefineNamed: {
                         Node* p = nodes[o[2]];
                         if (!p->key) p->key = std::make_unique<PropertyKey>(p->str);

@@ -177,6 +177,7 @@ struct FunctionInfo {
     // something the VM runs (the tree-walker does).
     std::shared_ptr<VmCode> vm;
     uint8_t vm_state = 0;
+    JSString name_value;   // `name` as a string value, made once (each function made from it shares it)
 };
 
 // Where the statement running now is: its script's URL and line, for an error's stack.

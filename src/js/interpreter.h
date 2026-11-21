@@ -166,6 +166,7 @@ public:
     Value callScript(Object* f, const Value& this_value, std::span<const Value> args, Object* new_target);
     // A call run by the bytecode VM (vm.cc), its frame already on the call stack.
     Value runVm(Object* f, VmCode& code, const Value& this_value, std::span<const Value> args, Object* new_target);
+    Value callCompiled(Object* f, VmCode& code, const Value& this_value, std::span<const Value> args);
 
 private:
     struct EnvScope {
@@ -202,6 +203,7 @@ private:
 
     void declareLexical(Env* env, const std::vector<std::u16string>* names) {
         if (!names) return;
+        if (env->global_object && !names->empty()) ++rt_.scope_gen;
         for (const auto& n : *names) env->vars[n] = Binding{Value::undefined(), true, false};
     }
 

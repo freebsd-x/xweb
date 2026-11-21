@@ -248,6 +248,10 @@ public:
     [[nodiscard]] ptrdiff_t ownPos(const PropertyKey& key, size_t hash) const noexcept { return find(key, hash, true); }
     [[nodiscard]] Property* ownAt(size_t pos, const PropertyKey& key, size_t hash) noexcept;
     Property& define(const PropertyKey& key, Property p);
+    // A property it surely hasn't yet (a new object's), added without looking for it first.
+    Property& defineNew(const PropertyKey& key, Property p);
+    // Room for so many properties, made before they're added (one allocation, not several).
+    void reserveProps(size_t n) { props_.reserve(n); }
     bool remove(const PropertyKey& key);
     [[nodiscard]] std::vector<PropertyKey> ownKeys() const;   // indexes, strings, then symbols, as the spec orders them
 
@@ -635,6 +639,10 @@ public:
     // A tagged template's strings array, made once per call site: lit and friends
     // recognise a template by that identity, and remake the DOM when it changes.
     std::unordered_map<const void*, Object*> template_objects;
+    // Changes whenever a name may newly stand between code and a global it found before:
+    // a script's top-level let/const/class, a direct eval's var. (The VM's global name
+    // caches hold while it doesn't.)
+    uint64_t scope_gen = 1;
     size_t call_depth = 0;
     size_t eval_depth = 0;   // C++ recursion in the interpreter
     std::vector<Value> extra_roots;   // values bindings keep while a script runs
