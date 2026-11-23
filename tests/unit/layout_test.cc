@@ -856,6 +856,22 @@ TEST(Inline, PercentHeightsLookPastInlineAndAnonymousBoxes) {
     EXPECT_FLOAT_EQ(r.box("c").h, 40);
 }
 
+TEST(Paint, WhatFillsARoundedClipTakesItsCorners) {
+    // A card's photo in overflow: hidden with border-radius: cut to the box and rounded.
+    const auto r = layout("<div style='width:100px;height:80px;border-radius:12px;overflow:hidden'>"
+                          "<div style='width:120px;height:100px;background:red'></div></div>"
+                          "<div style='width:100px;height:80px;border-radius:12px;overflow:hidden'>"
+                          "<div style='width:50px;height:100px;background:blue'></div></div>");
+    std::vector<PaintOp> rects;
+    for (const PaintOp& op : r.page.ops)
+        if (op.kind == PaintKind::Rect && op.color.a == 255 && (op.color.r == 255 || op.color.b == 255) && op.color.g == 0) rects.push_back(op);
+    ASSERT_EQ(rects.size(), 2u);
+    EXPECT_FLOAT_EQ(rects[0].w, 100);
+    EXPECT_FLOAT_EQ(rects[0].h, 80);
+    EXPECT_FLOAT_EQ(rects[0].radius, 12);
+    EXPECT_FLOAT_EQ(rects[1].radius, 0);   // it doesn't reach the corners on the right
+}
+
 TEST(Paint, AnAbsoluteBoxEscapesClipsBetweenItAndItsContainingBlock) {
     // YouTube: ytd-app absolute (in the viewport) inside a body with overflow:hidden and no
     // height. Clipped by its containing block's overflow (and outer ones), not by others.

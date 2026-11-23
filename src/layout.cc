@@ -334,6 +334,7 @@ public:
         paintContents(*root, root->x, root_y, viewport, 1.0f);
         flushPositioned();
         placeBelowContent();
+        roundClippedCorners(page.ops);
         page.height = std::max({vh_, max_bottom_, root_y + root->outerHeight() + root->margin_bottom_outer});
         last_ops = std::max<size_t>(1024, page.ops.size());
         // The canvas's images, under everything: placed for their element, drawn everywhere.
@@ -354,6 +355,7 @@ public:
 private:
     struct Rect {
         float x, y, w, h;
+        float rx = 0, ry = 0;   // an overflow clip's rounded corners (all four alike)
     };
 
     float lineHeightOf(const ComputedStyle& s) {
@@ -4562,7 +4564,25 @@ private:
             op.y = y + b.border[Top];
             op.w = b.width + b.padding[Left] + b.padding[Right];
             op.h = b.height + b.padding[Top] + b.padding[Bottom];
-            clip_stack_.push_back({op.x, op.y, op.w, op.h});
+            // Its corners, inside the border, if all four are rounded alike: what fills it
+            // is rounded to them afterwards (roundClippedCorners).
+            {
+                float radii[4][2];
+                const float bw = b.outerWidth(), bh = b.outerHeight();
+                for (int i = 0; i < 4; ++i) {
+                    radii[i][0] = std::max(0.0f, s.radius[i][0].resolve(bw));
+                    radii[i][1] = std::max(0.0f, s.radius[i][1].resolve(bh));
+                }
+                fitRadii(radii, bw, bh);
+                bool alike = true;
+                for (int i = 1; i < 4; ++i) alike = alike && std::abs(radii[i][0] - radii[0][0]) < 0.5f && std::abs(radii[i][1] - radii[0][1]) < 0.5f;
+                const float rx = radii[0][0] - std::max(b.border[Left], b.border[Right]), ry = radii[0][1] - std::max(b.border[Top], b.border[Bottom]);
+                if (alike && rx > 0.5f && ry > 0.5f) {
+                    op.radius = rx;
+                    op.radius_y = ry;
+                }
+            }
+            clip_stack_.push_back({op.x, op.y, op.w, op.h, op.radius, op.radius_y});
             out_->ops.push_back(std::move(op));
         }
         // A containing block: its own clip and those outside it are what its absolutely
@@ -4636,6 +4656,51 @@ private:
         cb_clip_depth_ = outer_cb_clip_depth;
         ctx_ops_ = outer_ctx_ops;
         ctx_boxes_ = outer_ctx_boxes;
+    }
+
+    // overflow: hidden with rounded corners: the clips we hand over are rectangles, so a
+    // picture or background filling such a box (a card's photo) is cut to the box and
+    // given its corners itself. What only partly fills it keeps square corners.
+    static void roundClippedCorners(std::vector<PaintOp>& ops) {
+        std::vector<const PaintOp*> clips;
+        int transformed = 0;
+        for (PaintOp& op : ops) {
+            switch (op.kind) {
+                case PaintKind::ClipBegin: clips.push_back(&op); continue;
+                case PaintKind::ClipEnd: if (!clips.empty()) clips.pop_back(); continue;
+                case PaintKind::TransformBegin: ++transformed; continue;
+                case PaintKind::TransformEnd: if (transformed > 0) --transformed; continue;
+                case PaintKind::Rect:
+                case PaintKind::Image: break;
+                default: continue;
+            }
+            if (transformed || clips.empty()) continue;
+            const PaintOp* c = nullptr;
+            for (auto it = clips.rbegin(); it != clips.rend() && !c; ++it)
+                if ((*it)->radius > 0) c = *it;
+            if (!c || op.w <= 0 || op.h <= 0) continue;
+            constexpr float e = 0.5f;
+            if (!(op.x <= c->x + e && op.y <= c->y + e && op.x + op.w >= c->x + c->w - e && op.y + op.h >= c->y + c->h - e)) continue;
+            if (op.kind == PaintKind::Image) {
+                if (op.text == kFrameSource || op.text == kCanvasSource) continue;
+                // Cut to the box: the same part of the picture shows.
+                const float du = (op.u1 - op.u0) / op.w, dv = (op.v1 - op.v0) / op.h;
+                const float l = std::max(op.x, c->x), t = std::max(op.y, c->y), r = std::min(op.x + op.w, c->x + c->w), b = std::min(op.y + op.h, c->y + c->h);
+                op.u1 = op.u0 + (r - op.x) * du;
+                op.v1 = op.v0 + (b - op.y) * dv;
+                op.u0 += (l - op.x) * du;
+                op.v0 += (t - op.y) * dv;
+                op.x = l, op.y = t, op.w = r - l, op.h = b - t;
+                op.radius = std::max(op.radius, c->radius);
+                op.radius_y = std::max(op.radius_y, c->radius_y);
+            } else {
+                op.x = std::max(op.x, c->x);
+                op.y = std::max(op.y, c->y);
+                op.w = std::min(op.w, c->w);
+                op.h = std::min(op.h, c->h);
+                op.radius = std::max(op.radius, std::min(c->radius, c->radius_y));
+            }
+        }
     }
 
     // Absolute and floated boxes inside inline elements still need painting.
@@ -4747,6 +4812,8 @@ private:
                         op.y = c.y;
                         op.w = c.w;
                         op.h = c.h;
+                        op.radius = c.rx;
+                        op.radius_y = c.ry;
                         out_->ops.push_back(std::move(op));
                     }
                     const std::vector<Rect> saved = std::move(clip_stack_);
@@ -4798,6 +4865,8 @@ private:
                     op.y = c.y;
                     op.w = c.w;
                     op.h = c.h;
+                    op.radius = c.rx;
+                    op.radius_y = c.ry;
                     out_->ops.push_back(std::move(op));
                 }
                 const std::vector<Rect> saved = std::move(clip_stack_);
