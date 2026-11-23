@@ -4338,10 +4338,13 @@ private:
                 positioned_.push_back(std::move(later));
             }
         }
-        // An inline-block (or -flex, -grid) positioned with a positive z-index likewise.
+        // An inline-block (or -flex, -grid) positioned relatively likewise: z-index auto
+        // too, as positioned boxes paint after their context's flow, in tree order
+        // (news.naver.com's header icons went under an absolute ::before painting the
+        // header's colour, which comes earlier in the tree).
         const auto lifted_atomic = [&](const Box::Fragment& f) {
             return !b.deferred_inline && f.atomic && f.atomic->node != b.node && f.atomic->kind != BoxKind::Replaced && f.atomic->style &&
-                   f.atomic->style->position == Position::Relative && f.atomic->style->z_index > 0 && transforms_.empty();
+                   f.atomic->style->position == Position::Relative && f.atomic->style->z_index >= 0 && transforms_.empty();
         };
         for (const auto& f : b.fragments) {
             if (lifted(f)) continue;
@@ -4515,8 +4518,11 @@ private:
             // scale, which the later turn wouldn't be inside.
             // (So does a flex or grid item's, positioned or not: netflix.com's static flex
             // item of z-index 3 holding its whole hero went under its z-index:2 shade.)
-            if ((k.style->position == Position::Relative || (k.flex_item && k.style->position == Position::Static)) &&
-                k.style->z_index != 0 && transforms_.empty()) {
+            // And with z-index auto too: a positioned box paints after its context's flow, in
+            // tree order, all of it (news.naver.com's relative header half, its logo in it,
+            // went under an earlier absolute ::before that paints the header's colour).
+            if ((k.style->position == Position::Relative || (k.flex_item && k.style->position == Position::Static && k.style->z_index != 0)) &&
+                transforms_.empty()) {
                 Positioned later{&k, cx, cy, cb, opacity, order_++, clip_stack_, ctx_ops_, ctx_boxes_};
                 later.in_flow = true;
                 positioned_.push_back(std::move(later));

@@ -21,4 +21,8 @@
 <div style="position:absolute;left:0;right:0;top:75px;min-width:600px;max-width:100px;margin:0 auto;height:20px;background:#c0c"></div>
 <div style="position:absolute;left:10px;right:10px;top:0;bottom:0;width:50px;height:30px;margin:auto;background:#333"></div>
 </div>
+<!-- Relatively positioned boxes, z-index auto, paint after an earlier absolute one in
+     tree order (news.naver.com's header: an absolute ::before paints its colour). -->
+<style>.po{position:relative;width:200px;height:40px}.po::before{content:"";position:absolute;inset:0;background:#36c}</style>
+<div class="po"><div style="position:relative;width:30px;height:20px;background:#fc0"></div><span style="position:relative;display:inline-block;width:30px;height:15px;background:#0f0"></span></div>
 </body></html>
