@@ -48,6 +48,10 @@ struct Coroutine {
     // What it runs: a function's body in the environment its call prepared, or a module.
     Object* function = nullptr;
     Env* env = nullptr;
+    // A body the bytecode VM runs (vm.cc): it binds its own parameters, from these.
+    bool vm = false;
+    Value vm_this;
+    std::vector<Value> vm_args;
     void* module = nullptr;            // a module record (modules.cc), for CoKind::Module
     Object* promise = nullptr;         // an async function's or module's result
     Object* holder = nullptr;          // the object that owns it (a generator, an async call's state)

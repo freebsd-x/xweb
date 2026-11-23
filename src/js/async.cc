@@ -710,7 +710,41 @@ void runCoroutineBody(Coroutine& co) {
         co.transfer = Value::undefined();
         return;
     }
+    if (co.vm) {
+        co.transfer = runVmCoroutineBody(co.rt, co);
+        return;
+    }
     co.transfer = runFunctionBody(co.rt, co.function, co.env);
+}
+
+Value startVmCoroutine(Runtime& rt, Object* f, const Value& this_value, std::span<const Value> args) {
+    FunctionInfo* info = f->code->info;
+    const auto prepare = [&](Coroutine& co) {
+        co.function = f;
+        co.vm = true;
+        co.vm_this = this_value;
+        co.vm_args.assign(args.begin(), args.end());
+    };
+    if (info->is_generator) {
+        const Value proto = rt.get(Value::object(f), u"prototype");
+        Object* fallback = info->is_async ? rt.async_generator_prototype : rt.generator_prototype;
+        Object* g = rt.allocate<Object>(proto.isObject() ? proto.asObject() : fallback, info->is_async ? ObjectClass::AsyncGenerator : ObjectClass::Generator);
+        g->co = std::make_shared<Coroutine>(rt, info->is_async ? CoKind::AsyncGenerator : CoKind::Generator);
+        prepare(*g->co);
+        g->co->holder = g;
+        return Value::object(g);
+    }
+    // An async function: its body runs now, until its first await.
+    Object* holder = internalObject(rt);
+    holder->co = std::make_shared<Coroutine>(rt, CoKind::AsyncFunction);
+    Coroutine& co = *holder->co;
+    prepare(co);
+    co.holder = holder;
+    co.promise = rt.newPromise();
+    Object* promise = co.promise;
+    resumeCoroutine(co);
+    continueAsync(rt, holder);
+    return Value::object(promise);
 }
 
 Value generatorYield(Runtime& rt, const Value& v) {

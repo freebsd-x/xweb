@@ -228,6 +228,10 @@ struct FunctionData {
 // Runs a script function's body in the environment a call prepared (runtime.cc): for a
 // generator's or async function's coroutine.
 Value runFunctionBody(Runtime& rt, Object* f, Env* env);
+struct Coroutine;
+Value runVmCoroutineBody(Runtime& rt, Coroutine& co);
+// An async function's or generator's call, its body the VM's (async.cc).
+Value startVmCoroutine(Runtime& rt, Object* f, const Value& this_value, std::span<const Value> args);
 
 // yield, yield* and await, from the interpreter (async.cc).
 Value generatorYield(Runtime& rt, const Value& v);

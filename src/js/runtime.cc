@@ -1213,6 +1213,8 @@ void Runtime::collect(bool mid_script) {
         markCell(co.on_fulfilled);
         markCell(co.on_rejected);
         markValue(co.transfer);
+        markValue(co.vm_this);
+        for (const Value& v : co.vm_args) markValue(v);
         for (const AsyncGenRequest& r : co.requests) { markValue(r.value); markCell(r.promise); }
         if (co.state != CoState::Suspended) return;
         for (Env* e : co.env_stack) markCell(e);
@@ -1889,6 +1891,8 @@ struct JsProfiled {
 
 Value Interpreter::callScript(Object* f, const Value& this_value, std::span<const Value> args, Object* new_target) {
     FunctionInfo* info = f->code->info;
+    if ((info->is_async || info->is_generator) && vmCodeFor(info))
+        return startVmCoroutine(rt_, f, this_value, args);
     if (info->is_async || info->is_generator) {
         // The parameters are bound now; the body runs on a coroutine of its own. An
         // async function's failure here rejects its promise rather than throwing.
@@ -2045,6 +2049,14 @@ void runModuleStatements(Runtime& rt, const std::shared_ptr<Program>& prog, Env*
 Value runFunctionBody(Runtime& rt, Object* f, Env* env) {
     Interpreter interp(rt, f->code->program);
     return interp.runInEnv(f->code->info, env);
+}
+
+// A coroutine's body the VM runs: its parameters bound from the call's arguments, kept.
+Value runVmCoroutineBody(Runtime& rt, Coroutine& co) {
+    Object* f = co.function;
+    VmCode* code = vmCodeFor(f->code->info);
+    Interpreter interp(rt, f->code->program);
+    return interp.runVm(f, *code, co.vm_this, co.vm_args, nullptr);
 }
 
 // Where a class's instance field initializer runs: the class's scope, not its

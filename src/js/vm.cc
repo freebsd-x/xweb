@@ -118,6 +118,9 @@ enum Opc : uint32_t {
     OpSuperSet,      // n k v
     OpSuperCall,     // d start argc arr    : super(...) in a derived constructor (arr: a spread's array, or none)
     OpNewTarget,     // d
+    OpYield,         // d s                 : a generator's yield: d is what next() sends
+    OpYieldStar,     // d s                 : yield* s
+    OpAwait,         // d s
     OpCount,
 };
 
@@ -134,6 +137,10 @@ struct VmCode {
     struct Handler {
         uint32_t start, end, target, reg;
         uint32_t env_depth = 0;   // how many block scopes deep its target is
+        // A finally's: where it starts and its kind register, for a generator's return()
+        // at a yield inside (it runs the finally, then returns).
+        bool is_finally = false;
+        uint32_t kind_reg = 0, fin_start = 0;
     };
     std::vector<Handler> handlers;   // innermost first
     std::vector<uint32_t> stubs;     // where a finally's jumps out go on
@@ -170,7 +177,7 @@ public:
 
     std::shared_ptr<VmCode> run() {
         FunctionInfo& f = *info_;
-        if (f.is_async || f.is_generator) fail("async or generator");
+        if (f.is_generator && !f.simple_params) fail("generator with parameter patterns");   // (they're bound at the call)
         if (f.own_arguments) fail("f.arguments");
         if (f.params.size() > 255) fail("too many parameters");
         // What nested functions and classes may see of this one's variables: every name
@@ -963,9 +970,15 @@ private:
         // A throw in the region: kept, through the finally, thrown again.
         const uint32_t throw_entry = here();
         emit(OpInt, {fin->kind_reg, kFinThrow});
-        code_->handlers.push_back({start, end, throw_entry, fin->val_reg, fin->env_depth});
         patchHere(to_fin);
         fin->start = here();
+        {
+            VmCode::Handler h{start, end, throw_entry, fin->val_reg, fin->env_depth};
+            h.is_finally = true;
+            h.kind_reg = fin->kind_reg;
+            h.fin_start = fin->start;
+            code_->handlers.push_back(h);
+        }
         for (uint32_t s : fin->starts) code_->ops[s] = fin->start;
         fin->starts.clear();
         body();
@@ -1068,7 +1081,10 @@ private:
                 const uint32_t it = temp();
                 floor_ = std::max(floor_, next_);   // (lives through the pattern)
                 emit(OpIterGet, {it, v});
-                // An error while it's being read: closed (its own errors dropped), thrown on.
+                // Read inside a finally that closes it however the reading ends: normally,
+                // by a throw (its own errors dropped), or by a generator's return() at a
+                // yield in a default or a target.
+                Finally* fin = beginFinally();
                 const uint32_t start = here();
                 for (Node* k : p->kids) {
                     TempMark e(*this);
@@ -1104,15 +1120,7 @@ private:
                     else bindPattern(target, x, mode);
                 }
                 const uint32_t end = here();
-                emit(OpIterClose, {it});
-                const uint32_t past = jumpFwd(OpJump);
-                const uint32_t exc = temp();
-                floor_ = std::max(floor_, next_);
-                const uint32_t handler = here();
-                emit(OpIterCloseFin, {it, kNone});
-                emit(OpThrow, {exc});
-                code_->handlers.push_back({start, end, handler, exc, env_depth_});
-                patchHere(past);
+                finishFinally(fin, start, end, [&] { emit(OpIterCloseFin, {it, fin->kind_reg}); });
                 return;
             }
             case N::ObjectPattern: {
@@ -1345,7 +1353,17 @@ private:
             case N::TaggedTemplate: fail("tagged template");
             case N::NewTarget: emit(OpNewTarget, {dst}); return;
             case N::Super: fail("super");
-            case N::Yield: case N::Await: fail("yield or await");
+            case N::Yield: {
+                TempMark m(*this);
+                const uint32_t v = n->a ? value(n->a) : constUndefined();
+                emit((n->flags & kSpreadProp) ? OpYieldStar : OpYield, {dst, v});
+                return;
+            }
+            case N::Await: {
+                TempMark m(*this);
+                emit(OpAwait, {dst, value(n->a)});
+                return;
+            }
             case N::ImportCall: case N::ImportMeta: fail("import");
             default: fail("an expression the VM doesn't know");
         }
@@ -2675,6 +2693,24 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                         pc += 5;
                         break;
                     }
+                    case OpYield: {
+                        Value sent = generatorYield(rt_, r[o[2]]);
+                        r[o[1]] = std::move(sent);
+                        pc += 3;
+                        break;
+                    }
+                    case OpYieldStar: {
+                        Value got = generatorDelegate(rt_, r[o[2]]);
+                        r[o[1]] = std::move(got);
+                        pc += 3;
+                        break;
+                    }
+                    case OpAwait: {
+                        Value got = awaitValue(rt_, r[o[2]]);
+                        r[o[1]] = std::move(got);
+                        pc += 3;
+                        break;
+                    }
                     case OpNewTarget: {
                         if (info->arrow) {
                             Env* fe = functionEnv(closure);
@@ -2798,6 +2834,23 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                     }
                     default: rt_.throwError("InternalError", "bad bytecode");
                 }
+            }
+        } catch (const GeneratorReturn& ret) {
+            // generator.return(v) at a yield: through the finally blocks around it, then
+            // returned (as a return statement there would).
+            const VmCode::Handler* h = nullptr;
+            for (const VmCode::Handler& c : code.handlers)
+                if (c.is_finally && at >= c.start && at < c.end) {
+                    h = &c;
+                    break;
+                }
+            if (!h) throw;
+            r[h->reg] = ret.value;
+            r[h->kind_reg] = Value::number(kFinReturn);
+            pc = h->fin_start;
+            while (edepth > h->env_depth) {
+                setEnv(env->outer);
+                --edepth;
             }
         } catch (const Thrown& t) {
             // The innermost handler around the instruction that threw, if any.
