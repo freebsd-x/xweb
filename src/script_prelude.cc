@@ -2088,13 +2088,23 @@ const char* const kScriptPrelude = R"JS(
     }
     class ListFormat {
       constructor(locales, o = {}) { this._type = o.type || 'conjunction'; this._style = o.style || 'long'; }
-      format(list) {
-        const a = Array.from(list, String), word = this._type === 'disjunction' ? 'or' : 'and';
-        if (this._type === 'unit') return a.join(this._style === 'narrow' ? ' ' : ', ');
-        if (a.length < 3) return a.join(' ' + word + ' ');
-        return a.slice(0, -1).join(', ') + ', ' + word + ' ' + a[a.length - 1];
+      // English (CLDR): "A, B, and C", "A and B"; short conjunctions with "&", narrow ones
+      // with commas only; units "A, B, C" or (narrow) "A B C".
+      formatToParts(list) {
+        const a = Array.from(list, String), parts = [];
+        const unit = this._type === 'unit', narrow = this._style === 'narrow';
+        let word = this._type === 'disjunction' ? 'or' : this._style === 'short' ? '&' : 'and';
+        const pair = unit ? (narrow ? ' ' : ', ') : (!narrow || this._type === 'disjunction') ? ' ' + word + ' ' : ', ';
+        const end = unit ? (narrow ? ' ' : ', ') : (!narrow || this._type === 'disjunction') ? ', ' + word + ' ' : ', ';
+        const mid = unit && narrow ? ' ' : ', ';
+        a.forEach((v, i) => {
+          if (i > 0) parts.push({ type: 'literal', value: a.length === 2 ? pair : i === a.length - 1 ? end : mid });
+          parts.push({ type: 'element', value: v });
+        });
+        return parts;
       }
-      formatToParts(list) { return [{ type: 'literal', value: this.format(list) }]; }
+      format(list) { return this.formatToParts(list).map(p => p.value).join(''); }
+      resolvedOptions() { return { locale, type: this._type, style: this._style }; }
     }
     class Collator {
       constructor(locales, o = {}) { this._sens = o.sensitivity || 'variant'; this._numeric = !!o.numeric; }
