@@ -348,7 +348,7 @@ void Runtime::throwError(const char* kind, const std::string& message) {
         if (const Property* p = error->own(PropertyKey(u"stack")); p && p->value.isString()) where = utf8(p->value.asString());
         for (char& c : where)
             if (c == '\n') c = ' ';
-        std::fprintf(stderr, "[js-error] %s: %s | %s\n", kind, message.c_str(), where.substr(0, 600).c_str());
+        std::fprintf(stderr, "[js-error] %s: %s | %s\n", kind, message.c_str(), where.substr(0, 3000).c_str());
     }
     throw Thrown{Value::object(error)};
 }
