@@ -300,6 +300,25 @@ TEST(Svg, UseInheritsFromTheUse) {
     EXPECT_EQ(at(r, 5, 5).r, 0);
 }
 
+TEST(Svg, UseOfAnotherFileThroughTheResolver) {
+    // namu.wiki's icons: <svg viewBox><use href="fa.svg#icon"/></svg>, the file fetched
+    // by the embedder. Nothing until it's here; then its element, in the <use>'s colour.
+    const auto sprite = SvgImage::parse("<svg xmlns='http://www.w3.org/2000/svg' id='icon' viewBox='0 0 10 10'><rect width='10' height='10' fill='currentColor'/></svg>");
+    ASSERT_TRUE(sprite);
+    const auto doc = parseHtml("<svg viewBox='0 0 10 10' width='10' height='10'><use href='/fa.svg#icon'/></svg>");
+    const Node& svg = *doc->body()->children[0];
+    std::string asked;
+    const SvgUseResolver none = [&](const std::string& href) -> const Node* { asked = href; return nullptr; };
+    EXPECT_EQ(at(renderSvg(svg, 10, 10, nullptr, {0, 128, 0, 255}, nullptr, &none), 5, 5).a, 0);
+    EXPECT_EQ(asked, "/fa.svg#icon");
+    const SvgUseResolver here = [&](const std::string& href) -> const Node* {
+        return href == "/fa.svg#icon" ? sprite->elementById("icon") : nullptr;
+    };
+    const Raster r = renderSvg(svg, 10, 10, nullptr, {0, 128, 0, 255}, nullptr, &here);
+    EXPECT_EQ(at(r, 5, 5).a, 255);
+    EXPECT_EQ(at(r, 5, 5).g, 128);
+}
+
 TEST(Svg, StyleSheetInsideTheFile) {
     const Raster r = svgOf("<svg width='10' height='10'><style>.x{fill:#0f0}</style><rect class='x' width='10' height='10' fill='red'/></svg>", 10, 10);
     EXPECT_EQ(at(r, 5, 5).g, 255);

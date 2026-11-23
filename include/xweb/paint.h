@@ -1,5 +1,7 @@
 #pragma once
 
+#include <functional>
+
 // Drawing what layout can't hand the compositor as rectangles and text: SVG, CSS
 // gradients and masks, rasterized here on the CPU into RGBA images. Written by hand,
 // like the parsers; nothing here touches the GPU, so it runs in the sandbox and in tests.
@@ -179,8 +181,11 @@ struct SvgSize {
 // its elements (null: attributes only); `color` is what currentColor is, at the top.
 // `natural`: drawn as an image, an SVG without a viewBox is stretched from its own size,
 // as a bitmap would be.
+// What a <use> pointing into another file (href="sprite.svg#icon") draws: the element,
+// once that file is here (the embedder fetches and keeps it), else nothing.
+using SvgUseResolver = std::function<const Node*(const std::string& href)>;
 [[nodiscard]] Raster renderSvg(const Node& svg, uint32_t width, uint32_t height, const StyledDocument* styles, Color color,
-                               const SvgSize* natural = nullptr);
+                               const SvgSize* natural = nullptr, const SvgUseResolver* external = nullptr);
 
 // The first <svg> in a parsed SVG file.
 [[nodiscard]] const Node* findSvgRoot(const Document& doc);
@@ -192,6 +197,8 @@ public:
     [[nodiscard]] static std::shared_ptr<const SvgImage> parse(std::string_view text);
     [[nodiscard]] const SvgSize& size() const noexcept { return size_; }
     [[nodiscard]] Raster render(uint32_t width, uint32_t height) const;
+    // Its element with this id (for a <use> elsewhere that points into it), or null.
+    [[nodiscard]] const Node* elementById(std::string_view id) const;
     // Whether `bytes` look like SVG rather than a bitmap format.
     [[nodiscard]] static bool sniff(std::string_view bytes, std::string_view content_type, std::string_view url);
 

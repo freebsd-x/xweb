@@ -182,6 +182,7 @@ struct Shape {
 
 class Renderer {
 public:
+    const SvgUseResolver* external_ = nullptr;
     Renderer(const Node& root, Canvas& canvas, const StyledDocument* styles) : canvas_(canvas), styles_(styles) {
         const Node* top = &root;
         while (top->parent) top = top->parent;
@@ -347,7 +348,7 @@ private:
         }
         if (name == "use") {
             const std::string* href = hrefOf(n);
-            if (!href || href->empty() || (*href)[0] != '#') return;
+            if (!href || href->empty()) return;
             const Node* target = lookup(*href);
             if (!target || target->ns != Namespace::Svg || active_.count(target) || active_.size() > 32) return;
             for (const Node* up = n; up; up = up->parent)
@@ -391,7 +392,9 @@ private:
         return st->display != Display::None || target->name == "symbol";
     }
 
+
     const Node* lookup(const std::string& ref) const {
+        if (!ref.empty() && ref[0] != '#') return external_ && *external_ ? (*external_)(ref) : nullptr;   // another file's
         if (ref.size() < 2 || ref[0] != '#') return nullptr;
         const auto it = ids_.find(ref.substr(1));
         return it == ids_.end() ? nullptr : it->second;
@@ -685,12 +688,14 @@ const Node* findSvgRoot(const Document& doc) {
     return nullptr;
 }
 
-Raster renderSvg(const Node& svg, uint32_t width, uint32_t height, const StyledDocument* styles, Color color, const SvgSize* natural) {
+Raster renderSvg(const Node& svg, uint32_t width, uint32_t height, const StyledDocument* styles, Color color, const SvgSize* natural,
+                 const SvgUseResolver* external) {
     if (width == 0 || height == 0 || width > kMaxRasterSide || height > kMaxRasterSide ||
         static_cast<uint64_t>(width) * height > kMaxRasterPixels)
         return {};
     Canvas canvas(width, height);
     Renderer r(svg, canvas, styles);
+    r.external_ = external;
     r.drawRoot(svg, static_cast<float>(width), static_cast<float>(height), color, natural);
     return canvas.toRaster();
 }
@@ -711,6 +716,19 @@ std::shared_ptr<const SvgImage> SvgImage::parse(std::string_view text) {
     const float w = out->size_.width.value_or(300), h = out->size_.height.value_or(150);
     out->styles_ = std::make_unique<StyledDocument>(*out->doc_, css::MediaContext{w, h});
     return out;
+}
+
+const Node* SvgImage::elementById(std::string_view id) const {
+    if (!doc_) return nullptr;
+    std::vector<const Node*> todo{doc_->root()};
+    while (!todo.empty()) {
+        const Node* n = todo.back();
+        todo.pop_back();
+        if (n->isElement())
+            if (const std::string* a = n->attr("id"); a && *a == id) return n;
+        todo.insert(todo.end(), n->children.begin(), n->children.end());
+    }
+    return nullptr;
 }
 
 Raster SvgImage::render(uint32_t width, uint32_t height) const {

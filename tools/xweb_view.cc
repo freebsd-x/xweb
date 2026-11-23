@@ -1622,7 +1622,22 @@ private:
                 mix(a.name);
                 mix(a.value);
             }
-            if (n->name == "use") uses = true;
+            if (n->name == "use") {
+                uses = true;
+                // One pointing into another file (namu.wiki's icons: <use href="fa.svg#icon">):
+                // that file fetched as an image is, and drawn again once it's here.
+                const std::string* href = n->attr("href");
+                if (!href) href = n->attr("xlink:href");
+                if (href && !href->empty() && (*href)[0] != '#' && page_) {
+                    const std::string file = href->substr(0, href->find('#'));
+                    const LoadedImage* doc = images_.find(file);
+                    mix(doc ? "here" : "coming");
+                    if (!doc && on_images_) {
+                        std::string url = web::resolveUrl(page_->base, file);
+                        if (!page_->requested.count(url)) on_images_(page_, {std::move(url)});
+                    }
+                }
+            }
             todo.insert(todo.end(), n->children.begin(), n->children.end());
         }
         if (uses) h ^= change_gen_ * 0x9E3779B97F4A7C15ull;
@@ -1630,7 +1645,14 @@ private:
         const web::Node* node = op.node;
         const web::StyledDocument* styles = styles_.get();
         const web::Color color = op.color;
-        if (const CachedRaster* r = cached(key, [&, pw = pw, ph = ph] { return web::renderSvg(*node, pw, ph, styles, color); })) drawRaster(dl, *r, x, y, op.w, op.h);
+        const web::SvgUseResolver external = [this](const std::string& href) -> const web::Node* {
+            const size_t hash_at = href.find('#');
+            if (hash_at == std::string::npos) return nullptr;
+            const LoadedImage* doc = images_.find(href.substr(0, hash_at));
+            return doc && doc->svg ? doc->svg->elementById(std::string_view(href).substr(hash_at + 1)) : nullptr;
+        };
+        if (const CachedRaster* r = cached(key, [&, pw = pw, ph = ph] { return web::renderSvg(*node, pw, ph, styles, color, nullptr, &external); }))
+            drawRaster(dl, *r, x, y, op.w, op.h);
     }
 
     // A <canvas>'s pixels as its scripts left them: a new image (a new texture) each
