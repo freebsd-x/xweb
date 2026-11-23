@@ -2663,9 +2663,10 @@ private:
                         url = std::move(work->queue.front());
                         work->queue.pop_front();
                     }
-                    Resource got = load(url, web::sameSite(page->url, url), referrerFor(page->url, url));
                     // XWEB_DEBUG_IMAGES=1: what each image came to, for finding why one's missing.
                     static const bool debug = std::getenv("XWEB_DEBUG_IMAGES") != nullptr;
+                    if (debug) std::fprintf(stderr, "[image] fetching %s\n", url.c_str());
+                    Resource got = load(url, web::sameSite(page->url, url), referrerFor(page->url, url));
                     // Said to the page's scripts, as an "error" at its <img>s.
                     const auto failed = [this, page, url, mine] {
                         XApplication::post([this, page, url, mine] {
