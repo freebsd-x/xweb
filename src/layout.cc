@@ -1050,6 +1050,33 @@ private:
         }
         k.laid_out_for = {base, cb_height.value_or(-1)};
         layoutContents(k, own, Flow{});
+        // Auto margins between both offsets take what the box leaves (10.3.7, 10.6.4):
+        // `left: 0; right: 0; max-width: 600px; margin: 0 auto` centres it; with too
+        // little room, the right (bottom) margin gives way.
+        const auto share = [](float room, bool a, bool b, float& ma, float& mb) {
+            if (a && b) {
+                if (room >= 0) ma = mb = room / 2;
+                else {
+                    ma = 0;
+                    mb = room;
+                }
+            } else if (a) {
+                ma = room;
+            } else if (b) {
+                mb = room;
+            }
+        };
+        if (!s.offset[Left].is_auto && !s.offset[Right].is_auto && (s.margin[Left].is_auto || s.margin[Right].is_auto)) {
+            const float room = base - s.offset[Left].resolve(base) - s.offset[Right].resolve(base) - k.outerWidth() -
+                               (s.margin[Left].is_auto ? 0 : k.margin[Left]) - (s.margin[Right].is_auto ? 0 : k.margin[Right]);
+            share(room, s.margin[Left].is_auto, s.margin[Right].is_auto, k.margin[Left], k.margin[Right]);
+        }
+        if ((cb_height || s.position == Position::Fixed) && !s.offset[Top].is_auto && !s.offset[Bottom].is_auto &&
+            (s.margin[Top].is_auto || s.margin[Bottom].is_auto)) {
+            const float room = base_h - s.offset[Top].resolve(base_h) - s.offset[Bottom].resolve(base_h) - k.outerHeight() -
+                               (s.margin[Top].is_auto ? 0 : k.margin[Top]) - (s.margin[Bottom].is_auto ? 0 : k.margin[Bottom]);
+            share(room, s.margin[Top].is_auto, s.margin[Bottom].is_auto, k.margin[Top], k.margin[Bottom]);
+        }
     }
 
     // Whether an absolutely positioned box's size depends on its containing block in a way
@@ -1058,7 +1085,8 @@ private:
         Box& k = const_cast<Box&>(kc);   // laid out, not yet painted: nothing has its old size
         const ComputedStyle& s = *k.style;
         if (s.position != Position::Absolute) return;
-        const bool by_height = s.height.hasPercent() || (s.height.is_auto && !s.offset[Top].is_auto && !s.offset[Bottom].is_auto);
+        const bool both_v = !s.offset[Top].is_auto && !s.offset[Bottom].is_auto;
+        const bool by_height = s.height.hasPercent() || (both_v && (s.height.is_auto || s.margin[Top].is_auto || s.margin[Bottom].is_auto));
         const bool by_width = s.width.hasPercent() || (!s.offset[Left].is_auto && !s.offset[Right].is_auto) ||
                               s.offset[Left].hasPercent() || s.margin[Left].hasPercent() || s.padding[Left].hasPercent();
         const bool width_changed = std::abs(k.laid_out_for.first - cb.w) > 0.01f;
