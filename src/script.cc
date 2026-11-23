@@ -902,14 +902,15 @@ void PageScript::Impl::installElement() {
                      return Value::undefined();
                  });
     }
-    method(st, u"getPropertyValue", 1, [getProp](Runtime& rt, const Value& t, Args a) { return str(getProp(t, lower(js::utf8(rt.toStringValue(arg(a, 0)))))); });
+    const auto propName = [](std::string name) { return name.starts_with("--") ? name : lower(name); };
+    method(st, u"getPropertyValue", 1, [getProp, propName](Runtime& rt, const Value& t, Args a) { return str(getProp(t, propName(js::utf8(rt.toStringValue(arg(a, 0)))))); });
     method(st, u"setProperty", 2, [setProp](Runtime& rt, const Value& t, Args a) {
         const std::string name = js::utf8(rt.toStringValue(arg(a, 0)));
         setProp(t, name.starts_with("--") ? name : lower(name), arg(a, 1).isNullish() ? "" : js::utf8(rt.toStringValue(arg(a, 1))));
         return Value::undefined();
     });
-    method(st, u"removeProperty", 1, [getProp, setProp](Runtime& rt, const Value& t, Args a) {
-        const std::string name = lower(js::utf8(rt.toStringValue(arg(a, 0))));
+    method(st, u"removeProperty", 1, [getProp, setProp, propName](Runtime& rt, const Value& t, Args a) {
+        const std::string name = propName(js::utf8(rt.toStringValue(arg(a, 0))));
         const std::string old = getProp(t, name);
         setProp(t, name, "");
         return str(old);

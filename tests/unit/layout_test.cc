@@ -845,6 +845,17 @@ TEST(Inline, AnInlineBlocksPercentHeightOfADefiniteBlock) {
     EXPECT_FLOAT_EQ(r.box("i").h, 80);
 }
 
+TEST(Inline, PercentHeightsLookPastInlineAndAnonymousBoxes) {
+    // An <img> at height: 100% in a <picture> (airbnb.com's cards): the picture is inline,
+    // so it's of the div; likewise in a block-in-inline and through nested inlines.
+    const auto r = layout("<div style='width:100px;height:80px'><span><span><i id=a style='display:inline-block;height:100%;width:10px'></i></span></span></div>"
+                          "<div style='width:100px;height:60px'><span><i id=b style='display:block;height:50%'></i></span></div>"
+                          "<div style='width:100px;height:40px'>text<i id=c style='display:block;height:100%'></i></div>");
+    EXPECT_FLOAT_EQ(r.box("a").h, 80);
+    EXPECT_FLOAT_EQ(r.box("b").h, 30);
+    EXPECT_FLOAT_EQ(r.box("c").h, 40);
+}
+
 TEST(Paint, AnAbsoluteBoxEscapesClipsBetweenItAndItsContainingBlock) {
     // YouTube: ytd-app absolute (in the viewport) inside a body with overflow:hidden and no
     // height. Clipped by its containing block's overflow (and outer ones), not by others.

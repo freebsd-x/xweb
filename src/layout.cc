@@ -59,6 +59,10 @@ struct Box {
     bool picture_inside = false;   // the picture inside a positioned or floated replaced element's block:
                                    // its style is the element's, but it's in flow in that block
     uint32_t tree_index = 0;       // where it comes in the box tree, depth first (paint order's tie-break)
+    // An inline made a block for the block inside it, or an anonymous block: in CSS
+    // neither is anyone's containing block, so percentage heights inside it are of its own
+    // containing block's (a <picture> around an <img> at height: 100%: airbnb.com's cards).
+    bool percent_transparent = false;
     float cb_height_hint = -1;     // its containing block's definite content height, if known: for a
                                    // picture's percentage height (an SVG at height: 100% of a 26px box)
     float last_baseline = -1;      // of the last line box, from the content box's top
@@ -657,7 +661,10 @@ private:
         // A block inside an inline: treat the inline as a block too. (The real
         // thing splits it in two around the block; rarely worth the difference.)
         if (box.kind == BoxKind::Inline && std::any_of(box.kids.begin(), box.kids.end(), [](const auto& k) { return k->inFlowBlock(); }))
+        {
             box.kind = BoxKind::Block;
+            box.percent_transparent = true;
+        }
 
         if (box.kind == BoxKind::Block || box.kind == BoxKind::InlineBlock) wrapInlineRuns(box);
     }
@@ -695,6 +702,7 @@ private:
                     run = std::make_unique<Box>();
                     run->kind = BoxKind::Block;
                     run->style = anonymousStyle(*box.style);
+                    run->percent_transparent = true;
                 }
                 run->kids.push_back(std::move(k));
             }
@@ -802,8 +810,21 @@ private:
 
     void layoutContents(Box& b, std::optional<float> own_height, Flow flow) {
         const ComputedStyle& s = *b.style;
-        // Before anything measures them: what a percentage height of theirs is of.
-        for (auto& k : b.kids) k->cb_height_hint = own_height ? *own_height : -1;
+        // What a percentage height inside it is of.
+        std::optional<float> percent_base = own_height;
+        if (!percent_base && b.percent_transparent && b.style->height.is_auto && b.cb_height_hint >= 0) percent_base = b.cb_height_hint;
+        // Before anything measures them: what a percentage height of theirs is of. An inline
+        // box is no one's containing block: what's in it (an <img> in a <picture>) is told too.
+        const float hint = percent_base ? *percent_base : -1;
+        std::vector<Box*> todo;
+        for (auto& k : b.kids) todo.push_back(k.get());
+        while (!todo.empty()) {
+            Box* k = todo.back();
+            todo.pop_back();
+            k->cb_height_hint = hint;
+            if (k->kind == BoxKind::Inline)
+                for (auto& g : k->kids) todo.push_back(g.get());
+        }
         b.own_height = own_height ? *own_height : -1;
         const bool isolated = establishesBfc(b);
         b.collapses_through = false;
@@ -909,7 +930,7 @@ private:
                 const size_t floats_before = flow.bfc->floats.size();
                 Flow child = flow;
                 child.ox += shift;
-                layoutBlock(k, cb_w, own_height, child, est);
+                layoutBlock(k, cb_w, percent_base, child, est);
                 k.x = k.margin[Left] + shift;
 
                 // Clearance that really moves a box ends any margin collapsing across it.
@@ -929,7 +950,7 @@ private:
                     if (actual != est && flow.bfc->floats.size() > floats_before && relayouts_ < kMaxRelayouts) {
                         ++relayouts_;
                         flow.bfc->floats.resize(floats_before);
-                        layoutBlock(k, cb_w, own_height, child, actual);
+                        layoutBlock(k, cb_w, percent_base, child, actual);
                     }
                 }
 

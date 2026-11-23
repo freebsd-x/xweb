@@ -96,7 +96,10 @@ inline std::vector<std::pair<std::string, std::string>> parseStyle(const std::st
                 const size_t e = s.find_last_not_of(" \t\n\r");
                 return b == std::string::npos ? std::string{} : s.substr(b, e - b + 1);
             };
-            const std::string name = lower(trim(cur.substr(0, colon)));
+            // Custom properties' names are case-sensitive: --AirImage-height isn't
+            // --airimage-height (airbnb.com's photos lost their size on the next setProperty).
+            std::string name = trim(cur.substr(0, colon));
+            if (!name.starts_with("--")) name = lower(name);
             const std::string value = trim(cur.substr(colon + 1));
             if (!name.empty()) {
                 const auto it = std::find_if(out.begin(), out.end(), [&](const auto& p) { return p.first == name; });

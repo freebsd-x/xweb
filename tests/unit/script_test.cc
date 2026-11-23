@@ -1386,3 +1386,19 @@ TEST(Script, SlotChangeAtTheNextMicrotask) {
         </script>)");
     EXPECT_EQ(p.console, "log:a:1b | c:1b | a:0b c:2b\n") << p.console;
 }
+
+TEST(Script, CustomPropertiesKeepTheirCase) {
+    // A second setProperty rewrote the attribute with the first one's name lowercased,
+    // and var(--AirImage-height) no longer found it.
+    Page p(R"JS(<body><div id=d style="height:var(--AirImage-height, 7px)"></div><script>
+        const d = document.getElementById('d');
+        d.style.setProperty('--AirImage-height', '40px');
+        d.style.setProperty('--Other', 'x');
+        d.style.setProperty('COLOR', 'red');
+        console.log(d.getAttribute('style'), d.style.getPropertyValue('--AirImage-height'), d.style.getPropertyValue('--airimage-height') === '');
+        d.style.removeProperty('--Other');
+        console.log(d.getAttribute('style'));
+        </script>)JS");
+    EXPECT_EQ(p.console, "log:height: var(--AirImage-height, 7px); --AirImage-height: 40px; --Other: x; color: red; 40px true\n"
+                         "log:height: var(--AirImage-height, 7px); --AirImage-height: 40px; color: red;\n") << p.console;
+}
