@@ -250,6 +250,11 @@ struct ComputedStyle {
     Color stop_color{0, 0, 0, 255};
     float stop_opacity = 1;
     std::string clip_path;   // "#id"
+    // A rectangle the box is clipped to: clip-path: inset(t r b l) (insets from each edge
+    // of its border box), or clip: rect(t, r, b, l) on an absolutely positioned box (its
+    // edges' places from the box's top left; auto: the box's own edge).
+    uint8_t clip_kind = 0;   // 0 none, 1 inset, 2 rect
+    Length clip_box[4];
     Length margin[4], padding[4], offset[4] = {Length::autoLength(), Length::autoLength(), Length::autoLength(), Length::autoLength()};
     float border_width[4] = {0, 0, 0, 0};
     Color border_color[4];

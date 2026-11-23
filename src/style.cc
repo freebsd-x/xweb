@@ -3636,11 +3636,54 @@ private:
             s.stroke_dasharray = total > 0 ? std::move(dashes) : nullptr;
             return;
         }
+        if (p == "clip") {
+            // rect(t, r, b, l) (commas optional), each a length or auto; auto: no clip.
+            size_t k = i;
+            if (s.clip_kind == 2) s.clip_kind = 0;
+            if (k < v.size() && v[k].type == TokenType::Function && lower(v[k].text) == "rect") {
+                std::vector<Length> parts;
+                size_t j = k + 1;
+                while (j < v.size() && v[j].type != TokenType::RightParen && parts.size() < 4) {
+                    if (v[j].type == TokenType::Whitespace || v[j].type == TokenType::Comma) { ++j; continue; }
+                    Length l;
+                    const size_t before = j;
+                    if (!lengthAt(v, j, c, l, true) || j == before) break;
+                    parts.push_back(l);
+                }
+                if (parts.size() == 4 && s.clip_kind != 1) {
+                    for (int side = 0; side < 4; ++side) s.clip_box[side] = parts[static_cast<size_t>(side)];
+                    s.clip_kind = 2;
+                }
+            }
+            return;
+        }
         if (p == "stop-color") { oneColor(s.stop_color); return; }
         if (p == "clip-path") {
             size_t k = i;
             std::string url;
             s.clip_path.clear();
+            s.clip_kind = 0;
+            // inset(t [r [b [l]]] [round ...]): a rectangle in from the border box's edges.
+            if (k < v.size() && v[k].type == TokenType::Function && lower(v[k].text) == "inset") {
+                std::vector<Length> ins;
+                size_t j = k + 1;
+                while (j < v.size() && v[j].type != TokenType::RightParen && ins.size() < 4) {
+                    if (v[j].type == TokenType::Whitespace) { ++j; continue; }
+                    if (v[j].type == TokenType::Ident && lower(v[j].text) == "round") break;
+                    Length l;
+                    const size_t before = j;
+                    if (!lengthAt(v, j, c, l, false) || j == before) break;
+                    ins.push_back(l);
+                }
+                if (!ins.empty()) {
+                    if (ins.size() == 1) ins.push_back(ins[0]);
+                    if (ins.size() == 2) ins.push_back(ins[0]);
+                    if (ins.size() == 3) ins.push_back(ins[1]);
+                    for (int side = 0; side < 4; ++side) s.clip_box[side] = ins[static_cast<size_t>(side)];
+                    s.clip_kind = 1;
+                }
+                return;
+            }
             if (urlAt(v, k, url) && url.find('#') != std::string::npos) s.clip_path = url.substr(url.find('#'));
             return;
         }

@@ -29,4 +29,12 @@
      it, over what's under (wikipedia.org's language button hides a rule with one). -->
 <div style="position:relative;height:60px;width:300px"><div style="position:absolute;left:0;right:0;top:30px;border-top:2px solid #888"></div>
 <div style="text-align:center;padding-top:16px"><button style="display:inline;position:relative;padding:6px 12px;outline:10px solid #fff;border:1px solid #36c;background:#eef;font:14px sans-serif">Button</button></div></div>
+<!-- clip: rect() and clip-path: inset(): "visually hidden" text shows nothing (apple.com's
+     menu words had a sliver of their hidden text at the end); an inset shows part. -->
+<div style="position:relative;height:60px;width:300px;font:20px sans-serif">
+<span style="position:absolute;left:0;top:0;width:1px;height:40px;overflow:hidden;clip:rect(1px,1px,1px,1px);white-space:nowrap;background:#f00">Hidden words</span>
+<span style="position:absolute;left:20px;top:0;width:1px;height:40px;overflow:hidden;clip-path:inset(0 0 99.9% 99.9%);white-space:nowrap;background:#f00">Hidden too</span>
+<div style="position:absolute;left:60px;top:0;width:100px;height:40px;background:#36c;clip-path:inset(10px 20px 5px 30%)"></div>
+<div style="position:absolute;left:180px;top:0;width:100px;height:40px;background:#3a3;clip:rect(5px, 80px, 30px, 10px)"></div>
+</div>
 </body></html>

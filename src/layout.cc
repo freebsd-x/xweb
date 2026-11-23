@@ -4466,7 +4466,43 @@ private:
         addText(cx - width - 6, top, marker, s, opacity);
     }
 
+    // clip-path: inset(...) and clip: rect(...): the box and all of it inside that
+    // rectangle, or nothing at all if it's empty (the "visually hidden" text of
+    // apple.com's menu showed a sliver at each word's end).
     void paintContents(const Box& b, float x, float y, const Rect& cb_in, float opacity_in) {
+        const ComputedStyle& s = *b.style;
+        const bool rect_clip = s.clip_kind == 2 && (s.position == Position::Absolute || s.position == Position::Fixed);
+        if (s.clip_kind != 1 && !rect_clip) {
+            paintContentsInner(b, x, y, cb_in, opacity_in);
+            return;
+        }
+        const float w = b.outerWidth(), h = b.outerHeight();
+        Rect r{x, y, w, h};
+        if (s.clip_kind == 1) {
+            const float t = s.clip_box[Top].resolve(h), rt = s.clip_box[Right].resolve(w), bt = s.clip_box[Bottom].resolve(h), l = s.clip_box[Left].resolve(w);
+            r = Rect{x + l, y + t, w - l - rt, h - t - bt};
+        } else {
+            const auto at = [](const Length& v, float edge, float size) { return v.is_auto ? edge : v.resolve(size); };
+            const float t = at(s.clip_box[Top], 0, h), rt = at(s.clip_box[Right], w, w), bt = at(s.clip_box[Bottom], h, h), l = at(s.clip_box[Left], 0, w);
+            r = Rect{x + l, y + t, rt - l, bt - t};
+        }
+        if (r.w <= 0 || r.h <= 0) return;   // nothing of it shows
+        PaintOp op;
+        op.kind = PaintKind::ClipBegin;
+        op.x = r.x;
+        op.y = r.y;
+        op.w = r.w;
+        op.h = r.h;
+        out_->ops.push_back(std::move(op));
+        clip_stack_.push_back(r);
+        paintContentsInner(b, x, y, cb_in, opacity_in);
+        if (!clip_stack_.empty()) clip_stack_.pop_back();
+        PaintOp end;
+        end.kind = PaintKind::ClipEnd;
+        out_->ops.push_back(std::move(end));
+    }
+
+    void paintContentsInner(const Box& b, float x, float y, const Rect& cb_in, float opacity_in) {
         const ComputedStyle& s = *b.style;
         const float opacity = opacity_in * s.opacity;
         paintFrame(b, x, y, opacity);
