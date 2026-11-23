@@ -118,6 +118,22 @@ enum Opc : uint32_t {
     OpSuperSet,      // n k v
     OpSuperCall,     // d start argc arr    : super(...) in a derived constructor (arr: a spread's array, or none)
     OpNewTarget,     // d
+    // d a b op: as OpBin, two numbers worked out here (anything else as OpBin does).
+    OpBAdd,
+    OpBSub,
+    OpBMul,
+    OpBBitAnd,
+    OpBBitOr,
+    OpBBitXor,
+    OpBShl,
+    OpBShr,
+    OpBUShr,
+    OpBLt,
+    OpBGt,
+    OpBLe,
+    OpBGe,
+    OpBStrictEq,
+    OpBStrictNe,
     OpYield,         // d s                 : a generator's yield: d is what next() sends
     OpYieldStar,     // d s                 : yield* s
     OpAwait,         // d s
@@ -865,7 +881,7 @@ private:
                     TempMark m(*this);
                     const uint32_t v = value(c->a);
                     const uint32_t eq = temp();
-                    emit(OpBin, {eq, d, v, static_cast<uint32_t>(Op::StrictEq)});
+                    emitBin(eq, d, v, Op::StrictEq);
                     patchTo(jumpFwd(OpJumpIfTrue, {eq}), bodies[i]);
                 }
                 Label* none = t.brk;
@@ -1303,7 +1319,7 @@ private:
                 TempMark m(*this);
                 const uint32_t l = value(n->a, false, {n->b});
                 const uint32_t r = value(n->b);
-                emit(OpBin, {dst, l, r, static_cast<uint32_t>(n->op)});
+                emitBin(dst, l, r, n->op);
                 return;
             }
             case N::Member: {
@@ -1367,6 +1383,31 @@ private:
             case N::ImportCall: case N::ImportMeta: fail("import");
             default: fail("an expression the VM doesn't know");
         }
+    }
+
+    // A binary operator: its own instruction for the usual ones (two numbers worked out
+    // in place), OpBin for the rest.
+    void emitBin(uint32_t d, uint32_t a, uint32_t b, Op op) {
+        Opc c = OpBin;
+        switch (op) {
+            case Op::Add: c = OpBAdd; break;
+            case Op::Sub: c = OpBSub; break;
+            case Op::Mul: c = OpBMul; break;
+            case Op::BitAnd: c = OpBBitAnd; break;
+            case Op::BitOr: c = OpBBitOr; break;
+            case Op::BitXor: c = OpBBitXor; break;
+            case Op::Shl: c = OpBShl; break;
+            case Op::Shr: c = OpBShr; break;
+            case Op::UShr: c = OpBUShr; break;
+            case Op::Lt: c = OpBLt; break;
+            case Op::Gt: c = OpBGt; break;
+            case Op::Le: c = OpBLe; break;
+            case Op::Ge: c = OpBGe; break;
+            case Op::StrictEq: c = OpBStrictEq; break;
+            case Op::StrictNe: c = OpBStrictNe; break;
+            default: break;
+        }
+        emit(c, {d, a, b, static_cast<uint32_t>(op)});
     }
 
     bool assignsAny(const std::vector<Node*>& ks) {
@@ -1507,7 +1548,7 @@ private:
                 } else {
                     const uint32_t old = copyOf(l->reg);
                     const uint32_t r = value(n->b);
-                    emit(OpBin, {l->reg, old, r, static_cast<uint32_t>(n->op)});
+                    emitBin(l->reg, old, r, n->op);
                 }
                 if (dst != l->reg) emit(OpMov, {dst, l->reg});
                 return;
@@ -1529,7 +1570,7 @@ private:
                 return;
             }
             const uint32_t r = value(n->b);
-            emit(OpBin, {dst, dst, r, static_cast<uint32_t>(n->op)});
+            emitBin(dst, dst, r, n->op);
             storeName(t, dst);
             return;
         }
@@ -1549,7 +1590,7 @@ private:
             expr(n->b, dst);
         } else {
             const uint32_t r = value(n->b);
-            emit(OpBin, {dst, dst, r, static_cast<uint32_t>(n->op)});
+            emitBin(dst, dst, r, n->op);
         }
         if (k != kNone) emit(OpSetElem, {o, k, dst});
         else emit(OpSetNamed, {o, node(t), dst});
@@ -1847,6 +1888,10 @@ VmCode* vmCodeFor(FunctionInfo* info) {
 // ── Running ──
 
 namespace {
+// ToInt32 for a number this side of ±2^63 (not NaN or infinite): truncated, then its low
+// 32 bits, as the tree-walker's binaryOp does; anything else goes the slow way.
+inline bool int32Exact(double d) { return d > -9.2e18 && d < 9.2e18; }
+inline int32_t toI32(double d) { return static_cast<int32_t>(static_cast<uint32_t>(static_cast<int64_t>(d))); }
 bool vmProfiling() {
     static const bool on = std::getenv("XWEB_JS_PROFILE") != nullptr;
     return on;
@@ -2205,6 +2250,172 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                         break;
                     }
                     case OpBin: r[o[1]] = binaryOp(static_cast<Op>(o[4]), r[o[2]], r[o[3]]); pc += 5; break;
+                    case OpBAdd: {
+                        const Value &a = r[o[2]], &b = r[o[3]];
+                        if (a.isNumber() && b.isNumber()) {
+                            const double x = a.asNumber(), y = b.asNumber();
+                            r[o[1]] = Value::number(x + y);
+                        } else {
+                            r[o[1]] = binaryOp(Op::Add, a, b);
+                        }
+                        pc += 5;
+                        break;
+                    }
+                    case OpBSub: {
+                        const Value &a = r[o[2]], &b = r[o[3]];
+                        if (a.isNumber() && b.isNumber()) {
+                            const double x = a.asNumber(), y = b.asNumber();
+                            r[o[1]] = Value::number(x - y);
+                        } else {
+                            r[o[1]] = binaryOp(Op::Sub, a, b);
+                        }
+                        pc += 5;
+                        break;
+                    }
+                    case OpBMul: {
+                        const Value &a = r[o[2]], &b = r[o[3]];
+                        if (a.isNumber() && b.isNumber()) {
+                            const double x = a.asNumber(), y = b.asNumber();
+                            r[o[1]] = Value::number(x * y);
+                        } else {
+                            r[o[1]] = binaryOp(Op::Mul, a, b);
+                        }
+                        pc += 5;
+                        break;
+                    }
+                    case OpBLt: {
+                        const Value &a = r[o[2]], &b = r[o[3]];
+                        if (a.isNumber() && b.isNumber()) {
+                            const double x = a.asNumber(), y = b.asNumber();
+                            r[o[1]] = Value::boolean(x < y);
+                        } else {
+                            r[o[1]] = binaryOp(Op::Lt, a, b);
+                        }
+                        pc += 5;
+                        break;
+                    }
+                    case OpBGt: {
+                        const Value &a = r[o[2]], &b = r[o[3]];
+                        if (a.isNumber() && b.isNumber()) {
+                            const double x = a.asNumber(), y = b.asNumber();
+                            r[o[1]] = Value::boolean(x > y);
+                        } else {
+                            r[o[1]] = binaryOp(Op::Gt, a, b);
+                        }
+                        pc += 5;
+                        break;
+                    }
+                    case OpBLe: {
+                        const Value &a = r[o[2]], &b = r[o[3]];
+                        if (a.isNumber() && b.isNumber()) {
+                            const double x = a.asNumber(), y = b.asNumber();
+                            r[o[1]] = Value::boolean(x <= y);
+                        } else {
+                            r[o[1]] = binaryOp(Op::Le, a, b);
+                        }
+                        pc += 5;
+                        break;
+                    }
+                    case OpBGe: {
+                        const Value &a = r[o[2]], &b = r[o[3]];
+                        if (a.isNumber() && b.isNumber()) {
+                            const double x = a.asNumber(), y = b.asNumber();
+                            r[o[1]] = Value::boolean(x >= y);
+                        } else {
+                            r[o[1]] = binaryOp(Op::Ge, a, b);
+                        }
+                        pc += 5;
+                        break;
+                    }
+                    case OpBStrictEq: {
+                        const Value &a = r[o[2]], &b = r[o[3]];
+                        if (a.isNumber() && b.isNumber()) {
+                            const double x = a.asNumber(), y = b.asNumber();
+                            r[o[1]] = Value::boolean(x == y);
+                        } else {
+                            r[o[1]] = binaryOp(Op::StrictEq, a, b);
+                        }
+                        pc += 5;
+                        break;
+                    }
+                    case OpBStrictNe: {
+                        const Value &a = r[o[2]], &b = r[o[3]];
+                        if (a.isNumber() && b.isNumber()) {
+                            const double x = a.asNumber(), y = b.asNumber();
+                            r[o[1]] = Value::boolean(x != y);
+                        } else {
+                            r[o[1]] = binaryOp(Op::StrictNe, a, b);
+                        }
+                        pc += 5;
+                        break;
+                    }
+                    case OpBBitAnd: {
+                        const Value &a = r[o[2]], &b = r[o[3]];
+                        if (a.isNumber() && b.isNumber() && int32Exact(a.asNumber()) && int32Exact(b.asNumber())) {
+                            const double x = a.asNumber(), y = b.asNumber();
+                            r[o[1]] = Value::number(static_cast<double>(toI32(x) & toI32(y)));
+                        } else {
+                            r[o[1]] = binaryOp(Op::BitAnd, a, b);
+                        }
+                        pc += 5;
+                        break;
+                    }
+                    case OpBBitOr: {
+                        const Value &a = r[o[2]], &b = r[o[3]];
+                        if (a.isNumber() && b.isNumber() && int32Exact(a.asNumber()) && int32Exact(b.asNumber())) {
+                            const double x = a.asNumber(), y = b.asNumber();
+                            r[o[1]] = Value::number(static_cast<double>(toI32(x) | toI32(y)));
+                        } else {
+                            r[o[1]] = binaryOp(Op::BitOr, a, b);
+                        }
+                        pc += 5;
+                        break;
+                    }
+                    case OpBBitXor: {
+                        const Value &a = r[o[2]], &b = r[o[3]];
+                        if (a.isNumber() && b.isNumber() && int32Exact(a.asNumber()) && int32Exact(b.asNumber())) {
+                            const double x = a.asNumber(), y = b.asNumber();
+                            r[o[1]] = Value::number(static_cast<double>(toI32(x) ^ toI32(y)));
+                        } else {
+                            r[o[1]] = binaryOp(Op::BitXor, a, b);
+                        }
+                        pc += 5;
+                        break;
+                    }
+                    case OpBShl: {
+                        const Value &a = r[o[2]], &b = r[o[3]];
+                        if (a.isNumber() && b.isNumber() && int32Exact(a.asNumber()) && int32Exact(b.asNumber())) {
+                            const double x = a.asNumber(), y = b.asNumber();
+                            r[o[1]] = Value::number(static_cast<double>(static_cast<int32_t>(static_cast<uint32_t>(toI32(x)) << (static_cast<uint32_t>(toI32(y)) & 31))));
+                        } else {
+                            r[o[1]] = binaryOp(Op::Shl, a, b);
+                        }
+                        pc += 5;
+                        break;
+                    }
+                    case OpBShr: {
+                        const Value &a = r[o[2]], &b = r[o[3]];
+                        if (a.isNumber() && b.isNumber() && int32Exact(a.asNumber()) && int32Exact(b.asNumber())) {
+                            const double x = a.asNumber(), y = b.asNumber();
+                            r[o[1]] = Value::number(static_cast<double>(toI32(x) >> (static_cast<uint32_t>(toI32(y)) & 31)));
+                        } else {
+                            r[o[1]] = binaryOp(Op::Shr, a, b);
+                        }
+                        pc += 5;
+                        break;
+                    }
+                    case OpBUShr: {
+                        const Value &a = r[o[2]], &b = r[o[3]];
+                        if (a.isNumber() && b.isNumber() && int32Exact(a.asNumber()) && int32Exact(b.asNumber())) {
+                            const uint32_t x = static_cast<uint32_t>(toI32(a.asNumber())), y = static_cast<uint32_t>(toI32(b.asNumber()));
+                            r[o[1]] = Value::number(static_cast<double>(x >> (y & 31)));
+                        } else {
+                            r[o[1]] = binaryOp(Op::UShr, a, b);
+                        }
+                        pc += 5;
+                        break;
+                    }
+
                     case OpNot: r[o[1]] = Value::boolean(!rt_.toBoolean(r[o[2]])); pc += 3; break;
                     case OpNeg: case OpBitNot: {
                         Value v = r[o[2]];
