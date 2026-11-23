@@ -1364,3 +1364,23 @@ TEST(Script, StyleSheetsListTheirRules) {
         </script>)");
     EXPECT_EQ(p.console, "log:3 a { color: red } null 1 p { margin: 0 }\n") << p.console;
 }
+
+TEST(Script, SlotChangeAtTheNextMicrotask) {
+    // A slot hears slotchange when what's assigned to it changes (at the next microtask,
+    // bubbling), not when nothing did; a component shows a part by it.
+    Page p(R"(<body><div id=h><b slot=a>1</b></div><script>
+        const h = document.getElementById('h');
+        const root = h.attachShadow({mode: 'open'});
+        const log = [];
+        root.addEventListener('slotchange', e => log.push(e.target.name + ':' + e.target.assignedNodes().length + (e.bubbles ? 'b' : '')));
+        root.innerHTML = '<slot name=a></slot><slot name=c></slot>';
+        Promise.resolve().then(() => {
+          log.push('|');
+          const i = document.createElement('i'); i.slot = 'c'; h.append(i); h.append(document.createElement('u'));
+        }).then(() => {
+          log.push('|');
+          h.querySelector('b').slot = 'c';
+        }).then(() => { console.log(log.join(' ')); });
+        </script>)");
+    EXPECT_EQ(p.console, "log:a:1b | c:1b | a:0b c:2b\n") << p.console;
+}

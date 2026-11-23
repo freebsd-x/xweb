@@ -201,8 +201,48 @@ void PageScript::Impl::upgrade(Node* el, const CustomDefinition& def) {
     if (inDocument(el)) callReaction(el, def.connected, {});
 }
 
+// A slot whose assigned nodes changed hears slotchange (bubbling, not composed) at the
+// next microtask: a host's children coming or going or changing their slot attribute, a
+// slot coming, going or renamed. Web components show or hide parts by it (microsoft.com's
+// featured block kept its header hidden, waiting for one).
+void PageScript::Impl::noteSlots(Node* root) {
+    if (!root || !root->shadow_host) return;
+    if (std::find(slot_roots_dirty.begin(), slot_roots_dirty.end(), root) == slot_roots_dirty.end()) slot_roots_dirty.push_back(root);
+    if (slot_delivery_queued) return;
+    slot_delivery_queued = true;
+    Impl* self = this;
+    Object* deliver = rt.newFunction(u"", 0, [self](Runtime&, const Value&, Args) {
+        self->slot_delivery_queued = false;
+        std::vector<Node*> roots;
+        roots.swap(self->slot_roots_dirty);
+        std::vector<Node*> changed;
+        for (Node* root : roots) {
+            std::vector<Node*> todo(root->children.rbegin(), root->children.rend());   // (tree order)
+            while (!todo.empty() && changed.size() < 10000) {
+                Node* n = todo.back();
+                todo.pop_back();
+                if (n->isHtml("slot")) {
+                    std::vector<const Node*> now;
+                    assignedNodes(n, now);
+                    auto& last = self->slot_last[n];
+                    if (now != last) {
+                        last = std::move(now);
+                        changed.push_back(n);
+                    }
+                }
+                todo.insert(todo.end(), n->children.rbegin(), n->children.rend());   // (not into nested shadow roots)
+            }
+        }
+        for (Node* slot : changed) self->fire(slot, u"slotchange", true, false);
+        return Value::undefined();
+    });
+    rt.enqueueMicrotask(Value::object(deliver));
+}
+
 void PageScript::Impl::afterInsert(Node* parent, Node* child, Node* prev, Node* next) {
     queueMutation(u"childList", parent, {child}, {}, prev, next, nullptr, nullptr);
+    if (parent->shadow_root) noteSlots(parent->shadow_root);
+    if (Node* r = parent->shadow_host ? parent : const_cast<Node*>(parent->containingShadowRoot())) noteSlots(r);
     if (!inDocument(parent)) return;
     scriptsInserted(child);
     if (custom_definitions.empty()) return;
@@ -220,6 +260,8 @@ void PageScript::Impl::afterInsert(Node* parent, Node* child, Node* prev, Node* 
 
 void PageScript::Impl::afterRemove(Node* parent, Node* child, Node* prev, Node* next, bool was_connected) {
     queueMutation(u"childList", parent, {}, {child}, prev, next, nullptr, nullptr);
+    if (parent->shadow_root) noteSlots(parent->shadow_root);
+    if (Node* r = parent->shadow_host ? parent : const_cast<Node*>(parent->containingShadowRoot())) noteSlots(r);
     if (!was_connected || custom_definitions.empty()) return;
     std::vector<Node*> els;
     shadowIncluding(child, els);
@@ -231,6 +273,8 @@ void PageScript::Impl::afterRemove(Node* parent, Node* child, Node* prev, Node* 
 void PageScript::Impl::afterAttr(Node* n, const std::string& name, const std::string* old) {
     ++dom_version;
     queueMutation(u"attributes", n, {}, {}, nullptr, nullptr, &name, old);
+    if (name == "slot" && n->parent && n->parent->shadow_root) noteSlots(n->parent->shadow_root);
+    if (name == "name" && n->isHtml("slot")) noteSlots(const_cast<Node*>(n->containingShadowRoot()));
     // An image a script points somewhere loads whether or not it's in the page (new
     // Image() for a canvas, preloading): its load event comes when it has.
     if ((name == "src" || name == "srcset") && n->isHtml("img") && host.load_image)

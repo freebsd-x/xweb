@@ -250,6 +250,7 @@ public:
         floor_ = next_;
         max_ = std::max(max_, next_);
         if (f.expression_body) {
+            site(f.body);   // (an arrow's errors are its own, not its caller's line)
             const uint32_t r = value(f.body);
             emit(OpReturn, {r});
         } else {

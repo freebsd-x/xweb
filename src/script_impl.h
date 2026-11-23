@@ -867,6 +867,12 @@ struct PageScript::Impl {
     std::vector<std::unique_ptr<ObserverState>> observers;
     std::unordered_map<const Node*, std::vector<Registration>> registrations;
     bool mutation_delivery_queued = false;
+    // slotchange: shadow roots whose slots' assignments may have changed, looked at in
+    // the next microtask; and what each slot had last time it was looked at.
+    std::vector<Node*> slot_roots_dirty;
+    bool slot_delivery_queued = false;
+    std::unordered_map<const Node*, std::vector<const Node*>> slot_last;
+    void noteSlots(Node* shadow_root);
     std::vector<std::pair<Node*, Object*>> adopters;   // shadow roots (or the document) and their adoptedStyleSheets arrays
     std::map<std::string, Object*> interface_protos;  // HTMLDivElement.prototype and the rest
     Object* proto_html_element = nullptr;
