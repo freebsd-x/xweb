@@ -217,6 +217,8 @@ Property& Object::define(const PropertyKey& key, Property p) {
     return props_.back().second;
 }
 
+Value NativeSlot::operator()(Runtime& rt, const Value& this_value, std::span<const Value> args) const { return (*fn_)(rt, this_value, args); }
+
 Property& Object::defineNew(const PropertyKey& key, Property p) {
     props_.emplace_back(key, std::move(p));
     if (props_.size() > kScanMax && index_.size() < props_.size() * 2) reindex();

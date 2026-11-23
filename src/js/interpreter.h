@@ -166,7 +166,7 @@ public:
     Value callScript(Object* f, const Value& this_value, std::span<const Value> args, Object* new_target);
     // A call run by the bytecode VM (vm.cc), its frame already on the call stack.
     Value runVm(Object* f, VmCode& code, const Value& this_value, std::span<const Value> args, Object* new_target);
-    Value callCompiled(Object* f, VmCode& code, const Value& this_value, std::span<const Value> args);
+    Value callCompiled(Object* f, VmCode& code, const Value& this_value, std::span<const Value> args, Object* new_target = nullptr);
 
 private:
     struct EnvScope {

@@ -32,8 +32,18 @@ void checkNewArrayLength(Runtime& rt, uint64_t n) {
 // object, which the method fills with fillSpecies (core-js tests this, and replaces
 // slice, concat, map and filter with its own slow ones where it fails).
 Object* arraySpeciesCreate(Runtime& rt, Object* original, uint64_t length) {
+    static const PropertyKey k_constructor(u"constructor");
+    // A plain array, Array's constructor and species as they were: a plain array (the
+    // usual case, every slice and map; the lookups below were most of a small slice).
+    if (original->cls == ObjectClass::Array && original->prototype == rt.array_prototype && !original->own(k_constructor)) {
+        const js::Property* c = rt.array_prototype->own(k_constructor);
+        if (c && !(c->flags & kAccessor) && c->value.isObject() && c->value.asObject() == rt.array_constructor) {
+            const js::Property* p = rt.array_constructor->own(PropertyKey(rt.sym_species));
+            if (p && (p->flags & kAccessor) && p->getter == rt.array_species_getter) return nullptr;
+        }
+    }
     if (!rt.isArray(Value::object(original))) return nullptr;
-    Value c = rt.get(Value::object(original), u"constructor");
+    Value c = rt.get(Value::object(original), k_constructor);
     if (c.isObject() && c.asObject() == rt.array_constructor) {
         const js::Property* p = rt.array_constructor->own(PropertyKey(rt.sym_species));
         if (p && (p->flags & kAccessor) && p->getter == rt.array_species_getter) return nullptr;

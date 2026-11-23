@@ -1838,7 +1838,7 @@ bool vmProfiling() {
 // A call from compiled code to compiled code, without Runtime::call's way round: no
 // dispatch on the kind of function, no roots to register (the arguments are the
 // caller's registers, on the stack), its frame on the call stack all the same.
-Value Interpreter::callCompiled(Object* f, VmCode& code, const Value& this_value, std::span<const Value> args) {
+Value Interpreter::callCompiled(Object* f, VmCode& code, const Value& this_value, std::span<const Value> args, Object* new_target) {
     if (rt_.call_depth >= Runtime::kMaxCallDepth) rt_.throwError("RangeError", "too much recursion");
     ++rt_.call_depth;
     struct Down {
@@ -1859,7 +1859,7 @@ Value Interpreter::callCompiled(Object* f, VmCode& code, const Value& this_value
         }
     } frame(&info->name);
     rt_.safePoint();
-    return callee.runVm(f, code, this_value, args, nullptr);
+    return callee.runVm(f, code, this_value, args, new_target);
 }
 
 Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::span<const Value> args, Object* new_target) {
@@ -2300,6 +2300,33 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                                     }
                             }
                         }
+                        // A built-in: called straight too (the arguments are registers, on the stack).
+                        if (fn.isObject()) {
+                            Object* fo = fn.asObject();
+                            if (fo->cls == ObjectClass::Function && fo->native && !fo->bound_target) {
+                                if (rt_.call_depth >= Runtime::kMaxCallDepth) rt_.throwError("RangeError", "too much recursion");
+                                ++rt_.call_depth;
+                                struct Down {
+                                    Runtime& rt;
+                                    Object* saved;
+                                    ~Down() {
+                                        --rt.call_depth;
+                                        rt.construct_target = saved;
+                                    }
+                                } down{rt_, rt_.construct_target};
+                                rt_.construct_target = nullptr;   // (called, not constructed)
+                                const std::span<const Value> av(r + o[4], o[5]);
+                                Value v;
+                                if (fo->gc_safe) v = fo->native(rt_, r[o[3]], av);
+                                else {
+                                    Runtime::NoGc no_gc(rt_);
+                                    v = fo->native(rt_, r[o[3]], av);
+                                }
+                                r[o[1]] = std::move(v);
+                                pc += 7;
+                                break;
+                            }
+                        }
                         if (!rt_.isCallable(fn)) rt_.throwError("TypeError", calleeName(call) + " is not a function");
                         Value v = rt_.call(fn, r[o[3]], std::span<const Value>(r + o[4], o[5]));
                         r[o[1]] = std::move(v);
@@ -2326,6 +2353,17 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                             Node* c = nw->a;
                             std::string what = c->kind == N::Identifier ? utf8(c->str) : c->kind == N::Member && !(c->flags & kComputed) ? utf8(c->str) : "expression";
                             rt_.throwError("TypeError", what + " is not a constructor");
+                        }
+                        // A compiled constructor: straight into it, as a call is.
+                        if (Object* fo = fn.asObject(); fo->cls == ObjectClass::Function && fo->code && !fo->native && !fo->bound_target && !vmProfiling()) {
+                            FunctionInfo* ci = fo->code->info;
+                            if (!ci->is_async && !ci->is_generator)
+                                if (VmCode* cc = vmCodeFor(ci)) {
+                                    Value v = callCompiled(fo, *cc, Value::undefined(), std::span<const Value>(r + o[3], o[4]), fo);
+                                    r[o[1]] = std::move(v);
+                                    pc += 6;
+                                    break;
+                                }
                         }
                         Value v = rt_.construct(fn, std::span<const Value>(r + o[3], o[4]));
                         r[o[1]] = std::move(v);

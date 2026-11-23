@@ -220,6 +220,58 @@ struct ValueSameZero {
 
 struct FunctionData;   // a script function's code and closure (runtime.cc)
 
+// A built-in's C++ (most objects have none): held out of line, 8 bytes in every object
+// rather than a std::function's 48. Used as one: tested, called, assigned.
+class NativeSlot {
+public:
+    NativeSlot() = default;
+    template <typename F>
+    NativeSlot& operator=(F&& f) {
+        fn_ = std::make_unique<NativeFunction>(std::forward<F>(f));
+        return *this;
+    }
+    explicit operator bool() const noexcept { return fn_ && *fn_; }
+    Value operator()(Runtime& rt, const Value& this_value, std::span<const Value> args) const;
+    operator const NativeFunction&() const noexcept {
+        static const NativeFunction none;
+        return fn_ ? *fn_ : none;
+    }
+
+private:
+    std::unique_ptr<NativeFunction> fn_;
+};
+
+// A map only some objects need (a Map's or Set's index): made when first written,
+// read as empty till then.
+template <typename M>
+class LazyMap {
+public:
+    using iterator = typename M::iterator;
+    template <typename K>
+    iterator find(const K& k) { return m_ ? m_->find(k) : none().find(k); }
+    iterator end() { return m_ ? m_->end() : none().end(); }
+    template <typename K>
+    size_t count(const K& k) const { return m_ ? m_->count(k) : 0; }
+    [[nodiscard]] size_t size() const noexcept { return m_ ? m_->size() : 0; }
+    void clear() { if (m_) m_->clear(); }
+    template <typename... A>
+    auto emplace(A&&... a) { return get().emplace(std::forward<A>(a)...); }
+    auto erase(iterator it) { return get().erase(it); }
+    template <typename K>
+    size_t erase(const K& k) { return m_ ? m_->erase(k) : 0; }
+
+private:
+    M& get() {
+        if (!m_) m_ = std::make_unique<M>();
+        return *m_;
+    }
+    static M& none() {
+        static M empty;   // (never written: only found in)
+        return empty;
+    }
+    std::unique_ptr<M> m_;
+};
+
 // An ArrayBuffer's bytes, shared by the views on it.
 struct BufferData {
     std::vector<uint8_t> bytes;
@@ -259,7 +311,7 @@ public:
     std::vector<Value> elements;
 
     // Functions.
-    NativeFunction native;
+    NativeSlot native;
     // A built-in that keeps nothing in its own heap buffers while it calls back into
     // JavaScript (or roots what it keeps): a collection may run inside it.
     bool gc_safe = false;
@@ -280,7 +332,7 @@ public:
     // Boolean, Number, String and Symbol wrappers' value; an iterator's state.
     Value primitive;
     std::vector<std::pair<Value, Value>> entries;   // Map and Set, in insertion order (deleted ones empty)
-    std::unordered_map<Value, size_t, ValueHash, ValueSameZero> index;   // a key's place in entries
+    LazyMap<std::unordered_map<Value, size_t, ValueHash, ValueSameZero>> index;   // a key's place in entries
     size_t cursor = 0;
     Object* target = nullptr;   // an iterator's subject
     uint8_t iter_kind = 0;
