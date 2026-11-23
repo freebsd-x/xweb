@@ -3908,6 +3908,55 @@ private:
         if (p == "min-height") { oneLength(s.min_height, true); noNegative(s.min_height); return; }
         if (p == "max-width") { if (kw == "none") s.max_width = Length::autoLength(); else { oneLength(s.max_width, false); noNegative(s.max_width); } return; }
         if (p == "max-height") { if (kw == "none") s.max_height = Length::autoLength(); else { oneLength(s.max_height, false); noNegative(s.max_height); } return; }
+        if (p == "outline" || p == "outline-width" || p == "outline-style" || p == "outline-color") {
+            const LengthContext c = lengthContext(s);
+            const std::string kw = keyword(v);
+            if (kw == "inherit") {
+                s.outline = parent.outline;
+                s.outline_width = parent.outline_width;
+                s.outline_color = parent.outline_color;
+                s.outline_color_set = parent.outline_color_set;
+                return;
+            }
+            if (p == "outline") {
+                s.outline = false;
+                s.outline_width = 3;
+                s.outline_color_set = false;
+            }
+            for (size_t start : valueStarts(v)) {
+                const Token& t = v[start];
+                bool ok = false;
+                const float w = borderWidthFrom(t, c, ok);
+                if (ok && p != "outline-color" && p != "outline-style") {
+                    s.outline_width = w;
+                    continue;
+                }
+                if (t.type == TokenType::Ident && p != "outline-width" && p != "outline-color") {
+                    const std::string n = lower(t.text);
+                    if (n == "auto" || isBorderStyle(n)) {
+                        s.outline = n != "none" && n != "hidden";
+                        continue;
+                    }
+                }
+                if (p == "outline-width" || p == "outline-style") continue;
+                size_t i = start;
+                Color parsed;
+                if (t.type == TokenType::Ident && lower(t.text) == "invert") continue;
+                if (colorFromTokens(v, i, s.color, parsed)) {
+                    s.outline_color = parsed;
+                    s.outline_color_set = !(t.type == TokenType::Ident && lower(t.text) == "currentcolor");
+                }
+            }
+            return;
+        }
+        if (p == "outline-offset") {
+            float px = 0;
+            if (!v.empty()) {
+                if (v[0].type == TokenType::Dimension && dimensionPx(v[0], lengthContext(s), px)) s.outline_offset = px;
+                else if (v[0].type == TokenType::Number && v[0].number == 0) s.outline_offset = 0;
+            }
+            return;
+        }
         if (p == "border") { setBorder(s, v, {Top, Right, Bottom, Left}); return; }
         if (p == "border-top") { setBorder(s, v, {Top}); return; }
         if (p == "border-right") { setBorder(s, v, {Right}); return; }
@@ -4514,6 +4563,11 @@ private:
                 default: break;
             }
         }
+
+        // A button is an inline-block even when it says inline (HTML's rendering of
+        // buttons): wikipedia.org's "Read Wikipedia in your language" sets display:inline
+        // and its box, background and outline went missing.
+        if (s.display == Display::Inline && el && el->isHtml("button")) s.display = Display::InlineBlock;
 
         // Lines drawn by an ancestor run through its descendants' text regardless.
         s.underline = s.underline || parent.underline;

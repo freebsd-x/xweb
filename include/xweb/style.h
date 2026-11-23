@@ -253,6 +253,12 @@ struct ComputedStyle {
     Length margin[4], padding[4], offset[4] = {Length::autoLength(), Length::autoLength(), Length::autoLength(), Length::autoLength()};
     float border_width[4] = {0, 0, 0, 0};
     Color border_color[4];
+    // outline: drawn outside the border box (outline-offset further out), not taking room.
+    bool outline = false;          // a style other than none
+    float outline_width = 3;       // medium
+    float outline_offset = 0;
+    bool outline_color_set = false;
+    Color outline_color;           // (currentColor unless set)
     enum class WidthKeyword { None, MinContent, MaxContent, FitContent } width_keyword = WidthKeyword::None;   // width is auto then
     Length width = Length::autoLength(), height = Length::autoLength();
     // auto (the initial value) resolves to 0, but a flex item's is its content.

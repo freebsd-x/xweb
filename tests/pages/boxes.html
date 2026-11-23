@@ -25,4 +25,8 @@
      tree order (news.naver.com's header: an absolute ::before paints its colour). -->
 <style>.po{position:relative;width:200px;height:40px}.po::before{content:"";position:absolute;inset:0;background:#36c}</style>
 <div class="po"><div style="position:relative;width:30px;height:20px;background:#fc0"></div><span style="position:relative;display:inline-block;width:30px;height:15px;background:#0f0"></span></div>
+<!-- A button saying display:inline is an inline-block still; an outline is drawn round
+     it, over what's under (wikipedia.org's language button hides a rule with one). -->
+<div style="position:relative;height:60px;width:300px"><div style="position:absolute;left:0;right:0;top:30px;border-top:2px solid #888"></div>
+<div style="text-align:center;padding-top:16px"><button style="display:inline;position:relative;padding:6px 12px;outline:10px solid #fff;border:1px solid #36c;background:#eef;font:14px sans-serif">Button</button></div></div>
 </body></html>

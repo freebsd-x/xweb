@@ -3873,7 +3873,22 @@ private:
                k == ControlKind::Submit || k == ControlKind::Reset || k == ControlKind::Button;
     }
 
+    // An outline: round the border box (outline-offset further out), taking no room.
+    void paintOutline(const Box& b, float x, float y, float opacity) {
+        const ComputedStyle& s = *b.style;
+        if (!s.outline || s.outline_width <= 0 || s.hidden) return;
+        const float o = s.outline_offset, t = s.outline_width;
+        const float ox = x - o - t, oy = y - o - t, ow = b.outerWidth() + 2 * (o + t), oh = b.outerHeight() + 2 * (o + t);
+        if (ow <= 0 || oh <= 0) return;
+        const Color c = faded(s.outline_color_set ? s.outline_color : s.color, opacity);
+        addRect(ox, oy, ow, t, c);
+        addRect(ox, oy + oh - t, ow, t, c);
+        addRect(ox, oy + t, t, oh - 2 * t, c);
+        addRect(ox + ow - t, oy + t, t, oh - 2 * t, c);
+    }
+
     void paintFrame(const Box& b, float x, float y, float opacity) {
+        if (b.style && b.style->outline) paintOutline(b, x, y, opacity);
         const ComputedStyle& s = *b.style;
         const float w = b.outerWidth(), h = b.outerHeight();
         if (s.hidden) return;
