@@ -1246,8 +1246,10 @@ TEST(Script, FrameDocumentsAttrNodesAndSmallGlobals) {
         n.value = 'u';
         console.log(!!f.contentDocument.body, f.contentDocument === d, a.getAttribute('title'), a.getAttributeNode('nope'),
                     typeof IntersectionObserverEntry, Notification.permission);
+        const w = f.contentWindow;
+        console.log(typeof w.Element.prototype.attachShadow, typeof w.Array, w.self === w, w.parent === window, w.document === d);
         </script>)");
-    EXPECT_EQ(p.console, "log:true true u null function denied\n") << p.console;
+    EXPECT_EQ(p.console, "log:true true u null function denied\nlog:function function true true true\n") << p.console;
 }
 
 TEST(Script, DocumentWriteIsOneStreamPerScript) {

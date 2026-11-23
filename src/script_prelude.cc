@@ -1848,15 +1848,20 @@ const char* const kScriptPrelude = R"JS(
         let w = frames.get(this);
         if (!w) {
           const frame = this;
-          w = Object.freeze({
+          // What it doesn't have of its own comes from this window: scripts take
+          // constructors from a frame's (rrweb's contentWindow.Element.prototype, a clean
+          // Array or fetch), and there's only the one realm to give them.
+          const own = {
             postMessage() {}, focus() {}, blur() {}, close() {},
             addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
             get closed() { return !frame.isConnected; },
             get parent() { return global; }, get top() { return global; }, get opener() { return null; },
-            get frames() { return w; }, get self() { return w; }, get window() { return w; }, length: 0,
+            get frames() { return w; }, get self() { return w; }, get window() { return w; }, get globalThis() { return w; }, length: 0,
             get location() { return { get href() { return frame.src || 'about:blank'; }, replace() {}, assign() {} }; },
             get document() { return frameDocument(frame); },
-          });
+          };
+          w = Object.create(global);
+          for (const k of Reflect.ownKeys(own)) Object.defineProperty(w, k, Object.getOwnPropertyDescriptor(own, k));
           frames.set(this, w);
         }
         return w;
