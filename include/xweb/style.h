@@ -245,6 +245,11 @@ struct ComputedStyle {
     std::shared_ptr<const BackgroundLayers> background_layers;   // null: no images
     std::shared_ptr<const BackgroundLayers> mask_layers;
     bool masked = false;   // shaped by a mask we can't draw
+    uint8_t mask_composite = 0;   // add, subtract, intersect, exclude
+    // Two opaque mask layers, one clipped to the border box and one to this box, that
+    // exclude each other: only the band between shows (a gradient ring drawn on a ::before).
+    // 0: no such mask; else 1 + BackgroundBox (Padding or Content).
+    uint8_t mask_ring = 0;
     // SVG, not inherited
     uint32_t svg_set = 0;   // SvgSetBits
     Color stop_color{0, 0, 0, 255};

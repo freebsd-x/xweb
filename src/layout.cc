@@ -3936,8 +3936,21 @@ private:
 
         const bool own_background = &b != skip_background_;
         if (own_background && s.box_shadow) paintShadows(base, x, y, opacity, false, *s.box_shadow);
+        if (own_background && s.mask_ring) {
+            // Background colour and gradients shown only in a band inside the edge.
+            auto p = std::make_shared<BoxPaint>(base);
+            p->part = BoxPaint::Part::Ring;
+            p->background = faded(s.background, opacity);
+            const bool content = s.mask_ring == 1 + static_cast<int>(BackgroundBox::Content);
+            for (int i = 0; i < 4; ++i) p->border[i] = b.border[i] + (content ? b.padding[i] : 0);
+            if (s.background_layers)
+                for (size_t i = s.background_layers->images.size(); i-- > 0;)
+                    if (const auto& g = s.background_layers->images[i].gradient) p->gradients.push_back(g);
+            if (p->background.visible() || !p->gradients.empty()) addBoxPaint(x, y, w, h, std::move(p));
+            if (s.box_shadow) paintShadows(base, x, y, opacity, true, *s.box_shadow);
+        }
         // A mask shows the background colour only where the mask's images are.
-        const Color bg = !own_background || s.masked ? Color{0, 0, 0, 0} : faded(s.background, opacity);
+        const Color bg = !own_background || s.masked || s.mask_ring ? Color{0, 0, 0, 0} : faded(s.background, opacity);
         if (bg.visible()) {
             if (uniform) {
                 addRect(x, y, w, h, bg, r0);
@@ -3948,7 +3961,7 @@ private:
                 addBoxPaint(x, y, w, h, std::move(p));
             }
         }
-        if (own_background) {
+        if (own_background && !s.mask_ring) {
             if (s.masked) {
                 const Color tint = faded(s.background, opacity);
                 if (tint.visible()) paintLayers(b, x, y, *s.mask_layers, opacity, &tint, Rect{0, 0, 0, 0}, false);
@@ -4262,7 +4275,10 @@ private:
             const std::string label = controlText(n);
             if (label.empty()) return;
             const float tw = text_.width(label, font);
-            clipped([&] { text(cx + std::max(0.0f, (b.width - tw) / 2), cy + (b.height - line_h) / 2, label, s.color); });
+            // Centred in what's left after text-indent, as Chromium does: -9999px is how an icon
+            // button hides its "Submit" (nate.com's search).
+            const float indent = s.text_indent.resolve(b.width);
+            clipped([&] { text(cx + indent + std::max(0.0f, (b.width - indent - tw) / 2), cy + (b.height - line_h) / 2, label, s.color); });
             return;
         }
         const std::string shown = controlText(n);

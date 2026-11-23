@@ -377,6 +377,30 @@ TEST(Mask, AMaskedColourIsKeptForTheMask) {
     EXPECT_TRUE(styles.styleOf(find("c"))->background.visible());
 }
 
+TEST(Mask, TwoOpaqueLayersThatExcludeEachOtherAreARing) {
+    // The gradient-border idiom: one layer on the content box, one on the border box, xor.
+    const auto doc = parseHtml("<!doctype html>"
+        "<div id=a style='-webkit-mask-image:linear-gradient(#fff 0 0),linear-gradient(#fff 0 0);-webkit-mask-clip:content-box,border-box;-webkit-mask-composite:xor'></div>"
+        "<div id=b style='mask:linear-gradient(#000 0 0) padding-box,linear-gradient(#000 0 0);mask-composite:exclude'></div>"
+        "<div id=c style='-webkit-mask-image:linear-gradient(#fff 0 0),linear-gradient(#fff 0 0);-webkit-mask-clip:content-box,border-box'></div>"
+        "<div id=d style='mask-image:linear-gradient(#fff,transparent),linear-gradient(#fff 0 0);mask-clip:content-box,border-box;mask-composite:exclude'></div>");
+    const StyledDocument styles(*doc, {800, 600});
+    const auto find = [&](const char* id) {
+        std::vector<const Node*> todo{doc->root()};
+        while (!todo.empty()) {
+            const Node* n = todo.back();
+            todo.pop_back();
+            if (const std::string* v = n->attr("id"); v && *v == id) return n;
+            todo.insert(todo.end(), n->children.begin(), n->children.end());
+        }
+        return static_cast<const Node*>(nullptr);
+    };
+    EXPECT_EQ(styles.styleOf(find("a"))->mask_ring, 1 + static_cast<int>(BackgroundBox::Content));
+    EXPECT_EQ(styles.styleOf(find("b"))->mask_ring, 1 + static_cast<int>(BackgroundBox::Padding));
+    EXPECT_EQ(styles.styleOf(find("c"))->mask_ring, 0);   // added, not excluded: all of it shows
+    EXPECT_EQ(styles.styleOf(find("d"))->mask_ring, 0);   // a fading layer isn't a ring
+}
+
 TEST(Values, LogicalPropertiesAreTheirPhysicalOnes) {
     const auto s = style("<style>#a{margin-left:0;margin-inline-start:20px;padding-block-end:3px;inline-size:50px;max-block-size:9px;"
                          "border-inline-end:2px solid red;inset-inline-start:4px;inset-block:1px 2px}#b{inset:5px}</style><div id=a></div><div id=b></div>");

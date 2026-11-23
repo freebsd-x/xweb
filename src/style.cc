@@ -3348,7 +3348,7 @@ private:
         else if (p == "background-color") to.background = from.background;
         else if (p == "background") { to.background = from.background; to.background_layers = from.background_layers; }
         else if (p.starts_with("background-")) to.background_layers = from.background_layers;
-        else if (p == "mask" || p == "-webkit-mask" || p.starts_with("mask-") || p.starts_with("-webkit-mask-")) { to.mask_layers = from.mask_layers; to.masked = from.masked; }
+        else if (p == "mask" || p == "-webkit-mask" || p.starts_with("mask-") || p.starts_with("-webkit-mask-")) { to.mask_layers = from.mask_layers; to.masked = from.masked; to.mask_composite = from.mask_composite; }
         else if (p == "stop-color") to.stop_color = from.stop_color;
         else if (p == "stop-opacity") to.stop_opacity = from.stop_opacity;
         else if (p == "clip-path") to.clip_path = from.clip_path;
@@ -3587,6 +3587,16 @@ private:
         if (p == "content") { setContent(s, v); return; }
         if (p == "mask" || p == "-webkit-mask" || p.starts_with("mask-") || p.starts_with("-webkit-mask-")) {
             const std::string longhand = p == "mask" || p == "-webkit-mask" ? std::string{} : p.substr(p.find("mask-") + 5);
+            if (longhand == "composite") {
+                // The first layer's; -webkit- spells them as Porter-Duff operators.
+                const std::string first = kw.substr(0, kw.find_first_of(", "));
+                if (first == "add" || first == "source-over") s.mask_composite = 0;
+                else if (first == "subtract" || first == "source-out") s.mask_composite = 1;
+                else if (first == "intersect" || first == "source-in") s.mask_composite = 2;
+                else if (first == "exclude" || first == "xor") s.mask_composite = 3;
+                return;
+            }
+            if (longhand.empty()) s.mask_composite = 0;
             if (longhand.empty()) {
                 BackgroundLayers layers;
                 if (layersFromShorthand(v, c, s.color, true, layers, nullptr)) s.mask_layers = std::make_shared<BackgroundLayers>(std::move(layers));
@@ -4585,6 +4595,26 @@ private:
         // Its colour only shows through the mask: layout draws it that way, or not at all.
         s.masked = s.mask_layers && std::any_of(s.mask_layers->images.begin(), s.mask_layers->images.end(),
                                                 [](const BackgroundImage& i) { return !i.url.empty(); });
+        s.mask_ring = 0;
+        if (s.mask_layers && s.mask_composite == 3 && s.mask_layers->images.size() == 2 && !s.masked) {
+            // What each layer covers: an opaque gradient fills its clip box when it repeats,
+            // else the smaller of its origin and clip boxes (they nest).
+            const BackgroundLayers& L = *s.mask_layers;
+            int box[2] = {-1, -1};
+            for (size_t i = 0; i < 2; ++i) {
+                const BackgroundImage& im = L.images[i];
+                if (!im.gradient || im.gradient->stops.empty()) break;
+                bool opaque = true;
+                for (const GradientStop& st : im.gradient->stops) opaque = opaque && st.color.a == 255;
+                const BackgroundSize& sz = L.sizes[i % L.sizes.size()];
+                if (!opaque || sz.kind != BackgroundSize::Kind::Explicit || !sz.width.is_auto || !sz.height.is_auto) break;
+                const auto [rx, ry] = L.repeats[i % L.repeats.size()];
+                const int clip = static_cast<int>(L.clips[i % L.clips.size()]), origin = static_cast<int>(L.origins[i % L.origins.size()]);
+                box[i] = rx && ry ? clip : std::max(clip, origin);
+            }
+            if (box[0] >= 0 && box[1] >= 0 && box[0] != box[1] && std::min(box[0], box[1]) == static_cast<int>(BackgroundBox::Border))
+                s.mask_ring = static_cast<uint8_t>(1 + std::max(box[0], box[1]));
+        }
 
         // Absolute, fixed and floated boxes are blocks, whatever they said.
         const bool out_of_flow = s.position == Position::Absolute || s.position == Position::Fixed;

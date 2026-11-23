@@ -145,7 +145,11 @@ struct BoxPaint {
     enum class Part : uint8_t {
         Background, Border, OuterShadow, InsetShadow,
         Checkbox, Radio, SelectArrow,   // form controls, as Chromium draws them; `checked` says which way
+        // `background` then `gradients` (bottom first, each over the whole box), only in the
+        // band `border` wide inside its edge: a mask-composite ring.
+        Ring,
     } part = Part::Background;
+    std::vector<std::shared_ptr<const Gradient>> gradients;
     bool checked = false;
     float w = 0, h = 0;      // the border box
     float ox = 0, oy = 0;    // where its top left is in the area drawn

@@ -479,6 +479,24 @@ TEST(Style, BorderStylesPerSide) {
     EXPECT_FLOAT_EQ(b->radius[2][1].px, 5);
 }
 
+TEST(BoxPaint, ARingShowsItsPaintOnlyNearTheEdge) {
+    BoxPaint b;
+    b.part = BoxPaint::Part::Ring;
+    b.w = 60;
+    b.h = 40;
+    for (float& w : b.border) w = 4;
+    b.background = {0, 0, 255, 255};
+    auto g = std::make_shared<Gradient>();
+    g->stops = {{Color{255, 0, 0, 255}}, {Color{255, 0, 0, 255}}};
+    b.gradients.push_back(g);
+    const Raster r = renderBoxPaint(b, 60, 40, 60, 40);
+    EXPECT_EQ(at(r, 1, 20).a, 255);
+    EXPECT_EQ(at(r, 1, 20).r, 255);   // the gradient, over the colour
+    EXPECT_EQ(at(r, 30, 2).a, 255);
+    EXPECT_EQ(at(r, 30, 20).a, 0);    // the middle is cut out
+    EXPECT_EQ(at(r, 10, 10).a, 0);
+}
+
 TEST(BoxPaint, ShadowsAndCorners) {
     // An inset shadow darkens the edges, not the middle.
     BoxPaint b;

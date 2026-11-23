@@ -1513,6 +1513,23 @@ Raster renderBoxPaint(const BoxPaint& box, float area_w, float area_h, uint32_t 
             canvas.fill(outer, false, p);
             break;
         }
+        case BoxPaint::Part::Ring: {
+            const Contours inner = scaled(insetShape(0, 0, box.w, box.h, box.radii, b[0], b[1], b[2], b[3]), kx, ky, box.ox, box.oy);
+            Contours both = outer;
+            both.insert(both.end(), inner.begin(), inner.end());
+            const std::vector<float> cov = coverageOf(W, H, both, true);
+            // The box's paint, unmasked, then through the ring.
+            Canvas fill(px_w, px_h);
+            if (box.background.visible()) fill.fillRect(box.ox * kx, box.oy * ky, box.w * kx, box.h * ky, box.background);
+            const uint32_t gw = static_cast<uint32_t>(std::lround(box.w * kx)), gh = static_cast<uint32_t>(std::lround(box.h * ky));
+            for (const auto& g : box.gradients) {
+                const Raster r = renderGradient(*g, box.w, box.h, gw, gh);
+                if (!r.empty()) fill.drawRaster(r, box.ox * kx, box.oy * ky, box.w * kx, box.h * ky);
+            }
+            const Canvas mask = Canvas::fromAlpha(px_w, px_h, cov);
+            canvas.composite(fill, 1, &mask);
+            break;
+        }
         case BoxPaint::Part::Border: {
             const Contours inner = scaled(insetShape(0, 0, box.w, box.h, box.radii, b[0], b[1], b[2], b[3]), kx, ky, box.ox, box.oy);
             Contours both = outer;
