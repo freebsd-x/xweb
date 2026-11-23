@@ -1942,6 +1942,14 @@ private:
                 b = std::max(b, q.y);
             }
         });
+        // Squeezed to nothing (scale(0): how skip links and closed menus hide until
+        // focused): nothing to see, text or not. A group with text was drawn untransformed,
+        // so it showed in full (ikea.com's "Skip to main content").
+        if (!(r - l >= 0.5f) || !(b - t >= 0.5f)) {
+            bool any = false;
+            eachTransformed(begin, end, [&](const web::PaintOp&, const web::Matrix&) { any = true; });
+            if (any) return true;
+        }
         if (text) return false;
         if (drawScaled(dl, begin, end, at)) return true;
         if (!(r > l && b > t) || !std::isfinite(l) || !std::isfinite(t) || !std::isfinite(r) || !std::isfinite(b)) return true;
