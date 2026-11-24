@@ -79,6 +79,8 @@ public:
     };
     // `now` styled, in place of `before` (null: nothing was): what changed starts moving.
     void styled(StyledDocument& now, const StyledDocument* before, double seconds);
+    // Whether anything would start or stop by styled(now, before): nothing's done.
+    [[nodiscard]] bool wouldStart(const StyledDocument& now, const StyledDocument& before) const;
     // Time has passed: what's moving laid over the document's styles again. True if any
     // value came out different.
     bool tick(StyledDocument& doc, double seconds);

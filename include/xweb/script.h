@@ -106,6 +106,10 @@ public:
     // Runs the page's scripts in document order, then DOMContentLoaded and load.
     // `source` gives an external script's text by its absolute address.
     void run(const std::function<std::optional<std::string>(const std::string& url)>& source);
+    // The same a little at a time: begin, then runSome until it returns true, each time for
+    // about so long (a script, once begun, is run through), with the event loop between.
+    void begin(const std::function<std::optional<std::string>(const std::string& url)>& source);
+    [[nodiscard]] bool runSome(double ms);
 
     // The user's doing, as events. Each returns false if a script cancelled the default.
     bool click(Node* target, float page_x, float page_y);

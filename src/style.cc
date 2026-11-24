@@ -1756,18 +1756,73 @@ struct PartRule {
 
 // The rules of one tree: the user agent's, the document's, or a shadow root's. A shadow
 // tree's rules only reach into it, and to its host through :host.
-struct Scope {
+struct ScopeRules {
     Buckets normal, before, after, placeholder;
     std::vector<IndexedSelector> host;      // rules whose subject is :host(...)
     std::deque<SlottedRule> slotted;
     std::deque<PartRule> parts;             // aimed at shadow trees of this tree's elements
+};
+
+struct Scope {
+    std::shared_ptr<const ScopeRules> rules;   // shadow roots of the same sheets have the same ones
     const Node* host_el = nullptr;          // a shadow scope's host
     // What it is, the same from one restyle to the next while its host and its sheets are
     // (its address isn't: shadow scopes are made afresh each time). See elementKey.
     uint64_t ident = 0;
 };
 
-class StyleResolver {
+// What's noted of sheets' rules as they're indexed, for the whole page.
+struct Notes {
+    bool uses_has_ = false;   // a rule with :has(): what an element matches can depend on its descendants
+    bool has_any_anchor_ = false;
+    bool style_selector_ = false;   // a selector asks about style attributes ([style])
+    // Elements asked about siblings after them (:last-child, ...): any, or with these.
+    std::map<std::string, const css::KeyframesRule*> keyframes_;
+    bool state_any_ = false;   // an element's :hover, :focus or :active is asked: any's, or of these
+    std::unordered_set<uint32_t> state_anchors_;
+    bool follow_any_ = false, follow_exact_any_ = false;
+    std::unordered_set<uint32_t> follow_anchors_, follow_exact_anchors_;   // (exact: :nth-last-*)
+    std::unordered_set<std::string> inherit_used_;   // properties a rule gives `inherit`
+    std::vector<const CompoundSelector*> has_args_;   // what the :has()s with no anchor look for
+    bool has_args_siblings_ = false;                  // one among later siblings
+    std::unordered_set<uint32_t> has_host_anchors_;   // tags of hosts a :host:has() is asked of
+    bool has_context_ = false;   // a :has() asked for another element, of any element
+    std::unordered_set<uint32_t> has_context_anchors_;   // of these (as has_anchors_)
+    // The compounds with those (in the rules' sheets, kept by the index or sheets_).
+    std::vector<const CompoundSelector*> has_context_compounds_;
+    std::unordered_set<uint32_t> has_anchors_;
+
+    void add(const Notes& o) {
+        const auto all = [](auto& into, const auto& from) { into.insert(from.begin(), from.end()); };
+        uses_has_ |= o.uses_has_;
+        has_any_anchor_ |= o.has_any_anchor_;
+        style_selector_ |= o.style_selector_;
+        for (const auto& [name, rule] : o.keyframes_) keyframes_[name] = rule;
+        state_any_ |= o.state_any_;
+        all(state_anchors_, o.state_anchors_);
+        follow_any_ |= o.follow_any_;
+        follow_exact_any_ |= o.follow_exact_any_;
+        all(follow_anchors_, o.follow_anchors_);
+        all(follow_exact_anchors_, o.follow_exact_anchors_);
+        all(inherit_used_, o.inherit_used_);
+        has_args_.insert(has_args_.end(), o.has_args_.begin(), o.has_args_.end());
+        has_args_siblings_ |= o.has_args_siblings_;
+        all(has_host_anchors_, o.has_host_anchors_);
+        has_context_ |= o.has_context_;
+        all(has_context_anchors_, o.has_context_anchors_);
+        has_context_compounds_.insert(has_context_compounds_.end(), o.has_context_compounds_.begin(), o.has_context_compounds_.end());
+        all(has_anchors_, o.has_anchors_);
+    }
+};
+
+class StyleResolver : Notes {
+    // Which sheets apply, collected before their rules are indexed.
+    struct SheetUse {
+        std::shared_ptr<const css::Stylesheet> sheet;
+        Origin origin;
+        std::string url;
+        bool to_ua;
+    };
 public:
     StyleResolver(const Document& doc, StyledDocument& out, const StyledDocument::SheetLoader& loader, const StyledDocument* previous)
         : doc_(doc), out_(out), loader_(loader) {
@@ -1784,7 +1839,7 @@ public:
         addSheet("::placeholder { color: #757575 }", Origin::UserAgent, 0);
         to_ua_ = false;
         collectSheets(doc_.root());
-        for (const std::string& css : doc_.root()->adopted_css) addSheet(css, Origin::Author, 0);   // document.adoptedStyleSheets
+        for (const auto& css : doc_.root()->adopted_css) addSheet(css, Origin::Author);   // document.adoptedStyleSheets
         recording_ = false;
         useIndex();
         collectShadowScopes();
@@ -1826,17 +1881,8 @@ public:
             std::shared_ptr<Scope> ua, doc;
             std::vector<WebFontFace> fonts;
             size_t order = 0;
-            bool uses_has = false, has_any_anchor = false, has_context = false;
-            std::unordered_set<uint32_t> has_anchors, has_context_anchors;
-            std::vector<const CompoundSelector*> has_context_compounds, has_args;
-            bool has_args_siblings = false;
-            bool style_selector = false, follow_any = false, follow_exact_any = false;
-            std::unordered_set<std::string> inherit_used;
-            bool state_any = false;
-            std::map<std::string, const css::KeyframesRule*> keyframes;
+            Notes notes;
             std::vector<std::shared_ptr<const css::Stylesheet>> sheets;   // (what those are in)
-            std::unordered_set<uint32_t> state_anchors;
-            std::unordered_set<uint32_t> follow_anchors, follow_exact_anchors;
         };
         static std::mutex mutex;
         // The last few: a page and its iframes' documents styled in turn each made theirs
@@ -1867,23 +1913,7 @@ public:
                 doc_p_ = last->doc.get();
                 out_.font_faces_ = last->fonts;
                 order_ = last->order;
-                uses_has_ = last->uses_has;
-                has_any_anchor_ = last->has_any_anchor;
-                has_anchors_ = last->has_anchors;
-                has_context_ = last->has_context;
-                has_context_anchors_ = last->has_context_anchors;
-                has_context_compounds_ = last->has_context_compounds;
-                has_args_ = last->has_args;
-                has_args_siblings_ = last->has_args_siblings;
-                style_selector_ = last->style_selector;
-                keyframes_ = last->keyframes;
-                state_any_ = last->state_any;
-                state_anchors_ = last->state_anchors;
-                follow_any_ = last->follow_any;
-                follow_anchors_ = last->follow_anchors;
-                follow_exact_any_ = last->follow_exact_any;
-                follow_exact_anchors_ = last->follow_exact_anchors;
-                inherit_used_ = last->inherit_used;
+                static_cast<Notes&>(*this) = last->notes;
                 uses_.clear();
                 return;
             }
@@ -1891,8 +1921,11 @@ public:
         auto made = std::make_shared<Cached>();
         made->ua = std::make_shared<Scope>();
         made->doc = std::make_shared<Scope>();
+        auto ua_rules = std::make_shared<ScopeRules>(), doc_rules = std::make_shared<ScopeRules>();
+        made->ua->rules = ua_rules;
+        made->doc->rules = doc_rules;
         for (const SheetUse& use : uses_) {
-            target_ = use.to_ua ? made->ua.get() : made->doc.get();
+            target_ = use.to_ua ? ua_rules.get() : doc_rules.get();
             applySheet(use.sheet, use.origin, use.url);
         }
         target_ = nullptr;
@@ -1900,24 +1933,8 @@ public:
         made->height = out_.media_.height;
         made->fonts = out_.font_faces_;
         made->order = order_;
-        made->uses_has = uses_has_;
-        made->has_any_anchor = has_any_anchor_;
-        made->has_anchors = has_anchors_;
-        made->has_context = has_context_;
-        made->has_context_anchors = has_context_anchors_;
-        made->has_context_compounds = has_context_compounds_;
-        made->has_args = has_args_;
-        made->has_args_siblings = has_args_siblings_;
-        made->style_selector = style_selector_;
-        made->keyframes = keyframes_;
+        made->notes = *this;
         made->sheets = sheets_;
-        made->state_any = state_any_;
-        made->state_anchors = state_anchors_;
-        made->follow_any = follow_any_;
-        made->follow_anchors = follow_anchors_;
-        made->follow_exact_any = follow_exact_any_;
-        made->follow_exact_anchors = follow_exact_anchors_;
-        made->inherit_used = inherit_used_;
         made->uses = std::move(uses_);
         uses_.clear();
         ua_p_ = made->ua.get();
@@ -1929,29 +1946,51 @@ public:
     }
 
     // Only `target` and its ancestors, as run() would style them (for a script's question
-    // about one element's style, not the whole page's 9000). False if it's somewhere that
+    // about one element's style, not the whole page's 9000). False if it isn't shown
     // takes more (a shadow tree or a slot) or isn't styled (too deep, or in display: none):
     // a full run then.
     bool runChain(const Node* target) {
-        std::vector<const Node*> chain;
-        for (const Node* n = target; n && n->type != NodeType::Document; n = n->parent) {
-            if (!n->isElement() || n->shadow_root || chain.size() > kMaxStyledDepth) return false;
-            chain.push_back(n);
+        // Up the composed tree: from a shadow tree to its host, from what's slotted to its slot.
+        struct Link {
+            const Node* el;
+            const Node* slot;   // it's in
+        };
+        std::vector<Link> chain;
+        std::vector<const Node*> assigned;
+        for (const Node* n = target; n && n->type != NodeType::Document;) {
+            if (!n->isElement() || chain.size() > kMaxStyledDepth || !n->parent) return false;
+            const Node* up = n->parent;
+            const Node* slot = nullptr;
+            if (up->shadow_host) {
+                up = up->shadow_host;
+            } else if (up->shadow_root) {
+                slot = slotOf(n, up->shadow_root);
+                if (!slot) return false;   // not shown
+                up = slot;
+            } else if (up->isHtml("slot") && up->containingShadowRoot()) {
+                assigned.clear();
+                assignedNodes(up, assigned);
+                if (!assigned.empty()) return false;   // what it'd show if nothing were
+            }
+            chain.push_back({n, slot});
+            n = up;
         }
-        if (chain.empty() || !chain.back()->parent || chain.back() != doc_.documentElement()) return false;
+        if (chain.empty() || chain.back().el != doc_.documentElement()) return false;
         std::reverse(chain.begin(), chain.end());
         ComputedStyle initial;
         const ComputedStyle* parent = &initial;
         uint64_t parent_key = 0, parent_full_key = 0;
         size_t pushed = 0;
         bool ok = true;
-        for (const Node* el : chain) {
-            const auto [style, key, children_key] = visit(el, *parent, doc_p_, nullptr, parent_key, parent_full_key);
+        for (size_t i = 0; i < chain.size(); ++i) {
+            const Node* el = chain[i].el;
+            const Scope* scope = scopeFor(el);
+            const auto [style, key, children_key] = visit(el, *parent, scope, chain[i].slot, parent_key, parent_full_key);
             if (el != target && style->display == Display::None && el->ns != Namespace::Svg) {
                 ok = false;
                 break;
             }
-            if (el != target && !host_context_ && bloomCovers(el)) {
+            if (el != target && scope == doc_p_ && !chain[i].slot && !chain[i + 1].slot && chain[i + 1].el->parent == el && !host_context_ && bloomCovers(el)) {
                 bloomPush(el);
                 ++pushed;
             }
@@ -1961,6 +2000,21 @@ public:
         }
         while (pushed--) bloomPop();
         return ok;
+    }
+
+    static const Node* slotOf(const Node* n, const Node* shadow_root) {
+        std::vector<const Node*> todo{shadow_root}, assigned;
+        while (!todo.empty()) {
+            const Node* s = todo.back();
+            todo.pop_back();
+            if (s->isHtml("slot")) {
+                assigned.clear();
+                assignedNodes(s, assigned);
+                if (std::find(assigned.begin(), assigned.end(), n) != assigned.end()) return s;
+            }
+            todo.insert(todo.end(), s->children.rbegin(), s->children.rend());
+        }
+        return nullptr;
     }
 
     void run() {
@@ -1982,9 +2036,29 @@ public:
     size_t dbg_kept_ = 0, dbg_roots_ = 0, dbg_shared_ = 0;
 
 private:
+    // A script's sheet: its text's looked up by where it is, not by what it is.
+    void addSheet(const SheetText& text, Origin origin, const std::string& url = {}) {
+        static std::mutex mutex;
+        static std::unordered_map<const std::string*, std::tuple<SheetText, std::string, std::shared_ptr<const css::Stylesheet>>> cache;
+        std::shared_ptr<const css::Stylesheet> parsed;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (const auto it = cache.find(text.get()); it != cache.end() && std::get<1>(it->second) == url) parsed = std::get<2>(it->second);
+        }
+        if (!parsed) {
+            parsed = parsedSheet(*text, url);
+            std::lock_guard<std::mutex> lock(mutex);
+            if (cache.size() >= 20'000) cache.clear();
+            cache[text.get()] = {text, url, parsed};   // (kept, so that its address stays its own)
+        }
+        addParsed(std::move(parsed), origin, 0, url);
+    }
+
     // `url` is where the sheet came from: its @imports are relative to that.
     void addSheet(std::string_view text, Origin origin, int depth, const std::string& url = {}) {
-        std::shared_ptr<const css::Stylesheet> parsed = parsedSheet(text, url);
+        addParsed(parsedSheet(text, url), origin, depth, url);
+    }
+    void addParsed(std::shared_ptr<const css::Stylesheet> parsed, Origin origin, int depth, const std::string& url) {
         const css::Stylesheet& sheet = *parsed;
         if (loader_ && depth < kMaxImportDepth) {
             for (size_t n = 0; n < sheet.imports.size(); ++n) {
@@ -2011,7 +2085,6 @@ private:
         for (const css::KeyframesRule& k : sheet.keyframes)
             if (std::all_of(k.media.begin(), k.media.end(), [&](const Tokens& q) { return css::mediaMatches(q, out_.media_); })) keyframes_[k.name] = &k;
         const css::Stylesheet& kept = sheet;
-        if (target_) target_->ident = (target_->ident ^ reinterpret_cast<uintptr_t>(parsed.get())) * 0x100000001B3ull + 0x9E37;
         sheets_.push_back(std::move(parsed));
         for (const css::Rule& rule : kept.rules) {
             const bool applies = std::all_of(rule.media.begin(), rule.media.end(), [&](const Tokens& q) {
@@ -2039,7 +2112,7 @@ private:
             if (s.name == "before") buckets = &target_->before;
             else if (s.name == "after") buckets = &target_->after;
             else if (s.name == "placeholder") buckets = &target_->placeholder;
-            else if (s.name == "slotted" && target_->host_el) {
+            else if (s.name == "slotted" && target_host_) {
                 SlottedRule r{sel, &s, &rule, origin, ++order_};
                 auto& simple = r.slot_side.parts.back().simple;
                 simple.erase(std::remove_if(simple.begin(), simple.end(), [](const SimpleSelector& x) {
@@ -2070,7 +2143,7 @@ private:
         }
         IndexedSelector entry{&sel, &rule, origin, ++order_};
         setAncestorHashes(entry);
-        if (target_->host_el && buckets == &target_->normal)
+        if (target_host_ && buckets == &target_->normal)
             for (const SimpleSelector& s : last.simple)
                 if (s.kind == SimpleKind::PseudoClass && (s.name == "host" || s.name == "host-context")) {
                     target_->host.push_back(entry);
@@ -2106,7 +2179,7 @@ private:
                 if (!media || css::mediaMatches(*mediaTokens(*media), out_.media_)) {
                     addSheet(n->textContent(), Origin::Author, 0);
                     // Rules a script put in its sheet (CSS-in-JS libraries do it this way).
-                    for (const std::string& css : n->adopted_css) addSheet(css, Origin::Author, 0);
+                    for (const auto& css : n->adopted_css) addSheet(css, Origin::Author);
                 }
             } else if (n->isHtml("link") && loader_) {
                 const std::string* rel = n->attr("rel");
@@ -2115,7 +2188,7 @@ private:
                     const std::string* media = n->attr("media");
                     if (!media || css::mediaMatches(*mediaTokens(*media), out_.media_)) {
                         addSheet(loader_(*href), Origin::Author, 0, *href);
-                        for (const std::string& css : n->adopted_css) addSheet(css, Origin::Author, 0, *href);
+                        for (const auto& css : n->adopted_css) addSheet(css, Origin::Author, *href);
                     }
                 } else if (rel && href && hasWord(lower(*rel), "preload")) {
                     // A style preloaded, not yet applied: fetched all the same, for its
@@ -2138,12 +2211,80 @@ private:
             auto scope = std::make_unique<Scope>();
             scope->host_el = n;
             scope->ident = reinterpret_cast<uintptr_t>(n) * 0x9E3779B97F4A7C15ull + 1;
-            target_ = scope.get();
+            recording_ = true;
+            uses_.clear();
             collectSheets(n->shadow_root);
-            for (const std::string& css : n->shadow_root->adopted_css) addSheet(css, Origin::Author, 0);
+            for (const auto& css : n->shadow_root->adopted_css) addSheet(css, Origin::Author);
+            recording_ = false;
+            for (const SheetUse& use : uses_) scope->ident = (scope->ident ^ reinterpret_cast<uintptr_t>(use.sheet.get())) * 0x100000001B3ull + 0x9E37;
+            const ShadowRules* made = shadowRules(n);
+            if (notes_added_.insert(made).second) {
+                add(made->notes);
+                for (const WebFontFace& f : made->fonts)
+                    if (out_.font_faces_.size() < kMaxFontFaces) out_.font_faces_.push_back(f);
+            }
+            scope->rules = made->rules;
             shadow_scopes_[n->shadow_root] = std::move(scope);
         }
+        uses_.clear();
+    }
+
+    // A shadow tree's rules (uses_, of a host of that tag), indexed: those made before for
+    // the same sheets, this time or an earlier one. (microsoft.com's 150 shadow roots adopt
+    // a few dozen sheets, again at each of its scripts' questions about a style.)
+    struct ShadowRules {
+        std::vector<SheetUse> uses;
+        std::string tag;
+        float width = 0, height = 0;
+        std::shared_ptr<const ScopeRules> rules;
+        Notes notes;
+        std::vector<WebFontFace> fonts;
+    };
+    const ShadowRules* shadowRules(const Node* host) {
+        static std::mutex mutex;
+        static std::unordered_map<uint64_t, std::shared_ptr<const ShadowRules>> cache;
+        const std::string tag = lower(host->name);
+        uint64_t key = std::hash<std::string>{}(tag);
+        for (const SheetUse& use : uses_) key = (key ^ reinterpret_cast<uintptr_t>(use.sheet.get())) * 0x9E3779B97F4A7C15ull + (key >> 29);
+        const float w = out_.media_.width, h = out_.media_.height;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (const auto it = cache.find(key); it != cache.end()) {
+                const ShadowRules& c = *it->second;
+                bool same = c.tag == tag && c.width == w && c.height == h && c.uses.size() == uses_.size();
+                for (size_t i = 0; same && i < uses_.size(); ++i) same = c.uses[i].sheet == uses_[i].sheet && c.uses[i].url == uses_[i].url;
+                if (same) {
+                    shadow_rules_.push_back(it->second);
+                    return it->second.get();
+                }
+            }
+        }
+        auto made = std::make_shared<ShadowRules>();
+        auto rules = std::make_shared<ScopeRules>();
+        // (Noted apart from the rest of the page's, to be noted again without the work.)
+        Notes page;
+        std::swap(page, static_cast<Notes&>(*this));
+        std::vector<WebFontFace> fonts;
+        fonts.swap(out_.font_faces_);
+        target_ = rules.get();
+        target_host_ = host;
+        for (const SheetUse& use : uses_) applySheet(use.sheet, use.origin, use.url);
         target_ = nullptr;
+        target_host_ = nullptr;
+        fonts.swap(out_.font_faces_);
+        std::swap(page, static_cast<Notes&>(*this));
+        made->uses = uses_;
+        made->tag = tag;
+        made->width = w;
+        made->height = h;
+        made->rules = std::move(rules);
+        made->notes = std::move(page);
+        made->fonts = std::move(fonts);
+        shadow_rules_.push_back(made);
+        std::lock_guard<std::mutex> lock(mutex);
+        if (cache.size() >= 1024) cache.clear();
+        cache[key] = made;
+        return made.get();
     }
 
     const Scope* scopeFor(const Node* el) const {
@@ -4535,9 +4676,9 @@ private:
         inherit(parent, s);
         std::vector<MatchedDecl> matched;
         host_context_ = nullptr;
-        collect(el, ua_p_->normal, matched);
+        collect(el, ua_p_->rules->normal, matched);
         host_context_ = scope->host_el;
-        collect(el, scope->normal, matched);
+        collect(el, scope->rules->normal, matched);
         // A host's own :host rules, below the rules of the tree it's in.
         if (el->shadow_root) {
             const auto it = shadow_scopes_.find(el->shadow_root);
@@ -4545,7 +4686,7 @@ private:
                 host_context_ = el;
                 fuel_ = kSelectorFuel;
                 std::vector<MatchedDecl> host_matched;
-                gather(el, it->second->host, host_matched);
+                gather(el, it->second->rules->host, host_matched);
                 for (MatchedDecl& m : host_matched) {
                     if (!m.important) m.origin = Origin::Hint;
                     matched.push_back(m);
@@ -4555,7 +4696,7 @@ private:
         // ::slotted() rules of the shadow tree whose slot this element went into.
         if (slot) {
             const Scope* slot_scope = scopeFor(slot);
-            for (const SlottedRule& r : slot_scope->slotted) {
+            for (const SlottedRule& r : slot_scope->rules->slotted) {
                 if (!r.slotted) continue;
                 host_context_ = nullptr;
                 fuel_ = kSelectorFuel;
@@ -4573,7 +4714,7 @@ private:
         if (scope->host_el) {
             if (const std::string* part = el->attr("part")) {
                 const Scope* outer = scopeFor(scope->host_el);
-                for (const PartRule& r : outer->parts) {
+                for (const PartRule& r : outer->rules->parts) {
                     if (!std::all_of(r.names.begin(), r.names.end(), [&](const std::string& n) { return hasWord(*part, n); })) continue;
                     host_context_ = outer->host_el;
                     fuel_ = kSelectorFuel;
@@ -5241,18 +5382,18 @@ private:
             // In a shadow tree's sheet, a :host compound is that host: its tag tells it
             // (microsoft.com's `:host:has([hide-controls])` turned keeping styles off for
             // the whole page). Its children, in either tree, go by all that's under it.
-            const bool of_host = target_ && target_->host_el && std::any_of(c.simple.begin(), c.simple.end(), [](const SimpleSelector& y) {
+            const bool of_host = target_host_ && std::any_of(c.simple.begin(), c.simple.end(), [](const SimpleSelector& y) {
                 return y.kind == SimpleKind::PseudoClass && y.name == "host";
             });
             // ::part and ::slotted style another element than the one the compound is asked of.
             const bool of_another = std::any_of(c.simple.begin(), c.simple.end(), [](const SimpleSelector& y) {
                 return y.kind == SimpleKind::PseudoElement && (y.name == "part" || y.name == "slotted");
             });
-            if (own.empty() && of_host) own.push_back(featureHash('t', lower(target_->host_el->name)));
+            if (own.empty() && of_host) own.push_back(featureHash('t', lower(target_host_->name)));
             for (const SimpleSelector& x : c.simple) {
                 if (x.kind == SimpleKind::PseudoClass && x.name == "has") {
                     uses_has_ = true;
-                    if (of_host) has_host_anchors_.insert(featureHash('t', lower(target_->host_el->name)));
+                    if (of_host) has_host_anchors_.insert(featureHash('t', lower(target_host_->name)));
                     const bool asked_of_subject = is_subject && !of_another;
                     // Those asked for another element are noted twice: as anchors, and as
                     // anchors whose children's keys must have what's under them.
@@ -5490,10 +5631,10 @@ private:
             have_print ? mix(base, match_print) : anchored ? mix(base, anchorPrint(el)) : base;
         const ComputedStyle& s = *out_.styles_[el];
         if (!kept && !(s.display == Display::None && el->ns != Namespace::Svg)) {
-            resolvePseudo(el, s, ua_p_->before, scope->before, scope->host_el, out_.before_);
-            resolvePseudo(el, s, ua_p_->after, scope->after, scope->host_el, out_.after_);
+            resolvePseudo(el, s, ua_p_->rules->before, scope->rules->before, scope->host_el, out_.before_);
+            resolvePseudo(el, s, ua_p_->rules->after, scope->rules->after, scope->host_el, out_.after_);
             if ((el->isHtml("input") || el->isHtml("textarea")) && el->attr("placeholder"))
-                resolvePseudo(el, s, ua_p_->placeholder, scope->placeholder, scope->host_el, out_.placeholder_, false);
+                resolvePseudo(el, s, ua_p_->rules->placeholder, scope->rules->placeholder, scope->host_el, out_.placeholder_, false);
         }
         return {&s, key, children_key};
     }
@@ -5533,34 +5674,9 @@ private:
     StyledDocument& out_;
     const StyledDocument::SheetLoader& loader_;
     std::vector<std::shared_ptr<const css::Stylesheet>> sheets_;
-    // Which sheets apply, collected before their rules are indexed.
-    struct SheetUse {
-        std::shared_ptr<const css::Stylesheet> sheet;
-        Origin origin;
-        std::string url;
-        bool to_ua;
-    };
     bool recording_ = false, to_ua_ = false;
-    bool uses_has_ = false;   // a rule with :has(): what an element matches can depend on its descendants
-    bool has_any_anchor_ = false;
-    bool style_selector_ = false;   // a selector asks about style attributes ([style])
-    // Elements asked about siblings after them (:last-child, ...): any, or with these.
-    std::map<std::string, const css::KeyframesRule*> keyframes_;
-    bool state_any_ = false;   // an element's :hover, :focus or :active is asked: any's, or of these
-    std::unordered_set<uint32_t> state_anchors_;
-    bool follow_any_ = false, follow_exact_any_ = false;
-    std::unordered_set<uint32_t> follow_anchors_, follow_exact_anchors_;   // (exact: :nth-last-*)
-    std::unordered_set<std::string> inherit_used_;   // properties a rule gives `inherit`
     int box_inherited_ = -1;   // whether one of those is one of kOwnBoxProperties' (-1: not known yet)
-    std::vector<const CompoundSelector*> has_args_;   // what the :has()s with no anchor look for
-    bool has_args_siblings_ = false;                  // one among later siblings
     std::unordered_map<const Node*, bool> has_arg_under_;
-    std::unordered_set<uint32_t> has_host_anchors_;   // tags of hosts a :host:has() is asked of
-    bool has_context_ = false;   // a :has() asked for another element, of any element
-    std::unordered_set<uint32_t> has_context_anchors_;   // of these (as has_anchors_)
-    // The compounds with those (in the rules' sheets, kept by the index or sheets_).
-    std::vector<const CompoundSelector*> has_context_compounds_;
-    std::unordered_set<uint32_t> has_anchors_;
     // The per-element maps below, from one pool let go at once: freeing them node by node
     // was a quarter of a restyle of 11st.co.kr's 8800 elements.
     std::pmr::monotonic_buffer_resource pool_{size_t{1} << 20};
@@ -5574,8 +5690,11 @@ private:
     std::shared_ptr<const void> index_kept_;   // what ua_p_ and doc_p_ point into
     const Scope* ua_p_ = nullptr;
     const Scope* doc_p_ = nullptr;
-    Scope* target_ = nullptr;   // where applySheet puts rules
+    ScopeRules* target_ = nullptr;   // where applySheet puts rules
+    const Node* target_host_ = nullptr;   // the host, of a shadow tree's
     std::unordered_map<const Node*, std::unique_ptr<Scope>> shadow_scopes_;   // by shadow root
+    std::vector<std::shared_ptr<const ShadowRules>> shadow_rules_;   // those those have
+    std::unordered_set<const ShadowRules*> notes_added_;
     bool in_host_arg_ = false;   // matching what's in :host(...)
     const Node* host_context_ = nullptr;   // the host of the shadow tree being matched in
     // The ancestor filter: counts of the hashes of the elements walk() is inside of.
@@ -5627,7 +5746,10 @@ std::unique_ptr<StyledDocument> StyledDocument::chainOf(const Node* target, cons
                                                         const StyledDocument* previous) {
     std::unique_ptr<StyledDocument> out(new StyledDocument(media, measure_ch, forms));
     StyleResolver resolver(doc, *out, loader, previous);
-    if (!resolver.runChain(target)) return nullptr;
+    if (!resolver.runChain(target)) {
+        // It isn't shown: no style, as styling the whole page would give it none.
+        out->styles_.erase(target);
+    }
     return out;
 }
 

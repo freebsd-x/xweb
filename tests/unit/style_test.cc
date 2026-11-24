@@ -462,7 +462,7 @@ TEST(Sheets, RulesInsertedIntoAStyleElementApply) {
         for (Node* c : n->children) todo.push_back(c);
     }
     ASSERT_TRUE(st);
-    st->adopted_css = {"#b{color:blue}", "#a{color:blue}"};
+    st->adopted_css = {std::make_shared<const std::string>("#b{color:blue}"), std::make_shared<const std::string>("#a{color:blue}")};
     const StyledDocument styled(*doc, css::MediaContext{800, 600});
     const auto colorOf = [&](const char* id) {
         std::vector<const Node*> t{doc->root()};
@@ -800,7 +800,7 @@ TEST(Restyle, AChainOfAncestorsStylesAsTheWholePage) {
     setAttribute(elementById(*doc, "f"), "class", "flag");
     chainSameAsFresh("x", "a :has() anchor's");
     chainSameAsFresh("p", "rem");
-    EXPECT_FALSE(StyledDocument::chainOf(elementById(*doc, "hidden"), *doc, css::MediaContext{800, 600}, {}, {}, nullptr, styles.get()));
+    EXPECT_FALSE(StyledDocument::chainOf(elementById(*doc, "hidden"), *doc, css::MediaContext{800, 600}, {}, {}, nullptr, styles.get())->styleOf(elementById(*doc, "hidden")));
 }
 
 // Siblings: one added after an element changes nothing of it, unless it can be asked
@@ -1152,4 +1152,40 @@ TEST(Motion, Easings) {
     EXPECT_FLOAT_EQ(easing("steps(4, start)").at(0.3f), 0.5f);
     EXPECT_FLOAT_EQ(easing("step-end").at(0.99f), 0);
     EXPECT_NEAR(easing("cubic-bezier(.5,-.5,.5,1.5)").at(0.5f), 0.5f, 1e-3);
+}
+
+// In shadow trees too, and of what's slotted: up the composed tree. Roots of the same
+// sheets share their rules, each still with its own host.
+TEST(Restyle, AChainGoesThroughShadowTrees) {
+    auto doc = parseHtml(R"(<!doctype html><style>.r { color: rgb(9, 0, 0) } x-a { font-size: 20px } x-a::part(p) { font-weight: 700 }</style>
+      <x-a class=r><template shadowrootmode=open><style>:host(.r) b { color: rgb(1, 0, 0) } ::slotted(u) { font-size: 2em } div { font-size: 2em }</style>
+        <div><slot></slot></div><b part=p>b</b><slot name=none><s>f</s></slot></template><u id=u1>1</u><i id=i slot=nowhere>n</i></x-a>
+      <x-a><template shadowrootmode=open><style>:host(.r) b { color: rgb(1, 0, 0) } ::slotted(u) { font-size: 2em } div { font-size: 2em }</style>
+        <div><slot></slot></div><b part=p>b</b><slot name=none><s>f</s></slot></template><u id=u2>2</u></x-a>)");
+    attachDeclarativeShadowRoots(*doc);
+    const StyledDocument fresh(*doc, css::MediaContext{800, 600});
+    std::vector<const Node*> asked, todo{doc->documentElement()};
+    while (!todo.empty()) {
+        const Node* n = todo.back();
+        todo.pop_back();
+        if (n->isElement() && fresh.styleOf(n) && fresh.styleOf(n)->display != Display::None) asked.push_back(n);
+        todo.insert(todo.end(), n->children.begin(), n->children.end());
+        if (n->shadow_root) todo.push_back(n->shadow_root);
+    }
+    size_t in_shadow = 0;
+    for (const Node* n : asked) {
+        auto chain = StyledDocument::chainOf(n, *doc, css::MediaContext{800, 600}, {}, {}, nullptr, &fresh);
+        ASSERT_TRUE(chain) << n->name;
+        EXPECT_EQ(chain->styleOf(n)->color, fresh.styleOf(n)->color) << n->name;
+        EXPECT_EQ(chain->styleOf(n)->font_size, fresh.styleOf(n)->font_size) << n->name;
+        EXPECT_EQ(chain->styleOf(n)->font_weight, fresh.styleOf(n)->font_weight) << n->name;
+        in_shadow += n->containingShadowRoot() != nullptr;
+        if (n->name == "b") {
+            EXPECT_EQ(fresh.styleOf(n)->font_weight, 700);
+            EXPECT_EQ(fresh.styleOf(n)->color.r, n->containingShadowRoot()->shadow_host->attr("class") ? 1 : 0);
+        }
+        if (n->name == "u") EXPECT_FLOAT_EQ(fresh.styleOf(n)->font_size, 80);
+    }
+    EXPECT_GE(in_shadow, 10u);
+    EXPECT_FALSE(StyledDocument::chainOf(elementById(*doc, "i"), *doc, css::MediaContext{800, 600}, {}, {}, nullptr, &fresh)->styleOf(elementById(*doc, "i")));   // in no slot
 }

@@ -119,6 +119,7 @@ void PageScript::Impl::domRoots(std::vector<Value>& roots) {
         for (Object* r : o->records) roots.push_back(Value::object(r));
     }
     for (auto& [node, arr] : adopters) roots.push_back(Value::object(arr));
+    for (auto& [sheet, text] : sheet_texts) roots.push_back(Value::object(sheet));
 }
 
 Object* PageScript::Impl::protoFor(const Node* n) {
@@ -1046,22 +1047,20 @@ void PageScript::Impl::installDom() {
     }
     const auto resync = [self] {
         // Every adopter's sheets as text again: a sheet's change shows wherever it's adopted.
-        for (auto& [node, arr] : self->adopters) {
-            node->adopted_css.clear();
-            for (const Value& v : arr->elements)
-                if (v.isObject() && v.asObject()->primitive.isString()) node->adopted_css.push_back(js::utf8(v.asObject()->primitive.asString()));
-        }
+        for (auto& [node, arr] : self->adopters) self->syncAdopted(node, arr);
         self->dirty = true;
     };
-    method(sheet_proto, u"replaceSync", 1, [resync](Runtime& rt, const Value& t, Args a) {
+    method(sheet_proto, u"replaceSync", 1, [self, resync](Runtime& rt, const Value& t, Args a) {
         if (!t.isObject()) rt.throwError("TypeError", "not a CSSStyleSheet");
         t.asObject()->primitive = Value::string(rt.toString(arg(a, 0)));
+        self->sheet_texts.erase(t.asObject());
         resync();
         return Value::undefined();
     });
-    method(sheet_proto, u"replace", 1, [resync](Runtime& rt, const Value& t, Args a) {
+    method(sheet_proto, u"replace", 1, [self, resync](Runtime& rt, const Value& t, Args a) {
         if (!t.isObject()) rt.throwError("TypeError", "not a CSSStyleSheet");
         t.asObject()->primitive = Value::string(rt.toString(arg(a, 0)));
+        self->sheet_texts.erase(t.asObject());
         resync();
         Object* p = rt.newPromise();
         rt.resolvePromise(p, t);
@@ -1078,13 +1077,14 @@ void PageScript::Impl::installDom() {
             const double at = arg(a, 1).isUndefined() ? 0 : rt.toIntegerOrInfinity(arg(a, 1));
             if (at < 0 || at > static_cast<double>(n->adopted_css.size())) rt.throwError("Error", "IndexSizeError: no such rule index");
             if (n->adopted_css.size() >= 100000) rt.throwError("Error", "QuotaExceededError: too many rules");
-            n->adopted_css.insert(n->adopted_css.begin() + static_cast<ptrdiff_t>(at), rule);
+            n->adopted_css.insert(n->adopted_css.begin() + static_cast<ptrdiff_t>(at), std::make_shared<const std::string>(rule));
             self->dirty = true;
             return Value::number(at);
         }
         Object* s = t.asObject();
         const std::u16string old = s->primitive.isString() ? s->primitive.asString() : u"";
         s->primitive = Value::string(old + u"\n" + js::utf16(rule));
+        self->sheet_texts.erase(s);
         resync();
         return Value::number(0);
     });
@@ -1141,7 +1141,7 @@ void PageScript::Impl::installDom() {
             // Rules a script put in; else the <style>'s own text, or the <link>'s sheet's
             // (no rules at all was each page's sheets to a script reading them).
             if (!n->adopted_css.empty()) {
-                for (const std::string& css : n->adopted_css) add(js::utf16(css));
+                for (const SheetText& css : n->adopted_css) add(js::utf16(*css));
             } else if (n->isHtml("style")) {
                 split(js::utf16(n->textContent()));
             } else if (const std::string* href = n->isHtml("link") ? n->attr("href") : nullptr; href && self->host.sheet_text) {
@@ -1193,7 +1193,7 @@ void PageScript::Impl::installDom() {
         });
         return Value::object(list);
     });
-    const auto adoptedAccessor = [self, resync](Object* o, bool document) {
+    const auto adoptedAccessor = [self](Object* o, bool document) {
         self->accessor(o, u"adoptedStyleSheets", [self, document](Runtime& rt, const Value& t, Args) {
             Node* n = document ? self->doc.root() : self->thisNode(t);
             for (auto& [node, arr] : self->adopters)
@@ -1201,7 +1201,7 @@ void PageScript::Impl::installDom() {
             Object* arr = rt.newArray();
             self->adopters.emplace_back(n, arr);
             return Value::object(arr);
-        }, [self, document, resync](Runtime& rt, const Value& t, Args a) {
+        }, [self, document](Runtime& rt, const Value& t, Args a) {
             Node* n = document ? self->doc.root() : self->thisNode(t);
             Object* arr = rt.newArray(rt.iterateToList(arg(a, 0)));
             bool found = false;
@@ -1211,7 +1211,8 @@ void PageScript::Impl::installDom() {
                     found = true;
                 }
             if (!found) self->adopters.emplace_back(n, arr);
-            resync();
+            self->syncAdopted(n, arr);
+            self->dirty = true;
             return Value::undefined();
         });
     };

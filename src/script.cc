@@ -1846,9 +1846,13 @@ PageScript::~PageScript() {
 }
 
 void PageScript::run(const std::function<std::optional<std::string>(const std::string&)>& source) {
+    begin(source);
+    while (!runSome(1e9)) {}
+}
+
+void PageScript::begin(const std::function<std::optional<std::string>(const std::string&)>& source) {
     Impl& s = *impl_;
     s.source = source;
-    s.running_scripts = true;
     std::vector<Node*> scripts;
     std::vector<Node*> todo{s.doc.root()};
     while (!todo.empty()) {
@@ -1865,10 +1869,20 @@ void PageScript::run(const std::function<std::optional<std::string>(const std::s
     }
     // Parser-blocking scripts in order, then the deferred ones (modules, defer, async).
     for (Node* n : scripts)
-        if (!Impl::deferred(n)) s.runScript(n);
+        if (!Impl::deferred(n)) s.to_run.push_back(n);
     for (Node* n : scripts)
-        if (Impl::deferred(n)) s.runScript(n);
-    s.running_scripts = false;
+        if (Impl::deferred(n)) s.to_run.push_back(n);
+}
+
+bool PageScript::runSome(double ms) {
+    Impl& s = *impl_;
+    const double start = s.now();
+    while (!s.to_run.empty()) {
+        Node* n = s.to_run.front();
+        s.to_run.pop_front();
+        s.runScript(n);
+        if (s.now() - start >= ms) return false;
+    }
     s.ready_state = "interactive";
     s.fire(s.doc.root(), u"readystatechange", false, false);
     s.fire(s.doc.root(), u"DOMContentLoaded", true, false);
@@ -1896,6 +1910,7 @@ void PageScript::run(const std::function<std::optional<std::string>(const std::s
                             "probe");
     }
     s.collect();
+    return true;
 }
 
 bool PageScript::Impl::firePointer(Node* target, const std::u16string& type, bool bubbles, float page_x, float page_y, int buttons, Node* related, bool cancelable) {

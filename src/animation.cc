@@ -275,6 +275,17 @@ std::vector<const Node*> Animator::moving() const {
     return out;
 }
 
+bool Animator::wouldStart(const StyledDocument& now, const StyledDocument& before) const {
+    for (const StyledDocument::Moving& m : now.movingElements()) {
+        const ComputedStyle* was = before.plainStyle(m.node, m.pseudo);
+        const auto it = entries_.find(Key{m.node, m.pseudo});
+        if (was == m.style || (it != entries_.end() && it->second.base_at == m.style)) continue;
+        if (it != entries_.end() || m.style->animations) return true;
+        if (was && m.style->transitions && was->display != Display::None && m.style->display != Display::None && movingDiff(*was, *m.style)) return true;
+    }
+    return false;
+}
+
 void Animator::styled(StyledDocument& now, const StyledDocument* before, double seconds) {
     std::set<Key> here;
     for (const StyledDocument::Moving& m : now.movingElements()) {

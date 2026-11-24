@@ -395,8 +395,8 @@ public:
     StyledDocument(const Document& doc, css::MediaContext media, const SheetLoader& loader = {}, const ChMeasure& measure_ch = {},
                    const class FormState* forms = nullptr, const StyledDocument* previous = nullptr);
     // Only `target` and its ancestors styled, as a whole document's styling would (with
-    // `previous` as that does): for one element's style, in a fraction of the time. Null
-    // when it can't be done so (in a shadow tree, a slot, under display: none).
+    // `previous` as that does): for one element's style, in a fraction of the time. It has
+    // none if it isn't shown.
     [[nodiscard]] static std::unique_ptr<StyledDocument> chainOf(const Node* target, const Document& doc, css::MediaContext media,
                                                                  const SheetLoader& loader, const ChMeasure& measure_ch,
                                                                  const class FormState* forms, const StyledDocument* previous);

@@ -1490,9 +1490,12 @@ private:
                                                   sheetLoader(missing),
                                                   [this](const web::ComputedStyle& s) { return web::chWidth(measurer_, s); },
                                                   &page_->forms, previous);
-        if (!chain || !missing.empty()) return false;
-        // What has transitions starts them from its style as it's asked for now: styled whole.
-        if (animates() && !chain->movingElements().empty()) return false;
+        if (!missing.empty()) return false;
+        // What starts moving does so from its style as it's asked for now: styled whole.
+        if (animates()) {
+            if (animator_.wouldStart(*chain, *previous)) return false;
+            animator_.cover(*chain);
+        }
         chain_styles_ = std::move(chain);
         return true;
     }
@@ -1515,7 +1518,7 @@ private:
                     mix(std::hash<std::string>{}(a.name));
                     mix(std::hash<std::string>{}(a.value));
                 }
-                for (const std::string& css : n->adopted_css) mix(std::hash<std::string>{}(css));
+                for (const web::SheetText& css : n->adopted_css) mix(std::hash<web::SheetText>{}(css));
                 mix(n->custom_state);
             }
             mix(n->children.size());
@@ -2538,6 +2541,25 @@ public:
         scripts_pending_.reset();
         if (!page || node_->page() != page.get()) return;   // gone on since
         startScripts(page);
+        scripts_running_ = page;
+        runSomeScripts();
+    }
+
+    // Some of them, then back to the event loop: a page with a hundred modules is drawn,
+    // and answers, as they run (microsoft.com's took 14 seconds together).
+    void runSomeScripts() {
+        std::shared_ptr<Page> page = scripts_running_;
+        if (!page || node_->page() != page.get() || !page->script) {
+            scripts_running_.reset();
+            return;
+        }
+        const bool done = page->script->runSome(50);
+        if (page->script->takeDirty()) node_->invalidate();
+        if (!done) {
+            XApplication::wakeIn(0);
+            return;
+        }
+        scripts_running_.reset();
         // The stylesheets fetched with the page are here: "load" at their <link>s (a style
         // preload's onload is how loadCSS makes it a stylesheet).
         if (page->script) {
@@ -2568,6 +2590,8 @@ public:
         if (scripts_pending_) {
             if (scripts_wait_frames_-- > 0) XApplication::post([] {});
             else runPendingScripts();
+        } else if (scripts_running_) {
+            runSomeScripts();
         }
         if (const auto again = node_->animate()) XApplication::wakeIn(*again);
         if (auto events = node_->takeAnimationEvents(); !events.empty())
@@ -2596,6 +2620,7 @@ public:
 private:
     enum class Mode { New, Reload, History };
 
+    std::shared_ptr<Page> scripts_running_;   // its scripts are being run, a few at a time
     std::shared_ptr<Page> scripts_pending_;   // installed, its scripts not run yet
     int scripts_wait_frames_ = 0;
     std::chrono::steady_clock::time_point load_started_ = std::chrono::steady_clock::now();
@@ -2933,7 +2958,7 @@ private:
             }).detach();
         };
         page->script = std::make_unique<web::PageScript>(*page->doc, std::move(host));
-        page->script->run([raw](const std::string& url) -> std::optional<std::string> {
+        page->script->begin([raw](const std::string& url) -> std::optional<std::string> {
             const auto it = raw->scripts.find(url);
             if (it == raw->scripts.end()) return std::nullopt;
             return it->second;

@@ -10,6 +10,9 @@
 
 namespace fbx::xweb {
 
+// A script's stylesheet's text: never changed, so the same pointer is the same text.
+using SheetText = std::shared_ptr<const std::string>;
+
 enum class NodeType { Document, Doctype, Element, Text, Comment, Fragment };
 enum class Namespace { Html, Svg, MathMl, Other };
 
@@ -40,7 +43,7 @@ public:
     Node* shadow_root = nullptr;
     Node* shadow_host = nullptr;
     bool shadow_open = true;            // a shadow root's mode
-    std::vector<std::string> adopted_css;   // a shadow root's adoptedStyleSheets, as text; a <style>'s or
+    std::vector<SheetText> adopted_css;   // a shadow root's adoptedStyleSheets, as text; a <style>'s or
                                             // <link>'s rules added through its sheet (insertRule)
     // A custom element's state: 0 none (or not yet looked at), 1 undefined (a custom
     // element name waiting for its definition), 2 custom (upgraded), 3 failed.

@@ -239,7 +239,7 @@ struct PageScript::Impl {
         html.swap(write_buffer);   // (scripts in it may write more, after them)
         insertWritten(html, script);
     }
-    bool running_scripts = false;
+    std::deque<Node*> to_run;   // the page's scripts still to run, in order
     size_t history_length = 1;
 
     struct Timer {
@@ -910,6 +910,17 @@ struct PageScript::Impl {
 
     Object* protoFor(const Node* n);
     void installDom();
+    // A sheet's text as styling has it, made once (the same for all that adopt it).
+    std::unordered_map<Object*, SheetText> sheet_texts;
+    void syncAdopted(Node* node, Object* arr) {
+        node->adopted_css.clear();
+        for (const Value& v : arr->elements) {
+            if (!v.isObject() || !v.asObject()->primitive.isString()) continue;
+            SheetText& text = sheet_texts[v.asObject()];
+            if (!text) text = std::make_shared<const std::string>(js::utf8(v.asObject()->primitive.asString()));
+            node->adopted_css.push_back(text);
+        }
+    }
     void domRoots(std::vector<Value>& roots);
     void afterInsert(Node* parent, Node* child, Node* prev, Node* next);
     void afterRemove(Node* parent, Node* child, Node* prev, Node* next, bool was_connected);
