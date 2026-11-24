@@ -159,7 +159,275 @@ std::vector<Token> colorArgs(const Tokens& v, size_t begin, size_t end) {
     return args;
 }
 
-bool colorFromTokens(const Tokens& v, size_t& i, const Color& current, Color& out) {
+// ── Colour spaces ──
+// (What's outside sRGB is clipped to it, channel by channel.)
+
+using Triple = std::array<double, 3>;
+enum class ColorSpace { Srgb, Linear, Oklab, Oklch, Lab, Lch, Hsl, Hwb, Xyz50, Xyz65, P3 };
+
+double toLinear(double c) { return std::abs(c) <= 0.04045 ? c / 12.92 : std::copysign(std::pow((std::abs(c) + 0.055) / 1.055, 2.4), c); }
+double fromLinear(double c) { return std::abs(c) <= 0.0031308 ? c * 12.92 : std::copysign(1.055 * std::pow(std::abs(c), 1 / 2.4) - 0.055, c); }
+Triple times(const double (&m)[9], const Triple& v) {
+    return {m[0] * v[0] + m[1] * v[1] + m[2] * v[2], m[3] * v[0] + m[4] * v[1] + m[5] * v[2], m[6] * v[0] + m[7] * v[1] + m[8] * v[2]};
+}
+constexpr double kToXyz[9] = {0.4123907993, 0.3575843394, 0.1804807884, 0.2126390059, 0.7151686788, 0.0721923154, 0.0193308187, 0.1191947798, 0.9505321522};
+constexpr double kFromXyz[9] = {3.2409699419, -1.5373831776, -0.4986107603, -0.9692436363, 1.8759675015, 0.0415550574, 0.0556300797, -0.2039769589, 1.0569715142};
+constexpr double kTo50[9] = {1.0479297925, 0.0229468705, -0.0501922295, 0.0296278157, 0.9904344845, -0.0170738250, -0.0092430581, 0.0150551448, 0.7518742899};
+constexpr double kTo65[9] = {0.9554734214, -0.0230985024, 0.0632592432, -0.0283697093, 1.0099953980, 0.0210415381, 0.0123140016, -0.0205076964, 1.3303659366};
+constexpr double kP3ToXyz[9] = {0.4865709486, 0.2656676932, 0.1982172852, 0.2289745641, 0.6917385218, 0.0792869141, 0, 0.0451133819, 1.0439443689};
+constexpr double kXyzToP3[9] = {2.4934969119, -0.9313836179, -0.4027107845, -0.8294889696, 1.7626640603, 0.0236246858, 0.0358458302, -0.0761723893, 0.9568845240};
+constexpr double kWhite50[3] = {0.9642956764, 1, 0.8251046025};
+constexpr double kRadians = 3.14159265358979323846 / 180;
+
+Triple polar(const Triple& v) {
+    double h = std::atan2(v[2], v[1]) / kRadians;
+    return {v[0], std::hypot(v[1], v[2]), h < 0 ? h + 360 : h};
+}
+Triple unpolar(const Triple& v) { return {v[0], v[1] * std::cos(v[2] * kRadians), v[1] * std::sin(v[2] * kRadians)}; }
+double hueOf(const Triple& c, double max, double min) {
+    if (max - min < 1e-9) return 0;
+    const double d = max - min;
+    const double h = max == c[0] ? (c[1] - c[2]) / d : max == c[1] ? (c[2] - c[0]) / d + 2 : (c[0] - c[1]) / d + 4;
+    return h < 0 ? h * 60 + 360 : h * 60;
+}
+Triple hslToRgb(double h, double s, double l) {
+    const auto f = [&](double n) {
+        const double k = std::fmod(n + h / 30, 12);
+        return l - s * std::min(l, 1 - l) * std::max(-1.0, std::min({k - 3, 9 - k, 1.0}));
+    };
+    h = std::fmod(h, 360);
+    if (h < 0) h += 360;
+    return {f(0), f(8), f(4)};
+}
+
+Triple linearTo(ColorSpace space, const Triple& c) {
+    const Triple rgb{fromLinear(c[0]), fromLinear(c[1]), fromLinear(c[2])};
+    switch (space) {
+        case ColorSpace::Srgb: return rgb;
+        case ColorSpace::Linear: return c;
+        case ColorSpace::Oklab: {
+            const double l = std::cbrt(0.4122214708 * c[0] + 0.5363325363 * c[1] + 0.0514459929 * c[2]);
+            const double m = std::cbrt(0.2119034982 * c[0] + 0.6806995451 * c[1] + 0.1073969566 * c[2]);
+            const double s = std::cbrt(0.0883024619 * c[0] + 0.2817188376 * c[1] + 0.6299787005 * c[2]);
+            return {0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s, 1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+                    0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s};
+        }
+        case ColorSpace::Oklch: return polar(linearTo(ColorSpace::Oklab, c));
+        case ColorSpace::Xyz65: return times(kToXyz, c);
+        case ColorSpace::Xyz50: return times(kTo50, times(kToXyz, c));
+        case ColorSpace::P3: {
+            const Triple p = times(kXyzToP3, times(kToXyz, c));
+            return {fromLinear(p[0]), fromLinear(p[1]), fromLinear(p[2])};
+        }
+        case ColorSpace::Lab: {
+            Triple f = linearTo(ColorSpace::Xyz50, c);
+            for (size_t i = 0; i < 3; ++i) {
+                const double v = f[i] / kWhite50[i];
+                f[i] = v > 216.0 / 24389 ? std::cbrt(v) : (24389.0 / 27 * v + 16) / 116;
+            }
+            return {116 * f[1] - 16, 500 * (f[0] - f[1]), 200 * (f[1] - f[2])};
+        }
+        case ColorSpace::Lch: return polar(linearTo(ColorSpace::Lab, c));
+        case ColorSpace::Hsl: case ColorSpace::Hwb: {
+            const double max = std::max({rgb[0], rgb[1], rgb[2]}), min = std::min({rgb[0], rgb[1], rgb[2]});
+            const double h = hueOf(rgb, max, min);
+            if (space == ColorSpace::Hwb) return {h, min, 1 - max};
+            const double l = (max + min) / 2;
+            return {h, max - min < 1e-9 ? 0 : (max - l) / std::min(l, 1 - l), l};
+        }
+    }
+    return c;
+}
+
+Triple linearFrom(ColorSpace space, const Triple& v) {
+    switch (space) {
+        case ColorSpace::Srgb: return {toLinear(v[0]), toLinear(v[1]), toLinear(v[2])};
+        case ColorSpace::Linear: return v;
+        case ColorSpace::Oklab: {
+            double l = v[0] + 0.3963377774 * v[1] + 0.2158037573 * v[2];
+            double m = v[0] - 0.1055613458 * v[1] - 0.0638541728 * v[2];
+            double s = v[0] - 0.0894841775 * v[1] - 1.2914855480 * v[2];
+            l = l * l * l;
+            m = m * m * m;
+            s = s * s * s;
+            return {4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s, -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+                    -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s};
+        }
+        case ColorSpace::Oklch: return linearFrom(ColorSpace::Oklab, unpolar(v));
+        case ColorSpace::Xyz65: return times(kFromXyz, v);
+        case ColorSpace::Xyz50: return times(kFromXyz, times(kTo65, v));
+        case ColorSpace::P3: return times(kFromXyz, times(kP3ToXyz, {toLinear(v[0]), toLinear(v[1]), toLinear(v[2])}));
+        case ColorSpace::Lab: {
+            const double fy = (v[0] + 16) / 116;
+            Triple f{fy + v[1] / 500, fy, fy - v[2] / 200};
+            for (size_t i = 0; i < 3; ++i) f[i] = (f[i] > 6.0 / 29 ? f[i] * f[i] * f[i] : (116 * f[i] - 16) * 27 / 24389) * kWhite50[i];
+            return linearFrom(ColorSpace::Xyz50, f);
+        }
+        case ColorSpace::Lch: return linearFrom(ColorSpace::Lab, unpolar(v));
+        case ColorSpace::Hsl: return linearFrom(ColorSpace::Srgb, hslToRgb(v[0], std::clamp(v[1], 0.0, 1.0), std::clamp(v[2], 0.0, 1.0)));
+        case ColorSpace::Hwb: {
+            const double w = std::clamp(v[1], 0.0, 1.0), b = std::clamp(v[2], 0.0, 1.0);
+            if (w + b >= 1) return linearFrom(ColorSpace::Srgb, {w / (w + b), w / (w + b), w / (w + b)});
+            Triple rgb = hslToRgb(v[0], 1, 0.5);
+            for (double& c : rgb) c = c * (1 - w - b) + w;
+            return linearFrom(ColorSpace::Srgb, rgb);
+        }
+    }
+    return v;
+}
+
+Color colorFromLinear(const Triple& c, double alpha) {
+    return {clampByte(fromLinear(c[0]) * 255), clampByte(fromLinear(c[1]) * 255), clampByte(fromLinear(c[2]) * 255), clampByte(alpha * 255)};
+}
+
+std::optional<ColorSpace> spaceNamed(const std::string& n) {
+    if (n == "srgb") return ColorSpace::Srgb;
+    if (n == "srgb-linear") return ColorSpace::Linear;
+    if (n == "oklab") return ColorSpace::Oklab;
+    if (n == "oklch") return ColorSpace::Oklch;
+    if (n == "lab") return ColorSpace::Lab;
+    if (n == "lch") return ColorSpace::Lch;
+    if (n == "hsl") return ColorSpace::Hsl;
+    if (n == "hwb") return ColorSpace::Hwb;
+    if (n == "xyz" || n == "xyz-d65") return ColorSpace::Xyz65;
+    if (n == "xyz-d50") return ColorSpace::Xyz50;
+    if (n == "display-p3") return ColorSpace::P3;
+    return std::nullopt;
+}
+
+bool colorFromTokens(const Tokens& v, size_t& i, const Color& current, Color& out, int depth = 0);
+
+// oklch(L C H / A) and the like, color(space a b c / A): `v` from `i` to `close`.
+bool colorOfSpace(const std::string& fn, const Tokens& v, size_t i, size_t close, Color& out) {
+    ColorSpace space = ColorSpace::Srgb;
+    Triple c{};
+    double alpha = 1;
+    size_t n = 0;
+    bool slash = false, named = fn != "color";
+    if (named) space = *spaceNamed(fn);
+    for (; i < close; ++i) {
+        const Token& t = v[i];
+        if (t.type == TokenType::Whitespace) continue;
+        if (t.type == TokenType::Delim && t.text == "/") {
+            if (n != 3) return false;
+            slash = true;
+            continue;
+        }
+        if (!named) {
+            const auto s = t.type == TokenType::Ident ? spaceNamed(lower(t.text)) : std::nullopt;
+            if (!s) return false;
+            space = *s;
+            if (space != ColorSpace::Srgb && space != ColorSpace::Linear && space != ColorSpace::P3 && space != ColorSpace::Xyz50 && space != ColorSpace::Xyz65) return false;
+            named = true;
+            continue;
+        }
+        const bool percent = t.type == TokenType::Percentage;
+        double x = t.number;
+        if (t.type == TokenType::Ident && lower(t.text) == "none") x = 0;
+        else if (t.type == TokenType::Dimension) {
+            const std::string u = lower(t.text);
+            if (u == "turn") x *= 360;
+            else if (u == "rad") x /= kRadians;
+            else if (u == "grad") x *= 0.9;
+            else if (u != "deg") return false;
+        } else if (!percent && t.type != TokenType::Number) {
+            return false;   // calc(), a relative colour, ...
+        }
+        if (slash) {
+            alpha = std::clamp(percent ? x / 100 : x, 0.0, 1.0);
+            ++n;
+            continue;
+        }
+        if (n >= 3) return false;
+        if (percent) {
+            double whole = 1;   // what 100% is
+            if (space == ColorSpace::Lab) whole = n == 0 ? 100 : 125;
+            else if (space == ColorSpace::Lch) whole = n == 0 ? 100 : 150;
+            else if ((space == ColorSpace::Oklab || space == ColorSpace::Oklch) && n > 0) whole = 0.4;
+            x = x / 100 * whole;
+        } else if (space == ColorSpace::Hwb && n > 0) {
+            x /= 100;
+        }
+        c[n++] = x;
+    }
+    if (n < 3 || n > 4) return false;
+    if (space == ColorSpace::Lab || space == ColorSpace::Lch) c[0] = std::clamp(c[0], 0.0, 100.0);
+    if (space == ColorSpace::Oklab || space == ColorSpace::Oklch) c[0] = std::clamp(c[0], 0.0, 1.0);
+    if (space == ColorSpace::Lch || space == ColorSpace::Oklch) c[1] = std::max(c[1], 0.0);
+    out = colorFromLinear(linearFrom(space, c), alpha);
+    return true;
+}
+
+// color-mix(in space [hue method], color [p%], color [p%])
+bool colorMix(const Tokens& v, size_t i, size_t close, const Color& current, Color& out, int depth) {
+    std::vector<Tokens> parts(1);
+    int nesting = 0;
+    for (; i < close; ++i) {
+        if (v[i].type == TokenType::Function || v[i].type == TokenType::LeftParen) ++nesting;
+        else if (v[i].type == TokenType::RightParen) --nesting;
+        if (nesting == 0 && v[i].type == TokenType::Comma) parts.emplace_back();
+        else if (v[i].type != TokenType::Whitespace || nesting) parts.back().push_back(v[i]);
+    }
+    if (parts.size() != 3 || parts[0].size() < 2 || lower(parts[0][0].text) != "in") return false;
+    const auto space = spaceNamed(lower(parts[0][1].text));
+    if (!space) return false;
+    const std::string hue_method = parts[0].size() > 2 ? lower(parts[0][2].text) : "shorter";
+    Color c[2];
+    std::optional<double> p[2];
+    for (size_t k = 0; k < 2; ++k) {
+        Tokens& t = parts[k + 1];
+        if (!t.empty() && t.front().type == TokenType::Percentage) {
+            p[k] = t.front().number;
+            t.erase(t.begin());
+        } else if (!t.empty() && t.back().type == TokenType::Percentage) {
+            p[k] = t.back().number;
+            t.pop_back();
+        }
+        if (p[k] && (*p[k] < 0 || *p[k] > 100)) return false;
+        size_t at = 0;
+        if (t.empty() || !colorFromTokens(t, at, current, c[k], depth + 1) || at != t.size()) return false;
+    }
+    double p0 = p[0] ? *p[0] : p[1] ? 100 - *p[1] : 50, p1 = p[1] ? *p[1] : 100 - p0;
+    const double sum = p0 + p1;
+    if (sum <= 0) return false;
+    const double share = std::min(1.0, sum / 100);   // less than all of it: the rest is transparent
+    p0 /= sum;
+    p1 /= sum;
+    Triple a[2];
+    double alpha[2];
+    for (size_t k = 0; k < 2; ++k) {
+        alpha[k] = c[k].a / 255.0;
+        a[k] = linearTo(*space, {toLinear(c[k].r / 255.0), toLinear(c[k].g / 255.0), toLinear(c[k].b / 255.0)});
+    }
+    const int hue = *space == ColorSpace::Oklch || *space == ColorSpace::Lch ? 2 : *space == ColorSpace::Hsl || *space == ColorSpace::Hwb ? 0 : -1;
+    const double mixed = alpha[0] * p0 + alpha[1] * p1;
+    Triple m{};
+    for (int n = 0; n < 3; ++n) {
+        const auto at = static_cast<size_t>(n);
+        if (n == hue) {
+            // A grey has none: the other's.
+            const auto grey = [&](const Triple& x) {
+                return *space == ColorSpace::Hwb ? x[1] + x[2] > 1 - 1e-4 : x[1] < (*space == ColorSpace::Lch ? 1e-2 : 1e-4);
+            };
+            double h0 = a[0][at], h1 = a[1][at];
+            if (grey(a[0])) h0 = h1;
+            else if (grey(a[1])) h1 = h0;
+            double d = h1 - h0;
+            if (hue_method == "longer") { if (d > 0 && d < 180) d -= 360; else if (d > -180 && d <= 0) d += 360; }
+            else if (hue_method == "increasing") { if (d < 0) d += 360; }
+            else if (hue_method == "decreasing") { if (d > 0) d -= 360; }
+            else if (d > 180) d -= 360;
+            else if (d < -180) d += 360;
+            m[at] = h0 + d * p1;
+        } else {
+            m[at] = mixed > 0 ? (a[0][at] * alpha[0] * p0 + a[1][at] * alpha[1] * p1) / mixed : 0;
+        }
+    }
+    out = mixed > 0 ? colorFromLinear(linearFrom(*space, m), mixed * share) : Color{0, 0, 0, 0};
+    return true;
+}
+
+bool colorFromTokens(const Tokens& v, size_t& i, const Color& current, Color& out, int depth) {
     const Token& t = v[i];
     if (t.type == TokenType::Hash) {
         if (!colorFromHash(t.text, out)) return false;
@@ -203,6 +471,16 @@ bool colorFromTokens(const Tokens& v, size_t& i, const Color& current, Color& ou
         }
         if (nesting != 0) return false;
         out = light;
+        return true;
+    }
+    if (const std::string fn = lower(t.text); fn == "color-mix" || fn == "color" || fn == "oklab" || fn == "oklch" || fn == "lab" || fn == "lch" || fn == "hwb") {
+        size_t end = i + 1;
+        for (int nesting = 1; end < v.size(); ++end) {
+            if (v[end].type == TokenType::Function || v[end].type == TokenType::LeftParen) ++nesting;
+            else if (v[end].type == TokenType::RightParen && --nesting == 0) break;
+        }
+        if (depth > 16 || !(fn == "color-mix" ? colorMix(v, i + 1, end, current, out, depth) : colorOfSpace(fn, v, i + 1, end, out))) return false;
+        i = end < v.size() ? end + 1 : end;
         return true;
     }
     const bool rgb = t.text == "rgb" || t.text == "rgba";

@@ -736,9 +736,9 @@ bool declarationSupported(const std::string& name, const std::vector<Token>& val
     for (const Token& t : value) {
         const std::string text = lower(t.text);
         if (t.type == TokenType::Function) {
-            for (const char* f : {"oklab", "oklch", "lab", "lch", "color-mix", "color", "hwb", "conic-gradient", "linear-gradient", "radial-gradient", "anchor", "image-set"})
+            for (const char* f : {"conic-gradient", "linear-gradient", "radial-gradient", "anchor", "image-set"})
                 if (text == f) return false;
-        } else if (t.type == TokenType::Ident && (text == "subgrid" || text == "masonry" || text == "sticky")) {
+        } else if (t.type == TokenType::Ident && (text == "subgrid" || text == "masonry" || text == "sticky" || text == "from")) {
             return false;
         }
     }

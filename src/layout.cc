@@ -1003,8 +1003,25 @@ private:
         if (!s.min_height.hasPercent()) h = std::max(h, std::max(0.0f, s.min_height.px - extra));
         else h = std::max(h, std::max(0.0f, b.percent_min_h - extra));
         b.height = clampCoord(h);
+        // What's in a button taller than it is in the middle (youtube.com's search icon).
+        if (b.node && b.node->isHtml("button") && h > content_h) lower(b, (h - content_h) / 2);
         b.margin_top_outer = mt;
         b.margin_bottom_outer = mb;
+    }
+
+    // What's in it, further down.
+    static void lower(Box& b, float by) {
+        for (auto& k : b.kids) {
+            if (k->outOfFlow()) k->static_y += by;
+            else if (k->kind != BoxKind::Replaced || k->blockLevel()) k->y += by;
+        }
+        for (Box::Fragment& f : b.fragments) {
+            f.y += by;
+            f.box_top += by;
+            f.baseline += by;
+            if (f.atomic && std::none_of(b.kids.begin(), b.kids.end(), [&](const auto& k) { return k.get() == f.atomic && k->kind != BoxKind::Replaced; })) f.atomic->y += by;
+        }
+        if (b.last_baseline >= 0) b.last_baseline += by;
     }
 
     // Laid out first against its parent's width; once painting knows the real containing

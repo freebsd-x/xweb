@@ -1200,3 +1200,32 @@ TEST(Restyle, AsksFontsOnlyForCh) {
     const StyledDocument kept(*doc2, css::MediaContext{800, 600}, {}, {}, nullptr, &ch);
     EXPECT_TRUE(kept.asksFonts());
 }
+
+// As Chrome computes them, to a unit.
+TEST(Colors, SpacesAndMixes) {
+    const auto near = [](const char* css, int r, int g, int b, int a) {
+        Color c{1, 2, 3, 4};
+        ASSERT_TRUE(parseColor(css::tokenize(css), Color{10, 20, 30, 255}, c)) << css;
+        EXPECT_NEAR(c.r, r, 1) << css;
+        EXPECT_NEAR(c.g, g, 1) << css;
+        EXPECT_NEAR(c.b, b, 1) << css;
+        EXPECT_NEAR(c.a, a, 1) << css;
+    };
+    near("color-mix(in srgb,#FFFFFF 80%,transparent)", 255, 255, 255, 204);
+    near("color-mix(in srgb, red, blue)", 128, 0, 128, 255);
+    near("color-mix(in srgb, 25% red, blue)", 64, 0, 191, 255);
+    near("color-mix(in srgb, red 20%, blue 20%)", 128, 0, 128, 102);
+    near("color-mix(in srgb, currentColor 50%, color-mix(in srgb, rgb(10 20 30), rgb(10 20 30)))", 10, 20, 30, 255);
+    near("color-mix(in oklab, white, black)", 99, 99, 99, 255);
+    near("color-mix(in hsl, red, lime)", 255, 255, 0, 255);
+    near("oklch(0.628 0.2577 29.23)", 255, 0, 0, 255);
+    near("oklch(62.8% 0.2577 29.23deg / 50%)", 255, 0, 0, 128);
+    near("oklab(1 0 0)", 255, 255, 255, 255);
+    near("lab(54.29 80.8 69.89)", 255, 0, 0, 255);
+    near("hwb(120 0% 50%)", 0, 128, 0, 255);
+    near("color(srgb 1 0.5 0 / .5)", 255, 128, 0, 128);
+    near("color(display-p3 1 1 1)", 255, 255, 255, 255);
+    Color c;
+    for (const char* bad : {"color-mix(in nothing, red, blue)", "color-mix(red, blue)", "color-mix(in srgb, red 0%, blue 0%)", "oklch(1 2)", "color(srgb 1 1)", "oklch(from red l c h)"})
+        EXPECT_FALSE(parseColor(css::tokenize(bad), Color{}, c)) << bad;
+}

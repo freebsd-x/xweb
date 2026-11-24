@@ -212,11 +212,13 @@ TEST(Media, RangeNonsenseMatchesNothing) {
 TEST(Supports, AnswersForThisEngine) {
     EXPECT_EQ(rulesUnderSupports("(display:grid)"), 1u);
     EXPECT_EQ(rulesUnderSupports("not (display:grid)"), 0u);
-    EXPECT_EQ(rulesUnderSupports("(color:oklab(0% 0 0%))"), 0u);
-    EXPECT_EQ(rulesUnderSupports("not (color:oklab(0% 0 0%))"), 1u);
+    EXPECT_EQ(rulesUnderSupports("(background:conic-gradient(red,red))"), 0u);
+    EXPECT_EQ(rulesUnderSupports("(color:color-mix(in lab, red, red))"), 1u);
+    EXPECT_EQ(rulesUnderSupports("(color:oklch(from red l c h))"), 0u);
+    EXPECT_EQ(rulesUnderSupports("not (background:conic-gradient(red,red))"), 1u);
     EXPECT_EQ(rulesUnderSupports("(color:light-dark(red,red))"), 1u);
-    EXPECT_EQ(rulesUnderSupports("(color:light-dark(red,red)) and (color:oklab(0% 0 0%))"), 0u);
-    EXPECT_EQ(rulesUnderSupports("(color:oklab(0% 0 0%)) or (display:flex)"), 1u);
+    EXPECT_EQ(rulesUnderSupports("(color:light-dark(red,red)) and (background:conic-gradient(red,red))"), 0u);
+    EXPECT_EQ(rulesUnderSupports("(background:conic-gradient(red,red)) or (display:flex)"), 1u);
     EXPECT_EQ(rulesUnderSupports("(-moz-appearance:none)"), 0u);
     EXPECT_EQ(rulesUnderSupports("selector(a > b)"), 1u);
     EXPECT_EQ(rulesUnderSupports("((display:grid) and (display:flex))"), 1u);
