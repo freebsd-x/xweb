@@ -1798,15 +1798,15 @@ public:
         // generations of kept storage: then everything's styled afresh, and let go).
         out_.index_id_ = index_kept_.get();
         out_.index_kept_ = index_kept_;
-        // (A :has() with nothing to tell its subject by would make every element an
-        // anchor, keyed by all that's under its parent: any change restyles all of it
-        // anyway, the keys costing a fifth more. So nothing kept for such a page.)
+        // (Too many :has()s with nothing to tell their anchors by: every element one,
+        // keyed by all that's under its parent. Any change restyles all of it anyway, the
+        // keys costing a fifth more. So nothing kept for such a page.)
         out_.reusable_ = !has_any_anchor_;
         constexpr size_t kMaxKeptGenerations = 8;
         // XWEB_NO_STYLE_REUSE=1: everything styled afresh, for telling whether a wrong
         // style came from keeping one.
         static const bool no_reuse = std::getenv("XWEB_NO_STYLE_REUSE") != nullptr;
-        dbg_why_ = !previous ? "; no previous" : !out_.reusable_ ? "; a :has() of anything" : !previous->reusable_ ? "; the previous wasn't reusable"
+        dbg_why_ = !previous ? "; no previous" : !out_.reusable_ ? "; too many :has()s of anything" : !previous->reusable_ ? "; the previous wasn't reusable"
                    : previous->index_id_ != out_.index_id_ ? "; the rules changed"
                    : previous->media_.width != out_.media_.width || previous->media_.height != out_.media_.height ? "; the viewport changed"
                    : previous->forms_ != out_.forms_ ? "; the forms changed" : "";
@@ -1834,7 +1834,8 @@ public:
             size_t order = 0;
             bool uses_has = false, has_any_anchor = false, has_context = false;
             std::unordered_set<uint32_t> has_anchors, has_context_anchors;
-            std::vector<const CompoundSelector*> has_context_compounds;
+            std::vector<const CompoundSelector*> has_context_compounds, has_args;
+            bool has_args_siblings = false;
             bool style_selector = false, follow_any = false, follow_exact_any = false;
             std::unordered_set<std::string> inherit_used;
             std::unordered_set<uint32_t> follow_anchors, follow_exact_anchors;
@@ -1874,6 +1875,8 @@ public:
                 has_context_ = last->has_context;
                 has_context_anchors_ = last->has_context_anchors;
                 has_context_compounds_ = last->has_context_compounds;
+                has_args_ = last->has_args;
+                has_args_siblings_ = last->has_args_siblings;
                 style_selector_ = last->style_selector;
                 follow_any_ = last->follow_any;
                 follow_anchors_ = last->follow_anchors;
@@ -1902,6 +1905,8 @@ public:
         made->has_context = has_context_;
         made->has_context_anchors = has_context_anchors_;
         made->has_context_compounds = has_context_compounds_;
+        made->has_args = has_args_;
+        made->has_args_siblings = has_args_siblings_;
         made->style_selector = style_selector_;
         made->follow_any = follow_any_;
         made->follow_anchors = follow_anchors_;
@@ -4925,7 +4930,12 @@ private:
                             anchors.insert(own.front());
                             noted = true;
                         }
-                        if (!noted) (context ? has_context_ : has_any_anchor_) = true;
+                        // With nothing to tell it by, by what it looks for (`:has(.x)` is
+                        // of what has an .x under it): see hasArgUnder.
+                        if (!noted) {
+                            for (const ComplexSelector& a : x.args) noteHasArgument(a);
+                            if (context) has_context_ = true;
+                        }
                     }
                 }
                 // :has()'s own argument is asked of what's under the anchor (in its print);
@@ -4941,6 +4951,54 @@ private:
         }
     }
 
+    // What a :has() looks for, when its anchor could be anything: the last compound of its
+    // argument. (ohou.se's `:has([class*=ErrorMessage]) input`, youtube.com's, github.com's:
+    // with every element an anchor, keeping styles was off, and each of github's layouts
+    // styled all 1900 elements, 250 ms.)
+    void noteHasArgument(const ComplexSelector& a) {
+        if (a.parts.size() < 2) return;   // (never matches)
+        const Combinator first = a.parts[1].combinator;
+        if (first == Combinator::NextSibling || first == Combinator::SubsequentSibling) has_args_siblings_ = true;
+        const CompoundSelector& c = a.parts.back();
+        const auto same = [](const CompoundSelector& p, const CompoundSelector& q) {
+            if (&p == &q) return true;
+            return p.simple.size() == q.simple.size() &&
+                   std::equal(p.simple.begin(), p.simple.end(), q.simple.begin(), [](const SimpleSelector& m, const SimpleSelector& n) {
+                       return m.kind == n.kind && m.name == n.name && m.value == n.value && m.op == n.op &&
+                              m.case_insensitive == n.case_insensitive && m.a == n.a && m.b == n.b && m.args.empty() && n.args.empty();
+                   });
+        };
+        for (const CompoundSelector* k : has_args_)
+            if (same(*k, c)) return;
+        constexpr size_t kMaxHasArgs = 64;   // each asked of each element, once a restyle
+        if (has_args_.size() >= kMaxHasArgs) has_any_anchor_ = true;
+        else has_args_.push_back(&c);
+    }
+
+    // Whether anything under `n` is what one of those looks for.
+    bool hasArgUnder(const Node* n) {
+        if (const auto it = has_arg_under_.find(n); it != has_arg_under_.end()) return it->second;
+        bool hit = false;
+        for (const Node* c : n->children) {
+            if (hit || !c->isElement()) continue;
+            for (const CompoundSelector* k : has_args_) {
+                fuel_ = kSelectorFuel;
+                if (matchCompound(c, *k)) { hit = true; break; }
+            }
+            hit = hit || hasArgUnder(c);
+        }
+        return has_arg_under_[n] = hit;
+    }
+    // Whether a :has() with no anchor of its own could match this element.
+    bool argAnchor(const Node* el) {
+        if (has_args_.empty()) return false;
+        const Node* saved = host_context_;
+        host_context_ = nullptr;
+        const bool hit = hasArgUnder(has_args_siblings_ && el->parent ? el->parent : el);
+        host_context_ = saved;
+        return hit;
+    }
+
     static bool asksForStyleAttribute(const ComplexSelector& sel) {
         for (const CompoundSelector& c : sel.parts)
             for (const SimpleSelector& x : c.simple) {
@@ -4952,12 +5010,14 @@ private:
     }
 
     // Whether a :has() might be asked of this element.
-    bool hasAnchor(const Node* el) const {
+    bool hasAnchor(const Node* el) {
         if (!uses_has_) return false;
-        return has_any_anchor_ || anchorIn(el, has_anchors_);
+        return has_any_anchor_ || anchorIn(el, has_anchors_) || argAnchor(el);
     }
     // Whether one might be asked of it for another element (its descendant or sibling).
-    bool contextAnchor(const Node* el) const { return has_context_ || anchorIn(el, has_context_anchors_); }
+    bool contextAnchor(const Node* el) {
+        return (has_context_ && (has_any_anchor_ || argAnchor(el))) || anchorIn(el, has_context_anchors_);
+    }
 
     static bool anchorIn(const Node* el, const std::unordered_set<uint32_t>& anchors) {
         if (anchors.empty()) return false;
@@ -5149,6 +5209,9 @@ private:
     std::unordered_set<uint32_t> follow_anchors_, follow_exact_anchors_;   // (exact: :nth-last-*)
     std::unordered_set<std::string> inherit_used_;   // properties a rule gives `inherit`
     int box_inherited_ = -1;   // whether one of those is one of kOwnBoxProperties' (-1: not known yet)
+    std::vector<const CompoundSelector*> has_args_;   // what the :has()s with no anchor look for
+    bool has_args_siblings_ = false;                  // one among later siblings
+    std::unordered_map<const Node*, bool> has_arg_under_;
     std::unordered_set<uint32_t> has_host_anchors_;   // tags of hosts a :host:has() is asked of
     bool has_context_ = false;   // a :has() asked for another element, of any element
     std::unordered_set<uint32_t> has_context_anchors_;   // of these (as has_anchors_)
@@ -5196,6 +5259,24 @@ StyledDocument::StyledDocument(const Document& doc, css::MediaContext media, con
     : media_(media), measure_ch_(measure_ch), forms_(forms) {
     StyleResolver resolver(doc, *this, loader, previous);
     resolver.run();
+    // XWEB_CHECK_REUSE=1: everything styled afresh too, and any difference told of.
+    static const bool check = std::getenv("XWEB_CHECK_REUSE") != nullptr;
+    if (!check || !previous) return;
+    const StyledDocument fresh(doc, media, loader, measure_ch, forms, nullptr);
+    static size_t told = 0, checks = 0;
+    size_t differ = 0;
+    for (const auto& [n, o] : fresh.styles_) {
+        const ComputedStyle* k = styleOf(n);
+        if (k && k->color == o->color && k->background == o->background && k->display == o->display && k->font_size == o->font_size &&
+            k->font_weight == o->font_weight && k->position == o->position && k->width.px == o->width.px && k->height.px == o->height.px &&
+            k->margin[0].px == o->margin[0].px && k->margin[3].px == o->margin[3].px && k->padding[0].px == o->padding[0].px &&
+            k->padding[3].px == o->padding[3].px && k->opacity == o->opacity && k->z_index == o->z_index && k->hidden == o->hidden)
+            continue;
+        ++differ;
+        if (told++ < 20)
+            std::fprintf(stderr, "[reuse] differs at <%s class=\"%s\">%s\n", n->name.c_str(), n->attr("class") ? n->attr("class")->substr(0, 60).c_str() : "", k ? "" : " (not styled)");
+    }
+    if (++checks % 20 == 0 || differ) std::fprintf(stderr, "[reuse] check %zu: %zu of %zu differ\n", checks, differ, fresh.styles_.size());
 }
 
 std::unique_ptr<StyledDocument> StyledDocument::chainOf(const Node* target, const Document& doc, css::MediaContext media,

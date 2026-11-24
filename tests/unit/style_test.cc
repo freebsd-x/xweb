@@ -974,3 +974,44 @@ TEST(Shadow, HostsDontShareStylesTheirHostRulesSetApart) {
     EXPECT_EQ(hosts, (std::vector<Color>{{1, 1, 1, 255}, {2, 2, 2, 255}}));
     EXPECT_EQ(slotted, (std::vector<Color>{{3, 3, 3, 255}, {2, 2, 2, 255}}));
 }
+
+// :has() with nothing to tell its anchor by: what has what it looks for under it is one.
+TEST(Restyle, AnAnchorlessHasGoesByWhatItLooksFor) {
+    auto doc = parseHtml(R"(<!doctype html><style>
+        :has(> .flag) { color: rgb(4, 5, 6) }
+        :has([class*=Err]) i { font-size: 25px }
+        :is(.a .b, .c):has(u) { font-size: 22px }
+        .kin :has(+ .next) { font-size: 23px }
+      </style>
+      <p id=other><b id=bold>x</b></p>
+      <div id=box><section id=sec><span id=deep>y</span></section><i id=it>i</i></div>
+      <div class=a><div class=b id=b>t<em id=em>e</em></div></div>
+      <div class=kin><s id=s>1</s><q id=q>2</q></div>)");
+    auto styles = std::make_unique<StyledDocument>(*doc, css::MediaContext{800, 600});
+    const auto again = [&](const char* step) {
+        styles = std::make_unique<StyledDocument>(*doc, css::MediaContext{800, 600}, StyledDocument::SheetLoader{},
+                                                  StyledDocument::ChMeasure{}, nullptr, styles.get());
+        expectSameAsFresh(*doc, *styles, step);
+    };
+    const ComputedStyle* bold = styles->styleOf(elementById(*doc, "bold"));
+    again("nothing changed");
+    EXPECT_EQ(styles->styleOf(elementById(*doc, "bold")), bold);   // kept
+    setAttribute(elementById(*doc, "deep"), "class", "flag");
+    again("a child to match");
+    EXPECT_EQ(styles->styleOf(elementById(*doc, "sec"))->color, (Color{4, 5, 6, 255}));
+    bold = styles->styleOf(elementById(*doc, "bold"));   // (its ancestors have only now become anchors)
+    again("nothing changed since");
+    EXPECT_EQ(styles->styleOf(elementById(*doc, "bold")), bold);
+    setAttribute(elementById(*doc, "deep"), "class", "MyErr");
+    again("for another element, and not for this one");
+    EXPECT_EQ(styles->styleOf(elementById(*doc, "it"))->font_size, 25);
+    setAttribute(elementById(*doc, "deep"), "class", "");
+    again("neither");
+    EXPECT_EQ(styles->styleOf(elementById(*doc, "it"))->font_size, 16);
+    setAttribute(elementById(*doc, "q"), "class", "next");
+    again("a sibling to match");
+    EXPECT_EQ(styles->styleOf(elementById(*doc, "s"))->font_size, 23);
+    setAttribute(elementById(*doc, "q"), "class", "");
+    again("not any more");
+    EXPECT_EQ(styles->styleOf(elementById(*doc, "s"))->font_size, 16);
+}
