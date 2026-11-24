@@ -915,3 +915,62 @@ TEST(Restyle, UnderAHasAnchorOnlyTheAnchorRestyles) {
     again("gone from the box");
     EXPECT_NE(styles->styleOf(elementById(*doc, "it"))->font_size, 25);
 }
+
+// A :host:has() in a shadow tree's sheet doesn't stop the page's styles being kept, and
+// what it's asked for (the host, its shadow tree) follows what's in that tree; one in
+// :host()'s argument never matches. (As Chromium has both.)
+TEST(Restyle, AHostsHasIsAnchoredOnTheHost) {
+    auto doc = parseHtml(R"(<!doctype html><p id=other>x</p>
+      <x-card id=host><template shadowrootmode=open><style>
+        :host:has(.flag) { color: rgb(4, 5, 6) }
+        :host:has(.flag) b { font-size: 25px }
+        :host(:has(.flag)) i { font-size: 27px }
+      </style><b>b</b><i>i</i><slot></slot></template><section><span id=deep>y</span></section></x-card>)");
+    attachDeclarativeShadowRoots(*doc);
+    Node* host = elementById(*doc, "host");
+    ASSERT_NE(host->shadow_root, nullptr);
+    const auto inner = [&](const char* tag) -> Node* {
+        for (Node* c : host->shadow_root->children)
+            if (c->isElement() && c->name == tag) return c;
+        return nullptr;
+    };
+    auto styles = std::make_unique<StyledDocument>(*doc, css::MediaContext{800, 600});
+    const auto again = [&](const char* step, float b) {
+        styles = std::make_unique<StyledDocument>(*doc, css::MediaContext{800, 600}, StyledDocument::SheetLoader{},
+                                                  StyledDocument::ChMeasure{}, nullptr, styles.get());
+        expectSameAsFresh(*doc, *styles, step);
+        EXPECT_EQ(styles->styleOf(inner("b"))->font_size, b) << step;
+        EXPECT_EQ(styles->styleOf(inner("i"))->font_size, 16) << step;
+        EXPECT_EQ(styles->styleOf(host)->color, b == 25 ? (Color{4, 5, 6, 255}) : (Color{0, 0, 0, 255})) << step;
+    };
+    const ComputedStyle* other = styles->styleOf(elementById(*doc, "other"));
+    again("nothing changed", 16);
+    EXPECT_EQ(styles->styleOf(elementById(*doc, "other")), other);   // kept
+    setAttribute(elementById(*doc, "deep"), "class", "flag");
+    again("in the light tree: not looked at", 16);
+    setAttribute(inner("i"), "class", "flag");
+    again("in the shadow tree", 25);
+    setAttribute(inner("i"), "class", "");
+    again("not any more", 16);
+}
+
+// Siblings alike but for what their shadow trees' :host rules and ::slotted ones say
+// aren't styled as one.
+TEST(Shadow, HostsDontShareStylesTheirHostRulesSetApart) {
+    auto doc = parseHtml(R"(<!doctype html>
+      <x-a><template shadowrootmode=open><style>:host { color: rgb(1, 1, 1) } ::slotted(u) { color: rgb(3, 3, 3) }</style><slot></slot></template><u>1</u></x-a>
+      <x-a><template shadowrootmode=open><style>:host { color: rgb(2, 2, 2) }</style><slot></slot></template><u>2</u></x-a>)");
+    attachDeclarativeShadowRoots(*doc);
+    const StyledDocument styles(*doc, css::MediaContext{800, 600});
+    std::vector<Color> hosts, slotted;
+    std::vector<const Node*> todo{doc->root()};
+    while (!todo.empty()) {
+        const Node* n = todo.back();
+        todo.pop_back();
+        todo.insert(todo.end(), n->children.rbegin(), n->children.rend());
+        if (n->isElement() && n->name == "x-a") hosts.push_back(styles.styleOf(n)->color);
+        if (n->isElement() && n->name == "u") slotted.push_back(styles.styleOf(n)->color);
+    }
+    EXPECT_EQ(hosts, (std::vector<Color>{{1, 1, 1, 255}, {2, 2, 2, 255}}));
+    EXPECT_EQ(slotted, (std::vector<Color>{{3, 3, 3, 255}, {2, 2, 2, 255}}));
+}

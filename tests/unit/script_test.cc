@@ -1402,3 +1402,13 @@ TEST(Script, CustomPropertiesKeepTheirCase) {
     EXPECT_EQ(p.console, "log:height: var(--AirImage-height, 7px); --AirImage-height: 40px; --Other: x; color: red; 40px true\n"
                          "log:height: var(--AirImage-height, 7px); --AirImage-height: 40px; color: red;\n") << p.console;
 }
+
+TEST(Script, ListFormatPartsAreElementsAndLiterals) {
+    // wired.com swaps each element part for an author's link.
+    Page p(R"JS(<body><script>
+        const f = (o, l) => new Intl.ListFormat('en', o).format(l);
+        console.log(new Intl.ListFormat('en').formatToParts(['A', 'B']).map(p => p.type[0] + '[' + p.value + ']').join(''));
+        console.log(f({}, ['A', 'B', 'C']), '|', f({style: 'short'}, ['A', 'B']), '|', f({type: 'disjunction'}, ['A', 'B', 'C']), '|', f({type: 'unit', style: 'narrow'}, ['A', 'B']), '|', f({}, ['A']));
+        </script>)JS");
+    EXPECT_EQ(p.console, "log:e[A]l[ and ]e[B]\nlog:A, B, and C | A & B | A, B, or C | A B | A\n") << p.console;
+}

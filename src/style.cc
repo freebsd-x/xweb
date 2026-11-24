@@ -1806,6 +1806,10 @@ public:
         // XWEB_NO_STYLE_REUSE=1: everything styled afresh, for telling whether a wrong
         // style came from keeping one.
         static const bool no_reuse = std::getenv("XWEB_NO_STYLE_REUSE") != nullptr;
+        dbg_why_ = !previous ? "; no previous" : !out_.reusable_ ? "; a :has() of anything" : !previous->reusable_ ? "; the previous wasn't reusable"
+                   : previous->index_id_ != out_.index_id_ ? "; the rules changed"
+                   : previous->media_.width != out_.media_.width || previous->media_.height != out_.media_.height ? "; the viewport changed"
+                   : previous->forms_ != out_.forms_ ? "; the forms changed" : "";
         if (!no_reuse && previous && previous->reusable_ && out_.reusable_ && previous->index_id_ == out_.index_id_ &&
             previous->media_.width == out_.media_.width && previous->media_.height == out_.media_.height &&
             previous->forms_ == out_.forms_) {
@@ -1958,10 +1962,11 @@ public:
         walk(root, initial, 0, doc_p_, nullptr);
         static const bool dbg = std::getenv("XWEB_DEBUG_RESTYLE") != nullptr;
         if (dbg)
-            std::fprintf(stderr, "[restyle] %zu elements, %zu kept, %zu shared, %.0f ms; previous %d context %d\n", out_.keys_.size(), dbg_kept_, dbg_shared_,
+            std::fprintf(stderr, "[restyle] %zu elements, %zu kept, %zu shared, %.0f ms; previous %d context %d%s\n", out_.keys_.size(), dbg_kept_, dbg_shared_,
                          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), previous_ != nullptr,
-                         has_context_);
+                         has_context_, dbg_why_);
     }
+    const char* dbg_why_ = "";   // why nothing could be kept (XWEB_DEBUG_RESTYLE)
     size_t dbg_kept_ = 0, dbg_roots_ = 0, dbg_shared_ = 0;
 
 private:
@@ -2228,6 +2233,9 @@ private:
         }
         if (n == css::kHasAnchor) return el == has_anchor_;
         if (n == "has") {
+            if (in_host_arg_) return false;   // :host(:has(...)) never matches, as in Chromium
+            // :host:has(...) is of what's in the host's shadow tree.
+            const bool of_host = el == host_context_ && el->shadow_root;
             // Each selector relative to this element: looked for among its descendants, or
             // (led by + or ~) its later siblings and theirs.
             const Node* saved = has_anchor_;
@@ -2237,7 +2245,9 @@ private:
                 if (a.parts.size() < 2 || hit) continue;
                 const bool siblings = a.parts[1].combinator == Combinator::NextSibling || a.parts[1].combinator == Combinator::SubsequentSibling;
                 std::vector<const Node*> todo;
-                if (siblings) {
+                if (of_host) {
+                    if (!siblings) todo.assign(el->shadow_root->children.begin(), el->shadow_root->children.end());
+                } else if (siblings) {
                     for (const Node* p = info.next; p && fuel_-- > 0; p = sib(p).next) todo.push_back(p);
                 } else {
                     todo.assign(el->children.begin(), el->children.end());
@@ -2259,11 +2269,14 @@ private:
             // The argument is matched against the host in its own tree.
             const Node* saved = host_context_;
             host_context_ = nullptr;
+            const bool saved_arg = in_host_arg_;
+            in_host_arg_ = true;
             bool hit = false;
             for (const Node* p = el; p && !hit; p = n == "host" ? nullptr : p->parent)
                 for (const ComplexSelector& a : s.args)
                     if (p->isElement() && matchComplex(p, a)) hit = true;
             host_context_ = saved;
+            in_host_arg_ = saved_arg;
             return hit;
         }
         if (n == "defined") {
@@ -2342,9 +2355,16 @@ private:
 
     bool matchCompound(const Node* el, const CompoundSelector& c) {
         // Seen from inside its shadow tree, the host is featureless: only :host matches it.
-        if (el == host_context_)
-            for (const SimpleSelector& s : c.simple)
-                if (!(s.kind == SimpleKind::PseudoClass && (s.name == "host" || s.name == "host-context"))) return false;
+        // (With it, :has(); and it's the anchor of its own :has()'s argument.)
+        if (el == host_context_) {
+            bool named = false;
+            for (const SimpleSelector& s : c.simple) {
+                if (s.kind != SimpleKind::PseudoClass) return false;
+                if (s.name == "host" || s.name == "host-context" || s.name == css::kHasAnchor) named = true;
+                else if (s.name != "has") return false;
+            }
+            if (!named) return false;
+        }
         for (const SimpleSelector& s : c.simple) {
             if (--fuel_ < 0) return false;
             if (!matchSimple(el, s)) return false;
@@ -4261,6 +4281,7 @@ private:
         }
         host_context_ = scope->host_el;
 
+        const size_t from_rules = matched.size();   // (:host and ::slotted ones are ranked as hints, but they're rules)
         std::string hint_text;
         hints(el, hint_text);
         std::shared_ptr<const std::vector<Declaration>> hint_decls;
@@ -4280,8 +4301,9 @@ private:
         // whether a wrong style came from sharing one).
         static const bool no_sharing = std::getenv("XWEB_NO_STYLE_SHARING") != nullptr;
         bool shareable = !no_sharing && !resolving_pseudo_ && el->parent && el->parent->type != NodeType::Document;
-        for (const MatchedDecl& m : matched) {
-            if (m.origin != Origin::Hint && m.origin != Origin::Inline)
+        for (size_t i = 0; i < matched.size(); ++i) {
+            const MatchedDecl& m = matched[i];
+            if (i < from_rules)
                 rules = mix(mix(rules, reinterpret_cast<uintptr_t>(m.decl)), (m.important ? 2u : 1u) + 4u * static_cast<unsigned>(m.origin));
             if (m.decl->name == "content") shareable = false;   // attr() is the element's
         }
@@ -4810,7 +4832,7 @@ private:
         if (style_attr) h = mix(h, styleAttrPrint(*style_attr, false));
         const bool anchor = hasAnchor(el);
         if (anchored) *anchored = anchor;
-        if (anchor) h = mix(h, subtreePrint(el->parent ? el->parent : el));
+        if (anchor) h = mix(h, anchorPrint(el));
         return h;
     }
 
@@ -4871,15 +4893,28 @@ private:
             }
             const bool last = i + 1 == sel.parts.size();
             if (own.empty() && last && outer && !outer->empty()) own = *outer;
+            // In a shadow tree's sheet, a :host compound is that host: its tag tells it
+            // (microsoft.com's `:host:has([hide-controls])` turned keeping styles off for
+            // the whole page). Its children, in either tree, go by all that's under it.
+            const bool of_host = target_ && target_->host_el && std::any_of(c.simple.begin(), c.simple.end(), [](const SimpleSelector& y) {
+                return y.kind == SimpleKind::PseudoClass && y.name == "host";
+            });
+            // ::part and ::slotted style another element than the one the compound is asked of.
+            const bool of_another = std::any_of(c.simple.begin(), c.simple.end(), [](const SimpleSelector& y) {
+                return y.kind == SimpleKind::PseudoElement && (y.name == "part" || y.name == "slotted");
+            });
+            if (own.empty() && of_host) own.push_back(featureHash('t', lower(target_->host_el->name)));
             for (const SimpleSelector& x : c.simple) {
                 if (x.kind == SimpleKind::PseudoClass && x.name == "has") {
                     uses_has_ = true;
+                    if (of_host) has_host_anchors_.insert(featureHash('t', lower(target_->host_el->name)));
+                    const bool asked_of_subject = is_subject && !of_another;
                     // Those asked for another element are noted twice: as anchors, and as
                     // anchors whose children's keys must have what's under them.
-                    if (!is_subject && (has_context_compounds_.empty() || has_context_compounds_.back() != &c))
+                    if (!asked_of_subject && !of_host && (has_context_compounds_.empty() || has_context_compounds_.back() != &c))
                         has_context_compounds_.push_back(&c);
                     for (const bool context : {false, true}) {
-                        if (context && is_subject) break;
+                        if (context && asked_of_subject) break;
                         auto& anchors = context ? has_context_anchors_ : has_anchors_;
                         // A tag, ID, class or attribute it must have ([data-type=X]:has(...),
                         // 11st.co.kr's: with nothing to tell its subject by, keeping styles
@@ -4899,6 +4934,8 @@ private:
                                   (x.name == "has" || x.name == "is" || x.name == "where" || x.name == "not" || x.name == "matches" ||
                                    x.name == "-webkit-any" || x.name == "-moz-any");
                 const bool same_element = same && x.name != "has";
+                // (A :has() in :host()'s argument never matches.)
+                if (x.kind == SimpleKind::PseudoClass && (x.name == "host" || x.name == "host-context")) continue;
                 for (const ComplexSelector& a : x.args) noteHasAnchors(a, is_subject && same, same_element ? &own : nullptr);
             }
         }
@@ -4963,6 +5000,13 @@ private:
         return h;
     }
 
+    // What a :has() asked of this element could see; of a host, its shadow tree too.
+    uint64_t anchorPrint(const Node* el) {
+        uint64_t h = subtreePrint(el->parent ? el->parent : el);
+        if (el->shadow_root && anchorIn(el, has_host_anchors_)) h = mix(h, subtreePrint(el->shadow_root));
+        return h;
+    }
+
     // Down the composed tree: a host's shadow tree (in its scope), a slot's assigned
     // nodes (in the host's tree's scope), everyone else's children.
     // One element styled (kept, or resolved), its pseudo-elements too unless it's display:
@@ -4983,7 +5027,7 @@ private:
         // can be asked of it for them (`[data-type=X]:has(...) .item`), by which of those
         // compounds it matches.
         const bool context_anchor = anchored && contextAnchor(el);
-        const bool print_matches = anchored && (!context_anchor || has_context_compounds_.size() <= kMaxContextCompounds);
+        const bool print_matches = anchored && !(el->shadow_root && anchorIn(el, has_host_anchors_)) && (!context_anchor || has_context_compounds_.size() <= kMaxContextCompounds);
         uint64_t match_print = 0;
         bool have_print = false;
         const ComputedStyle* kept = nullptr;
@@ -5043,7 +5087,7 @@ private:
         }
         if (have_print) out_.has_prints_[el] = match_print;
         const uint64_t children_key =
-            have_print ? mix(base, match_print) : anchored ? mix(base, subtreePrint(el->parent ? el->parent : el)) : base;
+            have_print ? mix(base, match_print) : anchored ? mix(base, anchorPrint(el)) : base;
         const ComputedStyle& s = *out_.styles_[el];
         if (!kept && !(s.display == Display::None && el->ns != Namespace::Svg)) {
             resolvePseudo(el, s, ua_p_->before, scope->before, scope->host_el, out_.before_);
@@ -5105,6 +5149,7 @@ private:
     std::unordered_set<uint32_t> follow_anchors_, follow_exact_anchors_;   // (exact: :nth-last-*)
     std::unordered_set<std::string> inherit_used_;   // properties a rule gives `inherit`
     int box_inherited_ = -1;   // whether one of those is one of kOwnBoxProperties' (-1: not known yet)
+    std::unordered_set<uint32_t> has_host_anchors_;   // tags of hosts a :host:has() is asked of
     bool has_context_ = false;   // a :has() asked for another element, of any element
     std::unordered_set<uint32_t> has_context_anchors_;   // of these (as has_anchors_)
     // The compounds with those (in the rules' sheets, kept by the index or sheets_).
@@ -5125,6 +5170,7 @@ private:
     const Scope* doc_p_ = nullptr;
     Scope* target_ = nullptr;   // where applySheet puts rules
     std::unordered_map<const Node*, std::unique_ptr<Scope>> shadow_scopes_;   // by shadow root
+    bool in_host_arg_ = false;   // matching what's in :host(...)
     const Node* host_context_ = nullptr;   // the host of the shadow tree being matched in
     // The ancestor filter: counts of the hashes of the elements walk() is inside of.
     std::vector<uint32_t> bloom_ = std::vector<uint32_t>(size_t{1} << kBloomBits);
