@@ -851,7 +851,7 @@ public:
                 continue;
             }
             if (op.kind == web::PaintKind::TransformBegin) {
-                // Drawn as one image, unless it holds text: then as if untransformed.
+                // Drawn as one image, where it can be: else as if untransformed.
                 const size_t end = transformEnd(i);
                 if (drawTransformed(dl, i, end, at)) i = end;
                 continue;
@@ -1794,8 +1794,11 @@ private:
     template <typename F>
     void eachTransformed(size_t begin, size_t end, F&& f) const {
         std::vector<web::Matrix> stack;
+        group_clips_.clear();
         for (size_t k = begin; k < end && k < layout_.ops.size(); ++k) {
             const web::PaintOp& op = layout_.ops[k];
+            if (op.kind == web::PaintKind::ClipBegin) group_clips_.emplace_back(&op, stack.empty() ? web::Matrix{} : stack.back());
+            else if (op.kind == web::PaintKind::ClipEnd) { if (!group_clips_.empty()) group_clips_.pop_back(); }
             if (op.kind == web::PaintKind::TransformBegin) stack.push_back(stack.empty() ? op.transform : stack.back().after(op.transform));
             else if (op.kind == web::PaintKind::TransformEnd) { if (!stack.empty()) stack.pop_back(); }
             else if (op.kind != web::PaintKind::ClipBegin && op.kind != web::PaintKind::ClipEnd && !stack.empty()) f(op, stack.back());
@@ -1840,6 +1843,13 @@ private:
                 case web::PaintKind::Gradient: if (op.gradient) str(gradientKey(*op.gradient)); break;
                 case web::PaintKind::Box: if (op.box) str(boxKey(*op.box)); break;
                 case web::PaintKind::Svg: mix(&op.node, sizeof op.node); break;
+                case web::PaintKind::Text:
+                    str(op.font.family);
+                    mix(&op.font.size, sizeof op.font.size);
+                    mix(&op.font.weight, sizeof op.font.weight);
+                    mix(&op.font.italic, sizeof op.font.italic);
+                    str(op.text);
+                    break;
                 default: str(op.text); break;
             }
         }
@@ -1856,6 +1866,25 @@ private:
         group_ = &canvas;
         eachTransformed(begin, end, [&](const web::PaintOp& op, const web::Matrix& m) {
             const web::Matrix page_to_canvas = unscaled ? to_canvas : to_canvas.after(m);
+            // The clips inside the group (a turned one by the box around it).
+            canvas.resetClip();
+            if (!group_clips_.empty()) {
+                float l = 0, t = 0, r = static_cast<float>(pw), b = static_cast<float>(ph);
+                for (const auto& [c, cm] : group_clips_) {
+                    const web::Matrix to = unscaled ? to_canvas : to_canvas.after(cm);
+                    const web::Point q[4] = {to.apply({c->x, c->y}), to.apply({c->x + c->w, c->y}), to.apply({c->x, c->y + c->h}), to.apply({c->x + c->w, c->y + c->h})};
+                    l = std::max(l, std::min({q[0].x, q[1].x, q[2].x, q[3].x}));
+                    t = std::max(t, std::min({q[0].y, q[1].y, q[2].y, q[3].y}));
+                    r = std::min(r, std::max({q[0].x, q[1].x, q[2].x, q[3].x}));
+                    b = std::min(b, std::max({q[0].y, q[1].y, q[2].y, q[3].y}));
+                }
+                if (!(r > l && b > t)) return;
+                canvas.setClip(l, t, r - l, b - t);
+            }
+            if (op.kind == web::PaintKind::Text) {
+                groupText(op, page_to_canvas);
+                return;
+            }
             if (op.kind == web::PaintKind::Rect) {
                 canvas.fill(web::transformed(web::roundedRect(op.x, op.y, op.w, op.h, op.radius, op.radius), page_to_canvas), false, web::Paint{op.color, nullptr, 1});
                 return;
@@ -1928,12 +1957,55 @@ private:
         return true;
     }
 
-    // Draws the group from `begin` to `end`; false if it holds text (then it isn't drawn).
+    // One line's text into the group's canvas: its glyphs at the size they come out, then
+    // through the matrix. (Unshaped: see shapes.)
+    void groupText(const web::PaintOp& op, const web::Matrix& m) {
+        if (op.text.empty() || op.color.a == 0) return;
+        const float k = std::clamp(m.scale(), 0.05f, 16.0f);
+        const float baseline = op.y + measurer_.ascent(op.font);
+        float x = op.x;
+        for (const web::FontRun& run : web::fontRuns(op.text, op.font)) {
+            const std::string piece = op.text.substr(run.begin, run.end - run.begin);
+            const float w = measurer_.width(piece, op.font);
+            std::string font = op.font.italic ? "italic " : "";
+            font += std::to_string(std::clamp((op.font.weight + 50) / 100 * 100, 100, 900)) + " " + std::to_string(op.font.size) + "px " +
+                    (run.family.empty() ? std::string("sans-serif") : "\"" + run.family + "\"");
+            const auto drawn = canvasText(piece, font, k, true);
+            if (drawn && !drawn->mask.empty() && drawn->advance > 0) {
+                const float asc = std::round(drawn->ascent * k) / k;
+                // (As wide as layout has it: hinting rounds each glyph's advance.)
+                const web::Matrix place = web::Matrix::translate(x, baseline - asc).after(web::Matrix::scaling(w / drawn->advance / k, 1 / k));
+                const web::Color solid{op.color.r, op.color.g, op.color.b, 255};
+                group_->drawRaster(drawn->mask, m.after(place), static_cast<float>(op.color.a) / 255, &solid);
+            }
+            x += w;
+        }
+    }
+
+    // Scripts whose letters join or reorder, which takes shaping.
+    static bool shapes(const std::string& utf8) {
+        for (size_t i = 0; i + 1 < utf8.size(); ++i) {
+            const unsigned char c = static_cast<unsigned char>(utf8[i]), d = static_cast<unsigned char>(utf8[i + 1]);
+            if (c >= 0xD6 && c <= 0xDF) return true;                     // Hebrew, Arabic, Syriac, ...
+            if (c == 0xE0) return true;                                  // Indic scripts, Thai, Lao
+            if (c == 0xE1 && d >= 0x80 && d <= 0x83) return true;        // Myanmar
+            if (c == 0xE1 && d >= 0x9E && d <= 0x9F) return true;        // Khmer
+            if (c == 0xEF && (d >= 0xAC && d != 0xBC && d != 0xBD && d != 0xBF && d != 0xBE)) return true;   // Arabic forms
+        }
+        return false;
+    }
+
+    // Draws the group from `begin` to `end`; false if it's left to be drawn untransformed.
     bool drawTransformed(fbx::xrender::DisplayList& dl, size_t begin, size_t end, Offset at) {
-        bool text = false;
+        bool text = false, plain = true, unshaped = false;
         float l = INFINITY, t = INFINITY, r = -INFINITY, b = -INFINITY;
         eachTransformed(begin, end, [&](const web::PaintOp& op, const web::Matrix& m) {
-            if (op.kind == web::PaintKind::Text) text = true;
+            if (op.kind == web::PaintKind::Text) {
+                text = true;
+                // Scarcely scaled (a hover's, the end of a growing-in): as it is, and crisp.
+                if (std::abs(m.a - 1) > 0.02f || std::abs(m.d - 1) > 0.02f || std::abs(m.b) > 0.005f || std::abs(m.c) > 0.005f) plain = false;
+                if (shapes(op.text)) unshaped = true;
+            }
             for (const web::Point p : {web::Point{op.x, op.y}, web::Point{op.x + op.w, op.y}, web::Point{op.x, op.y + op.h}, web::Point{op.x + op.w, op.y + op.h}}) {
                 const web::Point q = m.apply(p);
                 l = std::min(l, q.x);
@@ -1950,9 +2022,20 @@ private:
             eachTransformed(begin, end, [&](const web::PaintOp&, const web::Matrix&) { any = true; });
             if (any) return true;
         }
-        if (text) return false;
-        if (drawScaled(dl, begin, end, at)) return true;
+        if (text && (plain || unshaped)) return false;
+        if (!text && drawScaled(dl, begin, end, at)) return true;
         if (!(r > l && b > t) || !std::isfinite(l) || !std::isfinite(t) || !std::isfinite(r) || !std::isfinite(b)) return true;
+        if (text) {
+            // Only what can be seen, in steps of 512 px: sharp text of a whole page turned
+            // or scaled is more than a raster may hold.
+            const auto down = [](float v) { return std::floor(v / 512) * 512; };
+            const auto up = [](float v) { return std::ceil(v / 512) * 512; };
+            l = std::max(l, down(-at.x_));
+            r = std::min(r, up(-at.x_ + size_.width_));
+            t = std::max(t, down(-at.y_ - kOffscreenMargin));
+            b = std::min(b, up(-at.y_ + kMaxWindowHeight));
+            if (!(r > l && b > t)) return true;
+        }
         l = std::floor(l);
         t = std::floor(t);
         r = std::ceil(r);
@@ -1971,6 +2054,7 @@ private:
     }
 
     web::Canvas* group_ = nullptr;   // a transformed group being drawn into
+    mutable std::vector<std::pair<const web::PaintOp*, web::Matrix>> group_clips_;   // around the op eachTransformed is at
     web::Matrix group_m_;            // screen coordinates to its canvas
     uint64_t layout_gen_ = 0;
 
