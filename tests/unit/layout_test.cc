@@ -928,3 +928,11 @@ TEST(Inline, PlainInlinesHaveBoxes) {
     EXPECT_FLOAT_EQ(r.box("d").x, r.box("b").x + r.box("b").w + 2);
     EXPECT_FLOAT_EQ(r.box("d").y, r.box("a").y + 5);
 }
+
+TEST(Text, LettersToSpace) {
+    EXPECT_EQ(spacedLetters("ab c").size(), 4u);
+    EXPECT_EQ(spacedLetters("한글").size(), 2u);
+    EXPECT_EQ(spacedLetters("e\xCC\x81x").size(), 2u);   // a mark goes with its letter
+    EXPECT_EQ(spacedLetters("\xD8\xB3\xD9\x84").size(), 0u);   // letters that join
+    EXPECT_EQ(spacedLetters("\xFF\xC3").size(), 2u);     // not UTF-8: no reading past it
+}

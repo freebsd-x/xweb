@@ -479,6 +479,48 @@ void Animator::cover(StyledDocument& doc) const {
     doc.clearOverlay();
     for (const auto& [key, e] : entries_)
         if (e.shown) doc.lay(key.first, key.second, e.shown);
+    // A colour (or visibility) that's moving is inherited: by what's inside and had its.
+    for (const auto& [key, e] : entries_)
+        if (e.shown && e.base && key.second == 0 && (e.shown->color != e.base->color || e.shown->hidden != e.base->hidden))
+            inheritDown(doc, key.first, *e.base, *e.shown);
+}
+
+void Animator::inheritDown(StyledDocument& doc, const Node* from, const ComputedStyle& base, const ComputedStyle& shown) const {
+    const bool color = shown.color != base.color, hidden = shown.hidden != base.hidden;
+    struct At {
+        const Node* node;
+        int depth;
+    };
+    std::vector<At> todo{{from, 0}};
+    std::vector<const Node*> kids;
+    size_t budget = 5000;
+    while (!todo.empty() && budget) {
+        const At at = todo.back();
+        todo.pop_back();
+        const auto take = [&](const Node* n, int pseudo) {
+            const ComputedStyle* plain = doc.plainStyle(n, pseudo);
+            if (!plain) return false;
+            const bool c = color && plain->color == base.color, h = hidden && plain->hidden == base.hidden;
+            const auto own = entries_.find(Key{n, pseudo});
+            // (Its own colour's moving: not inherited.)
+            if ((!c && !h) || (own != entries_.end() && own->second.shown && own->second.base &&
+                               (own->second.shown->color != own->second.base->color || own->second.shown->hidden != own->second.base->hidden)))
+                return false;
+            const ComputedStyle* laid = pseudo == 1 ? doc.beforeOf(n) : pseudo == 2 ? doc.afterOf(n) : doc.styleOf(n);
+            auto with = std::make_shared<ComputedStyle>(laid ? *laid : *plain);
+            if (c) with->color = shown.color;
+            if (h) with->hidden = shown.hidden;
+            doc.lay(n, pseudo, std::move(with));
+            --budget;
+            return true;
+        };
+        if (at.depth > 0 && !take(at.node, 0)) continue;
+        for (const int pseudo : {1, 2})
+            if (budget) (void)take(at.node, pseudo);
+        composedChildren(at.node, kids);
+        for (const Node* k : kids)
+            if (k->isElement()) todo.push_back({k, at.depth + 1});
+    }
 }
 
 }  // namespace fbx::xweb

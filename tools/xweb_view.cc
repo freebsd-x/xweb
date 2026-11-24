@@ -1281,7 +1281,15 @@ public:
         if (want("text-transform")) out["text-transform"] = kTransform[static_cast<size_t>(s->text_transform)];
         if (want("text-indent")) out["text-indent"] = s->text_indent.is_auto ? std::string("0px") : len(s->text_indent);
         if (want("font-style")) out["font-style"] = s->italic ? "italic" : "normal";
-        if (want("letter-spacing")) out["letter-spacing"] = "normal";
+        {
+            static const char* kCorner[] = {"border-top-left-radius", "border-top-right-radius", "border-bottom-right-radius", "border-bottom-left-radius"};
+            for (size_t i = 0; i < 4; ++i)
+                if (want(kCorner[i])) {
+                    const std::string across = len(s->radius[i][0]), down = len(s->radius[i][1]);
+                    out[kCorner[i]] = across == down ? across : across + " " + down;
+                }
+        }
+        if (want("letter-spacing")) out["letter-spacing"] = s->letter_spacing == 0 ? std::string("normal") : px(s->letter_spacing);
         if (want("flex-direction")) out["flex-direction"] = std::string(s->flex_column ? "column" : "row") + (s->flex_reverse ? "-reverse" : "");
         if (want("flex-wrap")) out["flex-wrap"] = s->flex_wrap ? "wrap" : "nowrap";
         static const char* kAlign[] = {"normal", "flex-start", "flex-end", "center", "stretch", "baseline", "space-between", "space-around", "space-evenly"};
@@ -1645,6 +1653,35 @@ private:
 
     // One line's text, in the fonts it takes: usually there's only one.
     void text(fbx::xrender::DisplayList& dl, const web::PaintOp& op, float x, float y) {
+        for (auto& [piece, at] : spacedPieces(op))
+            plainText(dl, piece, x + at, y);
+    }
+    // With letter-spacing, letter by letter, each with how far along it is.
+    std::vector<std::pair<web::PaintOp, float>> spacedPieces(const web::PaintOp& op) {
+        std::vector<std::pair<web::PaintOp, float>> out;
+        const std::vector<std::string_view> letters = op.font.letter_spacing != 0 ? web::spacedLetters(op.text) : std::vector<std::string_view>{};
+        web::PaintOp one = op;
+        one.font.letter_spacing = 0;
+        if (letters.size() < 2) {
+            out.emplace_back(std::move(one), 0.0f);
+            return out;
+        }
+        // (The kerning between them, spread evenly.)
+        std::vector<float> widths;
+        float sum = 0;
+        for (const std::string_view l : letters) sum += widths.emplace_back(measurer_.width(l, one.font));
+        const float between = op.font.letter_spacing + (measurer_.width(op.text, one.font) - sum) / static_cast<float>(letters.size());
+        float x = 0;
+        for (size_t i = 0; i < letters.size(); ++i) {
+            if (letters[i] != " ") {
+                one.text.assign(letters[i]);
+                out.emplace_back(one, x);
+            }
+            x += widths[i] + between;
+        }
+        return out;
+    }
+    void plainText(fbx::xrender::DisplayList& dl, const web::PaintOp& op, float x, float y) {
         const std::vector<web::FontRun> runs = web::fontRuns(op.text, op.font);
         for (const web::FontRun& run : runs) {
             const std::string_view piece = std::string_view(op.text).substr(run.begin, run.end - run.begin);
@@ -2094,6 +2131,7 @@ private:
                 case web::PaintKind::Text:
                     str(op.font.family);
                     mix(&op.font.size, sizeof op.font.size);
+                    mix(&op.font.letter_spacing, sizeof op.font.letter_spacing);
                     mix(&op.font.weight, sizeof op.font.weight);
                     mix(&op.font.italic, sizeof op.font.italic);
                     str(op.text);
@@ -2207,7 +2245,14 @@ private:
 
     // One line's text into the group's canvas: its glyphs at the size they come out, then
     // through the matrix. (Unshaped: see shapes.)
-    void groupText(const web::PaintOp& op, const web::Matrix& m) {
+    void groupText(const web::PaintOp& whole, const web::Matrix& m) {
+        for (auto& [piece, at] : spacedPieces(whole)) {
+            web::PaintOp one = std::move(piece);
+            one.x += at;
+            groupPiece(one, m);
+        }
+    }
+    void groupPiece(const web::PaintOp& op, const web::Matrix& m) {
         if (op.text.empty() || op.color.a == 0) return;
         const float k = std::clamp(m.scale(), 0.05f, 16.0f);
         const float baseline = op.y + measurer_.ascent(op.font);

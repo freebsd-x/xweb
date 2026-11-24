@@ -1229,3 +1229,20 @@ TEST(Colors, SpacesAndMixes) {
     for (const char* bad : {"color-mix(in nothing, red, blue)", "color-mix(red, blue)", "color-mix(in srgb, red 0%, blue 0%)", "oklch(1 2)", "color(srgb 1 1)", "oklch(from red l c h)"})
         EXPECT_FALSE(parseColor(css::tokenize(bad), Color{}, c)) << bad;
 }
+
+TEST(Motion, AMovingColourIsInherited) {
+    auto doc = parseHtml(R"(<!doctype html><style>@keyframes c { from { color: rgb(0,0,0) } to { color: rgb(100,0,0) } }
+        #a { animation: c 1s linear forwards } #own { color: rgb(0,0,9) } #q::before { content: 'x' }</style>
+        <div id=a><p id=p><b id=b>b</b><i id=own>i</i></p><u id=q>u</u></div>)");
+    Animator an;
+    StyledDocument styles(*doc, css::MediaContext{800, 600});
+    an.styled(styles, nullptr, 0);
+    an.tick(styles, 0.5);
+    const auto red = [&](const char* id) { return static_cast<int>(styles.styleOf(elementById(*doc, id))->color.r); };
+    EXPECT_EQ(red("a"), 50);
+    EXPECT_EQ(red("b"), 50);
+    EXPECT_EQ(red("own"), 0);
+    EXPECT_EQ(styles.beforeOf(elementById(*doc, "q"))->color.r, 50);
+    an.tick(styles, 9);
+    EXPECT_EQ(red("b"), 100);
+}

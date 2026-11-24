@@ -22,7 +22,12 @@ struct FontSpec {
     int weight = 400;
     bool italic = false;
     std::string family;
+    float letter_spacing = 0;   // after each letter; `width` has it
 };
+
+// The text cut where letter-spacing goes: after each letter, with the marks on it. Nothing
+// when it can't be put in (letters that join).
+[[nodiscard]] std::vector<std::string_view> spacedLetters(std::string_view utf8);
 
 class TextMeasurer {
 public:

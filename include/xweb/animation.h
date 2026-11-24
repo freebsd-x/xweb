@@ -118,6 +118,7 @@ private:
         std::vector<Playing> playing;
         std::shared_ptr<const ComputedStyle> shown;  // what's laid over; null: nothing is
     };
+    void inheritDown(StyledDocument& doc, const Node* from, const ComputedStyle& base, const ComputedStyle& shown) const;
     bool advance(const Key& key, Entry& e, double seconds);
     std::map<Key, Entry> entries_;
     std::vector<Event> events_;

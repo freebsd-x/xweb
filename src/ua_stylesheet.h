@@ -58,7 +58,7 @@ mark { background-color: yellow; color: black; }
 nobr { white-space: nowrap; }
 img, video, canvas, iframe, embed, object, svg { display: inline-block; }
 video { object-fit: contain; }
-input, textarea, select, button { display: inline-block; font: 13.3333px sans-serif; line-height: normal; text-align: start; text-indent: 0; text-transform: none; white-space: normal; }
+input, textarea, select, button { display: inline-block; font: 13.3333px sans-serif; line-height: normal; text-align: start; text-indent: 0; text-transform: none; white-space: normal; letter-spacing: normal; }
 input { line-height: normal !important; }
 textarea { white-space: pre-wrap; }
 input { border: 2px inset gray; padding: 1px 2px; background-color: white; }

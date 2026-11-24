@@ -173,12 +173,33 @@ bool canWrap(WhiteSpace w) { return w == WhiteSpace::Normal || w == WhiteSpace::
 bool keepsNewlines(WhiteSpace w) { return w == WhiteSpace::Pre || w == WhiteSpace::PreWrap || w == WhiteSpace::PreLine; }
 bool isSpaceChar(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\f' || c == '\r'; }
 
+}  // namespace
+
+std::vector<std::string_view> spacedLetters(std::string_view t) {
+    std::vector<std::string_view> out;
+    for (size_t i = 0; i < t.size();) {
+        const auto b = static_cast<unsigned char>(t[i]);
+        const size_t len = std::min(t.size() - i, size_t{b < 0x80 ? 1u : (b >> 5) == 6 ? 2u : (b >> 4) == 14 ? 3u : (b >> 3) == 30 ? 4u : 1u});
+        uint32_t cp = len == 1 ? b : b & (0xFFu >> (len + 1));
+        for (size_t k = 1; k < len; ++k) cp = (cp << 6) | (static_cast<unsigned char>(t[i + k]) & 0x3F);
+        if ((cp >= 0x0590 && cp < 0x0E00) || (cp >= 0x1780 && cp < 0x1800)) return {};
+        const bool mark = (cp >= 0x0300 && cp < 0x0370) || cp == 0x200D || (cp >= 0xFE00 && cp < 0xFE10) || (cp >= 0x1F3FB && cp <= 0x1F3FF);
+        if (mark && !out.empty()) out.back() = t.substr(static_cast<size_t>(out.back().data() - t.data()), out.back().size() + len);
+        else out.push_back(t.substr(i, len));
+        i += len;
+    }
+    return out;
+}
+
+namespace {
+
 FontSpec fontOf(const ComputedStyle& s) {
     FontSpec f;
     f.size = s.font_size;
     f.weight = s.font_weight;
     f.italic = s.italic;
     f.family = s.font_family;
+    f.letter_spacing = s.letter_spacing;
     return f;
 }
 
@@ -2761,7 +2782,8 @@ private:
                 c.min = std::max(c.min, outer);
                 c.max = std::max(c.max, outer);
             } else {
-                c.automatic = ks.overflow_clip ? k.frameWidth() + k.margin[Left] + k.margin[Right] : c.min;
+                // (A min-width of 0 is one: none of its content's.)
+                c.automatic = ks.overflow_clip || !ks.min_width.is_auto ? k.frameWidth() + k.margin[Left] + k.margin[Right] : c.min;
             }
             out.push_back(c);
         }

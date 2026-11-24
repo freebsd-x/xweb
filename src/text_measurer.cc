@@ -374,6 +374,12 @@ float XrenderTextMeasurer::runWidth(std::string_view utf8, const std::string& fa
 }
 
 float XrenderTextMeasurer::width(std::string_view utf8, const FontSpec& font) {
+    const float w = plainWidth(utf8, font);
+    if (font.letter_spacing == 0) return w;
+    return w + font.letter_spacing * static_cast<float>(spacedLetters(utf8).size());
+}
+
+float XrenderTextMeasurer::plainWidth(std::string_view utf8, const FontSpec& font) {
     if (fonts_generation_ != g_fonts_generation) {
         cache_.clear();
         cache_used_ = 0;

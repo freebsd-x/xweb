@@ -49,6 +49,7 @@ public:
     [[nodiscard]] float lineGap(const FontSpec& font) override;
 
 private:
+    [[nodiscard]] float plainWidth(std::string_view utf8, const FontSpec& font);
     [[nodiscard]] float runWidth(std::string_view utf8, const std::string& family, const FontSpec& font);
     // Pages repeat their words: by a 64-bit hash of the font and the text (a key string
     // made and hashed for each word was half of measuring them).

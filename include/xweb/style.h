@@ -243,6 +243,7 @@ struct ComputedStyle {
     WhiteSpace white_space = WhiteSpace::Normal;
     ListStyle list_style = ListStyle::Disc;
     Length text_indent;
+    float letter_spacing = 0;
     std::shared_ptr<const CustomProperties> custom;
     float border_spacing = 0;
     bool border_collapse = false;

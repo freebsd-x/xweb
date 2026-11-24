@@ -646,6 +646,18 @@ private:
             ++i_;
             return true;
         }
+        if (t.type == TokenType::Ident) {
+            // (As far as lengths go: rounded-full is calc(infinity * 1px).)
+            const std::string n = lower(t.text);
+            if (n == "infinity") number = 33554432;
+            else if (n == "-infinity") number = -33554432;
+            else if (n == "pi") number = 3.14159265358979f;
+            else if (n == "e") number = 2.71828182845905f;
+            else return false;
+            is_number = true;
+            ++i_;
+            return true;
+        }
         if (t.type == TokenType::LeftParen || (t.type == TokenType::Function && t.text == "calc")) {
             ++i_;
             bool unitless = false;
@@ -3789,6 +3801,7 @@ private:
         else if (p == "-webkit-box-orient" || p == "box-orient") to.box_orient_vertical = from.box_orient_vertical;
         else if (p == "list-style-type" || p == "list-style") to.list_style = from.list_style;
         else if (p == "text-indent") to.text_indent = from.text_indent;
+        else if (p == "letter-spacing") to.letter_spacing = from.letter_spacing;
         else if (p == "visibility") to.hidden = from.hidden;
         else if (p == "border-spacing") to.border_spacing = from.border_spacing;
         else if (p == "border-collapse") to.border_collapse = from.border_collapse;
@@ -4885,6 +4898,15 @@ private:
             return;
         }
         if (p == "text-indent") { oneLength(s.text_indent, false); return; }
+        if (p == "letter-spacing") {
+            if (kw == "normal") { s.letter_spacing = 0; return; }
+            Length l;
+            l.is_auto = true;
+            oneLength(l, false);
+            // (A percentage is of the font's size.)
+            if (!l.is_auto) s.letter_spacing = std::clamp(l.resolve(s.font_size), -1000.0f, 1000.0f);
+            return;
+        }
         if (p == "text-decoration" || p == "text-decoration-line") {
             for (size_t start : valueStarts(v)) {
                 if (v[start].type != TokenType::Ident) continue;
@@ -4937,6 +4959,7 @@ private:
         s.white_space = parent.white_space;
         s.list_style = parent.list_style;
         s.text_indent = parent.text_indent;
+        s.letter_spacing = parent.letter_spacing;
         s.hidden = parent.hidden;
         s.pointer_events_none = parent.pointer_events_none;
         s.custom = parent.custom;
