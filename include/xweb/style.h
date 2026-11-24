@@ -14,6 +14,7 @@
 #include <utility>
 #include <vector>
 
+#include "xweb/animation.h"
 #include "xweb/css.h"
 #include "xweb/dom.h"
 
@@ -196,6 +197,21 @@ struct CustomProperties {
     }
 };
 
+// One function of a transform list, as it can be gone between with another like it.
+struct TransformFn {
+    enum class Kind : uint8_t { Translate, Rotate, Scale, Skew, Matrix } kind = Kind::Translate;
+    Length x, y;                   // Translate, Matrix
+    float v[4] = {0, 0, 0, 0};     // Rotate, Skew: degrees. Scale: factors. Matrix: a b c d
+    static TransformFn identity(Kind kind) noexcept {
+        TransformFn f;
+        f.kind = kind;
+        if (kind == Kind::Scale) f.v[0] = f.v[1] = 1;
+        if (kind == Kind::Matrix) f.v[0] = f.v[3] = 1;
+        return f;
+    }
+};
+void evaluateTransform(const std::vector<TransformFn>& list, Length shift[2], float linear[4]);
+
 struct ComputedStyle {
     Display display = Display::Inline;
     Position position = Position::Static;
@@ -282,6 +298,11 @@ struct ComputedStyle {
     // The rest of transform (rotate, scale, skew, matrix) as a 2x2 matrix a b c d, as SVG
     // orders them; and the rotate and scale properties. About transform-origin.
     float transform_linear[4] = {1, 0, 0, 1};
+    std::shared_ptr<const std::vector<TransformFn>> transform_list;   // as written; null: none
+    // What moves it: its transitions, its animations with their keyframes (null: none).
+    std::shared_ptr<const TransitionList> transitions;
+    std::shared_ptr<const AnimationList> animations;
+    std::shared_ptr<const struct MotionDecls> motion;   // those properties as set, while it's being worked out
     float rotate_deg = 0;
     float scale_prop[2] = {1, 1};
     Length transform_origin[2] = {Length{false, 0, 50}, Length{false, 0, 50}};
@@ -387,6 +408,17 @@ public:
     [[nodiscard]] const ComputedStyle* afterOf(const Node* element) const;
     // An <input> or <textarea>'s ::placeholder, if a rule styles it.
     [[nodiscard]] const ComputedStyle* placeholderOf(const Node* element) const;
+    // The elements that have (or may take up) something moving, and their styles as the
+    // cascade has them; and an Animator's values laid over those.
+    struct Moving {
+        const Node* node = nullptr;
+        int pseudo = 0;   // 1 ::before, 2 ::after
+        const ComputedStyle* style = nullptr;
+    };
+    [[nodiscard]] std::vector<Moving> movingElements() const;
+    [[nodiscard]] const ComputedStyle* plainStyle(const Node* element, int pseudo) const;
+    void clearOverlay();
+    void lay(const Node* element, int pseudo, std::shared_ptr<const ComputedStyle> style) { overlay_[pseudo][element] = std::move(style); }
     [[nodiscard]] const css::MediaContext& media() const noexcept { return media_; }
     // The page's @font-face rules, those applying. Sources are as absolute as the sheet's
     // address was: those in a <style> are still relative to the page.
@@ -412,6 +444,7 @@ private:
     // What each element's style was worked out from (see StyleResolver::elementKey), and
     // what the rules were: styles are only kept between documents with the same rules.
     std::unordered_map<const Node*, uint64_t> keys_;
+    std::unordered_map<const Node*, std::shared_ptr<const ComputedStyle>> overlay_[3];
     bool all_kept_ = false;
     bool states_matter_ = false;
     // A :has() anchor's rules that matched (a print of them): what its children's keys

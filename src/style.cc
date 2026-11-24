@@ -20,6 +20,17 @@
 
 namespace fbx::xweb {
 
+// transition's and animation's longhands, each a list, while they're being gathered.
+struct MotionDecls {
+    std::vector<std::string> t_props, a_names;
+    std::vector<float> t_durations, t_delays, a_durations, a_delays, a_counts;
+    std::vector<Easing> t_easings, a_easings;
+    std::vector<AnimationSpec::Direction> a_directions;
+    std::vector<int> a_fills;
+    std::vector<char> a_paused;
+};
+
+
 using css::AttrOp;
 using css::Combinator;
 using css::ComplexSelector;
@@ -527,15 +538,10 @@ bool filterFrom(const Tokens& v, size_t i, const LengthContext& c, std::vector<F
     return true;
 }
 
-bool transformShift(const Tokens& v, size_t i, const LengthContext& c, Length out[2], float linear[4]) {
-    Length x, y;
-    float m[4] = {1, 0, 0, 1};
+bool transformShift(const Tokens& v, size_t i, const LengthContext& c, std::vector<TransformFn>& list) {
     bool any = false;
     skipWs(v, i);
     if (i < v.size() && v[i].type == TokenType::Ident && lower(v[i].text) == "none") {
-        out[0] = out[1] = Length{};
-        linear[0] = linear[3] = 1;
-        linear[1] = linear[2] = 0;
         return true;
     }
     while (i < v.size()) {
@@ -566,51 +572,39 @@ bool transformShift(const Tokens& v, size_t i, const LengthContext& c, Length ou
         if (i >= v.size()) return false;
         ++i;   // the )
         any = true;
-        const auto add = [](Length& into, const Length& l) { into.px += l.px; into.percent += l.percent; };
-        if (name == "translate" || name == "translate3d") {
-            if (!args.empty()) add(x, args[0]);
-            if (args.size() > 1) add(y, args[1]);
-        } else if (name == "translatex") {
-            if (!args.empty()) add(x, args[0]);
-        } else if (name == "translatey") {
-            if (!args.empty()) add(y, args[0]);
-        } else {
-            // The linear part, applied after what came before it in the list.
-            float f[4] = {1, 0, 0, 1};
-            const auto num = [&](size_t k, double fallback) { return static_cast<float>(k < numbers.size() ? numbers[k] : fallback); };
-            if ((name == "rotate" || name == "rotatez") && !angles.empty()) {
-                const double r = angles[0] * M_PI / 180.0;
-                f[0] = static_cast<float>(std::cos(r));
-                f[1] = static_cast<float>(std::sin(r));
-                f[2] = -f[1];
-                f[3] = f[0];
-            } else if (name == "scale" || name == "scale3d") {
-                f[0] = num(0, 1);
-                f[3] = num(1, f[0]);
-            } else if (name == "scalex") {
-                f[0] = num(0, 1);
-            } else if (name == "scaley") {
-                f[3] = num(0, 1);
-            } else if ((name == "skew" || name == "skewx") && !angles.empty()) {
-                f[2] = static_cast<float>(std::tan(angles[0] * M_PI / 180.0));
-                if (name == "skew" && angles.size() > 1) f[1] = static_cast<float>(std::tan(angles[1] * M_PI / 180.0));
-            } else if (name == "skewy" && !angles.empty()) {
-                f[1] = static_cast<float>(std::tan(angles[0] * M_PI / 180.0));
-            } else if (name == "matrix" && numbers.size() == 6) {
-                for (int k = 0; k < 4; ++k) f[k] = static_cast<float>(numbers[static_cast<size_t>(k)]);
-                x.px += static_cast<float>(numbers[4]);
-                y.px += static_cast<float>(numbers[5]);
+        using K = TransformFn::Kind;
+        TransformFn f;
+        const auto num = [&](size_t k, double fallback) { return static_cast<float>(k < numbers.size() ? numbers[k] : fallback); };
+        if (name == "translate" || name == "translate3d" || name == "translatex" || name == "translatey") {
+            if (name == "translatey") {
+                if (!args.empty()) f.y = args[0];
+            } else {
+                if (!args.empty()) f.x = args[0];
+                if (name != "translatex" && args.size() > 1) f.y = args[1];
             }
-            if (!std::all_of(std::begin(f), std::end(f), [](float k) { return std::isfinite(k); })) return false;
-            const float r[4] = {m[0] * f[0] + m[2] * f[1], m[1] * f[0] + m[3] * f[1], m[0] * f[2] + m[2] * f[3], m[1] * f[2] + m[3] * f[3]};
-            std::copy(std::begin(r), std::end(r), m);
+        } else if ((name == "rotate" || name == "rotatez") && !angles.empty()) {
+            f.kind = K::Rotate;
+            f.v[0] = angles[0];
+        } else if (name == "scale" || name == "scale3d" || name == "scalex" || name == "scaley") {
+            f.kind = K::Scale;
+            f.v[0] = name == "scaley" ? 1 : num(0, 1);
+            f.v[1] = name == "scaley" ? num(0, 1) : name == "scalex" ? 1 : num(1, f.v[0]);
+        } else if ((name == "skew" || name == "skewx" || name == "skewy") && !angles.empty()) {
+            f.kind = K::Skew;
+            f.v[name == "skewy" ? 1 : 0] = angles[0];
+            if (name == "skew" && angles.size() > 1) f.v[1] = angles[1];
+        } else if (name == "matrix" && numbers.size() == 6) {
+            f.kind = K::Matrix;
+            for (int k = 0; k < 4; ++k) f.v[k] = static_cast<float>(numbers[static_cast<size_t>(k)]);
+            f.x.px = static_cast<float>(numbers[4]);
+            f.y.px = static_cast<float>(numbers[5]);
+        } else {
+            continue;   // out of the plane: not drawn
         }
+        if (!std::all_of(std::begin(f.v), std::end(f.v), [](float k) { return std::isfinite(k); })) return false;
+        if (list.size() < 100) list.push_back(f);
     }
-    if (!any) return false;
-    out[0] = x;
-    out[1] = y;
-    std::copy(std::begin(m), std::end(m), linear);
-    return true;
+    return any;
 }
 
 // ── Grid values ───────────────────────────────────────────────────────────────
@@ -1839,6 +1833,8 @@ public:
             bool style_selector = false, follow_any = false, follow_exact_any = false;
             std::unordered_set<std::string> inherit_used;
             bool state_any = false;
+            std::map<std::string, const css::KeyframesRule*> keyframes;
+            std::vector<std::shared_ptr<const css::Stylesheet>> sheets;   // (what those are in)
             std::unordered_set<uint32_t> state_anchors;
             std::unordered_set<uint32_t> follow_anchors, follow_exact_anchors;
         };
@@ -1880,6 +1876,7 @@ public:
                 has_args_ = last->has_args;
                 has_args_siblings_ = last->has_args_siblings;
                 style_selector_ = last->style_selector;
+                keyframes_ = last->keyframes;
                 state_any_ = last->state_any;
                 state_anchors_ = last->state_anchors;
                 follow_any_ = last->follow_any;
@@ -1912,6 +1909,8 @@ public:
         made->has_args = has_args_;
         made->has_args_siblings = has_args_siblings_;
         made->style_selector = style_selector_;
+        made->keyframes = keyframes_;
+        made->sheets = sheets_;
         made->state_any = state_any_;
         made->state_anchors = state_anchors_;
         made->follow_any = follow_any_;
@@ -2009,6 +2008,8 @@ private:
             if (!std::all_of(rule.media.begin(), rule.media.end(), [&](const Tokens& q) { return css::mediaMatches(q, out_.media_); })) continue;
             if (auto face = webFontFrom(rule, url)) out_.font_faces_.push_back(std::move(*face));
         }
+        for (const css::KeyframesRule& k : sheet.keyframes)
+            if (std::all_of(k.media.begin(), k.media.end(), [&](const Tokens& q) { return css::mediaMatches(q, out_.media_); })) keyframes_[k.name] = &k;
         const css::Stylesheet& kept = sheet;
         if (target_) target_->ident = (target_->ident ^ reinterpret_cast<uintptr_t>(parsed.get())) * 0x100000001B3ull + 0x9E37;
         sheets_.push_back(std::move(parsed));
@@ -2078,9 +2079,15 @@ private:
         for (const SimpleSelector& s : last.simple) {
             if (s.kind == SimpleKind::Id) { buckets->by_id[s.name].push_back(entry); return; }
         }
-        for (const SimpleSelector& s : last.simple) {
-            if (s.kind == SimpleKind::Class) { buckets->by_class[s.name].push_back(entry); return; }
-        }
+        // By the class fewest rules are under yet: `.dir.x` with all the `.dir`s would be
+        // tried on every element that has one.
+        std::vector<IndexedSelector>* least = nullptr;
+        for (const SimpleSelector& s : last.simple)
+            if (s.kind == SimpleKind::Class) {
+                std::vector<IndexedSelector>& b = buckets->by_class[s.name];
+                if (!least || b.size() < least->size()) least = &b;
+            }
+        if (least) { least->push_back(entry); return; }
         for (const SimpleSelector& s : last.simple) {
             if (s.kind == SimpleKind::Type) { buckets->by_type[s.name].push_back(entry); return; }
         }
@@ -2182,6 +2189,44 @@ private:
 
     // ── Matching ──────────────────────────────────────────────────────────────
 
+    // An element's classes, hashed, and a filter of them: it's asked about each of them by
+    // many rules (airbnb.com's have forty each, and looking through the attribute's text
+    // each time was three quarters of styling it).
+    struct ClassList {
+        const Node* node = nullptr;
+        const std::string* text = nullptr;
+        uint64_t filter = 0;
+        std::vector<std::pair<uint32_t, std::string_view>> words;
+    };
+    std::array<ClassList, 256> class_lists_;
+    bool hasClass(const Node* el, const SimpleSelector& s) {
+        ClassList& l = class_lists_[(reinterpret_cast<uintptr_t>(el) >> 5) * 0x9E3779B97F4A7C15ull >> 56];
+        if (l.node != el) {
+            l.node = el;
+            l.text = el->attr("class");
+            l.filter = 0;
+            l.words.clear();
+            if (l.text) {
+                const std::string_view list = *l.text;
+                for (size_t i = 0; i < list.size();) {
+                    while (i < list.size() && isWsChar(list[i])) ++i;
+                    const size_t b = i;
+                    while (i < list.size() && !isWsChar(list[i])) ++i;
+                    if (i == b) continue;
+                    const uint32_t h = featureHash('c', list.substr(b, i - b));
+                    l.words.emplace_back(h, list.substr(b, i - b));
+                    l.filter |= 1ull << (h >> 26);
+                }
+            }
+        }
+        if (!l.text) return false;
+        if (!s.name_hash) s.name_hash = featureHash('c', s.name);
+        if (!(l.filter >> (s.name_hash >> 26) & 1)) return false;
+        for (const auto& [h, word] : l.words)
+            if (h == s.name_hash && word == s.name) return true;
+        return false;
+    }
+
     bool matchSimple(const Node* el, const SimpleSelector& s) {
         switch (s.kind) {
             case SimpleKind::Universal: return true;
@@ -2190,10 +2235,7 @@ private:
                 const std::string* v = el->attr("id");
                 return v && *v == s.name;
             }
-            case SimpleKind::Class: {
-                const std::string* v = el->attr("class");
-                return v && hasWord(*v, s.name);
-            }
+            case SimpleKind::Class: return hasClass(el, s);
             case SimpleKind::Attribute: return matchAttribute(el, s);
             case SimpleKind::PseudoClass: return matchPseudo(el, s);
             case SimpleKind::PseudoElement: return true;   // the bucket it's in decides
@@ -3404,6 +3446,7 @@ private:
             to.transform_shift[0] = from.transform_shift[0];
             to.transform_shift[1] = from.transform_shift[1];
             std::copy(std::begin(from.transform_linear), std::end(from.transform_linear), to.transform_linear);
+            to.transform_list = from.transform_list;
         }
         else if (p == "rotate") to.rotate_deg = from.rotate_deg;
         else if (p == "scale") { to.scale_prop[0] = from.scale_prop[0]; to.scale_prop[1] = from.scale_prop[1]; }
@@ -3454,6 +3497,235 @@ private:
         return it == map.end() ? p : it->second;
     }
 
+    static bool timeOf(const Token& t, float& out) {
+        if (t.type == TokenType::Dimension) {
+            const std::string u = lower(t.text);
+            if (u == "s") { out = static_cast<float>(t.number); return true; }
+            if (u == "ms") { out = static_cast<float>(t.number / 1000); return true; }
+            return false;
+        }
+        if (t.type == TokenType::Number && t.number == 0) { out = 0; return true; }
+        return false;
+    }
+
+    // transition, animation and their longhands (kept apart until all are known).
+    void setMotion(ComputedStyle& s, const std::string& p, const Tokens& v) {
+        auto m = s.motion ? std::make_shared<MotionDecls>(*s.motion) : std::make_shared<MotionDecls>();
+        const std::vector<Tokens> parts = commaParts(v);
+        const auto words = [](const Tokens& part) {
+            std::vector<std::string> out;
+            for (const Token& t : part)
+                if (t.type == TokenType::Ident || t.type == TokenType::String) out.push_back(t.type == TokenType::String ? t.text : t.text);
+            return out;
+        };
+        const auto times = [&](std::vector<float>& into) {
+            into.clear();
+            for (const Tokens& part : parts)
+                for (const Token& t : part)
+                    if (float f; timeOf(t, f)) { into.push_back(f); break; }
+        };
+        const auto easings = [&](std::vector<Easing>& into) {
+            into.clear();
+            for (const Tokens& part : parts) {
+                size_t k = 0;
+                skipWs(part, k);
+                if (Easing e; easingAt(part, k, e)) into.push_back(e);
+            }
+        };
+        using D = AnimationSpec::Direction;
+        const auto directionOf = [](const std::string& w, D& d) {
+            if (w == "normal") d = D::Normal;
+            else if (w == "reverse") d = D::Reverse;
+            else if (w == "alternate") d = D::Alternate;
+            else if (w == "alternate-reverse") d = D::AlternateReverse;
+            else return false;
+            return true;
+        };
+        const auto fillOf = [](const std::string& w, int& f) {
+            if (w == "none") f = 0;
+            else if (w == "forwards") f = 1;
+            else if (w == "backwards") f = 2;
+            else if (w == "both") f = 3;
+            else return false;
+            return true;
+        };
+        if (p == "transition-property") {
+            m->t_props.clear();
+            for (const Tokens& part : parts)
+                for (const std::string& w : words(part)) { m->t_props.push_back(lower(w)); break; }
+        } else if (p == "transition-duration") times(m->t_durations);
+        else if (p == "transition-delay") times(m->t_delays);
+        else if (p == "transition-timing-function") easings(m->t_easings);
+        else if (p == "transition") {
+            m->t_props.clear(), m->t_durations.clear(), m->t_delays.clear(), m->t_easings.clear();
+            for (const Tokens& part : parts) {
+                std::string prop = "all";
+                float duration = 0, delay = 0;
+                int seen = 0;
+                Easing e;
+                for (size_t k = 0; k < part.size();) {
+                    const size_t at = k;
+                    if (float f; timeOf(part[k], f)) { (seen++ ? delay : duration) = f; ++k; continue; }
+                    if (Easing x; easingAt(part, k, x)) { e = x; continue; }
+                    k = at;
+                    if (part[k].type == TokenType::Ident && lower(part[k].text) != "allow-discrete" && lower(part[k].text) != "normal") prop = lower(part[k].text);
+                    ++k;
+                }
+                m->t_props.push_back(prop), m->t_durations.push_back(duration), m->t_delays.push_back(delay), m->t_easings.push_back(e);
+            }
+        } else if (p == "animation-name") {
+            m->a_names.clear();
+            for (const Tokens& part : parts)
+                for (const std::string& w : words(part)) { m->a_names.push_back(w); break; }
+        } else if (p == "animation-duration") times(m->a_durations);
+        else if (p == "animation-delay") times(m->a_delays);
+        else if (p == "animation-timing-function") easings(m->a_easings);
+        else if (p == "animation-iteration-count") {
+            m->a_counts.clear();
+            for (const Tokens& part : parts)
+                for (const Token& t : part) {
+                    if (t.type == TokenType::Number && t.number >= 0) m->a_counts.push_back(static_cast<float>(t.number));
+                    else if (t.type == TokenType::Ident && lower(t.text) == "infinite") m->a_counts.push_back(INFINITY);
+                }
+        } else if (p == "animation-direction") {
+            m->a_directions.clear();
+            for (const Tokens& part : parts)
+                for (const std::string& w : words(part))
+                    if (D d; directionOf(lower(w), d)) m->a_directions.push_back(d);
+        } else if (p == "animation-fill-mode") {
+            m->a_fills.clear();
+            for (const Tokens& part : parts)
+                for (const std::string& w : words(part))
+                    if (int f; fillOf(lower(w), f)) m->a_fills.push_back(f);
+        } else if (p == "animation-play-state") {
+            m->a_paused.clear();
+            for (const Tokens& part : parts)
+                for (const std::string& w : words(part)) m->a_paused.push_back(lower(w) == "paused");
+        } else if (p == "animation") {
+            m->a_names.clear(), m->a_durations.clear(), m->a_delays.clear(), m->a_easings.clear(), m->a_counts.clear(), m->a_directions.clear(), m->a_fills.clear(), m->a_paused.clear();
+            for (const Tokens& part : parts) {
+                std::string name = "none";
+                float duration = 0, delay = 0, count = 1;
+                int seen = 0, fill = 0;
+                bool paused = false, has_easing = false, has_dir = false, has_fill = false, has_state = false, has_count = false;
+                D dir = D::Normal;
+                Easing e;
+                for (size_t k = 0; k < part.size();) {
+                    const size_t at = k;
+                    const Token& t = part[k];
+                    if (t.type == TokenType::Number && !has_count && t.number >= 0) { count = static_cast<float>(t.number), has_count = true; ++k; continue; }
+                    if (float f; timeOf(t, f)) { (seen++ ? delay : duration) = f; ++k; continue; }
+                    if (Easing x; !has_easing && easingAt(part, k, x)) { e = x, has_easing = true; continue; }
+                    k = at + 1;
+                    if (t.type == TokenType::String) { name = t.text; continue; }
+                    if (t.type != TokenType::Ident) continue;
+                    const std::string w = lower(t.text);
+                    if (!has_count && w == "infinite") count = INFINITY, has_count = true;
+                    else if (!has_dir && directionOf(w, dir)) has_dir = true;
+                    else if (!has_fill && fillOf(w, fill)) has_fill = true;
+                    else if (!has_state && (w == "running" || w == "paused")) paused = w == "paused", has_state = true;
+                    else name = t.text;
+                }
+                m->a_names.push_back(name), m->a_durations.push_back(duration), m->a_delays.push_back(delay), m->a_easings.push_back(e);
+                m->a_counts.push_back(count), m->a_directions.push_back(dir), m->a_fills.push_back(fill), m->a_paused.push_back(paused);
+            }
+        } else {
+            return;
+        }
+        s.motion = std::move(m);
+    }
+
+    // Those properties put together, the keyframes' styles with them.
+    void finishMotion(ComputedStyle& s, const ComputedStyle& parent) {
+        if (!s.motion) return;
+        const MotionDecls m = *s.motion;
+        s.motion.reset();
+        const auto pick = [](const auto& list, size_t i, auto fallback) -> decltype(fallback) { return list.empty() ? fallback : list[i % list.size()]; };
+        const bool timed = std::any_of(m.t_durations.begin(), m.t_durations.end(), [](float d) { return d > 0; }) ||
+                           std::any_of(m.t_delays.begin(), m.t_delays.end(), [](float d) { return d > 0; });
+        if (timed) {
+            auto list = std::make_shared<TransitionList>();
+            const size_t n = m.t_props.empty() ? 1 : m.t_props.size();
+            for (size_t i = 0; i < n && i < 100; ++i) {
+                TransitionSpec t;
+                t.property = pick(m.t_props, i, std::string("all"));
+                if (t.property == "none") continue;
+                t.bits = movingBits(t.property);
+                t.duration = std::max(0.0f, pick(m.t_durations, i, 0.0f));
+                t.delay = pick(m.t_delays, i, 0.0f);
+                t.easing = pick(m.t_easings, i, Easing{});
+                list->push_back(std::move(t));
+            }
+            if (!list->empty()) s.transitions = std::move(list);
+        }
+        auto list = std::make_shared<AnimationList>();
+        for (size_t i = 0; i < m.a_names.size() && i < 32; ++i) {
+            if (m.a_names[i] == "none") continue;
+            const auto it = keyframes_.find(m.a_names[i]);
+            if (it == keyframes_.end()) continue;
+            AnimationSpec a;
+            a.name = m.a_names[i];
+            a.duration = std::max(0.0f, pick(m.a_durations, i, 0.0f));
+            a.delay = pick(m.a_delays, i, 0.0f);
+            a.easing = pick(m.a_easings, i, Easing{});
+            a.iterations = pick(m.a_counts, i, 1.0f);
+            a.direction = pick(m.a_directions, i, AnimationSpec::Direction::Normal);
+            const int fill = pick(m.a_fills, i, 0);
+            a.fill_forwards = fill & 1;
+            a.fill_backwards = fill & 2;
+            a.paused = !m.a_paused.empty() && m.a_paused[i % m.a_paused.size()];
+            auto frames = std::make_shared<std::vector<AnimationSpec::Frame>>();
+            for (const css::KeyframesRule::Frame& k : it->second->frames) {
+                AnimationSpec::Frame f;
+                auto style = std::make_shared<ComputedStyle>(s);
+                style->transitions.reset();
+                style->animations.reset();
+                for (const Declaration& d : k.declarations) {
+                    std::string name = d.name;
+                    if (name.starts_with("-webkit-")) name = name.substr(8);
+                    if (name == "animation-timing-function") {
+                        size_t w = 0;
+                        skipWs(d.value, w);
+                        if (easingAt(d.value, w, f.easing)) f.has_easing = true;
+                        continue;
+                    }
+                    const uint32_t bits = movingBits(name);
+                    if (!bits || name == "border" || name == "all") continue;
+                    if (name == "color" || name == "font-size") {
+                        Tokens sub;
+                        size_t budget = kMaxVarTokens;
+                        const Tokens* v = &d.value;
+                        if (hasVar(*v)) {
+                            if (!substitute(*v, *style, sub, 0, budget)) continue;
+                            v = &sub;
+                        }
+                        if (name == "color") {
+                            Color col;
+                            if (!parseColor(*v, parent.color, col)) continue;
+                            style->color = col;
+                        } else {
+                            size_t w = 0;
+                            skipWs(*v, w);
+                            setFontSize(*style, *v, w, parent.font_size, parent.font_keyword);
+                        }
+                    } else {
+                        apply(*style, parent, name, d.value);
+                    }
+                    f.bits |= bits;
+                }
+                f.style = std::move(style);
+                for (const float at : k.offsets) {
+                    f.offset = at;
+                    frames->push_back(f);
+                }
+            }
+            std::stable_sort(frames->begin(), frames->end(), [](const auto& x, const auto& y) { return x.offset < y.offset; });
+            a.frames = std::move(frames);
+            list->push_back(std::move(a));
+        }
+        if (!list->empty()) s.animations = std::move(list);
+    }
+
     void apply(ComputedStyle& s, const ComputedStyle& parent, const std::string& logical, const Tokens& raw) {
         const std::string& p = physical(logical);
         Tokens substituted;
@@ -3476,6 +3748,13 @@ private:
         }
         const Tokens& v = *vp;
         const std::string kw = keyword(v);
+        {
+            const std::string_view bare = std::string_view(p).starts_with("-webkit-") ? std::string_view(p).substr(8) : std::string_view(p);
+            if (bare.starts_with("transition") || bare.starts_with("animation")) {
+                if (kw != "inherit") setMotion(s, std::string(bare), kw == "initial" || kw == "unset" || kw == "revert" ? Tokens{} : v);
+                return;
+            }
+        }
         if (p.starts_with("border") && !p.ends_with("radius") && p != "border-spacing" && p != "border-collapse" &&
             (kw == "inherit" || kw == "initial" || kw == "unset" || kw == "revert")) {
             const bool from_parent = kw == "inherit";
@@ -3807,7 +4086,12 @@ private:
         if (p == "bottom") { oneLength(s.offset[Bottom], true); return; }
         if (p == "left") { oneLength(s.offset[Left], true); return; }
         if (p == "transform") {
-            if (transformShift(v, i, c, s.transform_shift, s.transform_linear)) s.makes_stacking_context = kw != "none";
+            std::vector<TransformFn> list;
+            if (transformShift(v, i, c, list)) {
+                s.makes_stacking_context = kw != "none";
+                evaluateTransform(list, s.transform_shift, s.transform_linear);
+                s.transform_list = list.empty() ? nullptr : std::make_shared<const std::vector<TransformFn>>(std::move(list));
+            }
             return;
         }
         if (p == "will-change") {
@@ -4631,6 +4915,7 @@ private:
             }
             apply(s, parent, p, m.decl->value);
         }
+        finishMotion(s, parent);
 
         for (int side = 0; side < 4; ++side)
             if (border_none_[side]) s.border_width[side] = 0;
@@ -5260,6 +5545,7 @@ private:
     bool has_any_anchor_ = false;
     bool style_selector_ = false;   // a selector asks about style attributes ([style])
     // Elements asked about siblings after them (:last-child, ...): any, or with these.
+    std::map<std::string, const css::KeyframesRule*> keyframes_;
     bool state_any_ = false;   // an element's :hover, :focus or :active is asked: any's, or of these
     std::unordered_set<uint32_t> state_anchors_;
     bool follow_any_ = false, follow_exact_any_ = false;
@@ -5346,6 +5632,8 @@ std::unique_ptr<StyledDocument> StyledDocument::chainOf(const Node* target, cons
 }
 
 const ComputedStyle* StyledDocument::beforeOf(const Node* element) const {
+    if (!overlay_[1].empty())
+        if (const auto o = overlay_[1].find(element); o != overlay_[1].end()) return o->second.get();
     const auto it = before_.find(element);
     return it == before_.end() ? nullptr : it->second;
 }
@@ -5356,11 +5644,64 @@ const ComputedStyle* StyledDocument::placeholderOf(const Node* element) const {
 }
 
 const ComputedStyle* StyledDocument::afterOf(const Node* element) const {
+    if (!overlay_[2].empty())
+        if (const auto o = overlay_[2].find(element); o != overlay_[2].end()) return o->second.get();
     const auto it = after_.find(element);
     return it == after_.end() ? nullptr : it->second;
 }
 
+const ComputedStyle* StyledDocument::plainStyle(const Node* element, int pseudo) const {
+    const auto& from = pseudo == 1 ? before_ : pseudo == 2 ? after_ : styles_;
+    const auto it = from.find(element);
+    return it == from.end() ? nullptr : it->second;
+}
+
+std::vector<StyledDocument::Moving> StyledDocument::movingElements() const {
+    std::vector<Moving> out;
+    for (int pseudo = 0; pseudo < 3; ++pseudo)
+        for (const auto& [node, style] : pseudo == 1 ? before_ : pseudo == 2 ? after_ : styles_)
+            if (style->transitions || style->animations) out.push_back({node, pseudo, style});
+    return out;
+}
+
+void StyledDocument::clearOverlay() {
+    for (auto& o : overlay_) o.clear();
+}
+
+void evaluateTransform(const std::vector<TransformFn>& list, Length shift[2], float linear[4]) {
+    Length x, y;
+    float m[4] = {1, 0, 0, 1};
+    for (const TransformFn& t : list) {
+        x.px += t.x.px, x.percent += t.x.percent, y.px += t.y.px, y.percent += t.y.percent;
+        // The linear part, applied after what came before it in the list.
+        float f[4] = {1, 0, 0, 1};
+        const auto rad = [](float deg) { return deg * M_PI / 180.0; };
+        switch (t.kind) {
+            case TransformFn::Kind::Translate: continue;
+            case TransformFn::Kind::Rotate:
+                f[0] = f[3] = static_cast<float>(std::cos(rad(t.v[0])));
+                f[1] = static_cast<float>(std::sin(rad(t.v[0])));
+                f[2] = -f[1];
+                break;
+            case TransformFn::Kind::Scale: f[0] = t.v[0], f[3] = t.v[1]; break;
+            case TransformFn::Kind::Skew:
+                f[2] = static_cast<float>(std::tan(rad(t.v[0])));
+                f[1] = static_cast<float>(std::tan(rad(t.v[1])));
+                break;
+            case TransformFn::Kind::Matrix: std::copy(std::begin(t.v), std::end(t.v), f); break;
+        }
+        if (!std::all_of(std::begin(f), std::end(f), [](float k) { return std::isfinite(k); })) continue;
+        const float r[4] = {m[0] * f[0] + m[2] * f[1], m[1] * f[0] + m[3] * f[1], m[0] * f[2] + m[2] * f[3], m[1] * f[2] + m[3] * f[3]};
+        std::copy(std::begin(r), std::end(r), m);
+    }
+    shift[0] = x;
+    shift[1] = y;
+    std::copy(std::begin(m), std::end(m), linear);
+}
+
 const ComputedStyle* StyledDocument::styleOf(const Node* element) const {
+    if (!overlay_[0].empty())
+        if (const auto o = overlay_[0].find(element); o != overlay_[0].end()) return o->second.get();
     const auto it = styles_.find(element);
     return it == styles_.end() ? nullptr : it->second;
 }

@@ -919,7 +919,30 @@ private:
             face.media = media;
             out.font_faces.push_back(std::move(face));
         }
-        // @keyframes, @page, @counter-style...: nothing uses them yet.
+        else if (name == "keyframes" || name == "-webkit-keyframes") {
+            KeyframesRule k;
+            for (const Token& t : preludeTokens())
+                if (t.type == TokenType::Ident || t.type == TokenType::String) k.name = t.text;
+            Stream f(tokens_, begin, end);
+            while (!f.done() && k.frames.size() < 1000) {
+                KeyframesRule::Frame frame;
+                while (!f.done() && f.type() != TokenType::LeftBrace) {
+                    const Token& t = tokens_[f.pos()];
+                    if (t.type == TokenType::Percentage && t.number >= 0 && t.number <= 100) frame.offsets.push_back(static_cast<float>(t.number / 100));
+                    else if (t.type == TokenType::Ident && lower(t.text) == "from") frame.offsets.push_back(0);
+                    else if (t.type == TokenType::Ident && lower(t.text) == "to") frame.offsets.push_back(1);
+                    f.skipComponent();
+                }
+                if (f.done()) break;
+                const size_t from = f.pos() + 1;
+                f.skipComponent();
+                parseDeclarationsInto(tokens_, from, f.pos() > from ? f.pos() - 1 : from, frame.declarations);
+                if (!frame.offsets.empty()) k.frames.push_back(std::move(frame));
+            }
+            k.media = media;
+            if (!k.name.empty()) out.keyframes.push_back(std::move(k));
+        }
+        // @page, @counter-style...: nothing uses them yet.
     }
 
     void qualifiedRule(Stream& s, std::vector<std::vector<Token>>& media, Stylesheet& out) {

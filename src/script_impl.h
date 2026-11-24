@@ -9,11 +9,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <deque>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "xweb/css.h"
 #include "xweb/html_parser.h"
@@ -179,6 +181,7 @@ struct PageScript::Impl {
     void hostRoots(std::vector<Value>& roots) {
         for (auto& [n, w] : wrappers) roots.push_back(Value::object(w));
         domRoots(roots);
+        for (const Value& t : tasks) roots.push_back(t);
         for (const Timer& t : timers) {
             roots.push_back(t.fn);
             roots.insert(roots.end(), t.args.begin(), t.args.end());
@@ -246,8 +249,12 @@ struct PageScript::Impl {
         bool repeat;
         Value fn;
         std::vector<Value> args;
+        int level = 0;   // how many timeouts deep it was set: from five on, 4 ms at least
     };
     std::vector<Timer> timers;
+    int timer_level = 0;                // of the one running
+    std::deque<Value> tasks;            // to run as soon as may be, each a task (posted messages)
+    double last_frames = -1000;         // when the animation frames last ran
     std::vector<std::pair<int, Value>> frames;
     // This round's animation frame callbacks, while they run (the next round's go to
     // frames): a rooted place, as a collection may run inside any of them.
@@ -430,6 +437,18 @@ struct PageScript::Impl {
             prev = parent->children.back();
         }
         parent->insertBefore(child, before);
+        if (!ids_found.empty()) {
+            std::vector<const Node*> todo{child};
+            while (!todo.empty()) {
+                const Node* n = todo.back();
+                todo.pop_back();
+                if (n->isElement() && n->attr("id")) {
+                    ids_found.clear();
+                    break;
+                }
+                todo.insert(todo.end(), n->children.begin(), n->children.end());
+            }
+        }
         dirty = true;
         afterInsert(parent, child, prev, before);
     }
@@ -914,6 +933,9 @@ struct PageScript::Impl {
     };
     std::unordered_map<const Node*, std::unique_ptr<CanvasSurface>> canvases;
     std::vector<Node*> script_images;   // <img>s a script gave a src, in the page or not
+    std::unordered_map<std::string, Node*> ids_found;   // getElementById's answers, and what it found none of
+    std::unordered_set<std::string> ids_absent;
+    uint64_t ids_absent_at = ~0ull;                     // (at this dom_version)
     uint64_t dom_version = 0;           // bumped by every change to the tree or an attribute: live lists recount
     CanvasSurface& surfaceOf(Node* canvas);
     void installCanvas();

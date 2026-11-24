@@ -113,6 +113,8 @@ public:
     // over/out, enter/leave when they differ. Pressed or let go: mousedown, mouseup.
     void pointerMoved(Node* target, Node* from, float page_x, float page_y);
     bool pointerPressed(Node* target, bool down, float page_x, float page_y);
+    // transitionend, animationstart and the like, at what it's of (pseudo 1 ::before, 2 ::after).
+    void animationEvent(Node* target, const std::string& type, const std::string& name, float elapsed, int pseudo);
     // Typing goes to `to` now, from `from` (either null).
     void focusMoved(Node* from, Node* to);
     bool submit(Node* form, Node* submitter);
@@ -130,7 +132,11 @@ public:
     void sheetLoaded(const std::string& url, bool ok);
 
     // The event loop: due timers, then animation frames, then microtasks.
-    void tick();
+    // (`draw`: a frame's about to be drawn, so animation frames run too.)
+    void tick(bool draw = true);
+    // How long until something's due, in ms (none: nothing is).
+    [[nodiscard]] std::optional<double> dueIn() const;
+    [[nodiscard]] bool framesDue() const;
     [[nodiscard]] bool busy() const;   // timers or frames waiting
     // Whether the tree or a control changed since last asked: time to lay out again.
     bool takeDirty();

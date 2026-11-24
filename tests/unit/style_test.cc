@@ -1060,3 +1060,96 @@ TEST(Restyle, StatesRestyleWhatTheyCanChange) {
     forms.focused = nullptr; go("none of them");
     EXPECT_EQ(by("x")->font_size, 21);
 }
+
+// Transitions and animations, by the clock given them.
+TEST(Motion, TransitionsGoFromWhatItWasAndTurnBack) {
+    auto doc = parseHtml(R"(<!doctype html><style>
+        #a { opacity: 1; width: 100px; color: rgb(0,0,0); transition: opacity 1s linear, width 2s linear 1s, color 0s }
+        .on { opacity: 0 !important; width: 300px !important; color: rgb(9,9,9) !important }
+        #b { width: auto; transition: all 1s } .wide { width: 50px !important }</style><p id=a>x</p><p id=b>y</p>)");
+    Animator an;
+    std::unique_ptr<StyledDocument> styles;
+    const auto restyle = [&](double t) {
+        auto next = std::make_unique<StyledDocument>(*doc, css::MediaContext{800, 600}, StyledDocument::SheetLoader{}, StyledDocument::ChMeasure{}, nullptr, styles.get());
+        an.styled(*next, styles.get(), t);
+        styles = std::move(next);
+    };
+    const auto a = [&] { return styles->styleOf(elementById(*doc, "a")); };
+    restyle(0);
+    EXPECT_FALSE(an.running());   // nothing moves as it's first shown
+    setAttribute(elementById(*doc, "a"), "class", "on");
+    setAttribute(elementById(*doc, "b"), "class", "wide");
+    restyle(10);
+    EXPECT_TRUE(an.running());
+    EXPECT_FLOAT_EQ(a()->opacity, 1);
+    EXPECT_EQ(a()->color, (Color{9, 9, 9, 255}));                                     // no time to take
+    EXPECT_FLOAT_EQ(styles->styleOf(elementById(*doc, "b"))->width.px, 50);           // nothing between auto and a length
+    an.tick(*styles, 10.5);
+    EXPECT_FLOAT_EQ(a()->opacity, 0.5f);
+    EXPECT_FLOAT_EQ(a()->width.px, 100);                                              // waiting
+    restyle(10.5);                                                                    // kept, and still laid over
+    EXPECT_FLOAT_EQ(a()->opacity, 0.5f);
+    an.tick(*styles, 12);
+    EXPECT_FLOAT_EQ(a()->opacity, 0);
+    EXPECT_FLOAT_EQ(a()->width.px, 200);
+    setAttribute(elementById(*doc, "a"), "class", "");
+    restyle(12);                                                                      // back, from where it's got to
+    an.tick(*styles, 12.5);
+    EXPECT_FLOAT_EQ(a()->opacity, 0.5f);
+    EXPECT_FLOAT_EQ(a()->width.px, 200);
+    an.tick(*styles, 20);
+    EXPECT_FALSE(an.running());
+    EXPECT_FLOAT_EQ(a()->width.px, 100);
+    int ends = 0;
+    for (const Animator::Event& e : an.takeEvents()) ends += e.type == "transitionend";
+    EXPECT_EQ(ends, 3);   // opacity's, opacity's back, width's back
+}
+
+TEST(Motion, KeyframesFillsDirectionsAndTurns) {
+    auto doc = parseHtml(R"(<!doctype html><style>
+        @keyframes fade { from { opacity: 0 } 50% { opacity: .8; animation-timing-function: linear } to { opacity: 1 } }
+        @keyframes spin { to { transform: rotate(360deg) } } @keyframes slide { from { left: 0 } to { left: 100px } }
+        #f { opacity: 0; animation: fade 2s linear 1s both } #s { animation: spin 4s linear infinite }
+        #p { position: absolute; animation: slide 1s linear 2 alternate } #n { animation: nothing 1s; opacity: .3 }
+        #q::before { content: 'x'; animation: fade 2s linear forwards }</style>
+        <p id=f>f</p><p id=s>s</p><p id=p>p</p><p id=n>n</p><p id=q>q</p>)");
+    Animator an;
+    StyledDocument styles(*doc, css::MediaContext{800, 600});
+    const auto by = [&](const char* id) { return styles.styleOf(elementById(*doc, id)); };
+    an.styled(styles, nullptr, 100);
+    EXPECT_FLOAT_EQ(by("f")->opacity, 0);
+    EXPECT_FLOAT_EQ(by("n")->opacity, 0.3f);
+    an.tick(styles, 102);      // 1 s in: half way
+    EXPECT_NEAR(by("f")->opacity, 0.8f, 1e-4);
+    EXPECT_NEAR(styles.beforeOf(elementById(*doc, "q"))->opacity, 1, 1e-4);
+    EXPECT_NEAR(by("s")->transform_linear[0], -1, 1e-4);   // half a turn
+    EXPECT_FALSE(an.finiteRunning() && !an.running());
+    an.tick(styles, 100.25);
+    EXPECT_NEAR(by("p")->offset[Left].px, 25, 1e-3);
+    an.tick(styles, 101.25);   // on its way back
+    EXPECT_NEAR(by("p")->offset[Left].px, 75, 1e-3);
+    an.tick(styles, 110);
+    EXPECT_TRUE(by("p")->offset[Left].is_auto);            // over, and not filling
+    EXPECT_FLOAT_EQ(by("f")->opacity, 1);                  // filling
+    EXPECT_TRUE(an.running());                             // the turning one
+    EXPECT_FALSE(an.finiteRunning());
+    int ended = 0;
+    for (const Animator::Event& e : an.takeEvents()) ended += e.type == "animationend";
+    EXPECT_EQ(ended, 3);
+}
+
+TEST(Motion, Easings) {
+    const auto easing = [](const char* css) {
+        Easing e;
+        size_t i = 0;
+        EXPECT_TRUE(easingAt(css::tokenize(css), i, e)) << css;
+        return e;
+    };
+    EXPECT_FLOAT_EQ(easing("linear").at(0.3f), 0.3f);
+    EXPECT_NEAR(easing("ease").at(0.5f), 0.8024f, 1e-3);
+    EXPECT_NEAR(easing("ease-in-out").at(0.5f), 0.5f, 1e-3);
+    EXPECT_FLOAT_EQ(easing("steps(4)").at(0.3f), 0.25f);
+    EXPECT_FLOAT_EQ(easing("steps(4, start)").at(0.3f), 0.5f);
+    EXPECT_FLOAT_EQ(easing("step-end").at(0.99f), 0);
+    EXPECT_NEAR(easing("cubic-bezier(.5,-.5,.5,1.5)").at(0.5f), 0.5f, 1e-3);
+}

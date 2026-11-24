@@ -1425,3 +1425,26 @@ TEST(Script, CheckedSelectorsGoByTheControls) {
         </script>)JS");
     EXPECT_EQ(p.console, "log:1 2 1 true 1 2\n") << p.console;
 }
+
+TEST(Script, ElementsWithIdsAreGlobals) {
+    Page p(R"JS(<body><div id=box>1</div><form name=login></form><div id=name>n</div><div id=Array></div><script>
+        const o = [box.textContent, window.box === box, login.tagName, typeof nothing, 'box' in window, 'nothing' in window, typeof Array, typeof name];
+        try { nothing2; } catch (e) { o.push(e.name); }
+        box = 5; o.push(box, window.hasOwnProperty('box'), document.getElementById('box').textContent);
+        var late = 3; o.push(late, window instanceof Window, window instanceof EventTarget, typeof window.addEventListener, Object.keys(window).includes('login'));
+        console.log(...o);
+        </script>)JS");
+    EXPECT_EQ(p.console, "log:1 true FORM undefined true false function string ReferenceError 5 true 1 3 true true function false\n") << p.console;
+}
+
+TEST(Script, GetElementByIdKeepsUp) {
+    Page p(R"JS(<body><p id=a>1</p><script>
+        const t = id => { const e = document.getElementById(id); return e ? e.textContent : null; }, o = [t('a'), t('a'), t('b'), t('b')];
+        const d = document.createElement('div'); d.innerHTML = '<p id=b>2</p>'; o.push(t('b')); document.body.append(d); o.push(t('b'));
+        const first = document.createElement('p'); first.id = 'a'; first.textContent = '0'; document.body.prepend(first); o.push(t('a'));
+        first.remove(); o.push(t('a')); document.getElementById('a').id = 'c'; o.push(t('a'), t('c')); d.innerHTML = ''; o.push(t('b'));
+        d.innerHTML = '<i id=b>3</i>'; o.push(t('b')); document.body.innerHTML = '<b id=c>4</b>'; o.push(t('c'), t('b'));
+        console.log(o.map(String).join(' '));
+        </script>)JS");
+    EXPECT_EQ(p.console, "log:1 1 null null null 2 0 1 null 1 null 3 4 null\n") << p.console;
+}

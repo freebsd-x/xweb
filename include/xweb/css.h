@@ -51,6 +51,7 @@ struct SimpleSelector {
     bool case_insensitive = false;
     int a = 0, b = 0;            // :nth-*(an+b)
     std::vector<ComplexSelector> args;   // :not() :is() :where()
+    mutable uint32_t name_hash = 0;      // the matcher's, of a class name (0: not worked out yet)
 };
 
 // The first compound of each of :has()'s selectors: matches only the element :has() is
@@ -94,8 +95,19 @@ struct FontFaceRule {
     std::vector<std::vector<Token>> media;
 };
 
+struct KeyframesRule {
+    struct Frame {
+        std::vector<float> offsets;   // 0 to 1
+        std::vector<Declaration> declarations;
+    };
+    std::string name;
+    std::vector<Frame> frames;
+    std::vector<std::vector<Token>> media;
+};
+
 struct Stylesheet {
     std::vector<Rule> rules;
+    std::vector<KeyframesRule> keyframes;
     std::vector<FontFaceRule> font_faces;
     std::vector<std::string> imports;   // @import URLs, in order
     std::vector<std::vector<Token>> import_media;   // each one's media query list (empty: always)

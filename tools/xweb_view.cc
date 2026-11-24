@@ -745,6 +745,10 @@ public:
     void show(std::shared_ptr<Page> page) {
         popup_ = nullptr;
         page_ = std::move(page);
+        // (Nothing of the last page's: its nodes are gone.)
+        animator_.clear();
+        styles_unbroken_ = false;
+        animate_only_ = states_only_ = false;
         images_.setPage(page_.get());
         rasters_.clear();
         canvas_images_.clear();   // another page's nodes
@@ -759,7 +763,52 @@ public:
         dirty_ = true;
         ++change_gen_;
         states_only_ = false;
+        animate_only_ = false;
     }
+
+    // ── Transitions and animations ──
+    // (XWEB_NO_ANIMATIONS=1: none, all at their styles' own values.)
+    static bool animates() {
+        static const bool off = std::getenv("XWEB_NO_ANIMATIONS") != nullptr;
+        return !off;
+    }
+    static double seconds() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+    // Time has passed: what's moving moves, and the page is laid out and drawn with it.
+    // What goes on for ever moves only while it can be seen. Returns in how many ms to
+    // come again (none: nothing's moving).
+    std::optional<double> animate() {
+        if (!animates() || !styles_ || !animator_.running()) return std::nullopt;
+        bool seen = animator_.finiteRunning();
+        if (!seen) {
+            int win_w = 0, win_h = 0;
+            XApplication::windowSize(win_w, win_h);
+            const auto shown = animator_.moving();
+            const float top = viewportTop(), at = getAbsoluteOffset().y_;
+            const std::set<const web::Node*> nodes(shown.begin(), shown.end());
+            for (const web::ElementBox& b : layout_.boxes)
+                if (nodes.count(b.node) && b.y + at + b.h > top && b.y + at < static_cast<float>(win_h) && b.x < static_cast<float>(win_w) && b.x + b.w > 0) {
+                    seen = true;
+                    break;
+                }
+        }
+        // (Things that go on for ever and aren't seen: looked at again now and then.)
+        if (!seen) return 500.0;
+        const double gap = std::max(16.0, 3 * last_layout_ms_) - (seconds() - animated_at_) * 1000;
+        if (gap > 1) return gap;
+        animated_at_ = seconds();
+        bool changed = animator_.tick(*styles_, animated_at_);
+        if (restyled_) animator_.cover(*restyled_);
+        if (changed) {
+            computed_cache_.clear();
+            computed_values_.clear();
+            if (!dirty_) animate_only_ = true;
+            dirty_ = true;
+            fresh_gen_ = ~0ull;
+        }
+        if (!animator_.running()) return std::nullopt;
+        return std::max(16.0, 3 * last_layout_ms_);
+    }
+    std::vector<web::Animator::Event> takeAnimationEvents() { return animator_.takeEvents(); }
     // What's hovered or pressed has changed: styled again, if any rule goes by that, and
     // laid out only if a style came out different.
     void stateChanged() {
@@ -789,7 +838,9 @@ public:
             dirty_ = false;
             laid_out_width_ = width;
             laid_out_height_ = height;
+            const auto t0 = std::chrono::steady_clock::now();
             relayout(width, height);
+            last_layout_ms_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         }
         return c.clamp({width, layout_.height});
     }
@@ -820,6 +871,15 @@ public:
     };
 
     // The lazy images that have come near what's shown, asked for.
+    // Draws come no nearer together than a frame, nor than a page that takes long to lay
+    // out can afford: what its scripts change between is drawn together.
+    [[nodiscard]] double drawIn() const {
+        const double since = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - drawn_at_).count();
+        return std::max(0.0, std::clamp(2 * last_layout_ms_, 16.0, 250.0) - since);
+    }
+    [[nodiscard]] bool mayDraw() const { return drawIn() <= 0.5; }
+    [[nodiscard]] bool changedSinceDrawn() const { return dirty_ || canvas_drawn_; }
+
     void wantNearImages(Offset at) {
         if (layout_.lazy_images.empty() || !page_ || !on_images_) return;
         constexpr float kNear = 2000;
@@ -839,6 +899,8 @@ public:
 
     void paintSelf(fbx::xrender::DisplayList& dl, Offset at) noexcept override {
         wantNearImages(at);
+        drawn_at_ = std::chrono::steady_clock::now();
+        canvas_drawn_ = false;
         ++perf_.paints;
         perf_.report();
         Timed timed{perf_.on, perf_.paint_ms};
@@ -1100,6 +1162,32 @@ public:
                                          "inline-flex", "grid", "inline-grid", "contents"};
         const auto idx = static_cast<size_t>(s->display);
         if (want("display")) out["display"] = idx < std::size(kDisplay) ? kDisplay[idx] : "block";
+        const auto secs = [](float v) {
+            char b[32];
+            std::snprintf(b, sizeof b, "%gs", v);
+            return std::string(b);
+        };
+        const auto joined = [](const auto& list, auto&& one) {
+            std::string out;
+            for (const auto& x : list) out += (out.empty() ? "" : ", ") + one(x);
+            return out;
+        };
+        // (Scripts wait as long as these say before going on.)
+        const web::TransitionList none_t(1);
+        const web::TransitionList& ts = s->transitions ? *s->transitions : none_t;
+        if (want("transition-duration")) out["transition-duration"] = joined(ts, [&](const auto& t) { return secs(t.duration); });
+        if (want("transition-delay")) out["transition-delay"] = joined(ts, [&](const auto& t) { return secs(t.delay); });
+        if (want("transition-property")) out["transition-property"] = joined(ts, [&](const auto& t) { return t.property; });
+        if (want("transition")) out["transition"] = joined(ts, [&](const auto& t) { return t.property + " " + secs(t.duration) + (t.delay ? " ease " + secs(t.delay) : ""); });
+        web::AnimationSpec none_a;
+        none_a.name = "none";
+        const web::AnimationList none_l{none_a};
+        const web::AnimationList& as = s->animations ? *s->animations : none_l;
+        if (want("animation-name")) out["animation-name"] = joined(as, [](const auto& a) { return a.name; });
+        if (want("animation-duration")) out["animation-duration"] = joined(as, [&](const auto& a) { return secs(a.duration); });
+        if (want("animation-delay")) out["animation-delay"] = joined(as, [&](const auto& a) { return secs(a.delay); });
+        if (want("animation-iteration-count"))
+            out["animation-iteration-count"] = joined(as, [](const auto& a) { return std::isinf(a.iterations) ? std::string("infinite") : std::to_string(static_cast<int>(a.iterations)); });
         if (want("visibility")) out["visibility"] = s->hidden ? "hidden" : "visible";
         if (want("pointer-events")) out["pointer-events"] = s->pointer_events_none ? "none" : "auto";
         static const char* kPosition[] = {"static", "relative", "absolute", "fixed"};
@@ -1377,11 +1465,16 @@ private:
 
     std::unique_ptr<web::StyledDocument> makeStyles(float width, float height, std::vector<std::string>& missing) {
         const Page& page = *page_;
-        return std::make_unique<web::StyledDocument>(
+        // (Not another page's styles: fonts_changed_ is set by one coming too.)
+        const web::StyledDocument* before = fonts_changed_ ? nullptr : restyled_ ? restyled_.get() : styles_.get();
+        auto made = std::make_unique<web::StyledDocument>(
             *page.doc, web::css::MediaContext{width, height}, sheetLoader(missing),
             [this](const web::ComputedStyle& s) { return web::chWidth(measurer_, s); }, &page_->forms,
             // The last styles, for what's unchanged; not once fonts have come since (ch).
-            fonts_changed_ ? nullptr : (restyled_ ? restyled_.get() : styles_.get()));
+            before);
+        // What changed starts moving; what's moving is laid over them.
+        if (animates()) animator_.styled(*made, before, seconds());
+        return made;
     }
 
     // A script's question about one element's style, the page having changed since it was
@@ -1398,6 +1491,8 @@ private:
                                                   [this](const web::ComputedStyle& s) { return web::chWidth(measurer_, s); },
                                                   &page_->forms, previous);
         if (!chain || !missing.empty()) return false;
+        // What has transitions starts them from its style as it's asked for now: styled whole.
+        if (animates() && !chain->movingElements().empty()) return false;
         chain_styles_ = std::move(chain);
         return true;
     }
@@ -1450,6 +1545,9 @@ private:
         }
         const Page& page = *page_;
         std::vector<std::string> missing_sheets;
+        if (animate_only_ && styles_ && !restyled_ && width == laid_out_for_w_ && height == laid_out_for_h_) {
+            // Only time has passed: the styles stand, with what's moving laid over them.
+        } else
         // Styled already for a script's getComputedStyle, and nothing's changed since.
         if (restyled_ && restyled_gen_ == change_gen_ && width == restyled_w_ && height == restyled_h_) {
             styles_ = std::move(restyled_);
@@ -1461,6 +1559,7 @@ private:
         const bool same = states_only_ && keepsLayouts() && styles_unbroken_ && styles_->allKept() && missing_sheets.empty() &&
                           width == laid_out_for_w_ && height == laid_out_for_h_ && contentPrint(false) == laid_out_print_;
         states_only_ = false;
+        animate_only_ = false;
         restyled_.reset();
         restyled_missing_.clear();
         if (same) {
@@ -2275,6 +2374,12 @@ private:
     std::vector<std::string> restyled_missing_;
     uint64_t change_gen_ = 0, restyled_gen_ = 0;
     float restyled_w_ = 0, restyled_h_ = 0;
+    web::Animator animator_;
+    bool animate_only_ = false;          // all that's changed since is where what's moving has got to
+    double animated_at_ = 0;
+    std::chrono::steady_clock::time_point drawn_at_{};
+    double last_layout_ms_ = 0;          // the last whole layout, styling and all
+    bool canvas_drawn_ = false;
     bool states_only_ = false;           // all that's changed since is what's hovered or pressed
     float laid_out_for_w_ = 0, laid_out_for_h_ = 0;
     bool styles_unbroken_ = false;       // each restyle since the last layout kept every style
@@ -2449,6 +2554,14 @@ public:
         XApplication::post([this] { XApplication::setTitle(node_->title().empty() ? "Web" : node_->title()); });
     }
 
+    // A frame with nothing but the page's timers to it: whether to lay out and draw.
+    bool drawNeeded() {
+        if (!node_->changedSinceDrawn()) return false;
+        if (node_->mayDraw()) return true;
+        XApplication::wakeIn(node_->drawIn());
+        return false;
+    }
+
     void onFrame() {
         // A page shown last frame: its scripts now. (Something posted, so the loop comes
         // round again rather than wait for input.)
@@ -2456,10 +2569,19 @@ public:
             if (scripts_wait_frames_-- > 0) XApplication::post([] {});
             else runPendingScripts();
         }
+        if (const auto again = node_->animate()) XApplication::wakeIn(*again);
+        if (auto events = node_->takeAnimationEvents(); !events.empty())
+            if (Page* page = node_->page(); page && page->script) {
+                for (const web::Animator::Event& e : events)
+                    page->script->animationEvent(const_cast<web::Node*>(e.node), e.type, e.name, e.elapsed, e.pseudo);
+                if (page->script->takeDirty()) node_->invalidate();
+            }
         // The page's event loop: timers and animation frames.
         if (Page* page = node_->page(); page && page->script) {
-            if (page->script->busy()) page->script->tick();
+            // Its animation frames when there may be a draw after them.
+            if (page->script->busy()) page->script->tick(page->script->framesDue() && node_->mayDraw());
             if (page->script->takeDirty()) node_->invalidate();
+            if (const auto due = page->script->dueIn()) XApplication::wakeIn(std::max(*due, page->script->framesDue() ? node_->drawIn() : 0.0));
         }
         if (!relayout_wanted_) return;
         const auto now = std::chrono::steady_clock::now();
@@ -3485,6 +3607,7 @@ int webViewMain(int argc, char** argv) {
     root->addChild(std::make_shared<FlexibleWidget>(scroll));
 
     XApplication::setOnFrame([] { browser.onFrame(); });
+    XApplication::setDrawNeeded([] { return browser.drawNeeded(); });
     XApplication::setOnShortcut([address](const fbx::shared::InputMessage& key) {
         constexpr int kF5 = 63, kL = 38, kR = 19, kLeft = 105, kRight = 106;
         constexpr uint32_t kCtrl = 2, kAlt = 4;

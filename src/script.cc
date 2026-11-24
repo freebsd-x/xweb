@@ -1130,14 +1130,39 @@ void PageScript::Impl::installDocument() {
     });
     method(p, u"getElementById", 1, [self](Runtime& rt, const Value& self_doc, Args a) {
         const std::string id = js::utf8(rt.toStringValue(arg(a, 0)));
-        std::vector<Node*> todo{self->docNode(self_doc)};
+        Node* const root = self->docNode(self_doc);
+        // Where it was found last, if that's still so (the cache is let go whenever an
+        // element with an id comes in or is given one); or that there was none, if nothing's
+        // changed since.
+        const bool cached = root == self->doc.root();
+        if (cached) {
+            if (const auto it = self->ids_found.find(id); it != self->ids_found.end()) {
+                Node* n = it->second;
+                const std::string* v = n->attr("id");
+                const Node* top = n;
+                while (top->parent) top = top->parent;
+                if (v && *v == id && top == root) return self->wrap(n);
+                self->ids_found.erase(it);
+            }
+            if (self->ids_absent_at != self->dom_version) {
+                self->ids_absent_at = self->dom_version;
+                self->ids_absent.clear();
+            } else if (self->ids_absent.count(id)) {
+                return Value::null();
+            }
+        }
+        std::vector<Node*> todo{root};
         while (!todo.empty()) {
             Node* n = todo.back();
             todo.pop_back();
             if (n->isElement())
-                if (const std::string* v = n->attr("id"); v && *v == id) return self->wrap(n);
+                if (const std::string* v = n->attr("id"); v && *v == id) {
+                    if (cached && self->ids_found.size() < 10000) self->ids_found[id] = n;
+                    return self->wrap(n);
+                }
             todo.insert(todo.end(), n->children.rbegin(), n->children.rend());
         }
+        if (cached && self->ids_absent.size() < 10000) self->ids_absent.insert(id);
         return Value::null();
     });
     method(p, u"getElementsByName", 1, [self](Runtime& rt, const Value& self_doc, Args a) {
@@ -1403,12 +1428,19 @@ void PageScript::Impl::installWindow() {
             if (self->timers.size() >= kMaxTimers) rt.throwError("RangeError", "too many timers");
             double delay = rt.toNumber(arg(a, 1));
             if (std::isnan(delay) || delay < 0) delay = 0;
-            Timer t{self->next_timer++, self->now() + delay, std::max(delay, 4.0), repeat, fn, {}};
+            if (!repeat && self->timer_level >= 5) delay = std::max(delay, 4.0);
+            Timer t{self->next_timer++, self->now() + delay, std::max(delay, 4.0), repeat, fn, {}, self->timer_level + 1};
             if (a.size() > 2) t.args.assign(a.begin() + 2, a.end());
             self->timers.push_back(std::move(t));
             return Value::number(self->timers.back().id);
         };
     };
+    method(g, u"__xwebTask", 1, [self](Runtime& rt, const Value&, Args a) {
+        if (!rt.isCallable(arg(a, 0))) rt.throwError("TypeError", "not a function");
+        if (self->tasks.size() >= kMaxTimers) rt.throwError("RangeError", "too many tasks");
+        self->tasks.push_back(arg(a, 0));
+        return Value::undefined();
+    });
     method(g, u"setTimeout", 2, addTimer(false));
     method(g, u"setInterval", 2, addTimer(true));
     const auto clearTimer = [self](Runtime& rt, const Value&, Args a) {
@@ -1924,6 +1956,15 @@ bool PageScript::pointerPressed(Node* target, bool down, float page_x, float pag
     return impl_->firePointer(target, down ? u"mousedown" : u"mouseup", true, page_x, page_y, down ? 1 : 0, nullptr, true);
 }
 
+void PageScript::animationEvent(Node* target, const std::string& type, const std::string& name, float elapsed, int pseudo) {
+    Impl& s = *impl_;
+    s.fire(target, js::utf16(type), true, type.starts_with("transition"), [&](Object* e) {
+        s.rt.put(e, type.starts_with("transition") ? u"propertyName" : u"animationName", str(name), js::kEnumerable);
+        s.rt.put(e, u"elapsedTime", Value::number(elapsed), js::kEnumerable);
+        s.rt.put(e, u"pseudoElement", str(pseudo == 1 ? "::before" : pseudo == 2 ? "::after" : ""), js::kEnumerable);
+    });
+}
+
 void PageScript::focusMoved(Node* from, Node* to) {
     Impl& s = *impl_;
     if (from == to) return;
@@ -2018,7 +2059,20 @@ void PageScript::toggle(Node* details) {
 
 void PageScript::scrolled() { impl_->fire(nullptr, u"scroll", false, false); }
 
-void PageScript::tick() {
+std::optional<double> PageScript::dueIn() const {
+    const Impl& s = *impl_;
+    if (!s.tasks.empty() || !s.sheet_events.empty()) return 0;
+    std::optional<double> in;
+    const double now = impl_->now();
+    for (const Impl::Timer& t : s.timers) in = std::min(in.value_or(1e9), t.due - now);
+    if (!s.frames.empty()) in = std::min(in.value_or(1e9), s.last_frames + 16 - now);
+    if (in) in = std::max(0.0, *in);
+    return in;
+}
+
+bool PageScript::framesDue() const { return !impl_->frames.empty() && impl_->now() - impl_->last_frames >= 15; }
+
+void PageScript::tick(bool draw) {
     Impl& s = *impl_;
     const double now = s.now();
     // XWEB_DEBUG_PERF: a timer or frame callback that held the page up, by its name and text.
@@ -2045,23 +2099,40 @@ void PageScript::tick() {
         for (const auto& [n, ok] : events) s.fire(n, ok ? u"load" : u"error", false, false);
         s.drainMicrotasks();
     }
-    // Due timers, earliest first; at most so many a tick (and for so long), so the page
-    // can't starve the window.
-    for (int ran = 0; ran < 200 && (ran == 0 || s.now() - now < 30); ++ran) {
+    // Tasks in their order, and due timers, earliest first, by turns; for so long a tick,
+    // so the page can't starve the window.
+    bool task_turn = true;
+    for (int ran = 0; ran < 5000 && (ran == 0 || s.now() - now < 30); ++ran, task_turn = !task_turn) {
+        const double at = s.now();
         auto it = std::min_element(s.timers.begin(), s.timers.end(), [](const Impl::Timer& a, const Impl::Timer& b) {
             return a.due < b.due || (a.due == b.due && a.id < b.id);
         });
-        if (it == s.timers.end() || it->due > now) break;
+        const bool timer_due = it != s.timers.end() && it->due <= at;
+        if (!s.tasks.empty() && (task_turn || !timer_due)) {
+            const Value fn = s.tasks.front();
+            s.tasks.pop_front();
+            s.timer_level = 0;
+            timed("task", fn, [&] { s.task([&] { s.rt.call(fn, Value::undefined(), {}); }); });
+            s.drainMicrotasks();
+            continue;
+        }
+        if (!timer_due) {
+            if (s.tasks.empty()) break;
+            continue;
+        }
         Impl::Timer t = *it;
-        if (t.repeat) it->due = now + t.interval;
+        if (t.repeat) it->due = at + t.interval;
         else s.timers.erase(it);
+        s.timer_level = t.level;
         timed("timer", t.fn, [&] { s.task([&] { s.rt.call(t.fn, Value::object(s.rt.global()), t.args); }); });
+        s.timer_level = 0;
         s.drainMicrotasks();
     }
-    if (!s.frames.empty()) {
+    if (!s.frames.empty() && draw) {
+        s.last_frames = s.now();
         s.running_frames.clear();
         s.running_frames.swap(s.frames);
-        const Value stamp = Value::number(now);
+        const Value stamp = Value::number(s.now());
         for (size_t i = 0; i < s.running_frames.size(); ++i) {
             const Value fn = s.running_frames[i].second;
             if (!s.rt.isCallable(fn)) continue;   // cancelled during this round
@@ -2073,7 +2144,7 @@ void PageScript::tick() {
     s.collect();
 }
 
-bool PageScript::busy() const { return !impl_->timers.empty() || !impl_->frames.empty() || !impl_->sheet_events.empty(); }
+bool PageScript::busy() const { return !impl_->timers.empty() || !impl_->tasks.empty() || !impl_->frames.empty() || !impl_->sheet_events.empty(); }
 
 bool PageScript::dirty() const { return impl_->dirty; }
 

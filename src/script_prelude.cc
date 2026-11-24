@@ -479,6 +479,8 @@ const char* const kScriptPrelude = R"JS(
 
   // Blob, FormData, Headers, Request, Response, fetch and XMLHttpRequest, over the
   // browser's __xwebFetch.
+  const queueTask = global.__xwebTask || ((f) => setTimeout(f, 0));
+  delete global.__xwebTask;
   const native = global.__xwebFetch;
   delete global.__xwebFetch;
   const bytes = Symbol('bytes');
@@ -1887,7 +1889,25 @@ const char* const kScriptPrelude = R"JS(
 
   // Window: the global object's interface (window instanceof Window, Window.prototype).
   if (typeof global.Window !== 'function' && typeof EventTarget === 'function') {
-    const proto = Object.create(EventTarget.prototype);
+    // An element's id (or an <iframe>, <form>, <img>, <embed> or <object>'s name) is a
+    // global, unless something else is one by that name: old pages say `menu.style`.
+    const base = EventTarget.prototype;
+    const kNamed = 'iframe[name="N"],form[name="N"],img[name="N"],embed[name="N"],object[name="N"]';
+    const named = (k) => {
+      if (typeof k !== 'string' || k === '' || typeof document === 'undefined' || !document.getElementById) return undefined;
+      const byId = document.getElementById(k);
+      if (byId) return byId;
+      if (!/^[A-Za-z][\w-]*$/.test(k)) return undefined;
+      const e = document.querySelector(kNamed.replaceAll('N', k));
+      return e ? (e.tagName === 'IFRAME' ? e.contentWindow : e) : undefined;
+    };
+    const names = new Proxy(Object.create(base), {
+      has(t, k) { return Reflect.has(t, k) || named(k) !== undefined; },
+      get(t, k, r) { if (Reflect.has(t, k)) return Reflect.get(t, k, r); return named(k); },
+      getOwnPropertyDescriptor() { return undefined; },
+      ownKeys() { return []; },
+    });
+    const proto = Object.create(names);
     function Window() { throw new TypeError('Illegal constructor'); }
     Object.defineProperty(Window, 'prototype', { value: proto, writable: false });
     Object.defineProperty(proto, 'constructor', { value: Window, writable: true, configurable: true });
@@ -2628,14 +2648,14 @@ const char* const kScriptPrelude = R"JS(
     _flush() {
       for (let n = this._queue.length - this._pending; n > 0; --n) {
         this._pending++;
-        setTimeout(() => {
+        queueTask(() => {
           this._pending--;
           if (!this._queue.length || this._closed) return;
           const data = this._queue.shift();
           const e = new MessageEvent('message', { data, origin: '', ports: [] });
           this.dispatchEvent(e);
           if (this._onmessage) try { this._onmessage.call(this, e); } catch (x) { reportError(x); }
-        }, 0);
+        });
       }
     }
   }
@@ -2662,11 +2682,11 @@ const char* const kScriptPrelude = R"JS(
       for (const other of channels.get(this.name) || []) {
         if (other === this) continue;
         const copy = structuredClone(data);
-        setTimeout(() => {
+        queueTask(() => {
           if (other._closed) return;
           const e = new MessageEvent('message', { data: copy, origin: '' });
           other.dispatchEvent(e);   // (its onmessage too)
-        }, 0);
+        });
       }
     }
     close() { this._closed = true; channels.get(this.name)?.delete(this); }
@@ -3243,10 +3263,10 @@ const char* const kScriptPrelude = R"JS(
         if (wanted !== origin) return;
       }
       const copy = structuredClone(data);
-      setTimeout(() => {
+      queueTask(() => {
         const e = new MessageEvent('message', { data: copy, origin, source: global, lastEventId: '', ports: [] });
         global.dispatchEvent(e);
-      }, 0);
+      });
     };
     Object.defineProperty(global, 'postMessage', { value: post, writable: true, configurable: true, enumerable: true });
   }
