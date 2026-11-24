@@ -206,7 +206,8 @@ Resource load(const std::string& address, bool cookies = false, const std::strin
 // which fetched one after another took seconds (bbc.com's 40 scripts: 3.6 s).
 constexpr size_t kFetchWorkers = 8;
 std::vector<Resource> loadAll(const std::vector<std::string>& urls, const std::string& page_url,
-                              const std::atomic<uint64_t>& generation, uint64_t mine) {
+                              const std::atomic<uint64_t>& generation, uint64_t mine,
+                              const std::function<void(const std::string& url, Resource& got)>& each = {}) {
     std::vector<Resource> out(urls.size());
     std::atomic<size_t> next{0};
     const auto work = [&] {
@@ -214,8 +215,9 @@ std::vector<Resource> loadAll(const std::vector<std::string>& urls, const std::s
             if (generation.load() != mine) return;
             const auto t0 = std::chrono::steady_clock::now();
             out[i] = load(urls[i], web::sameSite(page_url, urls[i]), referrerFor(page_url, urls[i]));
-            static const bool perf = std::getenv("XWEB_DEBUG_PERF") != nullptr;
             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (each) each(urls[i], out[i]);
+            static const bool perf = std::getenv("XWEB_DEBUG_PERF") != nullptr;
             if (perf && ms > 1000)
                 std::fprintf(stderr, "[perf] slow fetch %.0f ms (%s, %d): %s\n", ms, out[i].ok ? "ok" : "failed", out[i].http_status, urls[i].c_str());
         }
@@ -377,34 +379,47 @@ void loadScripts(Page& page, const std::atomic<uint64_t>& generation, uint64_t m
     size_t total = 0;
     // What's been fetched ahead, all at once, to be taken in order below.
     std::map<std::string, Resource> ahead;
+    std::vector<std::string> classic = urls;
+    std::sort(classic.begin(), classic.end());
+    // A script that doesn't say is in its charset attribute's encoding, else the page's
+    // (yes24's EUC-KR scripts).
+    const auto decode = [&](const std::string& url, Resource& r) {
+        std::string type = r.content_type;
+        if (web::detectCharset({}, type).empty()) {
+            const auto it = charsets.find(url);
+            const std::string cs = it != charsets.end() ? it->second : page.charset;
+            type = "text/javascript; charset=" + (cs.empty() ? std::string("utf-8") : cs);
+        }
+        r.body = web::decodeToUtf8(r.body, type);
+    };
     const auto fetchAhead = [&](std::vector<std::string> wanted) {
         std::erase_if(wanted, [&](const std::string& url) { return page.scripts.count(url) || ahead.count(url); });
         std::sort(wanted.begin(), wanted.end());
         wanted.erase(std::unique(wanted.begin(), wanted.end()), wanted.end());
-        std::vector<Resource> got = loadAll(wanted, page.url, generation, mine);
+        // Decoded and parsed as each comes, on the thread that fetched it.
+        std::vector<Resource> got = loadAll(wanted, page.url, generation, mine, [&](const std::string& url, Resource& r) {
+            if (!r.ok || r.http_status >= 400 || r.body.size() > kMaxScriptBytes) return;
+            decode(url, r);
+            web::js::parseAhead(r.body, !std::binary_search(classic.begin(), classic.end(), url));
+        });
         for (size_t i = 0; i < wanted.size(); ++i) ahead[wanted[i]] = std::move(got[i]);
     };
     const auto fetch = [&](const std::string& url) -> const std::string* {
         if (const auto it = page.scripts.find(url); it != page.scripts.end()) return &it->second;
         if (total > kMaxTotalBytes) return nullptr;
         Resource got;
+        bool decoded = false;
         if (auto it = ahead.find(url); it != ahead.end()) {
             got = std::move(it->second);
+            decoded = true;
             ahead.erase(it);
         } else {
             got = load(url, web::sameSite(page.url, url), referrerFor(page.url, url));
         }
         if (!got.ok || got.http_status >= 400 || got.body.size() > kMaxScriptBytes) return nullptr;
         total += got.body.size();
-        // A script that doesn't say is in its charset attribute's encoding, else the page's
-        // (yes24's EUC-KR scripts).
-        std::string type = got.content_type;
-        if (web::detectCharset({}, type).empty()) {
-            const auto it = charsets.find(url);
-            const std::string cs = it != charsets.end() ? it->second : page.charset;
-            type = "text/javascript; charset=" + (cs.empty() ? std::string("utf-8") : cs);
-        }
-        return &(page.scripts[url] = web::decodeToUtf8(got.body, type));
+        if (!decoded) decode(url, got);
+        return &(page.scripts[url] = std::move(got.body));
     };
     {
         std::vector<std::string> wanted = urls;
@@ -755,7 +770,7 @@ public:
         dirty_ = true;
         ++change_gen_;
         restyled_.reset();
-        fonts_changed_ = true;   // nothing kept from another page's styles
+        fonts_changed_ = page_changed_ = true;   // nothing kept from another page's styles
         computed_cache_.clear();
         computed_values_.clear();
     }
@@ -1041,7 +1056,7 @@ public:
             restyled_h_ = laid_out_height_;
             restyled_missing_ = std::move(missing);
         }
-        if (keepsLayouts() && styles_unbroken_ && restyled_->allKept() && restyled_missing_.empty() && contentPrint(false) == laid_out_print_) {
+        if (keepsLayouts() && !fonts_changed_ && styles_unbroken_ && restyled_->allKept() && restyled_missing_.empty() && contentPrint(false) == laid_out_print_) {
             ++perf_.script_kept;
             styles_ = std::move(restyled_);
             computed_cache_.clear();
@@ -1465,12 +1480,13 @@ private:
 
     std::unique_ptr<web::StyledDocument> makeStyles(float width, float height, std::vector<std::string>& missing) {
         const Page& page = *page_;
-        // (Not another page's styles: fonts_changed_ is set by one coming too.)
-        const web::StyledDocument* before = fonts_changed_ ? nullptr : restyled_ ? restyled_.get() : styles_.get();
+        // The last styles, for what's unchanged: not another page's, nor, once fonts have
+        // come since, ones worked out from a font's measure.
+        const web::StyledDocument* before = page_changed_ ? nullptr : restyled_ ? restyled_.get() : styles_.get();
+        if (before && fonts_changed_ && before->asksFonts()) before = nullptr;
         auto made = std::make_unique<web::StyledDocument>(
             *page.doc, web::css::MediaContext{width, height}, sheetLoader(missing),
             [this](const web::ComputedStyle& s) { return web::chWidth(measurer_, s); }, &page_->forms,
-            // The last styles, for what's unchanged; not once fonts have come since (ch).
             before);
         // What changed starts moving; what's moving is laid over them.
         if (animates()) animator_.styled(*made, before, seconds());
@@ -1559,7 +1575,7 @@ private:
             Timed styled{perf_.on, perf_.layout_style_ms};
             styles_ = makeStyles(width, height, missing_sheets);
         }
-        const bool same = states_only_ && keepsLayouts() && styles_unbroken_ && styles_->allKept() && missing_sheets.empty() &&
+        const bool same = states_only_ && !fonts_changed_ && keepsLayouts() && styles_unbroken_ && styles_->allKept() && missing_sheets.empty() &&
                           width == laid_out_for_w_ && height == laid_out_for_h_ && contentPrint(false) == laid_out_print_;
         states_only_ = false;
         animate_only_ = false;
@@ -1572,7 +1588,7 @@ private:
         }
         stale_ = false;   // styled whole now
         chain_styles_.reset();
-        fonts_changed_ = false;
+        fonts_changed_ = page_changed_ = false;
         const web::StyledDocument& styles = *styles_;
         if (!page.fonts_known) {
             page_->fonts_known = true;
@@ -2387,7 +2403,8 @@ private:
     float laid_out_for_w_ = 0, laid_out_for_h_ = 0;
     bool styles_unbroken_ = false;       // each restyle since the last layout kept every style
     uint64_t laid_out_print_ = 0, laid_out_full_print_ = 0;   // contentPrint() at the last layout
-    bool fonts_changed_ = false;
+    bool fonts_changed_ = false;   // fonts have come since the layout
+    bool page_changed_ = false;    // the styles are another page's
     uint64_t fresh_gen_ = UINT64_MAX;   // the change a script's forced layout was made after
     std::map<std::string, CachedRaster> rasters_;
     const web::Node* popup_ = nullptr;   // a <select> whose list is open
@@ -2678,6 +2695,7 @@ private:
         showAddress(url);
         XApplication::setTitle("Loading...");
         const uint64_t mine = ++generation_;
+        web::js::forgetParsed();   // the last page's, never run
         load_started_ = std::chrono::steady_clock::now();
         const float restore = mode == Mode::History ? history_[index_].scroll : (mode == Mode::Reload ? node_->scrollY() : 0);
         std::thread([this, url, mine, restore, post = std::move(post)] {
@@ -2876,9 +2894,9 @@ private:
         // import() and anything else not fetched ahead: off the UI thread, back on it.
         std::weak_ptr<Page> weak = page;
         const std::string page_url = page->url, page_charset = page->charset;
-        host.fetch_script = [this, weak, page_url, page_charset](const std::string& url, const std::string& charset,
+        host.fetch_script = [this, weak, page_url, page_charset](const std::string& url, const std::string& charset, bool module,
                                                                   std::function<void(std::optional<std::string>)> done) {
-            std::thread([this, weak, page_url, page_charset, url, charset, done = std::move(done)] {
+            std::thread([this, weak, page_url, page_charset, url, charset, module, done = std::move(done)] {
                 Resource got = load(url, web::sameSite(page_url, url), referrerFor(page_url, url));
                 std::optional<std::string> body;
                 // Not saying: as the script element says (jQuery's scriptCharset: Nate's
@@ -2889,6 +2907,7 @@ private:
                     type = "text/javascript; charset=" + (cs.empty() ? std::string("utf-8") : cs);
                 }
                 if (got.ok && got.http_status < 400 && got.body.size() <= (16u << 20)) body = web::decodeToUtf8(got.body, type);
+                if (body) web::js::parseAhead(*body, module);   // here, not on the UI thread
                 // XWEB_DEBUG_SCRIPTS=1: what each script fetch came to.
                 if (std::getenv("XWEB_DEBUG_SCRIPTS"))
                     std::fprintf(stderr, "[script] %s: %s status %d, %zu bytes\n", url.c_str(), body ? "ok" : "FAILED", got.http_status, got.body.size());

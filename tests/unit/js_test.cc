@@ -1,3 +1,4 @@
+#include <thread>
 // Our JavaScript engine: the language and its library, script in, value or error out.
 
 #include <gtest/gtest.h>
@@ -846,4 +847,30 @@ TEST(Js, RegExpsWithARequiredLiteralFailFastAndStillMatch) {
     EXPECT_EQ(run("var s = 'x'.repeat(20000) + ' ' + 'y'.repeat(5000); /\\S+(@|%40)\\S+\\.\\S+/.test(s)"), "false");
     EXPECT_EQ(run("[/\\S+(@|%40)\\S+\\.\\S+/.test('mail: a@b.com'), /\\S+(@|%40)\\S+\\.\\S+/.test('a%40b.org'), /AB(c|d)/i.test('abD'),"
                   " 'xoaob zob'.replace(/o(a|b)/g, '#')].join()"), "true,true,true,x## z#");
+}
+
+// Parsed ahead, on other threads: run as if not, once each, and only for the very source.
+TEST(Js, ParsedAheadRunsTheSame) {
+    const std::string pad = "/*" + std::string(5000, 'x') + "*/";
+    const std::string one = pad + "var a = 'one'; function f(n) { return n < 2 ? 1 : n * f(n - 1) } f(5) + a";
+    const std::string two = pad + "var a = 'two'; function f(n) { return n < 2 ? 1 : n * f(n - 1) } f(5) + a";
+    const std::string bad = pad + "var = ;";
+    const std::string mod = pad + "import x from './x.js'; export default 1";
+    std::vector<std::thread> threads;
+    for (const std::string* s : {&one, &two, &bad, &one}) threads.emplace_back([s] { parseAhead(*s, false); });
+    threads.emplace_back([&] { parseAhead(mod, true); });
+    for (std::thread& t : threads) t.join();
+    EXPECT_EQ(moduleRequests(mod), (std::vector<std::string>{"./x.js"}));
+    EXPECT_EQ(moduleRequests(mod), (std::vector<std::string>{"./x.js"}));
+    for (int again = 0; again < 2; ++again) {
+        Runtime rt;
+        auto r = rt.evaluate(one, "one");
+        ASSERT_TRUE(r.ok);
+        EXPECT_EQ(utf8(*rt.toString(r.value)), "120one");
+        r = rt.evaluate(two, "two");
+        ASSERT_TRUE(r.ok);
+        EXPECT_EQ(utf8(*rt.toString(r.value)), "120two");
+        EXPECT_FALSE(rt.evaluate(bad, "bad").ok);
+    }
+    forgetParsed();
 }

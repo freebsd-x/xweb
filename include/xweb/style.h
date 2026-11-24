@@ -427,6 +427,8 @@ public:
     // Every element's style is the one it had in those it was made from, and the same
     // elements are styled: none of them (nor their attributes) has changed.
     [[nodiscard]] bool allKept() const noexcept { return all_kept_; }
+    // Whether any style was worked out from a font's measure (ch).
+    [[nodiscard]] bool asksFonts() const noexcept { return asks_fonts_; }
     // Whether some rule goes by what's hovered, pressed or focused.
     [[nodiscard]] bool statesMatter() const noexcept { return states_matter_; }
 
@@ -447,6 +449,7 @@ private:
     std::unordered_map<const Node*, std::shared_ptr<const ComputedStyle>> overlay_[3];
     bool all_kept_ = false;
     bool states_matter_ = false;
+    bool asks_fonts_ = false;
     // A :has() anchor's rules that matched (a print of them): what its children's keys
     // are made from, instead of everything under it.
     std::unordered_map<const Node*, uint64_t> has_prints_;

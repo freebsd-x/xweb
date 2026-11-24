@@ -259,6 +259,8 @@ struct EvalContext {
     bool super_property = false;
     bool super_call = false;
 };
+// What parseAhead made of it, if it did: nobody else's from then on.
+std::unique_ptr<Program> takeParsed(std::string_view source, bool module);
 std::unique_ptr<Program> parse(std::u16string_view source, std::string& error, bool strict = false, bool module = false,
                                const EvalContext* eval = nullptr);
 

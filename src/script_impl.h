@@ -767,7 +767,7 @@ struct PageScript::Impl {
             if (host.fetch_script && pending_script_fetches < kMaxPendingScriptFetches) {
                 ++pending_script_fetches;
                 const std::string* cs = s->attr("charset");
-                host.fetch_script(url, isModule(s) ? std::string("utf-8") : cs ? *cs : std::string{}, [this, s, url](std::optional<std::string> body) {
+                host.fetch_script(url, isModule(s) ? std::string("utf-8") : cs ? *cs : std::string{}, isModule(s), [this, s, url](std::optional<std::string> body) {
                     --pending_script_fetches;
                     rt.setStepBudget(kTaskBudget);
                     if (!body) {

@@ -94,7 +94,7 @@ struct Page {
             pending.push_back([done, res] { done(res); });
         };
         // Scripts not fetched ahead, as a page's own fetch would bring them, a task later.
-        host.fetch_script = [this](const std::string& url, const std::string&, std::function<void(std::optional<std::string>)> done) {
+        host.fetch_script = [this](const std::string& url, const std::string&, bool, std::function<void(std::optional<std::string>)> done) {
             std::optional<std::string> body;
             if (url == "https://example.org/dir/chunk.js") body = "console.log('chunk ran', typeof window.chunkFlag); window.chunkLoaded = true;";
             pending.push_back([done, body] { done(body); });

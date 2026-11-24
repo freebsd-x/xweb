@@ -1390,7 +1390,8 @@ Runtime::Result Runtime::evaluate(std::string_view source, std::string_view name
     want_completion = want_value;
     Result result;
     std::string error;
-    std::shared_ptr<Program> prog(parse(utf16(source), error).release());
+    std::shared_ptr<Program> prog(takeParsed(source, false).release());
+    if (!prog) prog.reset(parse(utf16(source), error).release());
     if (!prog) {
         result.error = error;
         (void)name;

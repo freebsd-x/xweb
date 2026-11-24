@@ -2,6 +2,8 @@
 // imports to exports as live bindings, and evaluating dependencies first. A module's
 // body runs on a coroutine, so top-level await works.
 
+#include <list>
+#include <mutex>
 #include <algorithm>
 #include <map>
 #include <new>
@@ -339,7 +341,8 @@ struct Loader {
     // Parses a fetched source and works out what it imports.
     void parsed(ModuleRecord* rec, const std::string& source) {
         std::string error;
-        std::shared_ptr<Program> prog(parse(utf16(source), error, true, true).release());
+        std::shared_ptr<Program> prog(takeParsed(source, true).release());
+        if (!prog) prog.reset(parse(utf16(source), error, true, true).release());
         if (!prog) {
             rec->status = Status::FetchFailed;
             rec->error = error + " (" + rec->url + ")";
@@ -872,18 +875,87 @@ void loadLinkEvaluate(Runtime& rt, const std::string& url, std::function<void(Mo
 
 }  // namespace
 
+namespace {
+// Few at a time (a page's scripts not run yet), told apart by length nearly always.
+struct ParsedAhead {
+    static constexpr size_t kMaxBytes = 32u << 20;
+    struct Entry {
+        std::string source;
+        bool module;
+        std::unique_ptr<Program> program;
+    };
+    std::mutex mutex;
+    std::list<Entry> entries;
+    size_t bytes = 0;
+};
+ParsedAhead& parsedAhead() {
+    static auto* p = new ParsedAhead;   // (never destroyed: threads may be at it as the process ends)
+    return *p;
+}
+}  // namespace
+
 std::vector<std::string> moduleRequests(std::string_view source) {
     std::string error;
-    std::unique_ptr<Program> prog = parse(utf16(source), error, true, true);
     std::vector<std::string> out;
-    if (!prog) return out;
-    for (Node* s : prog->root->kids) {
-        if (s->kind == N::ImportDecl || (s->kind == N::ExportDecl && !s->str.empty())) {
-            std::string spec = utf8(s->str);
-            if (std::find(out.begin(), out.end(), spec) == out.end()) out.push_back(std::move(spec));
+    const auto list = [&out](const Program& prog) {
+        for (const Node* s : prog.root->kids) {
+            if (s->kind == N::ImportDecl || (s->kind == N::ExportDecl && !s->str.empty())) {
+                std::string spec = utf8(s->str);
+                if (std::find(out.begin(), out.end(), spec) == out.end()) out.push_back(std::move(spec));
+            }
         }
+    };
+    {
+        ParsedAhead& p = parsedAhead();
+        std::lock_guard<std::mutex> lock(p.mutex);
+        for (const ParsedAhead::Entry& e : p.entries)
+            if (e.module && e.source == source) {
+                list(*e.program);
+                return out;
+            }
     }
+    const std::unique_ptr<Program> prog = parse(utf16(source), error, true, true);
+    if (prog) list(*prog);
     return out;
+}
+
+void parseAhead(const std::string& source, bool module) {
+    // (Small ones parse in no time, and needn't be found again.)
+    if (source.size() < 4096) return;
+    std::string error;
+    std::unique_ptr<Program> prog = module ? parse(utf16(source), error, true, true) : parse(utf16(source), error);
+    if (!prog) return;   // reported when it's run
+    ParsedAhead& p = parsedAhead();
+    std::lock_guard<std::mutex> lock(p.mutex);
+    for (const ParsedAhead::Entry& e : p.entries)
+        if (e.module == module && e.source == source) return;
+    p.bytes += source.size();
+    p.entries.push_back({source, module, std::move(prog)});
+    while (p.bytes > ParsedAhead::kMaxBytes && p.entries.size() > 1) {
+        p.bytes -= p.entries.front().source.size();
+        p.entries.pop_front();
+    }
+}
+
+std::unique_ptr<Program> takeParsed(std::string_view source, bool module) {
+    ParsedAhead& p = parsedAhead();
+    std::lock_guard<std::mutex> lock(p.mutex);
+    for (auto it = p.entries.begin(); it != p.entries.end(); ++it)
+        if (it->module == module && it->source == source) {
+            std::unique_ptr<Program> prog = std::move(it->program);
+            p.bytes -= it->source.size();
+            p.entries.erase(it);
+            return prog;
+        }
+    return nullptr;
+}
+
+void forgetParsed() {
+    std::list<ParsedAhead::Entry> gone;
+    ParsedAhead& p = parsedAhead();
+    std::lock_guard<std::mutex> lock(p.mutex);
+    gone.swap(p.entries);   // (let go when the lock is)
+    p.bytes = 0;
 }
 
 void Runtime::evaluateModule(std::string_view source, const std::string& url, std::function<void(Result)> done) {

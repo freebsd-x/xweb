@@ -239,6 +239,7 @@ struct LengthContext {
     float viewport_w = 0, viewport_h = 0;
     float ch = 0;   // the width of "0" in this font, if known
     float line_height = 0, root_line_height = 0;   // for lh and rlh (0: 1.2 of the font size)
+    bool* ch_asked = nullptr;   // set once ch is
 };
 
 bool dimensionPx(const Token& t, const LengthContext& c, float& out) {
@@ -247,7 +248,10 @@ bool dimensionPx(const Token& t, const LengthContext& c, float& out) {
     if (u == "px") out = v;
     else if (u == "em") out = v * c.font_size;
     else if (u == "rem") out = v * c.root_font_size;
-    else if (u == "ch") out = v * (c.ch > 0 ? c.ch : c.font_size * 0.5f);
+    else if (u == "ch") {
+        out = v * (c.ch > 0 ? c.ch : c.font_size * 0.5f);
+        if (c.ch_asked) *c.ch_asked = true;
+    }
     else if (u == "ex") out = v * c.font_size * 0.5f;
     else if (u == "lh") out = v * (c.line_height > 0 ? c.line_height : c.font_size * 1.2f);
     else if (u == "rlh") out = v * (c.root_line_height > 0 ? c.root_line_height : c.root_font_size * 1.2f);
@@ -1826,6 +1830,7 @@ class StyleResolver : Notes {
 public:
     StyleResolver(const Document& doc, StyledDocument& out, const StyledDocument::SheetLoader& loader, const StyledDocument* previous)
         : doc_(doc), out_(out), loader_(loader) {
+        lengths_.ch_asked = &out.asks_fonts_;
         lengths_.viewport_w = out.media_.width;
         lengths_.viewport_h = out.media_.height;
         // Which sheets apply, in order, first; their rules indexed only if that's not
@@ -1863,6 +1868,7 @@ public:
             previous->media_.width == out_.media_.width && previous->media_.height == out_.media_.height &&
             previous->forms_ == out_.forms_) {
             previous_ = previous;
+            out_.asks_fonts_ = previous->asks_fonts_;
             if (previous->kept_.size() + 1 < kMaxKeptGenerations) {
                 out_.kept_ = previous->kept_;
                 out_.kept_.push_back(previous->storage_);

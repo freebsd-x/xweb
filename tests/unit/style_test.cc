@@ -1189,3 +1189,14 @@ TEST(Restyle, AChainGoesThroughShadowTrees) {
     EXPECT_GE(in_shadow, 10u);
     EXPECT_FALSE(StyledDocument::chainOf(elementById(*doc, "i"), *doc, css::MediaContext{800, 600}, {}, {}, nullptr, &fresh)->styleOf(elementById(*doc, "i")));   // in no slot
 }
+
+TEST(Restyle, AsksFontsOnlyForCh) {
+    auto doc = parseHtml("<!doctype html><style>#a{width:10em}</style><p id=a>x</p>");
+    const StyledDocument plain(*doc, css::MediaContext{800, 600});
+    EXPECT_FALSE(plain.asksFonts());
+    auto doc2 = parseHtml("<!doctype html><style>#a{width:10ch}</style><p id=a>x</p>");
+    const StyledDocument ch(*doc2, css::MediaContext{800, 600});
+    EXPECT_TRUE(ch.asksFonts());
+    const StyledDocument kept(*doc2, css::MediaContext{800, 600}, {}, {}, nullptr, &ch);
+    EXPECT_TRUE(kept.asksFonts());
+}

@@ -417,6 +417,12 @@ private:
 // nothing if it doesn't parse as a module. For loaders that fetch a graph ahead.
 std::vector<std::string> moduleRequests(std::string_view source);
 
+// A script or module parsed before it's run, on any thread: running that very source
+// takes the parse instead of making its own (moduleRequests looks at it too). What's never
+// run is let go as others come, or by forgetParsed.
+void parseAhead(const std::string& source, bool module);
+void forgetParsed();
+
 // What a module loader gives the runtime: the source at a URL, or an error.
 struct ModuleSource {
     bool ok = false;
