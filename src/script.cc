@@ -1866,20 +1866,78 @@ void PageScript::run(const std::function<std::optional<std::string>(const std::s
     s.collect();
 }
 
-bool PageScript::click(Node* target, float page_x, float page_y) {
-    Impl& s = *impl_;
-    if (!target) return true;
-    const float sy = s.host.scroll_y ? s.host.scroll_y() : 0;
-    const auto more = [&](Object* e) {
+bool PageScript::Impl::firePointer(Node* target, const std::u16string& type, bool bubbles, float page_x, float page_y, int buttons, Node* related, bool cancelable) {
+    const float sy = host.scroll_y ? host.scroll_y() : 0;
+    const bool pointer = type.starts_with(u"pointer");
+    return fire(target, type, bubbles, cancelable, [&](Object* e) {
         for (auto [k, v] : std::initializer_list<std::pair<const char16_t*, double>>{
-                 {u"clientX", page_x}, {u"clientY", page_y - sy}, {u"pageX", page_x}, {u"pageY", page_y}, {u"screenX", page_x}, {u"screenY", page_y - sy},
-                 {u"button", 0}, {u"buttons", 1}, {u"detail", 1}})
-            s.rt.put(e, k, Value::number(v), js::kEnumerable);
-        for (const char16_t* k : {u"ctrlKey", u"shiftKey", u"altKey", u"metaKey"}) s.rt.put(e, k, Value::boolean(false), js::kEnumerable);
+                 {u"clientX", page_x}, {u"clientY", page_y - sy}, {u"x", page_x}, {u"y", page_y - sy}, {u"pageX", page_x}, {u"pageY", page_y},
+                 {u"screenX", page_x}, {u"screenY", page_y - sy}, {u"movementX", 0}, {u"movementY", 0},
+                 {u"button", 0}, {u"buttons", static_cast<double>(buttons)}, {u"detail", type == u"click" || type == u"mousedown" || type == u"mouseup" ? 1 : 0}})
+            rt.put(e, k, Value::number(v), js::kEnumerable);
+        for (const char16_t* k : {u"ctrlKey", u"shiftKey", u"altKey", u"metaKey"}) rt.put(e, k, Value::boolean(false), js::kEnumerable);
+        rt.put(e, u"relatedTarget", related ? wrap(related) : Value::null(), js::kEnumerable);
+        if (pointer) {
+            rt.put(e, u"pointerId", Value::number(1), js::kEnumerable);
+            rt.put(e, u"pointerType", str("mouse"), js::kEnumerable);
+            rt.put(e, u"isPrimary", Value::boolean(true), js::kEnumerable);
+        }
+    });
+}
+
+bool PageScript::click(Node* target, float page_x, float page_y) {
+    if (!target) return true;
+    return impl_->firePointer(target, u"click", true, page_x, page_y, 0, nullptr, true);
+}
+
+void PageScript::pointerMoved(Node* target, Node* from, float page_x, float page_y) {
+    Impl& s = *impl_;
+    if (target != from) {
+        const auto chain = [](Node* n) {
+            std::vector<Node*> out;
+            for (; n; n = n->parent ? n->parent : n->shadow_host)
+                if (n->isElement()) out.push_back(n);
+            return out;
+        };
+        const std::vector<Node*> left = chain(from), entered = chain(target);
+        const auto in = [](const std::vector<Node*>& v, Node* n) { return std::find(v.begin(), v.end(), n) != v.end(); };
+        if (from) {
+            for (const char16_t* t : {u"pointerout", u"mouseout"}) s.firePointer(from, t, true, page_x, page_y, 0, target, true);
+            for (Node* n : left)
+                if (!in(entered, n))
+                    for (const char16_t* t : {u"pointerleave", u"mouseleave"}) s.firePointer(n, t, false, page_x, page_y, 0, target, false);
+        }
+        if (target) {
+            for (const char16_t* t : {u"pointerover", u"mouseover"}) s.firePointer(target, t, true, page_x, page_y, 0, from, true);
+            for (auto it = entered.rbegin(); it != entered.rend(); ++it)
+                if (!in(left, *it))
+                    for (const char16_t* t : {u"pointerenter", u"mouseenter"}) s.firePointer(*it, t, false, page_x, page_y, 0, from, false);
+        }
+    }
+    if (target)
+        for (const char16_t* t : {u"pointermove", u"mousemove"}) s.firePointer(target, t, true, page_x, page_y, 0, nullptr, true);
+}
+
+bool PageScript::pointerPressed(Node* target, bool down, float page_x, float page_y) {
+    if (!target) return true;
+    impl_->firePointer(target, down ? u"pointerdown" : u"pointerup", true, page_x, page_y, down ? 1 : 0, nullptr, true);
+    return impl_->firePointer(target, down ? u"mousedown" : u"mouseup", true, page_x, page_y, down ? 1 : 0, nullptr, true);
+}
+
+void PageScript::focusMoved(Node* from, Node* to) {
+    Impl& s = *impl_;
+    if (from == to) return;
+    const auto tell = [&](Node* n, const char16_t* type, bool bubbles, Node* related) {
+        s.fire(n, type, bubbles, false, [&](Object* e) { s.rt.put(e, u"relatedTarget", related ? s.wrap(related) : Value::null(), js::kEnumerable); });
     };
-    s.fire(target, u"mousedown", true, true, more);
-    s.fire(target, u"mouseup", true, true, more);
-    return s.fire(target, u"click", true, true, more);
+    if (from) {
+        tell(from, u"blur", false, to);
+        tell(from, u"focusout", true, to);
+    }
+    if (to) {
+        tell(to, u"focus", false, from);
+        tell(to, u"focusin", true, from);
+    }
 }
 
 bool PageScript::submit(Node* form, Node* submitter) {

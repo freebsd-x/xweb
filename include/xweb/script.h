@@ -109,6 +109,12 @@ public:
 
     // The user's doing, as events. Each returns false if a script cancelled the default.
     bool click(Node* target, float page_x, float page_y);
+    // The pointer moved over `target` from `from` (what it was over): mousemove, and
+    // over/out, enter/leave when they differ. Pressed or let go: mousedown, mouseup.
+    void pointerMoved(Node* target, Node* from, float page_x, float page_y);
+    bool pointerPressed(Node* target, bool down, float page_x, float page_y);
+    // Typing goes to `to` now, from `from` (either null).
+    void focusMoved(Node* from, Node* to);
     bool submit(Node* form, Node* submitter);
     void input(Node* control);
     void change(Node* control);

@@ -758,6 +758,15 @@ public:
     void invalidate() {
         dirty_ = true;
         ++change_gen_;
+        states_only_ = false;
+    }
+    // What's hovered or pressed has changed: styled again, if any rule goes by that, and
+    // laid out only if a style came out different.
+    void stateChanged() {
+        if (!styles_ || !styles_->statesMatter()) return;
+        const bool only = !dirty_ || states_only_;
+        invalidate();
+        states_only_ = only;
     }
     // A web font has come: styles measured in ch are measured again, not kept.
     void fontsChanged() {
@@ -1422,6 +1431,10 @@ private:
         mix(page_->failed_images.size());
         mix(page_->requested.size() >= kMaxImages);
         mix(page_->forms.version);
+        if (attributes) {
+            mix(reinterpret_cast<uintptr_t>(page_->forms.hovered));
+            mix(reinterpret_cast<uintptr_t>(page_->forms.pressed));
+        }
         mix(reinterpret_cast<uintptr_t>(page_->forms.focused));
         mix(page_->forms.caret);
         return h;
@@ -1445,8 +1458,16 @@ private:
             Timed styled{perf_.on, perf_.layout_style_ms};
             styles_ = makeStyles(width, height, missing_sheets);
         }
+        const bool same = states_only_ && keepsLayouts() && styles_unbroken_ && styles_->allKept() && missing_sheets.empty() &&
+                          width == laid_out_for_w_ && height == laid_out_for_h_ && contentPrint(false) == laid_out_print_;
+        states_only_ = false;
         restyled_.reset();
         restyled_missing_.clear();
+        if (same) {
+            stale_ = false;
+            chain_styles_.reset();
+            return;
+        }
         stale_ = false;   // styled whole now
         chain_styles_.reset();
         fonts_changed_ = false;
@@ -1462,6 +1483,8 @@ private:
         }
         layout_ = web::layoutPage(*page.doc, styles, measurer_, &images_, width, height, &page_->forms);
         styles_unbroken_ = true;
+        laid_out_for_w_ = width;
+        laid_out_for_h_ = height;
         laid_out_print_ = contentPrint(false);
         laid_out_full_print_ = contentPrint(true);
         spliceFrames();
@@ -2252,6 +2275,8 @@ private:
     std::vector<std::string> restyled_missing_;
     uint64_t change_gen_ = 0, restyled_gen_ = 0;
     float restyled_w_ = 0, restyled_h_ = 0;
+    bool states_only_ = false;           // all that's changed since is what's hovered or pressed
+    float laid_out_for_w_ = 0, laid_out_for_h_ = 0;
     bool styles_unbroken_ = false;       // each restyle since the last layout kept every style
     uint64_t laid_out_print_ = 0, laid_out_full_print_ = 0;   // contentPrint() at the last layout
     bool fonts_changed_ = false;
@@ -2991,6 +3016,18 @@ public:
             const web::Node* c = node_->controlAt(x, y);
             const web::ControlKind k = web::controlKind(c);
             node_->setCursor(web::isTypedInto(k) ? CursorShape::Text : (c || node_->linkAt(x, y)) ? CursorShape::Pointer : CursorShape::Default);
+            if (page && !node_->openPopup()) {
+                web::Node* over = node_->nodeAt(x, y);
+                auto* from = const_cast<web::Node*>(page->forms.hovered);
+                if (over != from) {
+                    page->forms.hovered = over;
+                    node_->stateChanged();
+                }
+                if (page->script) {
+                    page->script->pointerMoved(over, from, x, y);
+                    if (page->script->takeDirty()) changed();
+                }
+            }
             return false;
         }
         if (event.type_ == InputEventType::MouseButton) {
@@ -3009,9 +3046,27 @@ public:
             }
             const web::Node* control = page ? node_->controlAt(x, y) : nullptr;
             const web::ControlKind kind = web::controlKind(control);
+            web::Node* pressed_on = page ? const_cast<web::Node*>(page->forms.pressed) : nullptr;
+            if (page) {
+                page->forms.pressed = down ? node_->nodeAt(x, y) : nullptr;
+                if (page->forms.pressed != pressed_on) node_->stateChanged();
+            }
+            if (down && page && page->script) {
+                // A press a script cancels moves no focus.
+                const bool go_on = page->script->pointerPressed(node_->nodeAt(x, y), true, x, y);
+                if (page->script->takeDirty()) changed();
+                if (!go_on) {
+                    pressed_control_ = control;
+                    if (!control) return handleLinkClick(down, x, y);
+                    return true;
+                }
+            }
             if (!down && page && page->script) {
-                // Scripts hear the click first, and may cancel what it would do.
+                // Scripts hear the click first, and may cancel what it would do. It's at what
+                // both the press and the letting go were on.
                 web::Node* target = node_->nodeAt(x, y);
+                (void)page->script->pointerPressed(target, false, x, y);
+                while (pressed_on && target && !web::isOrHolds(target, pressed_on)) target = target->parent ? target->parent : target->shadow_host;
                 const bool go_on = page->script->click(target, x, y);
                 if (page->script->takeDirty()) changed();
                 if (!go_on) {
@@ -3179,8 +3234,10 @@ private:
     void focusField(const web::Node* field, size_t caret) {
         Page* page = node_->page();
         if (!page) return;
+        auto* from = const_cast<web::Node*>(page->forms.focused);
         page->forms.focused = field;
         page->forms.caret = std::min(caret, page->forms.value(field).size());
+        if (page->script) page->script->focusMoved(from, const_cast<web::Node*>(field));
         XApplication::requestFocus(shared_from_this());
         if (auto* bus = XApplication::getBus()) {
             if (web::controlKind(field) == web::ControlKind::Password) {
@@ -3197,7 +3254,9 @@ private:
     void blur() {
         Page* page = node_->page();
         if (!page || !page->forms.focused) return;
+        auto* from = const_cast<web::Node*>(page->forms.focused);
         page->forms.focused = nullptr;
+        if (page->script) page->script->focusMoved(from, nullptr);
         if (auto* bus = XApplication::getBus())
             bus->Call("com.freebsdx.IME", static_cast<uint32_t>(fbx::shared::IMEOpcode::Deactivate), {}, [](const fbx::shared::XBusMessage&) {});
         changed();

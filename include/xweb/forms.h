@@ -64,6 +64,9 @@ public:
     // The control being typed into, and where in it (a byte offset into value()).
     const Node* focused = nullptr;
     size_t caret = 0;
+    // What the pointer is over, and what it's pressed on: :hover, :active.
+    const Node* hovered = nullptr;
+    const Node* pressed = nullptr;
     uint64_t version = 0;   // of what's in the controls: each change another
 
 private:

@@ -78,6 +78,13 @@ void assignedNodes(const Node* slot, std::vector<const Node*>& out);
 // parent's shadow root, as declarative shadow DOM has it.
 void attachDeclarativeShadowRoots(class Document& doc);
 
+// Whether `el` is `n` or what it's in, shadow trees' hosts among those.
+[[nodiscard]] inline bool isOrHolds(const Node* el, const Node* n) {
+    for (; n; n = n->parent ? n->parent : n->shadow_host)
+        if (n == el) return true;
+    return false;
+}
+
 // Whether an <img> is to be fetched only when it comes near what's shown.
 [[nodiscard]] inline bool loadsLazily(const Node* img) {
     const std::string* v = img->attr("loading");

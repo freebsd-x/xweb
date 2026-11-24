@@ -1015,3 +1015,48 @@ TEST(Restyle, AnAnchorlessHasGoesByWhatItLooksFor) {
     again("not any more");
     EXPECT_EQ(styles->styleOf(elementById(*doc, "s"))->font_size, 16);
 }
+
+// What's hovered, pressed and focused: what a rule asks it of restyles, and what's under that.
+TEST(Restyle, StatesRestyleWhatTheyCanChange) {
+    auto doc = parseHtml(R"(<!doctype html><style>
+        .m:hover .d { font-size: 30px } a:active { color: rgb(1, 2, 3) } .f:focus-within { color: rgb(4, 5, 6) }
+        .x:not(:hover) { font-size: 21px } .p:has(.k:hover) { font-size: 22px } .s:hover + i { font-size: 23px }
+      </style><p id=other>o</p><div class=m id=m><b class=d id=d>x</b></div><a id=a>a</a><div class=f id=f><input id=q></div>
+      <u class=x id=x>x</u><div class=p id=p><em class=k id=k>k</em></div><s class=s id=s>s</s><i id=i>i</i>)");
+    FormState forms;
+    const auto make = [&](const StyledDocument* previous) {
+        return std::make_unique<StyledDocument>(*doc, css::MediaContext{800, 600}, StyledDocument::SheetLoader{}, StyledDocument::ChMeasure{}, &forms, previous);
+    };
+    auto styles = make(nullptr);
+    EXPECT_TRUE(styles->statesMatter());
+    const auto by = [&](const char* id) { return styles->styleOf(elementById(*doc, id)); };
+    const ComputedStyle* other = by("other");
+    int steps = 0;
+    const auto go = [&](const char* step) {
+        styles = make(styles.get());
+        const auto fresh = make(nullptr);
+        for (const char* id : {"other", "m", "d", "a", "f", "q", "x", "p", "k", "s", "i"}) {
+            EXPECT_EQ(by(id)->font_size, fresh->styleOf(elementById(*doc, id))->font_size) << step << " " << id;
+            EXPECT_EQ(by(id)->color, fresh->styleOf(elementById(*doc, id))->color) << step << " " << id;
+        }
+        if (++steps < 6) EXPECT_EQ(by("other"), other) << step;   // kept (and copied, after some generations)
+    };
+    forms.hovered = elementById(*doc, "d"); go("over the menu's child");
+    EXPECT_EQ(by("d")->font_size, 30);
+    forms.hovered = elementById(*doc, "other"); go("over something else");
+    EXPECT_EQ(by("d")->font_size, 16);
+    forms.hovered = elementById(*doc, "x"); go("not :not");
+    EXPECT_EQ(by("x")->font_size, 16);
+    forms.hovered = elementById(*doc, "k"); go("for what holds it");
+    EXPECT_EQ(by("p")->font_size, 22);
+    forms.hovered = elementById(*doc, "s"); go("for its sibling");
+    EXPECT_EQ(by("i")->font_size, 23);
+    forms.hovered = nullptr;
+    forms.pressed = elementById(*doc, "a"); go("pressed");
+    EXPECT_EQ(by("a")->color, (Color{1, 2, 3, 255}));
+    forms.pressed = nullptr;
+    forms.focused = elementById(*doc, "q"); go("focused");
+    EXPECT_EQ(by("f")->color, (Color{4, 5, 6, 255}));
+    forms.focused = nullptr; go("none of them");
+    EXPECT_EQ(by("x")->font_size, 21);
+}

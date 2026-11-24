@@ -1838,6 +1838,8 @@ public:
             bool has_args_siblings = false;
             bool style_selector = false, follow_any = false, follow_exact_any = false;
             std::unordered_set<std::string> inherit_used;
+            bool state_any = false;
+            std::unordered_set<uint32_t> state_anchors;
             std::unordered_set<uint32_t> follow_anchors, follow_exact_anchors;
         };
         static std::mutex mutex;
@@ -1878,6 +1880,8 @@ public:
                 has_args_ = last->has_args;
                 has_args_siblings_ = last->has_args_siblings;
                 style_selector_ = last->style_selector;
+                state_any_ = last->state_any;
+                state_anchors_ = last->state_anchors;
                 follow_any_ = last->follow_any;
                 follow_anchors_ = last->follow_anchors;
                 follow_exact_any_ = last->follow_exact_any;
@@ -1908,6 +1912,8 @@ public:
         made->has_args = has_args_;
         made->has_args_siblings = has_args_siblings_;
         made->style_selector = style_selector_;
+        made->state_any = state_any_;
+        made->state_anchors = state_anchors_;
         made->follow_any = follow_any_;
         made->follow_anchors = follow_anchors_;
         made->follow_exact_any = follow_exact_any_;
@@ -1965,6 +1971,7 @@ public:
         std::vector<const Node*> stack;
         const auto t0 = std::chrono::steady_clock::now();
         walk(root, initial, 0, doc_p_, nullptr);
+        out_.states_matter_ = state_any_ || !state_anchors_.empty();
         out_.all_kept_ = previous_ && dbg_kept_ == out_.keys_.size() && previous_->keys_.size() == out_.keys_.size();
         static const bool dbg = std::getenv("XWEB_DEBUG_RESTYLE") != nullptr;
         if (dbg)
@@ -2015,6 +2022,7 @@ private:
                 noteHasAnchors(sel);
                 if (!style_selector_) style_selector_ = asksForStyleAttribute(sel);
                 noteFollowing(sel);
+                noteStates(sel);
                 index(sel, rule, origin);
             }
             for (const Declaration& d : rule.declarations)
@@ -2355,7 +2363,13 @@ private:
                 if (const std::string* v = p->attr("lang")) return lower(*v).starts_with(lower(s.value));
             return false;
         }
-        // :hover, :visited, :focus and other states of a page nobody has touched yet.
+        if (stateOf(n)) {
+            const FormState* f = out_.forms_;
+            if (!f) return false;
+            if (n == "focus" || n == "focus-visible") return f->focused == el;
+            return isOrHolds(el, n == "hover" ? f->hovered : n == "active" ? f->pressed : f->focused);
+        }
+        // :visited, and other states of a page nobody has touched yet.
         return false;
     }
 
@@ -4726,6 +4740,11 @@ private:
         });
         h = mix(h, empty);
         if (const FormState* f = out_.forms_) {
+            if ((f->hovered || f->pressed || f->focused) && (state_any_ || anchorIn(el, state_anchors_))) {
+                const unsigned bits = (isOrHolds(el, f->hovered) ? 1u : 0u) | (isOrHolds(el, f->pressed) ? 2u : 0u) |
+                                      (f->focused == el ? 4u : 0u) | (isOrHolds(el, f->focused) ? 8u : 0u);
+                if (bits) h = mix(h, 0x5A7E + bits);
+            }
             const ControlKind k = controlKind(el);
             if (k == ControlKind::Checkbox || k == ControlKind::Radio) h = mix(h, f->checked(el) ? 2 : 3);
             if (el->isHtml("option")) {
@@ -4783,6 +4802,41 @@ private:
     }
 
     // `exact`: counts them (:nth-last-*), not just whether there are any.
+    // Which of the states that come and go with the pointer and the keyboard this is.
+    static int stateOf(const std::string& n) {
+        return n == "hover" ? 1 : n == "active" ? 2 : n == "focus" || n == "focus-visible" || n == "focus-within" ? 4 : 0;
+    }
+    static bool asksForState(const SimpleSelector& x) {
+        if (x.kind == SimpleKind::PseudoClass && stateOf(x.name)) return true;
+        for (const ComplexSelector& a : x.args)
+            for (const CompoundSelector& c : a.parts)
+                for (const SimpleSelector& y : c.simple)
+                    if (asksForState(y)) return true;
+        return false;
+    }
+    // The elements a rule asks the state of, as noteFollowing: only theirs is in their keys.
+    // (`told`: it's asked of an element whose own compound has told it already, as :not()'s is.)
+    void noteStates(const ComplexSelector& sel, bool told = false) {
+        for (size_t i = 0; i < sel.parts.size(); ++i) {
+            const CompoundSelector& c = sel.parts[i];
+            if (std::none_of(c.simple.begin(), c.simple.end(), asksForState)) continue;
+            bool noted = told && i + 1 == sel.parts.size();
+            for (const SimpleSelector& y : c.simple) {
+                if (noted) break;
+                if (y.kind == SimpleKind::Type) state_anchors_.insert(featureHash('t', y.name));
+                else if (y.kind == SimpleKind::Id) state_anchors_.insert(featureHash('i', y.name));
+                else if (y.kind == SimpleKind::Class) state_anchors_.insert(featureHash('c', y.name));
+                else continue;
+                noted = true;
+                break;
+            }
+            if (!noted) state_any_ = true;
+            // In :has(), :is() and the like, others' too.
+            for (const SimpleSelector& y : c.simple)
+                for (const ComplexSelector& a : y.args) noteStates(a, noted && y.name != "has");
+        }
+    }
+
     static bool asksForFollowing(const SimpleSelector& x, bool exact) {
         if (x.kind == SimpleKind::PseudoClass &&
             (exact ? x.name == "nth-last-child" || x.name == "nth-last-of-type"
@@ -5206,6 +5260,8 @@ private:
     bool has_any_anchor_ = false;
     bool style_selector_ = false;   // a selector asks about style attributes ([style])
     // Elements asked about siblings after them (:last-child, ...): any, or with these.
+    bool state_any_ = false;   // an element's :hover, :focus or :active is asked: any's, or of these
+    std::unordered_set<uint32_t> state_anchors_;
     bool follow_any_ = false, follow_exact_any_ = false;
     std::unordered_set<uint32_t> follow_anchors_, follow_exact_anchors_;   // (exact: :nth-last-*)
     std::unordered_set<std::string> inherit_used_;   // properties a rule gives `inherit`

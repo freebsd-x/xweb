@@ -698,6 +698,8 @@ struct PageScript::Impl {
         return dispatch(target ? wrap(target).asObject() : rt.global(), e);
     }
 
+    bool firePointer(Node* target, const std::u16string& type, bool bubbles, float page_x, float page_y, int buttons, Node* related, bool cancelable);
+
     // ── Scripts ──
 
     static std::string trimmed(const std::string& s) {

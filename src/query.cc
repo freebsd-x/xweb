@@ -196,6 +196,12 @@ private:
             }
             return el->attr("checked") || el->attr("selected");
         }
+        if (n == "hover" || n == "active" || n == "focus" || n == "focus-visible" || n == "focus-within") {
+            const FormState* f = queryForms();
+            if (!f) return false;
+            if (n == "focus" || n == "focus-visible") return f->focused == el;
+            return isOrHolds(el, n == "hover" ? f->hovered : n == "active" ? f->pressed : f->focused);
+        }
         if (n == "disabled") return el->attr("disabled") != nullptr;
         if (n == "enabled") return (el->isHtml("input") || el->isHtml("button") || el->isHtml("select") || el->isHtml("textarea")) && !el->attr("disabled");
         return false;
