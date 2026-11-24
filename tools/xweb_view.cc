@@ -616,7 +616,7 @@ std::vector<std::string> imageSources(const Page& page) {
     while (!todo.empty() && out.size() < kMaxImages) {
         const web::Node* n = todo.back();
         todo.pop_back();
-        if (n->isHtml("img"))
+        if (n->isHtml("img") && !web::loadsLazily(n))
             if (const auto src = web::imageSourceOf(n, viewport)) {
                 std::string url = web::resolveUrl(page.base, *src);
                 if (seen.insert(url).second) out.push_back(std::move(url));
@@ -810,7 +810,26 @@ public:
         ~Timed() { if (on) total += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(); }
     };
 
+    // The lazy images that have come near what's shown, asked for.
+    void wantNearImages(Offset at) {
+        if (layout_.lazy_images.empty() || !page_ || !on_images_) return;
+        constexpr float kNear = 2000;
+        int win_w = 0, win_h = 0;
+        XApplication::windowSize(win_w, win_h);
+        const float bottom = win_h > 0 ? static_cast<float>(win_h) : 1200;
+        std::vector<std::string> wanted;
+        std::erase_if(layout_.lazy_images, [&](const web::PageLayout::LazyImage& i) {
+            const float y = i.y + at.y_;
+            if (y + i.h < -kNear || y > bottom + kNear) return false;
+            std::string url = web::resolveUrl(page_->base, i.src);
+            if (!page_->requested.count(url)) wanted.push_back(std::move(url));
+            return true;
+        });
+        if (!wanted.empty()) on_images_(page_, std::move(wanted));
+    }
+
     void paintSelf(fbx::xrender::DisplayList& dl, Offset at) noexcept override {
+        wantNearImages(at);
         ++perf_.paints;
         perf_.report();
         Timed timed{perf_.on, perf_.paint_ms};
@@ -1476,9 +1495,10 @@ private:
         return kept.raster.empty() ? nullptr : &kept;
     }
 
-    void drawRaster(fbx::xrender::DisplayList& dl, const CachedRaster& r, float x, float y, float w, float h) {
+    void drawRaster(fbx::xrender::DisplayList& dl, const CachedRaster& r, float x, float y, float w, float h, float opacity = 1) {
+        if (opacity <= 0) return;
         if (group_) {
-            groupRaster(r.raster, x, y, w, h);
+            groupRaster(r.raster, x, y, w, h, opacity);
             return;
         }
         fbx::shared::ImageData d{};
@@ -1490,6 +1510,7 @@ private:
         d.pixel_ptr_ = r.raster.rgba.data();
         d.pixel_width_ = r.raster.width;
         d.pixel_height_ = r.raster.height;
+        d.opacity_ = opacity;
         dl.addCommand(fbx::shared::CommandType::DrawImage, {reinterpret_cast<const uint8_t*>(&d), sizeof(d)});
     }
 
@@ -1594,7 +1615,7 @@ private:
         std::string fallback;
         if (!memo) fallback = "b:" + boxKey(box) + ":" + keyNum(pw) + "x" + keyNum(ph);
         const std::string& key = memo ? memo->key : fallback;
-        if (const CachedRaster* r = cached(key, [&, pw = pw, ph = ph] { return web::renderBoxPaint(box, w, h, pw, ph); })) drawRaster(dl, *r, x0, y0, w, h);
+        if (const CachedRaster* r = cached(key, [&, pw = pw, ph = ph] { return web::renderBoxPaint(box, w, h, pw, ph); })) drawRaster(dl, *r, x0, y0, w, h, op.opacity);
     }
 
     void inlineSvg(fbx::xrender::DisplayList& dl, const web::PaintOp& op, float x, float y) {
@@ -1651,8 +1672,10 @@ private:
             const LoadedImage* doc = images_.find(href.substr(0, hash_at));
             return doc && doc->svg ? doc->svg->elementById(std::string_view(href).substr(hash_at + 1)) : nullptr;
         };
-        if (const CachedRaster* r = cached(key, [&, pw = pw, ph = ph] { return web::renderSvg(*node, pw, ph, styles, color, nullptr, &external); }))
-            drawRaster(dl, *r, x, y, op.w, op.h);
+        if (const CachedRaster* r = cached(key, [&, pw = pw, ph = ph] {
+                return web::renderSvg(*node, pw, ph, styles, color, nullptr, &external);
+            }))
+            drawRaster(dl, *r, x, y, op.w, op.h, op.opacity);
     }
 
     // A <canvas>'s pixels as its scripts left them: a new image (a new texture) each
@@ -1693,6 +1716,8 @@ private:
     void image(fbx::xrender::DisplayList& dl, const web::PaintOp& op, float x, float y) {
         const LoadedImage* loaded = op.text == web::kCanvasSource ? canvasImage(op.node) : images_.find(op.text);
         if (!loaded) return;
+        const float opacity = op.tint ? 1.0f : static_cast<float>(op.color.a) / 255;   // (a tint's is in what's drawn)
+        if (opacity <= 0) return;
         const bool cropped = op.u0 > 0 || op.v0 > 0 || op.u1 < 1 || op.v1 < 1;
         const bool filtered = op.filter && !op.filter->empty();
         if (loaded->svg || op.tint || op.radius > 0 || filtered || (cropped && group_)) {
@@ -1741,7 +1766,7 @@ private:
                     }
                 return out;
             });
-            if (r) drawRaster(dl, *r, x, y, op.w, op.h);
+            if (r) drawRaster(dl, *r, x, y, op.w, op.h, opacity);
             return;
         }
         if (group_) {
@@ -1749,7 +1774,7 @@ private:
             r.width = loaded->width;
             r.height = loaded->height;
             r.rgba = loaded->pixels;
-            groupRaster(r, x, y, op.w, op.h);
+            groupRaster(r, x, y, op.w, op.h, opacity);
             return;
         }
         fbx::shared::ImageData d{};
@@ -1765,6 +1790,7 @@ private:
         d.uv_y0_ = op.v0;
         d.uv_x1_ = op.u1;
         d.uv_y1_ = op.v1;
+        d.opacity_ = opacity;
         dl.addCommand(fbx::shared::CommandType::DrawImage, {reinterpret_cast<const uint8_t*>(&d), sizeof(d)});
     }
 
@@ -1774,10 +1800,10 @@ private:
     // and handed over as one image; with text in it, it's drawn untransformed.
 
     // Into the group being drawn: a raster shown at (x, y, w, h) on screen.
-    void groupRaster(const web::Raster& r, float x, float y, float w, float h) {
+    void groupRaster(const web::Raster& r, float x, float y, float w, float h, float opacity = 1) {
         if (r.empty()) return;
         const web::Matrix place = web::Matrix::translate(x, y).after(web::Matrix::scaling(w / static_cast<float>(r.width), h / static_cast<float>(r.height)));
-        group_->drawRaster(r, group_m_.after(place));
+        group_->drawRaster(r, group_m_.after(place), opacity);
     }
 
     // The TransformEnd that closes the TransformBegin at `begin` (the list's end if none).
@@ -1841,8 +1867,8 @@ private:
                     break;
                 }
                 case web::PaintKind::Gradient: if (op.gradient) str(gradientKey(*op.gradient)); break;
-                case web::PaintKind::Box: if (op.box) str(boxKey(*op.box)); break;
-                case web::PaintKind::Svg: mix(&op.node, sizeof op.node); break;
+                case web::PaintKind::Box: if (op.box) str(boxKey(*op.box)); mix(&op.opacity, sizeof op.opacity); break;
+                case web::PaintKind::Svg: mix(&op.node, sizeof op.node); mix(&op.opacity, sizeof op.opacity); break;
                 case web::PaintKind::Text:
                     str(op.font.family);
                     mix(&op.font.size, sizeof op.font.size);

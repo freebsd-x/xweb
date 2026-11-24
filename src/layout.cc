@@ -51,7 +51,7 @@ struct Box {
     float pref_width = -1;         // max-content width, once computed
     float min_content = -1;        // min-content width, once computed
     int list_number = 0;
-    const Box* deco_parent = nullptr;   // an inline with a background or border: the next such out
+    const Box* deco_parent = nullptr;   // an inline with a background or border (or faded): the next such out
     float inline_extent = 0;       // how far its widest line reaches, closing padding included
     bool synthetic = false;        // a pseudo-element's image: its node is the layout's own, not the page's
     bool deferred_inline = false;   // a positioned inline's text with a z-index, painted in its layer
@@ -2990,7 +2990,7 @@ private:
                     resolveSpacing(k, cb_width);
                     // Its background and borders are painted around its fragments, line by line.
                     const bool bordered = std::any_of(std::begin(k.border), std::end(k.border), [](float w) { return w > 0; });
-                    if (s.background.visible() || (s.background_layers && !s.masked) || bordered || s.box_shadow) {
+                    if (s.background.visible() || (s.background_layers && !s.masked) || bordered || s.box_shadow || s.opacity < 1) {
                         k.deco_parent = ctx.deco;
                         inner.deco = &k;
                     }
@@ -4087,7 +4087,10 @@ private:
         if (s.hidden) {
             // Not shown, but fetched all the same, as browsers do: a page that hides each
             // picture until its load event (musinsa.com's banners) would wait forever.
-            if (b.node->isHtml("img") && images_ && out_->images_wanted.size() < 512)
+            if (b.node->isHtml("img") && images_ && loadsLazily(b.node)) {
+                if (const std::optional<std::string> src = imageSourceOf(b.node, {vw_, vh_}); src && !src->empty() && !images_->imageSize(*src) && out_->lazy_images.size() < 10000)
+                    out_->lazy_images.push_back({*src, y, b.height});
+            } else if (b.node->isHtml("img") && images_ && out_->images_wanted.size() < 512)
                 if (const std::optional<std::string> src = imageSourceOf(b.node, {vw_, vh_}); src && !src->empty() && !images_->imageSize(*src) &&
                                                                                         std::find(out_->images_wanted.begin(), out_->images_wanted.end(), *src) == out_->images_wanted.end())
                     out_->images_wanted.push_back(*src);
@@ -4158,6 +4161,11 @@ private:
                 out_->ops.push_back(std::move(op));
                 return;
             }
+            if (src && images_ && is_img && loadsLazily(n)) {
+                if (out_->lazy_images.size() < 10000) out_->lazy_images.push_back({*src, transforms_.empty() ? cy : transforms_.back().apply({cx, cy}).y, b.height});
+                if (!b.alt.empty() && !images_->imageLoading(*src)) addText(cx, cy, b.alt, s, opacity);
+                return;
+            }
             // Not loaded: maybe one a script just added. Ask for it.
             if (src && images_ && out_->images_wanted.size() < 512 &&
                 std::find(out_->images_wanted.begin(), out_->images_wanted.end(), *src) == out_->images_wanted.end())
@@ -4166,7 +4174,7 @@ private:
             return;
         }
         if (n->ns == Namespace::Svg && n->name == "svg") {
-            if (b.width <= 0 || b.height <= 0) return;
+            if (b.width <= 0 || b.height <= 0 || opacity <= 0) return;
             PaintOp op;
             op.kind = PaintKind::Svg;
             op.x = cx;
@@ -4174,7 +4182,8 @@ private:
             op.w = b.width;
             op.h = b.height;
             op.node = n;
-            op.color = faded(s.color, opacity);
+            op.color = s.color;
+            op.opacity = opacity;   // (apple.com's menu arrows, hidden by it, showed)
             out_->ops.push_back(std::move(op));
             return;
         }
@@ -4195,6 +4204,7 @@ private:
             p->h = b.outerHeight();
             p->checked = st.checked(n);
             addBoxPaint(x, y, p->w, p->h, std::move(p));
+            out_->ops.back().opacity = opacity;   // (its colours are its own)
             return;
         }
         const FontSpec font = fontOf(s);
@@ -4356,12 +4366,19 @@ private:
             if (!sp.last) frame.padding[Right] = frame.border[Right] = 0;
             frame.width = std::max(0.0f, sp.x1 - sp.x0);
             frame.height = std::max(0.0f, sp.bottom - sp.top);
-            paintFrame(frame, cx + sp.x0 - frame.padding[Left] - frame.border[Left], cy + sp.top - frame.padding[Top] - frame.border[Top], opacity);
+            paintFrame(frame, cx + sp.x0 - frame.padding[Left] - frame.border[Left], cy + sp.top - frame.padding[Top] - frame.border[Top], opacity * decoOpacity(&d));
         }
     }
 
-    void paintFragments(const Box& b, float cx, float cy, const Rect& cb, float opacity) {
-        paintInlineDecorations(b, cx, cy, opacity);
+    // How faded what's in an inline is, by it and those it's in.
+    static float decoOpacity(const Box* d) {
+        float o = 1;
+        for (; d; d = d->deco_parent) o *= d->style->opacity;
+        return o;
+    }
+
+    void paintFragments(const Box& b, float cx, float cy, const Rect& cb, float block_opacity) {
+        paintInlineDecorations(b, cx, cy, block_opacity);
         // A relatively positioned inline with a positive z-index: its text takes its turn
         // among the positioned, not under them with the rest of the line (naver.com's "AI"
         // label went under the z-index:1 pill it sits on).
@@ -4387,7 +4404,8 @@ private:
                 box->fragments.push_back(f);
             }
             for (const auto& [style, box] : made) {
-                Positioned later{box, cx, cy, cb, opacity, order_++, clip_stack_, ctx_ops_, ctx_boxes_};
+                // (Its own opacity comes with its style, when it's painted as a box.)
+                Positioned later{box, cx, cy, cb, block_opacity, order_++, clip_stack_, ctx_ops_, ctx_boxes_};
                 later.in_flow = true;
                 positioned_.push_back(std::move(later));
             }
@@ -4402,6 +4420,8 @@ private:
         };
         for (const auto& f : b.fragments) {
             if (lifted(f)) continue;
+            const float opacity = block_opacity * decoOpacity(f.deco);
+            if (opacity <= 0 && !f.atomic && !f.link) continue;
             if (lifted_atomic(f)) {
                 if (f.link) out_->links.push_back({cx + f.atomic->x, cy + f.atomic->y, f.atomic->outerWidth(), f.atomic->outerHeight(), *f.link});
                 Positioned later{f.atomic, cx, cy, cb, opacity, order_++, clip_stack_, ctx_ops_, ctx_boxes_};
@@ -4426,7 +4446,8 @@ private:
                 }
                 if (f.link) out_->links.push_back({ax, ay, f.atomic->outerWidth(), f.atomic->outerHeight(), *f.link});
                 if (f.atomic->kind == BoxKind::Replaced) {
-                    paintReplaced(*f.atomic, ax, ay, opacity);
+                    // (Its own, unless it's the picture in a block of its own, which has it.)
+                    paintReplaced(*f.atomic, ax, ay, f.atomic->node != b.node ? opacity * f.atomic->style->opacity : opacity);
                 } else {
                     paintContents(*f.atomic, ax, ay, cb, opacity);
                 }
@@ -4708,7 +4729,7 @@ private:
         for (const auto& kp : b.kids) {
             if (kp->outOfFlow()) positioned_.push_back({kp.get(), cx + kp->static_x, cy + kp->static_y, cb, opacity, order_++, clipsFor(*kp), ctx_ops_, ctx_boxes_});
             else if (kp->floating()) pending_floats_.push_back({kp.get(), cx, cy, cb, opacity});
-            else if (kp->kind == BoxKind::Inline) collectOutOfFlowIn(*kp, cx, cy, cb, opacity);
+            else if (kp->kind == BoxKind::Inline) collectOutOfFlowIn(*kp, cx, cy, cb, opacity * kp->style->opacity);
         }
     }
 

@@ -281,7 +281,7 @@ void PageScript::Impl::afterAttr(Node* n, const std::string& name, const std::st
         if (const std::optional<std::string> src = imageSourceOf(n, {host.viewport_w, host.viewport_h})) {
             if (std::find(script_images.begin(), script_images.end(), n) == script_images.end() && script_images.size() < 10000)
                 script_images.push_back(n);
-            host.load_image(resolveUrl(host.base, *src));
+            if (!loadsLazily(n)) host.load_image(resolveUrl(host.base, *src));
         }
     if (n->custom_state != 2) return;
     const CustomDefinition* def = definitionFor(n);

@@ -210,7 +210,8 @@ public:
             s.vp_w = *natural->width;
             s.vp_h = *natural->height;
         }
-        apply(&svg, s);
+        // (In a page, with what its ancestors there give it: fill: currentColor on a button.)
+        apply(&svg, s, natural ? 0 : ~0u);
         children(&svg, s, 0, canvas_);
     }
 
@@ -218,13 +219,13 @@ private:
     const ComputedStyle* styleOf(const Node* n) const { return styles_ ? styles_->styleOf(n) : nullptr; }
 
     // An element's own settings over what it inherits.
-    void apply(const Node* n, State& s) const {
+    void apply(const Node* n, State& s, uint32_t inherited = 0) const {
         const ComputedStyle* st = styleOf(n);
         if (!st) {
             attributeFallback(n, s);
             return;
         }
-        const uint32_t set = st->svg_set;
+        const uint32_t set = st->svg_set | inherited;
         if (set & kSetColor) s.color = st->color;
         if (set & kSetFill) s.fill = st->fill;
         if (set & kSetStroke) s.stroke = st->stroke;

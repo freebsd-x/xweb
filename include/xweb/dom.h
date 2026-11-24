@@ -78,6 +78,12 @@ void assignedNodes(const Node* slot, std::vector<const Node*>& out);
 // parent's shadow root, as declarative shadow DOM has it.
 void attachDeclarativeShadowRoots(class Document& doc);
 
+// Whether an <img> is to be fetched only when it comes near what's shown.
+[[nodiscard]] inline bool loadsLazily(const Node* img) {
+    const std::string* v = img->attr("loading");
+    return v && v->size() == 4 && (*v)[0] != '\0' && std::equal(v->begin(), v->end(), "lazy", [](char a, char b) { return (a | 0x20) == b; });
+}
+
 class Document {
 public:
     Document();

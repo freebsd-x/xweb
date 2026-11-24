@@ -888,3 +888,32 @@ TEST(Paint, AnAbsoluteBoxEscapesClipsBetweenItAndItsContainingBlock) {
     EXPECT_EQ(red_depth, 0);    // e is between it and the viewport: no clip
     EXPECT_EQ(blue_depth, 1);   // its containing block clips it
 }
+
+TEST(Paint, OpacityReachesPicturesSvgControlsAndInlines) {
+    const auto r = layout("<div style='opacity:.5'><svg width=10 height=10></svg><input type=checkbox><span style='opacity:.5;color:red'>a<b>b</b><i style='background:lime'>i</i></span></div>"
+                          "<span style='opacity:0'><svg width=10 height=10></svg></span>");
+    int svgs = 0, boxes = 0, texts = 0;
+    for (const PaintOp& op : r.page.ops) {
+        if (op.kind == PaintKind::Svg) { ++svgs; EXPECT_FLOAT_EQ(op.opacity, 0.5f); }
+        if (op.kind == PaintKind::Box && op.box->part == BoxPaint::Part::Checkbox) { ++boxes; EXPECT_FLOAT_EQ(op.opacity, 0.5f); }
+        if (op.kind == PaintKind::Text && op.color.r == 255) { ++texts; EXPECT_NEAR(op.color.a, 64, 1) << op.text; }
+        if (op.kind == PaintKind::Rect && op.color.g == 255 && op.color.r == 0) EXPECT_NEAR(op.color.a, 64, 1);
+    }
+    EXPECT_EQ(svgs, 1);   // one that can't be seen isn't drawn
+    EXPECT_EQ(boxes, 1);
+    EXPECT_EQ(texts, 3);
+}
+
+TEST(Images, LazyOnesAreForWhenTheyComeNear) {
+    struct None : ImageSizes {
+        std::optional<std::pair<float, float>> imageSize(const std::string&) override { return std::nullopt; }
+    } none;
+    auto doc = parseHtml("<!doctype html><body style='margin:0'><img src=a.png><div style='height:5000px'></div><img loading=LAZY src=b.png width=10 height=20>");
+    const StyledDocument styles(*doc, css::MediaContext{800, 600});
+    FixedText text;
+    const PageLayout page = layoutPage(*doc, styles, text, &none, 800, 600);
+    ASSERT_EQ(page.images_wanted, std::vector<std::string>{"a.png"});
+    ASSERT_EQ(page.lazy_images.size(), 1u);
+    EXPECT_EQ(page.lazy_images[0].src, "b.png");
+    EXPECT_GE(page.lazy_images[0].y, 5000);
+}

@@ -176,7 +176,8 @@ int main(int argc, char** argv) {
                 if (!op.node) break;
                 const auto pw = static_cast<uint32_t>(std::clamp(std::lround(op.w), 1L, 4096L));
                 const auto ph = static_cast<uint32_t>(std::clamp(std::lround(op.h), 1L, 4096L));
-                const Raster r = renderSvg(*op.node, pw, ph, &styles, op.color);
+                Raster r = renderSvg(*op.node, pw, ph, &styles, op.color);
+                for (size_t p = 3; p < r.rgba.size(); p += 4) r.rgba[p] = static_cast<uint8_t>(std::lround(r.rgba[p] * op.opacity));
                 draw(r, op.x, op.y, op.w, op.h);
                 break;
             }

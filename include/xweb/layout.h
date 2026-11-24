@@ -77,6 +77,7 @@ struct PaintOp {
     const Node* node = nullptr;
     std::shared_ptr<const BoxPaint> box;
     Matrix transform;      // TransformBegin
+    float opacity = 1;     // Svg, Box: all of it. (An Image's is its colour's alpha, but a tint's.)
 };
 
 struct LinkArea {
@@ -98,6 +99,11 @@ struct PageLayout {
     std::vector<ElementBox> boxes;
     std::string title;
     std::vector<std::string> images_wanted;   // CSS images it would have drawn, not loaded yet
+    struct LazyImage {
+        std::string src;
+        float y = 0, h = 0;
+    };
+    std::vector<LazyImage> lazy_images;       // <img loading=lazy>s not loaded yet: wanted when they come near
 };
 
 // A StyledDocument::ChMeasure that asks `text`.
