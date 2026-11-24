@@ -334,6 +334,22 @@ TEST(Svg, GradientFillAndClipPath) {
     EXPECT_EQ(at(r, 75, 5).a, 0);   // clipped away
 }
 
+TEST(Svg, Masks) {
+    const Raster r = svgOf("<svg width='90' height='10'>"
+                           "<mask id='l'><rect width='30' height='10' fill='white'/><rect x='30' width='30' height='10' fill='#808080'/></mask>"
+                           "<mask id='a' style='mask-type:alpha'><rect width='30' height='10' fill='black'/></mask>"
+                           "<mask id='self'><rect width='90' height='10' fill='white' mask='url(#self)'/></mask>"
+                           "<g mask='url(#l)'><rect width='90' height='5' fill='red'/></g>"
+                           "<rect y='5' width='90' height='5' fill='blue' mask='url(#a)'/>"
+                           "<rect x='80' width='10' height='10' fill='lime' mask='url(#self)'/></svg>", 90, 10);
+    EXPECT_EQ(at(r, 10, 2).a, 255);
+    EXPECT_NEAR(at(r, 45, 2).a, 128, 2);
+    EXPECT_EQ(at(r, 70, 2).a, 0);
+    EXPECT_EQ(at(r, 10, 7).a, 255);
+    EXPECT_EQ(at(r, 45, 7).a, 0);
+    EXPECT_EQ(at(r, 85, 5).g, 255);
+}
+
 TEST(Svg, NaturalSize) {
     auto a = SvgImage::parse("<?xml version='1.0'?><svg width='40' height='20'></svg>");
     ASSERT_TRUE(a);

@@ -311,13 +311,22 @@ private:
         if (clip && !isSvg(clip, "clipPath")) clip = nullptr;
         if (opacity <= 0) return;
         const bool container = name == "g" || name == "svg" || name == "a" || name == "switch" || name == "use";
-        const bool layered = (clip || (container && opacity < 1)) && layers_ < kMaxLayerDepth;
+        const Node* masked = nullptr;
+        if (const std::string* mk = n->attr("mask"); mk && mk->starts_with("url(")) {
+            const size_t h = mk->find('#'), e = mk->find_first_of("\"')", h == std::string::npos ? 0 : h);
+            if (h != std::string::npos && e != std::string::npos) masked = lookup(mk->substr(h, e - h));
+            // (Not of one bounding box's size, nor inside itself.)
+            const std::string* units = masked ? masked->attr("maskContentUnits") : nullptr;
+            if (masked && (!isSvg(masked, "mask") || (units && *units == "objectBoundingBox") || active_.count(masked))) masked = nullptr;
+        }
+        const bool layered = (clip || masked || (container && opacity < 1)) && layers_ < kMaxLayerDepth;
         if (layered) {
             ++layers_;
             Canvas layer(into.width(), into.height());
             drawElement(n, s, depth, layer, container ? 1.0f : opacity);
             std::optional<Canvas> mask;
             if (clip) mask = clipCoverage(clip, s, depth);
+            if (masked) mask = maskCoverage(masked, s, depth, mask ? &*mask : nullptr);
             into.composite(layer, container ? opacity : 1.0f, mask ? &*mask : nullptr);
             --layers_;
             return;
@@ -619,6 +628,35 @@ private:
                 into.fill(c, false, *paint);
             }
         }
+    }
+
+    // A <mask>'s own drawing as coverage: how light it is, or (mask-type: alpha) how opaque.
+    Canvas maskCoverage(const Node* mask, const State& s, int depth, const Canvas* clip) {
+        State ms;
+        ms.m = s.m;
+        ms.color = s.color;
+        ms.vp_w = s.vp_w;
+        ms.vp_h = s.vp_h;
+        apply(mask, ms);
+        Canvas drawn(canvas_.width(), canvas_.height());
+        active_.insert(mask);
+        children(mask, ms, depth + 1, drawn);
+        active_.erase(mask);
+        const std::string* type = mask->attr("mask-type");
+        const std::string* css = mask->attr("style");
+        bool alpha = type && *type == "alpha";
+        if (css)
+            if (const size_t at = css->find("mask-type:"); at != std::string::npos) {
+                const size_t v = css->find_first_not_of(' ', at + 10);
+                alpha = v != std::string::npos && css->compare(v, 5, "alpha") == 0;
+            }
+        const std::vector<float>& px = drawn.pixels();
+        std::vector<float> cover(px.size() / 4);
+        for (size_t i = 0; i < cover.size(); ++i) {
+            cover[i] = alpha ? px[i * 4 + 3] : 0.2126f * px[i * 4] + 0.7152f * px[i * 4 + 1] + 0.0722f * px[i * 4 + 2];
+            if (clip) cover[i] *= clip->pixels()[i * 4 + 3];
+        }
+        return Canvas::fromAlpha(canvas_.width(), canvas_.height(), cover);
     }
 
     Canvas clipCoverage(const Node* clip, const State& s, int depth) {
