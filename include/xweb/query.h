@@ -11,6 +11,11 @@
 
 namespace fbx::xweb {
 
+// The controls' state :checked goes by, as scripts ask (null: their attributes). UI thread.
+class FormState;
+void setQueryForms(const FormState* forms);
+[[nodiscard]] const FormState* queryForms();
+
 // Nullopt if the text isn't a valid selector list (the DOM then throws SyntaxError).
 [[nodiscard]] std::optional<std::vector<css::ComplexSelector>> parseSelectors(std::string_view text);
 [[nodiscard]] bool matchesSelectors(const Node* element, const std::vector<css::ComplexSelector>& selectors);

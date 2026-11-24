@@ -1804,9 +1804,14 @@ void PageScript::Impl::install() {
 
 // ── The public face ───────────────────────────────────────────────────────────
 
-PageScript::PageScript(Document& doc, Host host) : impl_(std::make_unique<Impl>(doc, std::move(host))) { impl_->install(); }
+PageScript::PageScript(Document& doc, Host host) : impl_(std::make_unique<Impl>(doc, std::move(host))) {
+    setQueryForms(impl_->host.forms);
+    impl_->install();
+}
 
-PageScript::~PageScript() = default;
+PageScript::~PageScript() {
+    if (impl_ && queryForms() == impl_->host.forms) setQueryForms(nullptr);
+}
 
 void PageScript::run(const std::function<std::optional<std::string>(const std::string&)>& source) {
     Impl& s = *impl_;

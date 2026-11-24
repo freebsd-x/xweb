@@ -1965,6 +1965,7 @@ public:
         std::vector<const Node*> stack;
         const auto t0 = std::chrono::steady_clock::now();
         walk(root, initial, 0, doc_p_, nullptr);
+        out_.all_kept_ = previous_ && dbg_kept_ == out_.keys_.size() && previous_->keys_.size() == out_.keys_.size();
         static const bool dbg = std::getenv("XWEB_DEBUG_RESTYLE") != nullptr;
         if (dbg)
             std::fprintf(stderr, "[restyle] %zu elements, %zu kept, %zu shared, %.0f ms; previous %d context %d%s\n", out_.keys_.size(), dbg_kept_, dbg_shared_,

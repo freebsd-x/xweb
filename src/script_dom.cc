@@ -240,6 +240,7 @@ void PageScript::Impl::noteSlots(Node* root) {
 }
 
 void PageScript::Impl::afterInsert(Node* parent, Node* child, Node* prev, Node* next) {
+    if (parent->isHtml("style")) parent->adopted_css.clear();   // a new sheet: what was inserted in the old is gone
     queueMutation(u"childList", parent, {child}, {}, prev, next, nullptr, nullptr);
     if (parent->shadow_root) noteSlots(parent->shadow_root);
     if (Node* r = parent->shadow_host ? parent : const_cast<Node*>(parent->containingShadowRoot())) noteSlots(r);
@@ -259,6 +260,7 @@ void PageScript::Impl::afterInsert(Node* parent, Node* child, Node* prev, Node* 
 }
 
 void PageScript::Impl::afterRemove(Node* parent, Node* child, Node* prev, Node* next, bool was_connected) {
+    if (parent->isHtml("style")) parent->adopted_css.clear();   // a new sheet: what was inserted in the old is gone
     queueMutation(u"childList", parent, {}, {child}, prev, next, nullptr, nullptr);
     if (parent->shadow_root) noteSlots(parent->shadow_root);
     if (Node* r = parent->shadow_host ? parent : const_cast<Node*>(parent->containingShadowRoot())) noteSlots(r);
@@ -291,6 +293,7 @@ void PageScript::Impl::afterAttr(Node* n, const std::string& name, const std::st
 }
 
 void PageScript::Impl::afterCharacterData(Node* n, const std::string& old) {
+    if (n->parent && n->parent->isHtml("style")) n->parent->adopted_css.clear();
     queueMutation(u"characterData", n, {}, {}, nullptr, nullptr, nullptr, &old);
 }
 

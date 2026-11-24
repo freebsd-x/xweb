@@ -64,6 +64,7 @@ public:
     // The control being typed into, and where in it (a byte offset into value()).
     const Node* focused = nullptr;
     size_t caret = 0;
+    uint64_t version = 0;   // of what's in the controls: each change another
 
 private:
     struct State {

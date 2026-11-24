@@ -917,3 +917,14 @@ TEST(Images, LazyOnesAreForWhenTheyComeNear) {
     EXPECT_EQ(page.lazy_images[0].src, "b.png");
     EXPECT_GE(page.lazy_images[0].y, 5000);
 }
+
+TEST(Inline, PlainInlinesHaveBoxes) {
+    // Scripts measure text by a <span>'s; they were only known of ones with a background or border.
+    const auto r = layout("<p style='margin:0'><span id=a>abc</span> <em id=b><b id=c>de</b>f</em><i id=d style='position:relative;top:5px;left:2px'>g</i></p>");
+    EXPECT_FLOAT_EQ(r.box("a").x, 0);
+    EXPECT_GT(r.box("a").w, 0);
+    EXPECT_FLOAT_EQ(r.box("c").x, r.box("b").x);
+    EXPECT_LT(r.box("c").w, r.box("b").w);
+    EXPECT_FLOAT_EQ(r.box("d").x, r.box("b").x + r.box("b").w + 2);
+    EXPECT_FLOAT_EQ(r.box("d").y, r.box("a").y + 5);
+}

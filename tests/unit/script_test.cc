@@ -1412,3 +1412,16 @@ TEST(Script, ListFormatPartsAreElementsAndLiterals) {
         </script>)JS");
     EXPECT_EQ(p.console, "log:e[A]l[ and ]e[B]\nlog:A, B, and C | A & B | A, B, or C | A B | A\n") << p.console;
 }
+
+TEST(Script, CheckedSelectorsGoByTheControls) {
+    Page p(R"JS(<body><input type=checkbox id=c><input type=checkbox checked><select id=s><option>a<option selected>b</select><style id=st></style><script>
+        const n = () => document.querySelectorAll('input:checked').length;
+        const o = [n()];
+        document.getElementById('c').checked = true; o.push(n());
+        document.querySelectorAll('input')[1].checked = false; o.push(n(), document.getElementById('c').matches(':checked'));
+        const st = document.getElementById('st'); st.sheet.insertRule('a{}', 0); o.push(st.sheet.cssRules.length);
+        st.textContent = 'b{} c{}'; o.push(st.sheet.cssRules.length);
+        console.log(...o);
+        </script>)JS");
+    EXPECT_EQ(p.console, "log:1 2 1 true 1 2\n") << p.console;
+}

@@ -2,11 +2,18 @@
 // from the cascade's prepared index.
 
 #include "xweb/query.h"
+#include "xweb/forms.h"
 
 #include <algorithm>
 #include <cctype>
 
 namespace fbx::xweb {
+
+namespace {
+const FormState* g_query_forms = nullptr;
+}
+void setQueryForms(const FormState* forms) { g_query_forms = forms; }
+const FormState* queryForms() { return g_query_forms; }
 
 namespace {
 
@@ -175,7 +182,20 @@ private:
         if (n == "nth-last-of-type") return nth(s.a, s.b, p.type_count - p.type_index + 1);
         if (n == "empty") return std::none_of(el->children.begin(), el->children.end(), [](const Node* c) { return c->isElement() || (c->type == NodeType::Text && !c->data.empty()); });
         if (n == "link" || n == "any-link") return (el->isHtml("a") || el->isHtml("area")) && el->attr("href");
-        if (n == "checked") return el->attr("checked") || el->attr("selected");
+        if (n == "checked") {
+            if (const FormState* f = queryForms()) {
+                const ControlKind k = controlKind(el);
+                if (k == ControlKind::Checkbox || k == ControlKind::Radio) return f->checked(el);
+                if (el->isHtml("option"))
+                    for (const Node* sel = el->parent; sel; sel = sel->parent)
+                        if (sel->isHtml("select")) {
+                            const auto opts = optionsOf(sel);
+                            const int at = f->selected(sel);
+                            return at >= 0 && static_cast<size_t>(at) < opts.size() && opts[static_cast<size_t>(at)] == el;
+                        }
+            }
+            return el->attr("checked") || el->attr("selected");
+        }
         if (n == "disabled") return el->attr("disabled") != nullptr;
         if (n == "enabled") return (el->isHtml("input") || el->isHtml("button") || el->isHtml("select") || el->isHtml("textarea")) && !el->attr("disabled");
         return false;

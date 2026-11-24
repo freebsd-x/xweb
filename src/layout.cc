@@ -51,7 +51,7 @@ struct Box {
     float pref_width = -1;         // max-content width, once computed
     float min_content = -1;        // min-content width, once computed
     int list_number = 0;
-    const Box* deco_parent = nullptr;   // an inline with a background or border (or faded): the next such out
+    const Box* deco_parent = nullptr;   // an inline: the next out
     float inline_extent = 0;       // how far its widest line reaches, closing padding included
     bool synthetic = false;        // a pseudo-element's image: its node is the layout's own, not the page's
     bool deferred_inline = false;   // a positioned inline's text with a z-index, painted in its layer
@@ -76,7 +76,7 @@ struct Box {
         Box* atomic = nullptr;
         Color background{0, 0, 0, 0};
         const std::string* link = nullptr;
-        const Box* deco = nullptr;      // the innermost inline with a background or border it's in
+        const Box* deco = nullptr;      // the innermost inline it's in
         float baseline = 0;             // its line's
         uint32_t line = 0;              // which line of the block
     };
@@ -2989,11 +2989,9 @@ private:
                         if (const std::string* href = k.node->attr("href")) inner.link = href;
                     resolveSpacing(k, cb_width);
                     // Its background and borders are painted around its fragments, line by line.
-                    const bool bordered = std::any_of(std::begin(k.border), std::end(k.border), [](float w) { return w > 0; });
-                    if (s.background.visible() || (s.background_layers && !s.masked) || bordered || s.box_shadow || s.opacity < 1) {
-                        k.deco_parent = ctx.deco;
-                        inner.deco = &k;
-                    }
+                    // (And its place is known by them: a script measures text by a <span>.)
+                    k.deco_parent = ctx.deco;
+                    inner.deco = &k;
                     const float open = k.margin[Left] + k.padding[Left] + k.border[Left];
                     const float close = k.margin[Right] + k.padding[Right] + k.border[Right];
                     if (open != 0) {
@@ -4321,7 +4319,8 @@ private:
     // Inline boxes' backgrounds and borders: on each line, one box around its fragments,
     // as tall as its font plus its padding and borders; the start and end sides only
     // where the box starts and ends. Outer ones first.
-    void paintInlineDecorations(const Box& b, float cx, float cy, float opacity) {
+    void paintInlineDecorations(const Box& b, float cx, float cy, const Rect& cb, float opacity) {
+        const ComputedStyle* lifted_style = b.deferred_inline ? b.style : nullptr;
         struct Span {
             const Box* box;
             uint32_t line;
@@ -4330,14 +4329,16 @@ private:
             bool first = false, last = false;
         };
         std::vector<Span> spans;
-        std::vector<std::pair<const Box*, size_t>> last_span;   // each box's latest span
+        std::unordered_map<const Box*, size_t> last_span;   // each box's latest span
         for (const auto& f : b.fragments) {
             int depth = 0;
             for (const Box* d = f.deco; d; d = d->deco_parent) ++depth;
             for (const Box* d = f.deco; d && spans.size() < 10000; d = d->deco_parent, --depth) {
-                const auto seen = std::find_if(last_span.begin(), last_span.end(), [&](const auto& e) { return e.first == d; });
+                const auto seen = last_span.find(d);
                 const FontSpec font = fontOf(*d->style);
-                const float top = f.baseline - text_.ascent(font), bottom = f.baseline + text_.descent(font);
+                // (Its own text's place, where that's it: raised, in a <sup>.)
+                const float top = !f.atomic && f.style == d->style ? f.box_top : f.baseline - text_.ascent(font);
+                const float bottom = top + text_.ascent(font) + text_.descent(font);
                 if (seen != last_span.end() && spans[seen->second].line == f.line) {
                     Span& sp = spans[seen->second];
                     sp.x0 = std::min(sp.x0, f.x);
@@ -4345,13 +4346,17 @@ private:
                     continue;
                 }
                 spans.push_back({d, f.line, depth, f.x, f.x + f.w, top, bottom, seen == last_span.end()});
-                if (seen == last_span.end()) last_span.emplace_back(d, spans.size() - 1);
+                if (seen == last_span.end()) last_span.emplace(d, spans.size() - 1);
                 else seen->second = spans.size() - 1;
             }
         }
         if (spans.empty()) return;
         for (const auto& [box, i] : last_span) spans[i].last = true;
         std::stable_sort(spans.begin(), spans.end(), [](const Span& a, const Span& c) { return a.depth < c.depth; });
+        struct Union {
+            float x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+        };
+        std::unordered_map<const Box*, Union> unions;   // each box's, all its lines together
         for (const Span& sp : spans) {
             const Box& d = *sp.box;
             Box frame;
@@ -4366,19 +4371,46 @@ private:
             if (!sp.last) frame.padding[Right] = frame.border[Right] = 0;
             frame.width = std::max(0.0f, sp.x1 - sp.x0);
             frame.height = std::max(0.0f, sp.bottom - sp.top);
-            paintFrame(frame, cx + sp.x0 - frame.padding[Left] - frame.border[Left], cy + sp.top - frame.padding[Top] - frame.border[Top], opacity * decoOpacity(&d));
+            const Point moved = decoShift(&d, cb, lifted_style);
+            const float fx = cx + moved.x + sp.x0 - frame.padding[Left] - frame.border[Left], fy = cy + moved.y + sp.top - frame.padding[Top] - frame.border[Top];
+            if (d.node && d.node->isElement() && !d.synthetic) {
+                auto& u = unions[&d];
+                if (sp.first) u = {fx, fy, fx + frame.outerWidth(), fy + frame.outerHeight()};
+                else u = {std::min(u.x0, fx), std::min(u.y0, fy), std::max(u.x1, fx + frame.outerWidth()), std::max(u.y1, fy + frame.outerHeight())};
+                if (sp.last) recordRect(d.node, u.x0, u.y0, u.x1 - u.x0, u.y1 - u.y0);
+            }
+            const ComputedStyle& ds = *d.style;
+            const bool bordered = std::any_of(std::begin(frame.border), std::end(frame.border), [](float w) { return w > 0; });
+            if (bordered || ds.background.visible() || ds.background_layers || ds.box_shadow || ds.outline)
+                paintFrame(frame, fx, fy, opacity * decoOpacity(&d, lifted_style));
         }
     }
 
     // How faded what's in an inline is, by it and those it's in.
-    static float decoOpacity(const Box* d) {
+    // (`except`: a lifted inline's own style, which is the box's it's painted in.)
+    static float decoOpacity(const Box* d, const ComputedStyle* except = nullptr) {
         float o = 1;
-        for (; d; d = d->deco_parent) o *= d->style->opacity;
+        for (; d; d = d->deco_parent)
+            if (d->style != except) o *= d->style->opacity;
         return o;
+    }
+    // How far it's moved by being positioned relatively, or being in what is.
+    static Point decoShift(const Box* d, const Rect& cb, const ComputedStyle* except) {
+        Point p;
+        for (; d; d = d->deco_parent) {
+            const ComputedStyle& s = *d->style;
+            if (s.position != Position::Relative || d->style == except) continue;
+            if (!s.offset[Left].is_auto) p.x += s.offset[Left].resolve(cb.w);
+            else if (!s.offset[Right].is_auto) p.x -= s.offset[Right].resolve(cb.w);
+            if (!s.offset[Top].is_auto) p.y += s.offset[Top].resolve(cb.h);
+            else if (!s.offset[Bottom].is_auto) p.y -= s.offset[Bottom].resolve(cb.h);
+        }
+        return p;
     }
 
     void paintFragments(const Box& b, float cx, float cy, const Rect& cb, float block_opacity) {
-        paintInlineDecorations(b, cx, cy, block_opacity);
+        paintInlineDecorations(b, cx, cy, cb, block_opacity);
+        const ComputedStyle* lifted_style = b.deferred_inline ? b.style : nullptr;
         // A relatively positioned inline with a positive z-index: its text takes its turn
         // among the positioned, not under them with the rest of the line (naver.com's "AI"
         // label went under the z-index:1 pill it sits on).
@@ -4420,7 +4452,8 @@ private:
         };
         for (const auto& f : b.fragments) {
             if (lifted(f)) continue;
-            const float opacity = block_opacity * decoOpacity(f.deco);
+            const float opacity = block_opacity * decoOpacity(f.deco, lifted_style);
+            const Point moved = decoShift(f.deco, cb, lifted_style);
             if (opacity <= 0 && !f.atomic && !f.link) continue;
             if (lifted_atomic(f)) {
                 if (f.link) out_->links.push_back({cx + f.atomic->x, cy + f.atomic->y, f.atomic->outerWidth(), f.atomic->outerHeight(), *f.link});
@@ -4429,9 +4462,9 @@ private:
                 positioned_.push_back(std::move(later));
                 continue;
             }
-            const float fx = cx + f.x;
+            const float fx = cx + moved.x + f.x;
             if (f.atomic) {
-                float ax = cx + f.atomic->x, ay = cy + f.atomic->y;
+                float ax = cx + moved.x + f.atomic->x, ay = cy + moved.y + f.atomic->y;
                 // (A picture in a wrapper of its own was moved and transformed with the
                 // wrapper: shifted again, a centred thumbnail landed off its frame.)
                 if (f.atomic->node != b.node) shift(*f.atomic, ax, ay);
@@ -4455,7 +4488,7 @@ private:
                 continue;
             }
             const ComputedStyle& s = *f.style;
-            const float fy = cy + f.box_top;
+            const float fy = cy + moved.y + f.box_top;
             if (f.link) out_->links.push_back({fx, fy, f.w, f.box_h, *f.link});
             if (s.hidden) continue;
             if (f.background.visible()) addRect(fx, fy, f.w, f.box_h, faded(f.background, opacity));

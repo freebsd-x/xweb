@@ -790,16 +790,16 @@ public:
     struct PerfLog {
         bool on = std::getenv("XWEB_DEBUG_PERF") != nullptr;
         std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
-        int paints = 0, layouts = 0, script_restyles = 0, script_layouts = 0, script_chains = 0;
+        int paints = 0, layouts = 0, script_restyles = 0, script_layouts = 0, script_chains = 0, script_kept = 0, script_same = 0;
         double paint_ms = 0, layout_ms = 0, layout_style_ms = 0, script_restyle_ms = 0, script_layout_ms = 0;
         // (Also from a script's questions: a long task paints nothing meanwhile.)
         void report() {
             const auto now = std::chrono::steady_clock::now();
             if (!on || now - since < std::chrono::seconds(5)) return;
-            std::fprintf(stderr, "[perf] 5s: %d paints (%.0f ms), %d layouts (%.0f ms, styling %.0f); for scripts %d restyles (%.0f ms), %d layouts (%.0f ms), %d chains\n",
-                         paints, paint_ms, layouts, layout_ms, layout_style_ms, script_restyles, script_restyle_ms, script_layouts, script_layout_ms, script_chains);
+            std::fprintf(stderr, "[perf] 5s: %d paints (%.0f ms), %d layouts (%.0f ms, styling %.0f); for scripts %d restyles (%.0f ms), %d layouts (%.0f ms; %d kept, %d same), %d chains\n",
+                         paints, paint_ms, layouts, layout_ms, layout_style_ms, script_restyles, script_restyle_ms, script_layouts, script_layout_ms, script_kept, script_same, script_chains);
             since = now;
-            paints = layouts = script_restyles = script_layouts = script_chains = 0;
+            paints = layouts = script_restyles = script_layouts = script_chains = script_kept = script_same = 0;
             paint_ms = layout_ms = layout_style_ms = script_restyle_ms = script_layout_ms = 0;
         }
     } perf_;
@@ -957,11 +957,53 @@ public:
         ++perf_.script_layouts;
         perf_.report();
         Timed timed{perf_.on, perf_.script_layout_ms};
+        // What it changed came to nothing (a style set and put back, something in a part
+        // that isn't shown: three in four of yanolja.com's questions): the last layout
+        // still answers. (The next frame lays the page out all the same.)
+        if (nothingChanged()) return;
+        if (!restyled_ || restyled_gen_ != change_gen_ || restyled_w_ != laid_out_width_ || restyled_h_ != laid_out_height_) {
+            std::vector<std::string> missing;
+            Timed styled{perf_.on, perf_.layout_style_ms};
+            restyled_ = makeStyles(laid_out_width_, laid_out_height_, missing);
+            restyled_gen_ = change_gen_;
+            restyled_w_ = laid_out_width_;
+            restyled_h_ = laid_out_height_;
+            restyled_missing_ = std::move(missing);
+        }
+        if (keepsLayouts() && styles_unbroken_ && restyled_->allKept() && restyled_missing_.empty() && contentPrint(false) == laid_out_print_) {
+            ++perf_.script_kept;
+            styles_ = std::move(restyled_);
+            computed_cache_.clear();
+            computed_values_.clear();
+            chain_styles_.reset();
+            stale_ = false;
+            dirty_ = true;
+            return;
+        }
         relayout(laid_out_width_, laid_out_height_);
         dirty_ = true;
         fresh_gen_ = change_gen_;
         stale_ = false;
     }
+    // The page as it was when it was last laid out, whatever was done in between: that
+    // layout's styles and boxes answer a script's question.
+    // (XWEB_NO_LAYOUT_KEEP=1: laid out each time, for telling whether a wrong answer came of it.)
+    static bool keepsLayouts() {
+        static const bool off = std::getenv("XWEB_NO_LAYOUT_KEEP") != nullptr;
+        return !off;
+    }
+    bool nothingChanged() {
+        if (!keepsLayouts()) return false;
+        if (restyled_ || fonts_changed_ || !styles_ || !styles_unbroken_ || contentPrint(true) != laid_out_full_print_) return false;
+        ++perf_.script_same;
+        chain_styles_.reset();
+        computed_cache_.clear();
+        computed_values_.clear();
+        stale_ = false;
+        dirty_ = true;   // (the next frame lays it out all the same)
+        return true;
+    }
+
     // For a script's question about styles: styled now, laid out at the next frame (or
     // question about a box), with these styles if nothing's changed by then.
     void restyleForScript() {
@@ -969,8 +1011,10 @@ public:
         ++perf_.script_restyles;
         perf_.report();
         Timed timed{perf_.on, perf_.script_restyle_ms};
+        if (nothingChanged()) return;
         std::vector<std::string> missing;
         restyled_ = makeStyles(laid_out_width_, laid_out_height_, missing);
+        styles_unbroken_ = styles_unbroken_ && restyled_->allKept();   // (kept from styles a layout was made with)
         computed_cache_.clear();
         computed_values_.clear();
         restyled_gen_ = change_gen_;
@@ -1349,6 +1393,40 @@ private:
         return true;
     }
 
+    // All a layout depends on besides styles and attributes: the tree and its text, which
+    // images are here, and what's in the form controls.
+    // (`attributes`: and with what styles depend on too. The same then, nothing has changed.)
+    [[nodiscard]] uint64_t contentPrint(bool attributes) const {
+        uint64_t h = 1469598103934665603ull;
+        const auto mix = [&h](uint64_t v) { h = (h ^ v) * 0x9E3779B97F4A7C15ull; h ^= h >> 29; };
+        std::vector<const web::Node*> todo{page_->doc->root()};
+        while (!todo.empty()) {
+            const web::Node* n = todo.back();
+            todo.pop_back();
+            mix(reinterpret_cast<uintptr_t>(n));
+            if (n->type == web::NodeType::Text) mix(std::hash<std::string>{}(n->data));
+            if (n->shadow_root) todo.push_back(n->shadow_root);
+            if (attributes) {
+                for (const web::Attribute& a : n->attrs) {
+                    mix(std::hash<std::string>{}(a.name));
+                    mix(std::hash<std::string>{}(a.value));
+                }
+                for (const std::string& css : n->adopted_css) mix(std::hash<std::string>{}(css));
+                mix(n->custom_state);
+            }
+            mix(n->children.size());
+            todo.insert(todo.end(), n->children.rbegin(), n->children.rend());
+        }
+        if (attributes) mix(page_->sheets.size());
+        mix(page_->images.size());
+        mix(page_->failed_images.size());
+        mix(page_->requested.size() >= kMaxImages);
+        mix(page_->forms.version);
+        mix(reinterpret_cast<uintptr_t>(page_->forms.focused));
+        mix(page_->forms.caret);
+        return h;
+    }
+
     void relayout(float width, float height) {
         ++perf_.layouts;
         Timed timed{perf_.on, perf_.layout_ms};
@@ -1383,6 +1461,9 @@ private:
             if (on_fonts_) on_fonts_(page_, web::wantedWebFonts(*page.doc, styles));
         }
         layout_ = web::layoutPage(*page.doc, styles, measurer_, &images_, width, height, &page_->forms);
+        styles_unbroken_ = true;
+        laid_out_print_ = contentPrint(false);
+        laid_out_full_print_ = contentPrint(true);
         spliceFrames();
         ++layout_gen_;
         computed_cache_.clear();
@@ -2171,6 +2252,8 @@ private:
     std::vector<std::string> restyled_missing_;
     uint64_t change_gen_ = 0, restyled_gen_ = 0;
     float restyled_w_ = 0, restyled_h_ = 0;
+    bool styles_unbroken_ = false;       // each restyle since the last layout kept every style
+    uint64_t laid_out_print_ = 0, laid_out_full_print_ = 0;   // contentPrint() at the last layout
     bool fonts_changed_ = false;
     uint64_t fresh_gen_ = UINT64_MAX;   // the change a script's forced layout was made after
     std::map<std::string, CachedRaster> rasters_;

@@ -392,6 +392,10 @@ public:
     // address was: those in a <style> are still relative to the page.
     [[nodiscard]] const std::vector<WebFontFace>& fontFaces() const noexcept { return font_faces_; }
 
+    // Every element's style is the one it had in those it was made from, and the same
+    // elements are styled: none of them (nor their attributes) has changed.
+    [[nodiscard]] bool allKept() const noexcept { return all_kept_; }
+
 private:
     StyledDocument(css::MediaContext media, const ChMeasure& measure_ch, const class FormState* forms)
         : media_(media), measure_ch_(measure_ch), forms_(forms) {}
@@ -406,6 +410,7 @@ private:
     // What each element's style was worked out from (see StyleResolver::elementKey), and
     // what the rules were: styles are only kept between documents with the same rules.
     std::unordered_map<const Node*, uint64_t> keys_;
+    bool all_kept_ = false;
     // A :has() anchor's rules that matched (a print of them): what its children's keys
     // are made from, instead of everything under it.
     std::unordered_map<const Node*, uint64_t> has_prints_;

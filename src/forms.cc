@@ -225,6 +225,7 @@ int FormState::selected(const Node* select) const {
 }
 
 void FormState::setValue(const Node* control, std::string value) {
+    ++version;
     if (value.size() > kMaxFieldBytes) value.resize(kMaxFieldBytes);
     if (controlKind(control) != ControlKind::TextArea) value.erase(std::remove_if(value.begin(), value.end(), [](char c) { return c == '\n' || c == '\r'; }), value.end());
     // An input's maxlength, in characters.
@@ -244,6 +245,7 @@ void FormState::setValue(const Node* control, std::string value) {
 }
 
 void FormState::activate(const Node* control) {
+    ++version;
     const ControlKind k = controlKind(control);
     if (k == ControlKind::Checkbox) {
         const bool now = !checked(control);
@@ -271,6 +273,7 @@ void FormState::activate(const Node* control) {
 }
 
 void FormState::setChecked(const Node* control, bool on) {
+    ++version;
     if (on && controlKind(control) == ControlKind::Radio) {
         if (!checked(control)) activate(control);
         return;
@@ -281,11 +284,13 @@ void FormState::setChecked(const Node* control, bool on) {
 }
 
 void FormState::select(const Node* select, int index) {
+    ++version;
     const int count = static_cast<int>(optionsOf(select).size());
     states_[select].selected = index >= 0 && index < count ? index : -1;
 }
 
 void FormState::reset(const Node* form) {
+    ++version;
     for (const Node* c : controlsOf(form)) states_.erase(c);
     if (focused && formOwner(focused) == form) caret = value(focused).size();
 }
