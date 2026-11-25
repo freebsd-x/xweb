@@ -244,6 +244,9 @@ struct ComputedStyle {
     ListStyle list_style = ListStyle::Disc;
     Length text_indent;
     float letter_spacing = 0;
+    bool balance = false;   // text-wrap: balance
+    uint8_t container_type = 0;   // 1 of its inline size, 2 of both
+    std::shared_ptr<const std::vector<std::string>> container_names;
     std::shared_ptr<const CustomProperties> custom;
     float border_spacing = 0;
     bool border_collapse = false;
@@ -292,6 +295,7 @@ struct ComputedStyle {
     Length min_width = Length::autoLength(), min_height = Length::autoLength();
     Length max_width = Length::autoLength(), max_height = Length::autoLength();
     int z_index = 0;
+    bool z_set = false;   // not auto: a stacking context, even of 0
     // How far transform's translate functions, and the translate property, move it as
     // painted; percentages are of its own border box.
     Length transform_shift[2];
@@ -428,6 +432,8 @@ public:
     // Every element's style is the one it had in those it was made from, and the same
     // elements are styled: none of them (nor their attributes) has changed.
     [[nodiscard]] bool allKept() const noexcept { return all_kept_; }
+    // What's a container, for its size to be asked (MediaContext::containers).
+    [[nodiscard]] const std::vector<const Node*>& containers() const noexcept { return containers_; }
     // Whether any style was worked out from a font's measure (ch).
     [[nodiscard]] bool asksFonts() const noexcept { return asks_fonts_; }
     // Whether some rule goes by what's hovered, pressed or focused.
@@ -451,6 +457,7 @@ private:
     bool all_kept_ = false;
     bool states_matter_ = false;
     bool asks_fonts_ = false;
+    std::vector<const Node*> containers_;
     // A :has() anchor's rules that matched (a print of them): what its children's keys
     // are made from, instead of everything under it.
     std::unordered_map<const Node*, uint64_t> has_prints_;

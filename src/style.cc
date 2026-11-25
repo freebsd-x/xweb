@@ -515,6 +515,7 @@ struct LengthContext {
     float font_size = 16;
     float root_font_size = 16;
     float viewport_w = 0, viewport_h = 0;
+    float cq_w = -1, cq_h = -1;   // the container's, for cqw and the like (-1: the viewport's)
     float ch = 0;   // the width of "0" in this font, if known
     float line_height = 0, root_line_height = 0;   // for lh and rlh (0: 1.2 of the font size)
     bool* ch_asked = nullptr;   // set once ch is
@@ -541,9 +542,17 @@ bool dimensionPx(const Token& t, const LengthContext& c, float& out) {
     else if (u == "q") out = v * 96.0f / 101.6f;
     else if (u == "vw") out = v * c.viewport_w / 100.0f;
     else if (u == "vh" || u == "dvh" || u == "svh" || u == "lvh") out = v * c.viewport_h / 100.0f;
+    else if (u == "cqw" || u == "cqi") out = v * (c.cq_w >= 0 ? c.cq_w : c.viewport_w) / 100.0f;
+    else if (u == "cqh" || u == "cqb") out = v * (c.cq_h >= 0 ? c.cq_h : c.viewport_h) / 100.0f;
+    else if (u == "cqmin" || u == "cqmax") {
+        const float w = c.cq_w >= 0 ? c.cq_w : c.viewport_w, h = c.cq_h >= 0 ? c.cq_h : c.viewport_h;
+        out = v * (u == "cqmin" ? std::min(w, h) : std::max(w, h)) / 100.0f;
+    }
     else if (u == "vmin") out = v * std::min(c.viewport_w, c.viewport_h) / 100.0f;
     else if (u == "vmax") out = v * std::max(c.viewport_w, c.viewport_h) / 100.0f;
     else return false;
+    // (As far as Chrome's go: 3.40282e38px is a pill's radius in Tailwind's.)
+    out = std::clamp(out, -33554432.0f, 33554432.0f);
     return true;
 }
 
@@ -2072,6 +2081,7 @@ struct Notes {
     bool style_selector_ = false;   // a selector asks about style attributes ([style])
     // Elements asked about siblings after them (:last-child, ...): any, or with these.
     std::map<std::string, const css::KeyframesRule*> keyframes_;
+    std::unordered_map<std::string, const css::PropertyRule*> properties_;   // @property's
     bool state_any_ = false;   // an element's :hover, :focus or :active is asked: any's, or of these
     std::unordered_set<uint32_t> state_anchors_;
     bool follow_any_ = false, follow_exact_any_ = false;
@@ -2092,6 +2102,7 @@ struct Notes {
         has_any_anchor_ |= o.has_any_anchor_;
         style_selector_ |= o.style_selector_;
         for (const auto& [name, rule] : o.keyframes_) keyframes_[name] = rule;
+        for (const auto& [name, rule] : o.properties_) properties_[name] = rule;
         state_any_ |= o.state_any_;
         all(state_anchors_, o.state_anchors_);
         follow_any_ |= o.follow_any_;
@@ -2378,6 +2389,7 @@ private:
             if (!std::all_of(rule.media.begin(), rule.media.end(), [&](const Tokens& q) { return css::mediaMatches(q, out_.media_); })) continue;
             if (auto face = webFontFrom(rule, url)) out_.font_faces_.push_back(std::move(*face));
         }
+        for (const css::PropertyRule& k : sheet.properties) properties_[k.name] = &k;
         for (const css::KeyframesRule& k : sheet.keyframes)
             if (std::all_of(k.media.begin(), k.media.end(), [&](const Tokens& q) { return css::mediaMatches(q, out_.media_); })) keyframes_[k.name] = &k;
         const css::Stylesheet& kept = sheet;
@@ -2955,11 +2967,37 @@ private:
         bloom_nodes_.pop_back();
     }
 
+    // The size of the nearest container (of that name) an element's in, if there is one
+    // and it's been laid out. (Its ancestors are styled by now.)
+    std::optional<std::pair<float, float>> containerSize(const Node* el, const std::string& name) const {
+        if (!out_.media_.containers) return std::nullopt;
+        for (const Node* n = el;;) {
+            n = n->parent && n->parent->shadow_host ? n->parent->shadow_host : n->parent;
+            if (!n || !n->isElement()) return std::nullopt;
+            const auto st = out_.styles_.find(n);
+            if (st == out_.styles_.end() || !st->second->container_type) continue;
+            if (!name.empty()) {
+                const auto& names = st->second->container_names;
+                if (!names || std::find(names->begin(), names->end(), name) == names->end()) continue;
+            }
+            const auto size = out_.media_.containers->find(n);
+            if (size == out_.media_.containers->end()) return std::nullopt;
+            return size->second;
+        }
+    }
+    bool containersMatch(const Node* el, const css::Rule& rule) const {
+        return std::all_of(rule.containers.begin(), rule.containers.end(), [&](const css::Rule::Container& c) {
+            const auto size = containerSize(el, c.name);
+            return size && css::mediaMatches(c.condition, css::MediaContext{size->first, size->second});
+        });
+    }
+
     void gather(const Node* el, const std::vector<IndexedSelector>& list, std::vector<MatchedDecl>& out) {
         const bool filtered = bloomCovers(el);
         for (const IndexedSelector& e : list) {
             if (filtered && !mayMatch(e)) continue;
             if (!matchComplex(el, *e.selector)) continue;
+            if (!e.rule->containers.empty() && !containersMatch(el, *e.rule)) continue;
             for (const Declaration& d : e.rule->declarations)
                 out.push_back({&d, d.important, e.origin, e.selector->specificity.key(), e.order});
         }
@@ -3141,6 +3179,15 @@ private:
                     }
                 }
             }
+            // A registered one always has a value: its initial one.
+            if (!done && !properties_.empty())
+                if (const auto reg = properties_.find(name); reg != properties_.end() && reg->second->initial) {
+                    const Tokens& initial = *reg->second->initial;
+                    if (initial.size() > budget) return false;
+                    budget -= initial.size();
+                    out.insert(out.end(), initial.begin(), initial.end());
+                    done = true;
+                }
             if (!done) {
                 if (comma + 1 >= j) return false;
                 const Tokens fallback(in.begin() + static_cast<std::ptrdiff_t>(comma + 1),
@@ -3195,6 +3242,11 @@ private:
         LengthContext c = lengths_;
         c.font_size = s.font_size;
         c.line_height = s.usedLineHeight();
+        if (!out_.containers_.empty() && current_element_)
+            if (const auto size = containerSize(current_element_, {})) {
+                c.cq_w = size->first;
+                if (size->second > 0) c.cq_h = size->second;
+            }
         if (out_.measure_ch_) c.ch = out_.measure_ch_(s);
         return c;
     }
@@ -3801,6 +3853,7 @@ private:
         else if (p == "-webkit-box-orient" || p == "box-orient") to.box_orient_vertical = from.box_orient_vertical;
         else if (p == "list-style-type" || p == "list-style") to.list_style = from.list_style;
         else if (p == "text-indent") to.text_indent = from.text_indent;
+        else if (p == "text-wrap" || p == "text-wrap-style") to.balance = from.balance;
         else if (p == "letter-spacing") to.letter_spacing = from.letter_spacing;
         else if (p == "visibility") to.hidden = from.hidden;
         else if (p == "border-spacing") to.border_spacing = from.border_spacing;
@@ -3859,6 +3912,9 @@ private:
         else if (p == "float") to.float_side = from.float_side;
         else if (p == "clear") to.clear = from.clear;
         else if (p == "position") to.position = from.position;
+        else if (p == "container-type") to.container_type = from.container_type;
+        else if (p == "container-name") to.container_names = from.container_names;
+        else if (p == "container") to.container_type = from.container_type, to.container_names = from.container_names;
         else if (p == "width") { to.width = from.width; to.width_keyword = from.width_keyword; }
         else if (p == "height") to.height = from.height;
         else if (p == "min-width") to.min_width = from.min_width;
@@ -3878,7 +3934,7 @@ private:
         else if (p == "aspect-ratio") { to.aspect_ratio = from.aspect_ratio; to.aspect_auto = from.aspect_auto; }
         else if (p == "object-position") { to.object_x = from.object_x; to.object_y = from.object_y; }
         else if (p == "box-shadow") to.box_shadow = from.box_shadow;
-        else if (p == "z-index") to.z_index = from.z_index;
+        else if (p == "z-index") to.z_index = from.z_index, to.z_set = from.z_set;
         else if (p == "filter") to.filter = from.filter;
         else if (p == "transform") {
             to.transform_shift[0] = from.transform_shift[0];
@@ -4512,6 +4568,22 @@ private:
             if (p != "row-gap") s.column_gap = std::max(0.0f, p == "column-gap" ? first.px : second.px);
             return;
         }
+        if (p == "container-type" || p == "container-name" || p == "container") {
+            auto names = std::make_shared<std::vector<std::string>>();
+            uint8_t type = 0;
+            bool in_type = p == "container-type";
+            for (const Token& t : v) {
+                if (t.type == TokenType::Delim && t.text == "/" && p == "container") in_type = true;
+                if (t.type != TokenType::Ident) continue;
+                const std::string n = lower(t.text);
+                if (!in_type) { if (n != "none") names->push_back(t.text); }
+                else if (n == "inline-size") type = 1;
+                else if (n == "size") type = 2;
+            }
+            if (p != "container-name") s.container_type = type;
+            if (p != "container-type") s.container_names = names->empty() ? nullptr : std::move(names);
+            return;
+        }
         if (p == "position") {
             if (kw == "static" || kw == "sticky") s.position = Position::Static;
             else if (kw == "relative") s.position = Position::Relative;
@@ -4613,7 +4685,9 @@ private:
         }
         if (p == "z-index") {
             if (i < v.size() && v[i].type == TokenType::Number)
-                s.z_index = static_cast<int>(std::clamp(v[i].number, -1e6, 1e6));
+                s.z_index = static_cast<int>(std::clamp(v[i].number, -1e6, 1e6)), s.z_set = true;
+            else if (kw == "auto")
+                s.z_index = 0, s.z_set = false;
             return;
         }
         if (p == "visibility") { s.hidden = kw == "hidden" || kw == "collapse"; s.svg_set |= kSetVisibility; return; }
@@ -4898,6 +4972,17 @@ private:
             return;
         }
         if (p == "text-indent") { oneLength(s.text_indent, false); return; }
+        if (p == "text-wrap" || p == "text-wrap-style") {
+            bool balance = false;
+            for (const Token& t : v) {
+                const std::string n = lower(t.text);
+                balance = balance || n == "balance";
+                if (p == "text-wrap" && n == "nowrap" && s.white_space == WhiteSpace::Normal) s.white_space = WhiteSpace::NoWrap;
+                if (p == "text-wrap" && n == "wrap" && s.white_space == WhiteSpace::NoWrap) s.white_space = WhiteSpace::Normal;
+            }
+            s.balance = balance;
+            return;
+        }
         if (p == "letter-spacing") {
             if (kw == "normal") { s.letter_spacing = 0; return; }
             Length l;
@@ -4960,6 +5045,7 @@ private:
         s.list_style = parent.list_style;
         s.text_indent = parent.text_indent;
         s.letter_spacing = parent.letter_spacing;
+        s.balance = parent.balance;
         s.hidden = parent.hidden;
         s.pointer_events_none = parent.pointer_events_none;
         s.custom = parent.custom;
@@ -5012,7 +5098,7 @@ private:
                     if (matchComplex(el, a)) hit = true;
                 if (!hit) continue;
                 host_context_ = slot_scope->host_el;
-                if (!matchComplex(slot, r.slot_side)) continue;
+                if (!matchComplex(slot, r.slot_side) || !containersMatch(el, *r.rule)) continue;
                 for (const Declaration& d : r.rule->declarations)
                     matched.push_back({&d, d.important, d.important ? r.origin : Origin::Hint, r.slot_side.specificity.key(), r.order});
             }
@@ -5025,7 +5111,7 @@ private:
                     if (!std::all_of(r.names.begin(), r.names.end(), [&](const std::string& n) { return hasWord(*part, n); })) continue;
                     host_context_ = outer->host_el;
                     fuel_ = kSelectorFuel;
-                    if (!matchComplex(scope->host_el, r.host_side)) continue;
+                    if (!matchComplex(scope->host_el, r.host_side) || !containersMatch(el, *r.rule)) continue;
                     for (const Declaration& d : r.rule->declarations)
                         matched.push_back({&d, d.important, d.important ? r.origin : Origin::Part, r.host_side.specificity.key(), r.order});
                 }
@@ -5083,7 +5169,7 @@ private:
                                       own.font_size == o.font_size && own.font_weight == o.font_weight && own.font_family == o.font_family &&
                                       own.position == o.position && own.width.px == o.width.px && own.height.px == o.height.px &&
                                       own.margin[0].px == o.margin[0].px && own.margin[3].px == o.margin[3].px &&
-                                      own.padding[0].px == o.padding[0].px && own.opacity == o.opacity && own.z_index == o.z_index &&
+                                      own.padding[0].px == o.padding[0].px && own.opacity == o.opacity && own.z_index == o.z_index && own.z_set == o.z_set &&
                                       own.hidden == o.hidden && own.line_height == o.line_height && own.float_side == o.float_side &&
                                       own.border_width[0] == o.border_width[0] && own.border_color[0] == o.border_color[0];
                     if (!same) std::fprintf(stderr, "[sharing] differs at <%s class=%s>\n", el->name.c_str(), el->attr("class") ? el->attr("class")->c_str() : "");
@@ -5200,7 +5286,12 @@ private:
                     return false;
             return true;
         };
-        bool custom_changes = false;
+        // Those registered as not inherited start afresh.
+        std::vector<const std::string*> afresh;
+        if (parent.custom)
+            for (const auto& [name, rule] : properties_)
+                if (!rule->inherits && parent.custom->find(name)) afresh.push_back(&name);
+        bool custom_changes = !afresh.empty();
         for (const MatchedDecl& m : matched) {
             if (!m.decl->name.starts_with("--")) continue;
             const Tokens* now = s.custom ? s.custom->find(m.decl->name) : nullptr;
@@ -5231,6 +5322,7 @@ private:
                         else layer->own.erase(name);
                     }
             }
+            for (const std::string* name : afresh) layer->own[*name] = std::nullopt;
             for (const MatchedDecl& m : matched) {
                 if (!m.decl->name.starts_with("--")) continue;
                 // initial is the guaranteed-invalid value, as if never set; inherit and
@@ -5934,9 +6026,16 @@ private:
             out_.styles_[el] = &made;
         }
         if (have_print) out_.has_prints_[el] = match_print;
-        const uint64_t children_key =
+        uint64_t children_key =
             have_print ? mix(base, match_print) : anchored ? mix(base, anchorPrint(el)) : base;
         const ComputedStyle& s = *out_.styles_[el];
+        // A container's size is in the keys of all that's in it.
+        if (s.container_type) {
+            out_.containers_.push_back(el);
+            if (out_.media_.containers)
+                if (const auto it = out_.media_.containers->find(el); it != out_.media_.containers->end())
+                    children_key = mix(mix(children_key, static_cast<uint64_t>(std::lround(it->second.first * 16))), static_cast<uint64_t>(std::lround(it->second.second * 16)));
+        }
         if (!kept && !(s.display == Display::None && el->ns != Namespace::Svg)) {
             resolvePseudo(el, s, ua_p_->rules->before, scope->rules->before, scope->host_el, out_.before_);
             resolvePseudo(el, s, ua_p_->rules->after, scope->rules->after, scope->host_el, out_.after_);

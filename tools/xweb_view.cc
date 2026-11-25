@@ -38,6 +38,8 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "xrender/font_manager.h"
@@ -762,6 +764,7 @@ public:
         page_ = std::move(page);
         // (Nothing of the last page's: its nodes are gone.)
         animator_.clear();
+        container_sizes_.clear();
         styles_unbroken_ = false;
         animate_only_ = states_only_ = false;
         images_.setPage(page_.get());
@@ -1244,7 +1247,7 @@ public:
             out["background-image"] = v.empty() ? "none" : v;
         }
         if (want("opacity")) out["opacity"] = std::to_string(s->opacity).substr(0, 4);
-        if (want("z-index")) out["z-index"] = std::to_string(s->z_index);
+        if (want("z-index")) out["z-index"] = s->z_set ? std::to_string(s->z_index) : std::string("auto");
         // Lengths as specified: px, or the percentage when that's what was said.
         const auto len = [&px](const web::Length& l) {
             if (l.is_auto) return std::string("auto");
@@ -1493,7 +1496,7 @@ private:
         const web::StyledDocument* before = page_changed_ ? nullptr : restyled_ ? restyled_.get() : styles_.get();
         if (before && fonts_changed_ && before->asksFonts()) before = nullptr;
         auto made = std::make_unique<web::StyledDocument>(
-            *page.doc, web::css::MediaContext{width, height}, sheetLoader(missing),
+            *page.doc, web::css::MediaContext{width, height, &container_sizes_}, sheetLoader(missing),
             [this](const web::ComputedStyle& s) { return web::chWidth(measurer_, s); }, &page_->forms,
             before);
         // What changed starts moving; what's moving is laid over them.
@@ -1510,7 +1513,7 @@ private:
         if (!previous) return false;
         ++perf_.script_chains;
         std::vector<std::string> missing;
-        auto chain = web::StyledDocument::chainOf(n, *page_->doc, web::css::MediaContext{laid_out_width_, laid_out_height_},
+        auto chain = web::StyledDocument::chainOf(n, *page_->doc, web::css::MediaContext{laid_out_width_, laid_out_height_, &container_sizes_},
                                                   sheetLoader(missing),
                                                   [this](const web::ComputedStyle& s) { return web::chWidth(measurer_, s); },
                                                   &page_->forms, previous);
@@ -1562,6 +1565,26 @@ private:
         return h;
     }
 
+    bool containersChanged() {
+        const auto& list = styles_->containers();
+        if (list.empty() && container_sizes_.empty()) return false;
+        const std::unordered_set<const web::Node*> which(list.begin(), list.end());
+        web::css::ContainerSizes sizes;
+        for (const web::ElementBox& b : layout_.boxes) {
+            if (!which.count(b.node)) continue;
+            const web::ComputedStyle* s = styles_->styleOf(b.node);
+            if (!s) continue;
+            float w = b.w, h = b.h;
+            for (int i : {1, 3}) w -= s->border_width[i] + (s->padding[i].hasPercent() ? 0 : s->padding[i].px);
+            for (int i : {0, 2}) h -= s->border_width[i] + (s->padding[i].hasPercent() ? 0 : s->padding[i].px);
+            // (Heights only where they count: those of inline-size containers come of what's in them.)
+            sizes.emplace(b.node, std::pair{std::max(0.0f, w), s->container_type == 2 ? std::max(0.0f, h) : 0.0f});
+        }
+        if (sizes == container_sizes_) return false;
+        container_sizes_ = std::move(sizes);
+        return true;
+    }
+
     void relayout(float width, float height) {
         ++perf_.layouts;
         Timed timed{perf_.on, perf_.layout_ms};
@@ -1609,6 +1632,14 @@ private:
         }
         layout_ = web::layoutPage(*page.doc, styles, measurer_, &images_, width, height, &page_->forms);
         styles_unbroken_ = true;
+        // Containers laid out otherwise than they were styled by: again, by their sizes now
+        // (and by those that come of it, but not for ever).
+        if (container_rounds_ < 3 && containersChanged()) {
+            ++container_rounds_;
+            relayout(width, height);
+            container_rounds_ = 0;
+            return;
+        }
         laid_out_for_w_ = width;
         laid_out_for_h_ = height;
         laid_out_print_ = contentPrint(false);
@@ -2438,6 +2469,8 @@ private:
     std::vector<std::string> restyled_missing_;
     uint64_t change_gen_ = 0, restyled_gen_ = 0;
     float restyled_w_ = 0, restyled_h_ = 0;
+    web::css::ContainerSizes container_sizes_;
+    int container_rounds_ = 0;
     web::Animator animator_;
     bool animate_only_ = false;          // all that's changed since is where what's moving has got to
     double animated_at_ = 0;

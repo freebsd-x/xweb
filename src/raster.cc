@@ -710,6 +710,7 @@ Contours strokeOutline(const std::vector<Point>& in, bool closed, const StrokeSt
     for (const Point& p : in)
         if (finite(p) && (pts.empty() || std::hypot(p.x - pts.back().x, p.y - pts.back().y) > 1e-6f)) pts.push_back(p);
     if (closed && pts.size() > 1 && std::hypot(pts.front().x - pts.back().x, pts.front().y - pts.back().y) <= 1e-6f) pts.pop_back();
+    if (pts.empty()) return out;   // none of them anywhere that can be drawn
     const auto disc = [&](Point c) {
         for (auto& e : ellipse(c.x, c.y, h, h, scale)) addOriented(out, std::move(e));
     };

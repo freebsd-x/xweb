@@ -5,9 +5,16 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <utility>
 #include <vector>
+
+namespace fbx::xweb {
+class Node;
+}
 
 namespace fbx::xweb::css {
 
@@ -87,6 +94,12 @@ struct Rule {
     std::vector<Declaration> declarations;
     // Enclosing @media queries, all of which must match.
     std::vector<std::vector<Token>> media;
+    // Enclosing @containers, all of which must match of the element's containers.
+    struct Container {
+        std::string name;               // empty: the nearest of any
+        std::vector<Token> condition;   // as a @media query, the container being the viewport
+    };
+    std::vector<Container> containers;
 };
 
 struct FontFaceRule {
@@ -105,8 +118,16 @@ struct KeyframesRule {
     std::vector<std::vector<Token>> media;
 };
 
+// @property --name.
+struct PropertyRule {
+    std::string name;
+    bool inherits = true;
+    std::optional<std::vector<Token>> initial;
+};
+
 struct Stylesheet {
     std::vector<Rule> rules;
+    std::vector<PropertyRule> properties;
     std::vector<KeyframesRule> keyframes;
     std::vector<FontFaceRule> font_faces;
     std::vector<std::string> imports;   // @import URLs, in order
@@ -115,8 +136,12 @@ struct Stylesheet {
 
 [[nodiscard]] Stylesheet parseStylesheet(std::string_view css);
 
+// The content boxes' sizes of what's a container (container-type), as last laid out.
+using ContainerSizes = std::unordered_map<const Node*, std::pair<float, float>>;
+
 struct MediaContext {
     float width = 0, height = 0;
+    const ContainerSizes* containers = nullptr;
 };
 
 // One @media prelude, or a <link media=...>'s value once tokenized.

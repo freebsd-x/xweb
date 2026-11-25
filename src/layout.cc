@@ -885,6 +885,7 @@ private:
 
         if (inline_content) {
             content_h = layoutInline(b, flow);
+            if (s.balance) content_h = balanceLines(b, flow, content_h);
             applyEllipsis(b);
             if (s.clampsLines()) content_h = applyLineClamp(b, content_h);
             if (content_h == 0 && can_collapse_through) {
@@ -1066,8 +1067,18 @@ private:
             float main_f = factor(cs.justify_content);
             if (cs.flex_reverse) main_f = 1 - main_f;
             const float cross_f = factor(k.style->align_self != FlexAlign::Auto ? k.style->align_self : cs.align_items);
-            const float free_w = c.width - k.outerWidth() - k.margin[Left] - k.margin[Right];
-            const float free_h = c.height - k.outerHeight() - k.margin[Top] - k.margin[Bottom];
+            float free_w = c.width - k.outerWidth() - k.margin[Left] - k.margin[Right];
+            float free_h = c.height - k.outerHeight() - k.margin[Top] - k.margin[Bottom];
+            // (A percentage is of the containing block: this, if it's positioned, whose
+            // height wasn't known when that was measured: theverge.com's tabs.)
+            if (cs.position != Position::Static) {
+                const ComputedStyle& ks = *k.style;
+                const float pw = c.width + c.padding[Left] + c.padding[Right], ph = c.height + c.padding[Top] + c.padding[Bottom];
+                if (!ks.width.is_auto && ks.width.hasPercent())
+                    free_w = c.width - ks.width.resolve(pw) - (ks.border_box ? 0 : k.frameWidth()) - k.margin[Left] - k.margin[Right];
+                if (!ks.height.is_auto && ks.height.hasPercent())
+                    free_h = c.height - ks.height.resolve(ph) - (ks.border_box ? 0 : k.frameHeight()) - k.margin[Top] - k.margin[Bottom];
+            }
             k.static_x = free_w * (row ? main_f : cross_f);
             k.static_y = free_h * (row ? cross_f : main_f);
         }
@@ -1253,6 +1264,8 @@ private:
     }
 
     float intrinsicWidth(Box& b, bool max_content) {
+        // A size container's is as if there were nothing in it.
+        if (b.node && b.kind == BoxKind::Block && b.style && b.style->container_type) return 0;
         if (b.isTable()) {
             const TableGrid grid = tableGrid(b);
             std::vector<float> mins, maxes;
@@ -3227,6 +3240,35 @@ private:
     }
 
     // Returns the height of the lines; fills b.fragments.
+    // text-wrap: balance: in the narrowest width that takes no more lines (a few of them).
+    float balanceLines(Box& b, Flow flow, float height) {
+        const size_t lines = b.fragments.empty() ? 0 : b.fragments.back().line + 1;
+        if (lines < 2 || lines > 6 || b.width < 1) return height;
+        for (const auto& k : b.kids)
+            if (k->floating()) return height;
+        const float whole = b.width;
+        float low = whole / static_cast<float>(lines) * 0.8f, high = whole;
+        for (int i = 0; i < 9 && high - low > 1; ++i) {
+            b.width = (low + high) / 2;
+            const float h = layoutInline(b, flow);
+            float right = 0;
+            for (const Box::Fragment& f : b.fragments) right = std::max(right, f.x + f.w);
+            if (h <= height + 0.01f && right <= b.width + 0.5f) high = b.width;
+            else low = b.width;
+        }
+        b.width = high;
+        const float h = layoutInline(b, flow);
+        b.width = whole;
+        // Aligned in the box's own width.
+        const float by = b.style->text_align == TextAlign::Center ? (whole - high) / 2 : b.style->text_align == TextAlign::Right ? whole - high : 0;
+        if (by > 0)
+            for (Box::Fragment& f : b.fragments) {
+                f.x += by;
+                if (f.atomic) f.atomic->x += by;
+            }
+        return h;
+    }
+
     float layoutInline(Box& b, Flow flow) {
         b.fragments.clear();
         b.inline_extent = 0;
@@ -3941,6 +3983,31 @@ private:
         const float ox = x - o - t, oy = y - o - t, ow = b.outerWidth() + 2 * (o + t), oh = b.outerHeight() + 2 * (o + t);
         if (ow <= 0 || oh <= 0) return;
         const Color c = faded(s.outline_color_set ? s.outline_color : s.color, opacity);
+        // Round where the box's corners are.
+        auto p = std::make_shared<BoxPaint>();
+        bool rounded = false;
+        float inner[4][2];
+        for (int i = 0; i < 4; ++i) {
+            inner[i][0] = std::max(0.0f, s.radius[i][0].resolve(b.outerWidth()));
+            inner[i][1] = std::max(0.0f, s.radius[i][1].resolve(b.outerHeight()));
+        }
+        fitRadii(inner, b.outerWidth(), b.outerHeight());
+        for (int i = 0; i < 4; ++i) {
+            const bool round = inner[i][0] > 0 && inner[i][1] > 0;
+            rounded = rounded || round;
+            for (int k = 0; k < 2; ++k) p->radii[i][k] = round ? std::max(0.0f, inner[i][k] + o + t) : 0;
+            p->border[i] = t;
+            p->colors[i] = c;
+            p->styles[i] = BorderStyle::Solid;
+        }
+        if (rounded) {
+            p->part = BoxPaint::Part::Border;
+            p->w = ow;
+            p->h = oh;
+            fitRadii(p->radii, ow, oh);
+            addBoxPaint(ox, oy, ow, oh, std::move(p));
+            return;
+        }
         addRect(ox, oy, ow, t, c);
         addRect(ox, oy + oh - t, ow, t, c);
         addRect(ox, oy + t, t, oh - 2 * t, c);
@@ -4684,7 +4751,7 @@ private:
         // A stacking context: its negative z-index descendants go in here, over its own
         // background and under its content.
         const size_t outer_ctx_ops = ctx_ops_, outer_ctx_boxes = ctx_boxes_;
-        const bool stacking = &b == root_ || s.position == Position::Fixed || ((s.position != Position::Static || b.flex_item) && s.z_index != 0) ||
+        const bool stacking = &b == root_ || s.position == Position::Fixed || ((s.position != Position::Static || b.flex_item) && s.z_set) || s.filter ||
                               s.opacity < 1 || s.linearlyTransformed() || s.makes_stacking_context;
         if (stacking && !painting_below_) {
             ctx_ops_ = out_->ops.size();
@@ -4872,7 +4939,7 @@ private:
             // z-index:1 hero, with a z-index:3 box in it, went over the z-index:2 header).
             // One with z-index auto lets them take their turn among the rest (below).
             const ComputedStyle& ps = *p.box->style;
-            const bool own_context = ps.z_index != 0 || ps.opacity < 1 || ps.linearlyTransformed() || ps.makes_stacking_context ||
+            const bool own_context = ps.z_set || ps.filter || ps.opacity < 1 || ps.linearlyTransformed() || ps.makes_stacking_context ||
                                      ps.position == Position::Fixed;
             std::vector<Positioned> outer;
             if (own_context) outer.swap(positioned_);

@@ -904,9 +904,14 @@ private:
             media.pop_back();
         } else if (name == "supports") {
             if (supportsMatches(preludeTokens())) parseRange(begin, end, media, out, depth + 1);
-        } else if (name == "layer" || name == "container" || name == "scope") {
-            // Rules inside still apply, without the layer's or container's conditions.
-            if (name == "layer") parseRange(begin, end, media, out, depth + 1);
+        } else if (name == "layer") {
+            // Rules inside still apply, without the layer's order.
+            parseRange(begin, end, media, out, depth + 1);
+        } else if (name == "container") {
+            if (pushContainer(preludeTokens())) {
+                parseRange(begin, end, media, out, depth + 1);
+                containers_.pop_back();
+            }
         }
         else if (name == "font-face") {
             FontFaceRule face;
@@ -918,6 +923,26 @@ private:
             }
             face.media = media;
             out.font_faces.push_back(std::move(face));
+        }
+        else if (name == "property") {
+            PropertyRule p;
+            for (const Token& t : preludeTokens())
+                if (t.type == TokenType::Ident && t.text.starts_with("--")) p.name = t.text;
+            std::vector<Declaration> decls;
+            parseDeclarationsInto(tokens_, begin, end, decls);
+            bool any = false, inherits_said = false;
+            for (const Declaration& d : decls) {
+                if (d.name == "inherits") {
+                    inherits_said = true;
+                    p.inherits = !(d.value.size() == 1 && lower(d.value[0].text) == "false");
+                } else if (d.name == "initial-value") {
+                    p.initial = d.value;
+                } else if (d.name == "syntax" && !d.value.empty() && d.value[0].text == "*") {
+                    any = true;
+                }
+            }
+            // (An initial value is needed but for "*".)
+            if (!p.name.empty() && inherits_said && (p.initial || any)) out.properties.push_back(std::move(p));
         }
         else if (name == "keyframes" || name == "-webkit-keyframes") {
             KeyframesRule k;
@@ -959,6 +984,7 @@ private:
         parseDeclarationsInto(tokens_, block, block_end, rule.declarations);
         if (!rule.declarations.empty()) {
             rule.media = media;
+            rule.containers = containers_;
             out.rules.push_back(std::move(rule));
         }
         nestedRules(sourceOf(begin, prelude_end), block, block_end, media, out, 1);
@@ -1047,6 +1073,11 @@ private:
                     media.pop_back();
                 } else if (name == "supports") {
                     if (supportsMatches(condition)) nestedBlock(parent, inner, inner_end, media, out, depth + 1);
+                } else if (name == "container") {
+                    if (pushContainer(condition)) {
+                        nestedBlock(parent, inner, inner_end, media, out, depth + 1);
+                        containers_.pop_back();
+                    }
                 } else if (name == "layer" || name == "scope") {
                     nestedBlock(parent, inner, inner_end, media, out, depth + 1);
                 }
@@ -1083,11 +1114,33 @@ private:
         parseDeclarationsInto(tokens_, begin, end, rule.declarations);
         if (!rule.declarations.empty()) {
             rule.media = media;
+            rule.containers = containers_;
             out.rules.push_back(std::move(rule));
         }
         nestedRules(selector, begin, end, media, out, depth);
     }
 
+    // "name (condition)". False for what's not of sizes (style(...)): never matched.
+    bool pushContainer(std::vector<Token> t) {
+        Rule::Container c;
+        size_t i = 0;
+        while (i < t.size() && t[i].type == TokenType::Whitespace) ++i;
+        if (i < t.size() && t[i].type == TokenType::Ident && lower(t[i].text) != "not") {
+            c.name = t[i].text;
+            ++i;
+        }
+        c.condition.assign(t.begin() + static_cast<std::ptrdiff_t>(i), t.end());
+        for (Token& k : c.condition) {
+            if (k.type == TokenType::Function && (lower(k.text) == "style" || lower(k.text) == "scroll-state")) return false;
+            if (k.type != TokenType::Ident) continue;
+            std::string n = lower(k.text);
+            for (const auto& [from, to] : {std::pair{"inline-size", "width"}, std::pair{"block-size", "height"}})
+                if (const size_t at = n.find(from); at != std::string::npos) k.text = n.substr(0, at) + to;
+        }
+        containers_.push_back(std::move(c));
+        return true;
+    }
+    std::vector<Rule::Container> containers_;
     const std::vector<Token>& tokens_;
     std::string_view source_;
 };

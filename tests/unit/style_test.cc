@@ -1246,3 +1246,50 @@ TEST(Motion, AMovingColourIsInherited) {
     an.tick(styles, 9);
     EXPECT_EQ(red("b"), 100);
 }
+
+TEST(Containers, QueriesAndUnits) {
+    auto doc = parseHtml(R"(<!doctype html><style>
+        #c { container: card / inline-size } #o { container-type: inline-size }
+        @container (min-width: 300px) { p { color: rgb(1,0,0) } .n { & b { color: rgb(2,0,0) } } }
+        @container other (min-width: 1px) { p { color: rgb(3,0,0) } }
+        @container card (inline-size > 350px) { p { opacity: .5 } }
+        @container style(--x) { p { opacity: .1 } }
+        i { width: 50cqw }</style>
+        <div id=o><div id=c><p id=p>x</p><div class=n><b id=b>b</b></div><i id=i>i</i></div></div><p id=out>y</p>)");
+    css::ContainerSizes sizes;
+    auto styles = std::make_unique<StyledDocument>(*doc, css::MediaContext{800, 600, &sizes});
+    EXPECT_EQ(styles->containers().size(), 2u);
+    const auto by = [&](const char* id) { return styles->styleOf(elementById(*doc, id)); };
+    EXPECT_EQ(by("p")->color.r, 0);               // not laid out yet
+    const auto at = [&](float w) {
+        sizes[elementById(*doc, "c")] = {w, 0};
+        styles = std::make_unique<StyledDocument>(*doc, css::MediaContext{800, 600, &sizes}, StyledDocument::SheetLoader{}, StyledDocument::ChMeasure{}, nullptr, styles.get());
+    };
+    at(320);
+    EXPECT_EQ(by("p")->color.r, 1);
+    EXPECT_EQ(by("b")->color.r, 2);
+    EXPECT_FLOAT_EQ(by("p")->opacity, 1);
+    EXPECT_FLOAT_EQ(by("i")->width.px, 160);
+    EXPECT_EQ(by("out")->color.r, 0);
+    at(400);
+    EXPECT_FLOAT_EQ(by("p")->opacity, 0.5f);
+    at(200);                                      // (kept styles don't stay behind)
+    EXPECT_EQ(by("p")->color.r, 0);
+    EXPECT_FLOAT_EQ(by("i")->width.px, 100);
+}
+
+TEST(CustomProperties, Registered) {
+    auto doc = parseHtml(R"(<!doctype html><style>
+        @property --w { syntax: "*"; inherits: false; initial-value: 7px }
+        @property --i { syntax: "<length>"; inherits: true; initial-value: 3px }
+        @property --bad { syntax: "<length>"; inherits: false }
+        p { width: var(--w, 1px); height: var(--i); margin-left: var(--bad, 5px) } #set { --w: 9px; --i: 4px }
+        </style><div id=set><p id=in>x</p></div><p id=out style="--w: 2px">y</p><p id=plain>z</p>)");
+    const StyledDocument styles(*doc, css::MediaContext{800, 600});
+    const auto by = [&](const char* id) { return styles.styleOf(elementById(*doc, id)); };
+    EXPECT_FLOAT_EQ(by("in")->width.px, 7);      // not inherited; its initial value before the fallback
+    EXPECT_FLOAT_EQ(by("in")->height.px, 4);
+    EXPECT_FLOAT_EQ(by("out")->width.px, 2);
+    EXPECT_FLOAT_EQ(by("plain")->height.px, 3);
+    EXPECT_FLOAT_EQ(by("plain")->margin[3].px, 5);
+}
