@@ -2870,6 +2870,7 @@ private:
         host.viewport_w = w > 0 ? static_cast<float>(w) : 1000;
         host.viewport_h = h > 0 ? static_cast<float>(h) - kToolbarHeight : 800;
         host.forms = &page->forms;
+        host.breathe = [] { XApplication::breathe(); };
         host.console = [](std::string_view level, const std::string& text) { std::cerr << "[page " << level << "] " << text << "\n"; };
         host.navigate = [this](const std::string& url) { XApplication::post([this, url] { navigate(url, Mode::New); }); };
         host.rect = [this, raw = page.get()](const web::Node* n) -> std::optional<web::ElementRect> {

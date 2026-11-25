@@ -354,8 +354,9 @@ void Runtime::throwError(const char* kind, const std::string& message) {
 }
 
 void Runtime::step() {
+    if ((++steps_ & 0x3FFF) == 0 && on_breathe) on_breathe();
     // Where it was when stopped, to know which script (its stack line, without the "at").
-    if (++steps_ > step_budget_) {
+    if (steps_ > step_budget_) {
         std::string where = utf8(stackLine());
         const size_t at = where.find("at ");
         if (at != std::string::npos) {

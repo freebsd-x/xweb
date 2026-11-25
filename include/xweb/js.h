@@ -498,6 +498,9 @@ public:
     }
     // How much work one evaluate() may do before it's stopped.
     void setStepBudget(uint64_t steps) { step_budget_ = steps; }
+    // Called now and then as a script runs, for whoever's kept waiting by it. It mustn't
+    // run any, nor touch the page.
+    std::function<void()> on_breathe;
     // A new task (an event, a timer) starts with the whole budget again.
     void resetSteps() { steps_ = 0; }
 

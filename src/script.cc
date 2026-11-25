@@ -1798,6 +1798,7 @@ void PageScript::Impl::install() {
         });
     };
     rt.base_url = host.base;
+    rt.on_breathe = host.breathe;
     rt.setModuleLoader([this](const std::string& url, std::function<void(js::ModuleSource)> done) {
         if (std::optional<std::string> got = source ? source(url) : std::nullopt) {
             done(js::ModuleSource{true, std::move(*got), {}});

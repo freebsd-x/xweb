@@ -75,6 +75,7 @@ public:
         // import): fetched now, its text (or nothing) handed back later on this thread.
         // `charset`: what to read it as if the response doesn't say (a script's charset
         // attribute; "utf-8" for modules; empty: as the page is).
+        std::function<void()> breathe;   // called now and then as scripts run (js::Runtime::on_breathe)
         std::function<void(const std::string& url, const std::string& charset, bool module, std::function<void(std::optional<std::string>)> done)> fetch_script;
         // fetch() and XMLHttpRequest: the request, and later on this thread its response.
         // The browser decides what a page may reach (see the viewer's policy).
