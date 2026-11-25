@@ -275,6 +275,8 @@ void PageScript::Impl::afterRemove(Node* parent, Node* child, Node* prev, Node* 
 
 void PageScript::Impl::afterAttr(Node* n, const std::string& name, const std::string* old) {
     if (name == "id") ids_found.clear();
+    if (names_known && (name == "id" || name == "name"))
+        if (const std::string* v = n->attr(name)) names_ever.insert(*v);
     ++dom_version;
     queueMutation(u"attributes", n, {}, {}, nullptr, nullptr, &name, old);
     if (name == "slot" && n->parent && n->parent->shadow_root) noteSlots(n->parent->shadow_root);

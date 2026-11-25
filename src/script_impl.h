@@ -437,18 +437,7 @@ struct PageScript::Impl {
             prev = parent->children.back();
         }
         parent->insertBefore(child, before);
-        if (!ids_found.empty()) {
-            std::vector<const Node*> todo{child};
-            while (!todo.empty()) {
-                const Node* n = todo.back();
-                todo.pop_back();
-                if (n->isElement() && n->attr("id")) {
-                    ids_found.clear();
-                    break;
-                }
-                todo.insert(todo.end(), n->children.begin(), n->children.end());
-            }
-        }
+        if (names_known && noteNames(child)) ids_found.clear();
         dirty = true;
         afterInsert(parent, child, prev, before);
     }
@@ -946,6 +935,32 @@ struct PageScript::Impl {
     std::vector<Node*> script_images;   // <img>s a script gave a src, in the page or not
     std::unordered_map<std::string, Node*> ids_found;   // getElementById's answers, and what it found none of
     std::unordered_set<std::string> ids_absent;
+    // Every id and name there's been on an element (once asked, kept up as they come in):
+    // one that hasn't is nowhere, without looking.
+    std::unordered_set<std::string> names_ever;
+    bool names_known = false;
+    bool noteNames(const Node* top) {
+        bool ids = false;
+        std::vector<const Node*> todo{top};
+        while (!todo.empty()) {
+            const Node* n = todo.back();
+            todo.pop_back();
+            for (const Attribute& a : n->attrs)
+                if (a.name == "id" || a.name == "name") {
+                    names_ever.insert(a.value);
+                    ids = ids || a.name == "id";
+                }
+            todo.insert(todo.end(), n->children.begin(), n->children.end());
+        }
+        return ids;
+    }
+    bool everNamed(const std::string& name) {
+        if (!names_known) {
+            names_known = true;
+            noteNames(doc.root());
+        }
+        return names_ever.count(name) != 0;
+    }
     uint64_t ids_absent_at = ~0ull;                     // (at this dom_version)
     uint64_t dom_version = 0;           // bumped by every change to the tree or an attribute: live lists recount
     CanvasSurface& surfaceOf(Node* canvas);

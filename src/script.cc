@@ -1135,6 +1135,7 @@ void PageScript::Impl::installDocument() {
         // element with an id comes in or is given one); or that there was none, if nothing's
         // changed since.
         const bool cached = root == self->doc.root();
+        if (cached && !self->everNamed(id)) return Value::null();
         if (cached) {
             if (const auto it = self->ids_found.find(id); it != self->ids_found.end()) {
                 Node* n = it->second;
@@ -1164,6 +1165,9 @@ void PageScript::Impl::installDocument() {
         }
         if (cached && self->ids_absent.size() < 10000) self->ids_absent.insert(id);
         return Value::null();
+    });
+    rt.method(rt.global(), u"__xwebEverNamed", 1, [self](Runtime& rt, const Value&, Args a) {
+        return Value::boolean(self->everNamed(js::utf8(rt.toStringValue(arg(a, 0)))));
     });
     method(p, u"getElementsByName", 1, [self](Runtime& rt, const Value& self_doc, Args a) {
         const std::string want = js::utf8(rt.toStringValue(arg(a, 0)));

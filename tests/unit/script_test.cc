@@ -1448,3 +1448,18 @@ TEST(Script, GetElementByIdKeepsUp) {
         </script>)JS");
     EXPECT_EQ(p.console, "log:1 1 null null null 2 0 1 null 1 null 3 4 null\n") << p.console;
 }
+
+TEST(Script, NamesComingLaterAreFound) {
+    Page p(R"(<div id=h></div><script>
+        const log = console.log, is = (k) => typeof window[k];
+        log(is('one'), document.getElementById('one'));
+        h.innerHTML = '<p id=one></p><form name=two></form>';
+        log(is('one'), is('two'));
+        const d = document.createElement('div'); d.innerHTML = '<b id=three></b>'; log(is('three'));
+        h.append(d); log(is('three'), document.getElementById('three').tagName);
+        const e = document.createElement('i'); h.append(e); e.id = 'four'; log(is('four'));
+        e.setAttribute('id', 'five'); log(is('four'), is('five'));
+        const c = h.cloneNode(true); c.id = 'six'; h.remove(); log(is('one')); document.body.append(c); log(is('one'), is('six'));
+        </script>)");
+    EXPECT_EQ(p.console, "log:undefined null\nlog:object object\nlog:undefined\nlog:object B\nlog:object\nlog:undefined object\nlog:undefined\nlog:object object\n");
+}

@@ -1893,8 +1893,10 @@ const char* const kScriptPrelude = R"JS(
     // global, unless something else is one by that name: old pages say `menu.style`.
     const base = EventTarget.prototype;
     const kNamed = 'iframe[name="N"],form[name="N"],img[name="N"],embed[name="N"],object[name="N"]';
+    const ever = global.__xwebEverNamed;
+    delete global.__xwebEverNamed;
     const named = (k) => {
-      if (typeof k !== 'string' || k === '' || typeof document === 'undefined' || !document.getElementById) return undefined;
+      if (typeof k !== 'string' || k === '' || !ever(k) || !document.getElementById) return undefined;
       const byId = document.getElementById(k);
       if (byId) return byId;
       if (!/^[A-Za-z][\w-]*$/.test(k)) return undefined;
