@@ -2087,6 +2087,7 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
     const Value* const consts = code.consts.data();
     uint32_t pc = 0;
     uint32_t at = 0;   // where the instruction running now starts (for its handler)
+    ThrowSite& site = throwSite();   // (this thread's: looked up once)
 
     const auto nameError = [&](Node* nm) {
         rt_.throwError("ReferenceError", "can't use '" + utf8(nm->str) + "' before it's declared");
@@ -2108,16 +2109,20 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                 switch (static_cast<Opc>(o[0])) {
                     case OpSite: {
                         rt_.step();
-                        here(nodes[o[1]]);
+                        const Node* n = nodes[o[1]];
+                        site.url = &prog_->url;
+                        site.line_starts = &prog_->line_starts;
+                        site.line = n->line;
+                        site.offset = n->offset;
                         pc += 2;
                         break;
                     }
                     case OpUndef: r[o[1]] = Value::undefined(); pc += 2; break;
                     case OpNull: r[o[1]] = Value::null(); pc += 2; break;
-                    case OpTrue: r[o[1]] = Value::boolean(true); pc += 2; break;
-                    case OpFalse: r[o[1]] = Value::boolean(false); pc += 2; break;
+                    case OpTrue: r[o[1]].setBoolean(true); pc += 2; break;
+                    case OpFalse: r[o[1]].setBoolean(false); pc += 2; break;
                     case OpEmpty: r[o[1]] = Value::empty(); pc += 2; break;
-                    case OpInt: r[o[1]] = Value::number(static_cast<double>(o[2])); pc += 3; break;
+                    case OpInt: r[o[1]].setNumber(static_cast<double>(o[2])); pc += 3; break;
                     case OpConst: r[o[1]] = consts[o[2]]; pc += 3; break;
                     case OpMov: r[o[1]] = r[o[2]]; pc += 3; break;
                     case OpLoadLex: {
@@ -2180,9 +2185,9 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                     case OpDeleteFree: {
                         Node* nm = nodes[o[2]];
                         Object* with = nullptr;
-                        if (findBinding(closure, nm->str, nullptr, nullptr, &with)) r[o[1]] = Value::boolean(false);
-                        else if (with) r[o[1]] = Value::boolean(rt_.deleteProperty(with, nm->str));
-                        else r[o[1]] = Value::boolean(rt_.deleteProperty(globalObject(closure), nm->str));
+                        if (findBinding(closure, nm->str, nullptr, nullptr, &with)) r[o[1]].setBoolean(false);
+                        else if (with) r[o[1]].setBoolean(rt_.deleteProperty(with, nm->str));
+                        else r[o[1]].setBoolean(rt_.deleteProperty(globalObject(closure), nm->str));
                         pc += 3;
                         break;
                     }
@@ -2246,7 +2251,7 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                         Object* obj = rt_.toObject(r[o[2]]);
                         const bool ok = rt_.deleteProperty(obj, key);
                         if (!ok && strict) rt_.throwError("TypeError", "can't delete property '" + (key.isSymbol() ? std::string("symbol") : utf8(key.name)) + "'");
-                        r[o[1]] = Value::boolean(ok);
+                        r[o[1]].setBoolean(ok);
                         pc += 4;
                         break;
                     }
@@ -2255,7 +2260,7 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                         const Value &a = r[o[2]], &b = r[o[3]];
                         if (a.isNumber() && b.isNumber()) {
                             const double x = a.asNumber(), y = b.asNumber();
-                            r[o[1]] = Value::number(x + y);
+                            r[o[1]].setNumber(x + y);
                         } else {
                             r[o[1]] = binaryOp(Op::Add, a, b);
                         }
@@ -2266,7 +2271,7 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                         const Value &a = r[o[2]], &b = r[o[3]];
                         if (a.isNumber() && b.isNumber()) {
                             const double x = a.asNumber(), y = b.asNumber();
-                            r[o[1]] = Value::number(x - y);
+                            r[o[1]].setNumber(x - y);
                         } else {
                             r[o[1]] = binaryOp(Op::Sub, a, b);
                         }
@@ -2277,7 +2282,7 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                         const Value &a = r[o[2]], &b = r[o[3]];
                         if (a.isNumber() && b.isNumber()) {
                             const double x = a.asNumber(), y = b.asNumber();
-                            r[o[1]] = Value::number(x * y);
+                            r[o[1]].setNumber(x * y);
                         } else {
                             r[o[1]] = binaryOp(Op::Mul, a, b);
                         }
@@ -2288,7 +2293,7 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                         const Value &a = r[o[2]], &b = r[o[3]];
                         if (a.isNumber() && b.isNumber()) {
                             const double x = a.asNumber(), y = b.asNumber();
-                            r[o[1]] = Value::boolean(x < y);
+                            r[o[1]].setBoolean(x < y);
                         } else {
                             r[o[1]] = binaryOp(Op::Lt, a, b);
                         }
@@ -2299,7 +2304,7 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                         const Value &a = r[o[2]], &b = r[o[3]];
                         if (a.isNumber() && b.isNumber()) {
                             const double x = a.asNumber(), y = b.asNumber();
-                            r[o[1]] = Value::boolean(x > y);
+                            r[o[1]].setBoolean(x > y);
                         } else {
                             r[o[1]] = binaryOp(Op::Gt, a, b);
                         }
@@ -2310,7 +2315,7 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                         const Value &a = r[o[2]], &b = r[o[3]];
                         if (a.isNumber() && b.isNumber()) {
                             const double x = a.asNumber(), y = b.asNumber();
-                            r[o[1]] = Value::boolean(x <= y);
+                            r[o[1]].setBoolean(x <= y);
                         } else {
                             r[o[1]] = binaryOp(Op::Le, a, b);
                         }
@@ -2321,7 +2326,7 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                         const Value &a = r[o[2]], &b = r[o[3]];
                         if (a.isNumber() && b.isNumber()) {
                             const double x = a.asNumber(), y = b.asNumber();
-                            r[o[1]] = Value::boolean(x >= y);
+                            r[o[1]].setBoolean(x >= y);
                         } else {
                             r[o[1]] = binaryOp(Op::Ge, a, b);
                         }
@@ -2332,7 +2337,7 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                         const Value &a = r[o[2]], &b = r[o[3]];
                         if (a.isNumber() && b.isNumber()) {
                             const double x = a.asNumber(), y = b.asNumber();
-                            r[o[1]] = Value::boolean(x == y);
+                            r[o[1]].setBoolean(x == y);
                         } else {
                             r[o[1]] = binaryOp(Op::StrictEq, a, b);
                         }
@@ -2343,7 +2348,7 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                         const Value &a = r[o[2]], &b = r[o[3]];
                         if (a.isNumber() && b.isNumber()) {
                             const double x = a.asNumber(), y = b.asNumber();
-                            r[o[1]] = Value::boolean(x != y);
+                            r[o[1]].setBoolean(x != y);
                         } else {
                             r[o[1]] = binaryOp(Op::StrictNe, a, b);
                         }
@@ -2354,7 +2359,7 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                         const Value &a = r[o[2]], &b = r[o[3]];
                         if (a.isNumber() && b.isNumber() && int32Exact(a.asNumber()) && int32Exact(b.asNumber())) {
                             const double x = a.asNumber(), y = b.asNumber();
-                            r[o[1]] = Value::number(static_cast<double>(toI32(x) & toI32(y)));
+                            r[o[1]].setNumber(static_cast<double>(toI32(x) & toI32(y)));
                         } else {
                             r[o[1]] = binaryOp(Op::BitAnd, a, b);
                         }
@@ -2365,7 +2370,7 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                         const Value &a = r[o[2]], &b = r[o[3]];
                         if (a.isNumber() && b.isNumber() && int32Exact(a.asNumber()) && int32Exact(b.asNumber())) {
                             const double x = a.asNumber(), y = b.asNumber();
-                            r[o[1]] = Value::number(static_cast<double>(toI32(x) | toI32(y)));
+                            r[o[1]].setNumber(static_cast<double>(toI32(x) | toI32(y)));
                         } else {
                             r[o[1]] = binaryOp(Op::BitOr, a, b);
                         }
@@ -2376,7 +2381,7 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                         const Value &a = r[o[2]], &b = r[o[3]];
                         if (a.isNumber() && b.isNumber() && int32Exact(a.asNumber()) && int32Exact(b.asNumber())) {
                             const double x = a.asNumber(), y = b.asNumber();
-                            r[o[1]] = Value::number(static_cast<double>(toI32(x) ^ toI32(y)));
+                            r[o[1]].setNumber(static_cast<double>(toI32(x) ^ toI32(y)));
                         } else {
                             r[o[1]] = binaryOp(Op::BitXor, a, b);
                         }
@@ -2387,7 +2392,7 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                         const Value &a = r[o[2]], &b = r[o[3]];
                         if (a.isNumber() && b.isNumber() && int32Exact(a.asNumber()) && int32Exact(b.asNumber())) {
                             const double x = a.asNumber(), y = b.asNumber();
-                            r[o[1]] = Value::number(static_cast<double>(static_cast<int32_t>(static_cast<uint32_t>(toI32(x)) << (static_cast<uint32_t>(toI32(y)) & 31))));
+                            r[o[1]].setNumber(static_cast<double>(static_cast<int32_t>(static_cast<uint32_t>(toI32(x)) << (static_cast<uint32_t>(toI32(y)) & 31))));
                         } else {
                             r[o[1]] = binaryOp(Op::Shl, a, b);
                         }
@@ -2398,7 +2403,7 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                         const Value &a = r[o[2]], &b = r[o[3]];
                         if (a.isNumber() && b.isNumber() && int32Exact(a.asNumber()) && int32Exact(b.asNumber())) {
                             const double x = a.asNumber(), y = b.asNumber();
-                            r[o[1]] = Value::number(static_cast<double>(toI32(x) >> (static_cast<uint32_t>(toI32(y)) & 31)));
+                            r[o[1]].setNumber(static_cast<double>(toI32(x) >> (static_cast<uint32_t>(toI32(y)) & 31)));
                         } else {
                             r[o[1]] = binaryOp(Op::Shr, a, b);
                         }
@@ -2409,7 +2414,7 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                         const Value &a = r[o[2]], &b = r[o[3]];
                         if (a.isNumber() && b.isNumber() && int32Exact(a.asNumber()) && int32Exact(b.asNumber())) {
                             const uint32_t x = static_cast<uint32_t>(toI32(a.asNumber())), y = static_cast<uint32_t>(toI32(b.asNumber()));
-                            r[o[1]] = Value::number(static_cast<double>(x >> (y & 31)));
+                            r[o[1]].setNumber(static_cast<double>(x >> (y & 31)));
                         } else {
                             r[o[1]] = binaryOp(Op::UShr, a, b);
                         }
@@ -2417,7 +2422,7 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                         break;
                     }
 
-                    case OpNot: r[o[1]] = Value::boolean(!rt_.toBoolean(r[o[2]])); pc += 3; break;
+                    case OpNot: r[o[1]].setBoolean(!rt_.toBoolean(r[o[2]])); pc += 3; break;
                     case OpNeg: case OpBitNot: {
                         Value v = r[o[2]];
                         if (!v.isNumber()) v = rt_.toPrimitive(v, "number");
@@ -2425,14 +2430,14 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                             const bigint::Big x = bigint::decode(v.bigintDigits());
                             r[o[1]] = Value::bigint(JSString::make(bigint::encode(o[0] == OpNeg ? bigint::negate(x) : bigint::bitNot(x))));
                         } else if (o[0] == OpNeg) {
-                            r[o[1]] = Value::number(-rt_.toNumber(v));
+                            r[o[1]].setNumber(-rt_.toNumber(v));
                         } else {
-                            r[o[1]] = Value::number(~rt_.toInt32(v));
+                            r[o[1]].setNumber(~rt_.toInt32(v));
                         }
                         pc += 3;
                         break;
                     }
-                    case OpPlus: r[o[1]] = Value::number(rt_.toNumber(r[o[2]])); pc += 3; break;
+                    case OpPlus: r[o[1]].setNumber(rt_.toNumber(r[o[2]])); pc += 3; break;
                     case OpTypeof: r[o[1]] = rt_.typeOf(r[o[2]]); pc += 3; break;
                     case OpToNumeric: {
                         const Value& v = r[o[2]];
@@ -2448,14 +2453,14 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                         const Value& v = r[o[2]];
                         const double delta = o[0] == OpInc ? 1 : -1;
                         if (v.isNumber()) {
-                            r[o[1]] = Value::number(v.asNumber() + delta);
+                            r[o[1]].setNumber(v.asNumber() + delta);
                         } else {
                             const Value p = v.isBigInt() ? v : rt_.toPrimitive(v, "number");
                             if (p.isBigInt()) {
                                 const bigint::Big x = bigint::decode(p.bigintDigits());
                                 r[o[1]] = Value::bigint(JSString::make(bigint::encode(bigint::add(x, bigint::fromInt64(o[0] == OpInc ? 1 : -1)))));
                             } else {
-                                r[o[1]] = Value::number(rt_.toNumber(p) + delta);
+                                r[o[1]].setNumber(rt_.toNumber(p) + delta);
                             }
                         }
                         pc += 3;

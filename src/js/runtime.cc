@@ -5,6 +5,7 @@
 #include <chrono>
 #include <charconv>
 #include <cmath>
+#include <map>
 #include <cstring>
 #include <limits>
 #include <new>
@@ -353,8 +354,32 @@ void Runtime::throwError(const char* kind, const std::string& message) {
     throw Thrown{Value::object(error)};
 }
 
-void Runtime::step() {
-    if ((++steps_ & 0x3FFF) == 0 && on_breathe) on_breathe();
+void Runtime::stepSlow() {
+    if ((steps_ & 0x3FFF) == 0) {
+        if (on_breathe) on_breathe();
+        // XWEB_DEBUG_HOT=1: which script's functions are at it, by where it is every 16384
+        // steps; the first few told each 200 of them.
+        static const bool hot = std::getenv("XWEB_DEBUG_HOT") != nullptr;
+        if (hot) {
+            static std::map<std::string, int> at, whose;
+            static int n = 0;
+            const ThrowSite& t = throwSite();
+            size_t line = 0;
+            if (t.line_starts && t.line && t.line <= t.line_starts->size()) line = (*t.line_starts)[t.line - 1];
+            const std::string url = t.url ? t.url->substr(0, 70) : "?";
+            ++at[url + ":" + std::to_string(t.line) + ":" + std::to_string(t.offset >= line ? t.offset - line : 0)];
+            std::string calls;
+            for (size_t i = t_call_frames.size(), k = 0; i-- > 0 && k < 6; ++k) calls += (k ? " < " : "") + (t_call_frames[i].name ? utf8(*t_call_frames[i].name) : "");
+            ++whose[calls];
+            if (++n % 200 == 0)
+                for (const auto* m : {&at, &whose}) {
+                    std::vector<std::pair<int, std::string>> top;
+                    for (const auto& [k, v] : *m) top.emplace_back(v, k);
+                    std::sort(top.rbegin(), top.rend());
+                    for (size_t i = 0; i < std::min<size_t>(top.size(), 8); ++i) std::fprintf(stderr, "[hot] %5.1f%% %s\n", 100.0 * top[i].first / n, top[i].second.c_str());
+                }
+        }
+    }
     // Where it was when stopped, to know which script (its stack line, without the "at").
     if (steps_ > step_budget_) {
         std::string where = utf8(stackLine());

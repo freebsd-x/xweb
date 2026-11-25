@@ -112,6 +112,18 @@ public:
     static Value object(Object* o) { Value v; v.type_ = o ? Type::Object : Type::Null; v.o_ = o; return v; }
     static Value symbol(Symbol* s) { Value v; v.type_ = Type::Symbol; v.sym_ = s; return v; }
 
+    // As assigning number(d) and boolean(b), in place.
+    void setNumber(double d) noexcept {
+        if (counted()) release();
+        type_ = Type::Number;
+        n_ = d;
+    }
+    void setBoolean(bool b) noexcept {
+        if (counted()) release();
+        type_ = Type::Boolean;
+        b_ = b;
+    }
+
     [[nodiscard]] Type type() const noexcept { return type_; }
     [[nodiscard]] bool isUndefined() const noexcept { return type_ == Type::Undefined; }
     [[nodiscard]] bool isNull() const noexcept { return type_ == Type::Null; }
@@ -684,7 +696,10 @@ public:
     std::vector<Env*> env_pool;
 
     // The interpreter's own (runtime.cc).
-    void step();
+    void step() {
+        if ((++steps_ & 0x3FFF) == 0 || steps_ > step_budget_) stepSlow();
+    }
+    void stepSlow();
     // Many steps at once (the regex matcher, which counts its own).
     void steps(uint64_t n) {
         steps_ += n;
