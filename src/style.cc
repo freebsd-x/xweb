@@ -2121,6 +2121,7 @@ struct Notes {
 };
 
 class StyleResolver : Notes {
+    static constexpr size_t kMaxKeptGenerations = 32;
     // Which sheets apply, collected before their rules are indexed.
     struct SheetUse {
         std::shared_ptr<const css::Stylesheet> sheet;
@@ -2149,6 +2150,8 @@ public:
         recording_ = false;
         useIndex();
         collectShadowScopes();
+        out_.has_hosts_ = !hosts_.empty();
+        out_.asks_style_ = style_selector_;
         // Styles kept from the last time only with the same rules (and not too many
         // generations of kept storage: then everything's styled afresh, and let go).
         out_.index_id_ = index_kept_.get();
@@ -2157,7 +2160,6 @@ public:
         // keyed by all that's under its parent. Any change restyles all of it anyway, the
         // keys costing a fifth more. So nothing kept for such a page.)
         out_.reusable_ = !has_any_anchor_;
-        constexpr size_t kMaxKeptGenerations = 32;
         // XWEB_NO_STYLE_REUSE=1: everything styled afresh, for telling whether a wrong
         // style came from keeping one.
         static const bool no_reuse = std::getenv("XWEB_NO_STYLE_REUSE") != nullptr;
@@ -2179,18 +2181,20 @@ public:
         }
     }
 
+    // What useIndex makes and keeps.
+    struct Cached {
+        std::vector<SheetUse> uses;
+        float width = 0, height = 0;
+        std::shared_ptr<Scope> ua, doc;
+        std::vector<WebFontFace> fonts;
+        size_t order = 0;
+        Notes notes;
+        std::vector<std::shared_ptr<const css::Stylesheet>> sheets;   // (what those are in)
+    };
+
     // The user agent's and the document's rules, indexed: those made last time if the
     // sheets and the viewport are the same, else made now (and kept for next time).
     void useIndex() {
-        struct Cached {
-            std::vector<SheetUse> uses;
-            float width = 0, height = 0;
-            std::shared_ptr<Scope> ua, doc;
-            std::vector<WebFontFace> fonts;
-            size_t order = 0;
-            Notes notes;
-            std::vector<std::shared_ptr<const css::Stylesheet>> sheets;   // (what those are in)
-        };
         static std::mutex mutex;
         // The last few: a page and its iframes' documents styled in turn each made theirs
         // again, and with it, styled everything afresh (11st.co.kr's 9000 elements).
@@ -2250,6 +2254,123 @@ public:
         std::lock_guard<std::mutex> lock(mutex);
         recent.insert(recent.begin(), std::move(made));
         if (recent.size() > kRecent) recent.pop_back();
+    }
+
+    // `out` made `previous` over again, but for what's inside the elements whose style
+    // attributes have changed (restyle). Only with nothing else changed.
+    struct Again {
+        bool maps = true;   // the styles themselves too (a chain makes its own few)
+    };
+    StyleResolver(const Document& doc, StyledDocument& out, const StyledDocument::SheetLoader& loader, const StyledDocument& previous, Again again)
+        : doc_(doc), out_(out), loader_(loader) {
+        lengths_.ch_asked = &out.asks_fonts_;
+        lengths_.viewport_w = out.media_.width;
+        lengths_.viewport_h = out.media_.height;
+        const auto* index = static_cast<const Cached*>(previous.index_kept_.get());
+        index_kept_ = previous.index_kept_;
+        ua_p_ = index->ua.get();
+        doc_p_ = index->doc.get();
+        order_ = index->order;
+        static_cast<Notes&>(*this) = index->notes;
+        out_.index_id_ = previous.index_id_;
+        out_.index_kept_ = previous.index_kept_;
+        out_.reusable_ = true;
+        out_.font_faces_ = previous.font_faces_;
+        out_.states_matter_ = previous.states_matter_;
+        out_.asks_style_ = false;
+        out_.asks_fonts_ = previous.asks_fonts_;
+        out_.kept_ = previous.kept_;
+        out_.kept_.push_back(previous.storage_);
+        previous_ = &previous;
+        if (!again.maps) return;
+        out_.styles_ = previous.styles_;
+        out_.before_ = previous.before_;
+        out_.after_ = previous.after_;
+        out_.placeholder_ = previous.placeholder_;
+        out_.keys_ = previous.keys_;
+        out_.has_prints_ = previous.has_prints_;
+        out_.containers_ = previous.containers_;
+    }
+    // Whether that can be told of this one.
+    static bool canStyleAgain(const StyledDocument& previous, const StyledDocument& now) {
+        if (!previous.reusable_ || previous.has_hosts_ || !previous.index_kept_ || previous.kept_.size() + 1 >= kMaxKeptGenerations ||
+            previous.media_.width != now.media_.width || previous.media_.height != now.media_.height || previous.forms_ != now.forms_)
+            return false;
+        // (A selector that asks for style attributes sees them from anywhere.)
+        return !static_cast<const Cached*>(previous.index_kept_.get())->notes.style_selector_;
+    }
+    // False if it comes out that something else has changed.
+    bool restyle(const std::vector<const Node*>& changed) {
+        const std::unordered_set<const Node*> all(changed.begin(), changed.end());
+        bool same = true;
+        for (const Node* n : all) {
+            std::vector<const Node*> chain;
+            bool inside = false, here = false;
+            for (const Node* p = n; p; p = p->parent) {
+                if (p != n && all.count(p)) inside = true;
+                if (p == doc_.documentElement()) here = true;
+                if (p->isElement()) chain.push_back(p);
+            }
+            // Done with the one it's inside of; or not in the page; or somewhere deep.
+            if (inside || !here) continue;
+            if (chain.size() > kMaxStyledDepth) return false;
+            std::reverse(chain.begin(), chain.end());
+            ComputedStyle initial;
+            const ComputedStyle* parent = &initial;
+            uint64_t parent_key = 0, parent_full_key = 0;
+            size_t pushed = 0;
+            bool shown = true;
+            for (size_t i = 0; i + 1 < chain.size(); ++i) {
+                const size_t kept = dbg_kept_;
+                const auto [style, key, children_key] = visit(chain[i], *parent, doc_p_, nullptr, parent_key, parent_full_key);
+                if (dbg_kept_ == kept) {
+                    while (pushed--) bloomPop();
+                    return false;
+                }
+                if (style->display == Display::None && chain[i]->ns != Namespace::Svg) {
+                    shown = false;
+                    break;
+                }
+                if (!host_context_ && bloomCovers(chain[i])) {
+                    bloomPush(chain[i]);
+                    ++pushed;
+                }
+                parent = style;
+                parent_key = children_key;
+                parent_full_key = key;
+            }
+            if (shown) {
+                // All in it, out; and in again as it's now.
+                size_t had = 0;
+                std::vector<const Node*> todo{n};
+                while (!todo.empty()) {
+                    const Node* e = todo.back();
+                    todo.pop_back();
+                    if (out_.keys_.erase(e)) {
+                        ++had;
+                        out_.styles_.erase(e);
+                        out_.before_.erase(e);
+                        out_.after_.erase(e);
+                        out_.placeholder_.erase(e);
+                        out_.has_prints_.erase(e);
+                    }
+                    todo.insert(todo.end(), e->children.begin(), e->children.end());
+                }
+                const size_t keys = out_.keys_.size(), kept = dbg_kept_;
+                walk(n, *parent, chain.size() - 1, doc_p_, nullptr, parent_key, parent_full_key);
+                const size_t now = out_.keys_.size() - keys;
+                same = same && now == had && dbg_kept_ - kept == now;
+            }
+            while (pushed--) bloomPop();
+        }
+        // (Visited again, some of them more than once; or styled no more.)
+        std::unordered_set<const Node*> seen;
+        std::erase_if(out_.containers_, [&](const Node* c) {
+            const auto st = out_.styles_.find(c);
+            return st == out_.styles_.end() || !st->second->container_type || !seen.insert(c).second;
+        });
+        out_.all_kept_ = same;
+        return true;
     }
 
     // Only `target` and its ancestors, as run() would style them (for a script's question
@@ -6127,10 +6248,14 @@ StyledDocument::StyledDocument(const Document& doc, css::MediaContext media, con
     : media_(media), measure_ch_(measure_ch), forms_(forms) {
     StyleResolver resolver(doc, *this, loader, previous);
     resolver.run();
+    if (previous) checkReuse(doc, loader);
+}
+
+void StyledDocument::checkReuse(const Document& doc, const SheetLoader& loader) const {
     // XWEB_CHECK_REUSE=1: everything styled afresh too, and any difference told of.
     static const bool check = std::getenv("XWEB_CHECK_REUSE") != nullptr;
-    if (!check || !previous) return;
-    const StyledDocument fresh(doc, media, loader, measure_ch, forms, nullptr);
+    if (!check) return;
+    const StyledDocument fresh(doc, media_, loader, measure_ch_, forms_, nullptr);
     static size_t told = 0, checks = 0;
     size_t differ = 0;
     for (const auto& [n, o] : fresh.styles_) {
@@ -6147,12 +6272,26 @@ StyledDocument::StyledDocument(const Document& doc, css::MediaContext media, con
     if (++checks % 20 == 0 || differ) std::fprintf(stderr, "[reuse] check %zu: %zu of %zu differ\n", checks, differ, fresh.styles_.size());
 }
 
+std::unique_ptr<StyledDocument> StyledDocument::withStyleAttributes(const std::vector<const Node*>& changed, const Document& doc, css::MediaContext media,
+                                                                    const SheetLoader& loader, const ChMeasure& measure_ch, const FormState* forms,
+                                                                    const StyledDocument& previous) {
+    static const bool no_reuse = std::getenv("XWEB_NO_STYLE_REUSE") != nullptr;
+    std::unique_ptr<StyledDocument> out(new StyledDocument(media, measure_ch, forms));
+    if (no_reuse || !StyleResolver::canStyleAgain(previous, *out)) return nullptr;
+    StyleResolver resolver(doc, *out, loader, previous, StyleResolver::Again{});
+    if (!resolver.restyle(changed)) return nullptr;
+    out->checkReuse(doc, loader);
+    return out;
+}
+
 std::unique_ptr<StyledDocument> StyledDocument::chainOf(const Node* target, const Document& doc, css::MediaContext media,
                                                         const SheetLoader& loader, const ChMeasure& measure_ch, const FormState* forms,
-                                                        const StyledDocument* previous) {
+                                                        const StyledDocument* previous, bool same_rules) {
     std::unique_ptr<StyledDocument> out(new StyledDocument(media, measure_ch, forms));
-    StyleResolver resolver(doc, *out, loader, previous);
-    if (!resolver.runChain(target)) {
+    std::optional<StyleResolver> resolver;
+    if (same_rules && previous && StyleResolver::canStyleAgain(*previous, *out)) resolver.emplace(doc, *out, loader, *previous, StyleResolver::Again{false});
+    else resolver.emplace(doc, *out, loader, previous);
+    if (!resolver->runChain(target)) {
         // It isn't shown: no style, as styling the whole page would give it none.
         out->styles_.erase(target);
     }

@@ -2168,6 +2168,15 @@ bool PageScript::busy() const { return !impl_->timers.empty() || !impl_->tasks.e
 
 bool PageScript::dirty() const { return impl_->dirty; }
 
+const std::vector<const Node*>* PageScript::onlyStyleAttributes() const { return impl_->dirty.other ? nullptr : &impl_->dirty.style_attributes; }
+
+bool PageScript::takeChanges(std::vector<const Node*>& style_attributes) {
+    Impl& s = *impl_;
+    const bool other = std::exchange(s.dirty.other, false);
+    style_attributes = std::exchange(s.dirty.style_attributes, {});
+    return other;
+}
+
 bool PageScript::takeDirty() {
     const bool d = impl_->dirty;
     impl_->dirty = false;

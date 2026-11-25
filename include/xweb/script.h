@@ -145,6 +145,11 @@ public:
     [[nodiscard]] bool busy() const;   // timers or frames waiting
     // Whether the tree or a control changed since last asked: time to lay out again.
     bool takeDirty();
+    // Since it was last asked: the elements whose style attributes have changed, and whether
+    // anything else has (for styling only those again).
+    bool takeChanges(std::vector<const Node*>& style_attributes);
+    // As takeChanges would, leaving them: null if anything else has.
+    [[nodiscard]] const std::vector<const Node*>* onlyStyleAttributes() const;
     // The same, without forgetting it (a script asking where something is now).
     [[nodiscard]] bool dirty() const;
     // A <canvas>'s pixels as its scripts drew them, and a number that changes whenever

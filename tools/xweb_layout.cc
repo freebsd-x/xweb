@@ -99,6 +99,25 @@ int main(int argc, char** argv) {
             const PageLayout l = layoutPage(*doc, styles, text, &images, w, h, nullptr, std::getenv("XWEB_LAYOUT_BENCH_KEEP") ? &state : nullptr);
             laid += ms(t);
         }
+        // (And with one element's style attribute said to have changed: the last div's.)
+        {
+            const Node* last = nullptr;
+            std::vector<const Node*> todo{doc->documentElement()};
+            while (!todo.empty()) {
+                const Node* e = todo.back();
+                todo.pop_back();
+                if (e->isHtml("div") && styles.styleOf(e)) last = e;
+                todo.insert(todo.end(), e->children.rbegin(), e->children.rend());
+            }
+            std::unique_ptr<StyledDocument> at;
+            const auto t = Clock::now();
+            int did = 0;
+            for (int i = 0; i < n * 20; ++i) {
+                at = StyledDocument::withStyleAttributes({last}, *doc, {w, h}, sheet_text, ch, nullptr, styles);
+                did += at != nullptr;
+            }
+            std::fprintf(stderr, "bench: a style attribute %.2f ms (%d of %d)\n", ms(t) / (n * 20), did, n * 20);
+        }
         std::fprintf(stderr, "bench: styling %.1f ms, restyling (all kept) %.1f ms, layout %.1f ms\n", fresh / n, kept / n, laid / n);
         return 0;
     }

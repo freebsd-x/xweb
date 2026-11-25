@@ -777,7 +777,9 @@ public:
         computed_cache_.clear();
         computed_values_.clear();
     }
-    void invalidate() {
+    // (`by_script`: the script knows what's changed, takeChanges.)
+    void invalidate(bool by_script = false) {
+        if (!by_script) styles_other_ = true;
         dirty_ = true;
         ++change_gen_;
         states_only_ = false;
@@ -831,6 +833,7 @@ public:
     // laid out only if a style came out different.
     void stateChanged() {
         if (!styles_ || !styles_->statesMatter()) return;
+        styles_other_ = true;
         const bool only = !dirty_ || states_only_;
         invalidate();
         states_only_ = only;
@@ -868,16 +871,16 @@ public:
     struct PerfLog {
         bool on = std::getenv("XWEB_DEBUG_PERF") != nullptr;
         std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
-        int paints = 0, layouts = 0, script_restyles = 0, script_layouts = 0, script_chains = 0, script_kept = 0, script_same = 0;
+        int paints = 0, layouts = 0, script_restyles = 0, script_layouts = 0, script_chains = 0, script_kept = 0, script_same = 0, styled_parts = 0;
         double paint_ms = 0, layout_ms = 0, layout_style_ms = 0, script_restyle_ms = 0, script_layout_ms = 0;
         // (Also from a script's questions: a long task paints nothing meanwhile.)
         void report() {
             const auto now = std::chrono::steady_clock::now();
             if (!on || now - since < std::chrono::seconds(5)) return;
-            std::fprintf(stderr, "[perf] 5s: %d paints (%.0f ms), %d layouts (%.0f ms, styling %.0f); for scripts %d restyles (%.0f ms), %d layouts (%.0f ms; %d kept, %d same), %d chains\n",
-                         paints, paint_ms, layouts, layout_ms, layout_style_ms, script_restyles, script_restyle_ms, script_layouts, script_layout_ms, script_kept, script_same, script_chains);
+            std::fprintf(stderr, "[perf] 5s: %d paints (%.0f ms), %d layouts (%.0f ms, styling %.0f); for scripts %d restyles (%.0f ms), %d layouts (%.0f ms; %d kept, %d same), %d chains; %d styled in part\n",
+                         paints, paint_ms, layouts, layout_ms, layout_style_ms, script_restyles, script_restyle_ms, script_layouts, script_layout_ms, script_kept, script_same, script_chains, styled_parts);
             since = now;
-            paints = layouts = script_restyles = script_layouts = script_chains = script_kept = script_same = 0;
+            paints = layouts = script_restyles = script_layouts = script_chains = script_kept = script_same = styled_parts = 0;
             paint_ms = layout_ms = layout_style_ms = script_restyle_ms = script_layout_ms = 0;
         }
     } perf_;
@@ -1059,7 +1062,7 @@ public:
             restyled_h_ = laid_out_height_;
             restyled_missing_ = std::move(missing);
         }
-        if (keepsLayouts() && !fonts_changed_ && styles_unbroken_ && restyled_->allKept() && restyled_missing_.empty() && contentPrint(false) == laid_out_print_) {
+        if (keepsLayouts() && !fonts_changed_ && styles_unbroken_ && restyled_->allKept() && restyled_missing_.empty() && (content_as_laid_out_ || contentPrint(false) == laid_out_print_)) {
             ++perf_.script_kept;
             styles_ = std::move(restyled_);
             computed_cache_.clear();
@@ -1083,7 +1086,11 @@ public:
     }
     bool nothingChanged() {
         if (!keepsLayouts()) return false;
-        if (restyled_ || fonts_changed_ || !styles_ || !styles_unbroken_ || contentPrint(true) != laid_out_full_print_) return false;
+        if (restyled_ || fonts_changed_ || !styles_ || !styles_unbroken_) return false;
+        // (Style attributes have, and nothing else: styling those again is sooner done than
+        // looking at everything.)
+        if (!styles_other_ && page_->script && page_->script->onlyStyleAttributes() && !page_->script->onlyStyleAttributes()->empty()) return false;
+        if (contentPrint(true) != laid_out_full_print_) return false;
         ++perf_.script_same;
         chain_styles_.reset();
         computed_cache_.clear();
@@ -1130,6 +1137,11 @@ public:
                 computed_values_.clear();
             }
             if (const auto it = computed_values_.find(std::make_pair(n, name)); it != computed_values_.end()) return it->second;
+            // Only style attributes have changed, none of them of what it's in: as it was.
+            if (const web::StyledDocument* as_was = unchangedStyles(n)) {
+                stale_ = true;
+                return computedValue(n, name, as_was);
+            }
             if (styleChainForScript(n)) {
                 stale_ = true;
                 return computedValue(n, name, chain_styles_.get());
@@ -1495,10 +1507,19 @@ private:
         // come since, ones worked out from a font's measure.
         const web::StyledDocument* before = page_changed_ ? nullptr : restyled_ ? restyled_.get() : styles_.get();
         if (before && fonts_changed_ && before->asksFonts()) before = nullptr;
-        auto made = std::make_unique<web::StyledDocument>(
-            *page.doc, web::css::MediaContext{width, height, &container_sizes_}, sheetLoader(missing),
-            [this](const web::ComputedStyle& s) { return web::chWidth(measurer_, s); }, &page_->forms,
-            before);
+        const web::css::MediaContext media{width, height, &container_sizes_};
+        const auto ch = [this](const web::ComputedStyle& s) { return web::chWidth(measurer_, s); };
+        // Nothing but some elements' style attributes since: those, and what's in them.
+        std::vector<const web::Node*> style_attributes;
+        bool other = std::exchange(styles_other_, false) || !page_->script;
+        if (page_->script && page_->script->takeChanges(style_attributes)) other = true;
+        std::unique_ptr<web::StyledDocument> made;
+        if (!other && before) {
+            made = web::StyledDocument::withStyleAttributes(style_attributes, *page.doc, media, sheetLoader(missing), ch, &page_->forms, *before);
+            if (made) ++perf_.styled_parts;
+        }
+        if (other) content_as_laid_out_ = false;
+        if (!made) made = std::make_unique<web::StyledDocument>(*page.doc, media, sheetLoader(missing), ch, &page_->forms, before);
         // What changed starts moving; what's moving is laid over them.
         if (animates()) animator_.styled(*made, before, seconds());
         return made;
@@ -1507,6 +1528,17 @@ private:
     // A script's question about one element's style, the page having changed since it was
     // styled: just that element and its ancestors styled (the rest stays to do, stale_).
     // False when that can't be: then the whole page is.
+    const web::StyledDocument* unchangedStyles(const web::Node* n) const {
+        if (styles_other_ || fonts_changed_ || page_changed_ || !page_ || !page_->script) return nullptr;
+        const web::StyledDocument* previous = restyled_ ? restyled_.get() : styles_.get();
+        const std::vector<const web::Node*>* changed = page_->script->onlyStyleAttributes();
+        if (!previous || !changed || previous->hasShadowTrees() || previous->asksStyleAttributes()) return nullptr;
+        for (const web::Node* p = n; p; p = p->parent) {
+            if (std::find(changed->begin(), changed->end(), p) != changed->end()) return nullptr;
+            if (!p->parent && p->type != web::NodeType::Document) return nullptr;   // (not in the page)
+        }
+        return previous;
+    }
     bool styleChainForScript(const web::Node* n) {
         if (laid_out_width_ <= 0 || !page_ || !page_->doc || fonts_changed_) return false;
         const web::StyledDocument* previous = restyled_ ? restyled_.get() : styles_.get();
@@ -1516,7 +1548,8 @@ private:
         auto chain = web::StyledDocument::chainOf(n, *page_->doc, web::css::MediaContext{laid_out_width_, laid_out_height_, &container_sizes_},
                                                   sheetLoader(missing),
                                                   [this](const web::ComputedStyle& s) { return web::chWidth(measurer_, s); },
-                                                  &page_->forms, previous);
+                                                  &page_->forms, previous,
+                                                  !styles_other_ && page_->script && page_->script->onlyStyleAttributes());
         if (!missing.empty()) return false;
         // What starts moving does so from its style as it's asked for now: styled whole.
         if (animates()) {
@@ -1582,6 +1615,7 @@ private:
         }
         if (sizes == container_sizes_) return false;
         container_sizes_ = std::move(sizes);
+        styles_other_ = true;
         return true;
     }
 
@@ -1646,6 +1680,7 @@ private:
         laid_out_for_h_ = height;
         laid_out_print_ = contentPrint(false);
         laid_out_full_print_ = contentPrint(true);
+        content_as_laid_out_ = true;
         spliceFrames();
         ++layout_gen_;
         computed_cache_.clear();
@@ -2471,6 +2506,8 @@ private:
     std::vector<std::string> restyled_missing_;
     uint64_t change_gen_ = 0, restyled_gen_ = 0;
     float restyled_w_ = 0, restyled_h_ = 0;
+    bool content_as_laid_out_ = false;   // nothing but style attributes since the layout
+    bool styles_other_ = true;   // something besides what the page's script tells of, since the styles were made
     web::LayoutState layout_state_;
     web::css::ContainerSizes container_sizes_;
     int container_rounds_ = 0;
@@ -2652,7 +2689,7 @@ public:
             return;
         }
         const bool done = page->script->runSome(50);
-        if (page->script->takeDirty()) node_->invalidate();
+        if (page->script->takeDirty()) node_->invalidate(true);
         if (!done) {
             XApplication::wakeIn(0);
             return;
@@ -2696,13 +2733,13 @@ public:
             if (Page* page = node_->page(); page && page->script) {
                 for (const web::Animator::Event& e : events)
                     page->script->animationEvent(const_cast<web::Node*>(e.node), e.type, e.name, e.elapsed, e.pseudo);
-                if (page->script->takeDirty()) node_->invalidate();
+                if (page->script->takeDirty()) node_->invalidate(true);
             }
         // The page's event loop: timers and animation frames.
         if (Page* page = node_->page(); page && page->script) {
             // Its animation frames when there may be a draw after them.
             if (page->script->busy()) page->script->tick(page->script->framesDue() && node_->mayDraw());
-            if (page->script->takeDirty()) node_->invalidate();
+            if (page->script->takeDirty()) node_->invalidate(true);
             if (const auto due = page->script->dueIn()) XApplication::wakeIn(std::max(*due, page->script->framesDue() ? node_->drawIn() : 0.0));
         }
         if (!relayout_wanted_) return;
@@ -2877,7 +2914,7 @@ private:
             // Laid out again once per change, not per question: a script asking for many
             // boxes or styles in one turn mustn't redo the whole page each time.
             const bool changed = raw->script && raw->script->takeDirty();
-            if (changed) node_->invalidate();
+            if (changed) node_->invalidate(true);
             if (changed || node_->layoutStale() || node_->stale()) node_->refreshForScript();
             if (const web::ElementBox* b = node_->boxOf(n)) return web::ElementRect{b->x, b->y, b->w, b->h};
             return std::nullopt;
@@ -2885,13 +2922,13 @@ private:
         host.computed_style = [this, raw = page.get()](const web::Node* n) {
             // Styled again, not laid out: styles are all it asks about.
             const bool changed = raw->script && raw->script->takeDirty();
-            if (changed) node_->invalidate();
+            if (changed) node_->invalidate(true);
             if (changed || node_->stale()) node_->restyleForScript();
             return node_->computedStyleShared(n);
         };
         host.computed_value = [this, raw = page.get()](const web::Node* n, const std::string& name) {
             const bool changed = raw->script && raw->script->takeDirty();
-            if (changed) node_->invalidate();
+            if (changed) node_->invalidate(true);
             return node_->computedValueForScript(n, name, changed);
         };
         Page* raw = page.get();
@@ -2903,7 +2940,7 @@ private:
                 // Here or given up on already: say so now (the loader won't again).
                 if (p->images.count(url) || p->failed_images.count(url)) {
                     p->script->imageLoaded(url, p->images.count(url) > 0);
-                    if (p->script->takeDirty()) node_->invalidate();
+                    if (p->script->takeDirty()) node_->invalidate(true);
                     return;
                 }
                 loadImages(p, {url}, generation_.load());
@@ -2998,7 +3035,7 @@ private:
                     if (!p || !p->script) return;   // the page is gone
                     if (body) p->scripts[url] = *body;
                     done(body);
-                    if (p->script->takeDirty()) node_->invalidate();
+                    if (p->script->takeDirty()) node_->invalidate(true);
                 });
             }).detach();
         };
@@ -3054,7 +3091,7 @@ private:
                     std::shared_ptr<Page> p = weak.lock();
                     if (!p || !p->script) return;
                     done(r);
-                    if (p->script->takeDirty()) node_->invalidate();
+                    if (p->script->takeDirty()) node_->invalidate(true);
                 });
             }).detach();
         };
@@ -3064,7 +3101,7 @@ private:
             if (it == raw->scripts.end()) return std::nullopt;
             return it->second;
         });
-        if (page->script->takeDirty()) node_->invalidate();
+        if (page->script->takeDirty()) node_->invalidate(true);
     }
 
     // A click's default action, for element.click() and the like: follow a link, tick a

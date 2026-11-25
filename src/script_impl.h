@@ -212,7 +212,23 @@ struct PageScript::Impl {
     js::Symbol* listeners = nullptr;   // where a target keeps its listeners
     js::Symbol* stop_flag = nullptr;
     js::Symbol* stop_now_flag = nullptr;
-    bool dirty = false;
+    // Something of the page has changed; and, since the styles were last made, whether
+    // anything but some elements' style attributes.
+    struct Dirty {
+        bool set = false, other = false;
+        std::vector<const Node*> style_attributes;
+        Dirty& operator=(bool v) {
+            set = v;
+            other = other || v;
+            return *this;
+        }
+        operator bool() const { return set; }
+        void style(const Node* n) {
+            set = true;
+            if (style_attributes.size() >= 4096) other = true;
+            else if (style_attributes.empty() || style_attributes.back() != n) style_attributes.push_back(n);
+        }
+    } dirty;
     std::string ready_state = "loading";
     Node* current_script = nullptr;
     std::string write_buffer;   // what the running script has document.write()n, not yet parsed
@@ -515,12 +531,12 @@ struct PageScript::Impl {
             if (a.name == name) {
                 const std::string old = a.value;
                 a.value = value;
-                dirty = true;
+                if (name == "style") dirty.style(n); else dirty = true;
                 afterAttr(n, name, &old);
                 return;
             }
         n->attrs.push_back({name, value});
-        dirty = true;
+        if (name == "style") dirty.style(n); else dirty = true;
         afterAttr(n, name, nullptr);
     }
 
@@ -530,7 +546,7 @@ struct PageScript::Impl {
         const std::string old = *had;
         const auto it = std::remove_if(n->attrs.begin(), n->attrs.end(), [&](const Attribute& a) { return a.name == name; });
         n->attrs.erase(it, n->attrs.end());
-        dirty = true;
+        if (name == "style") dirty.style(n); else dirty = true;
         afterAttr(n, name, &old);
     }
 

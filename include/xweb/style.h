@@ -399,12 +399,18 @@ public:
     // ancestors) keeps the style it had there instead of being matched again.
     StyledDocument(const Document& doc, css::MediaContext media, const SheetLoader& loader = {}, const ChMeasure& measure_ch = {},
                    const class FormState* forms = nullptr, const StyledDocument* previous = nullptr);
+    // `previous` with only these elements' style attributes changed since, and nothing else
+    // of the page: they and what's in them styled, the rest as it was. Null when that can't
+    // be done (then all of it must be).
+    [[nodiscard]] static std::unique_ptr<StyledDocument> withStyleAttributes(const std::vector<const Node*>& changed, const Document& doc, css::MediaContext media,
+                                                                             const SheetLoader& loader, const ChMeasure& measure_ch, const class FormState* forms,
+                                                                             const StyledDocument& previous);
     // Only `target` and its ancestors styled, as a whole document's styling would (with
     // `previous` as that does): for one element's style, in a fraction of the time. It has
-    // none if it isn't shown.
+    // none if it isn't shown. `same_rules`: nothing but style attributes has changed since.
     [[nodiscard]] static std::unique_ptr<StyledDocument> chainOf(const Node* target, const Document& doc, css::MediaContext media,
                                                                  const SheetLoader& loader, const ChMeasure& measure_ch,
-                                                                 const class FormState* forms, const StyledDocument* previous);
+                                                                 const class FormState* forms, const StyledDocument* previous, bool same_rules = false);
 
     // Nullptr for anything that has no box-generating style (or is too deep).
     [[nodiscard]] const ComputedStyle* styleOf(const Node* element) const;
@@ -440,6 +446,9 @@ public:
             for (const auto& [node, style] : o) out.push_back(style);
         return out;
     }
+    [[nodiscard]] bool hasShadowTrees() const noexcept { return has_hosts_; }
+    // Whether a selector asks for style attributes.
+    [[nodiscard]] bool asksStyleAttributes() const noexcept { return asks_style_; }
     // What's a container, for its size to be asked (MediaContext::containers).
     [[nodiscard]] const std::vector<const Node*>& containers() const noexcept { return containers_; }
     // Whether any style was worked out from a font's measure (ch).
@@ -464,6 +473,9 @@ private:
     std::unordered_map<const Node*, std::shared_ptr<const ComputedStyle>> overlay_[3];
     bool all_kept_ = false;
     bool states_matter_ = false;
+    bool has_hosts_ = false;   // shadow trees
+    bool asks_style_ = true;
+    void checkReuse(const Document& doc, const SheetLoader& loader) const;
     bool asks_fonts_ = false;
     std::vector<const Node*> containers_;
     // A :has() anchor's rules that matched (a print of them): what its children's keys

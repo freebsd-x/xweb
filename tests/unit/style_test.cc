@@ -1293,3 +1293,71 @@ TEST(CustomProperties, Registered) {
     EXPECT_FLOAT_EQ(by("plain")->height.px, 3);
     EXPECT_FLOAT_EQ(by("plain")->margin[3].px, 5);
 }
+
+// Style attributes changed at random, styled again with only those: as styling it all gives.
+TEST(Restyle, StyleAttributesOnly) {
+    uint32_t seed = std::getenv("FUZZ_SEED") ? static_cast<uint32_t>(std::atoi(std::getenv("FUZZ_SEED"))) : 99;
+    const int rounds = std::getenv("FUZZ_ROUNDS") ? std::atoi(std::getenv("FUZZ_ROUNDS")) : 40;
+    const auto rnd = [&seed](uint32_t n) {
+        seed = seed * 1664525 + 1013904223;
+        return (seed >> 8) % n;
+    };
+    static const char* const kStyles[] = {"", "color:red", "display:none", "width:10px", "font-size:30px;color:inherit", "--v:7px", "--v:9px;opacity:.5", "display:block;margin:inherit",
+                                          "transform:scale(2)", "visibility:hidden", "container-type:inline-size", "display:contents", "all:unset", "letter-spacing:2px"};
+    size_t parts = 0, kept = 0;
+    for (int round = 0; round < rounds; ++round) {
+        const std::string html = "<!doctype html><style>p{padding-left:var(--v,1px)} div>p+b{color:blue} :is(i,b):first-child{width:5em} p::before{content:'x';color:inherit}"
+                                 ".a .b{font-weight:700} div:has(> .b) i{opacity:.3} b{margin:inherit} u{font-size:2em} " + std::string(round % 7 == 0 ? "[style*=red]{width:77px}" : "") + "</style><div id=r></div>";
+        auto doc = parseHtml(html);
+        std::vector<Node*> all{const_cast<Node*>(elementById(*doc, "r"))};
+        for (int i = 0; i < 30; ++i) {
+            static const char* const kTags[] = {"div", "p", "b", "i", "u", "span"};
+            Node* n = doc->make(NodeType::Element);
+            n->name = kTags[rnd(6)];
+            n->ns = Namespace::Html;
+            if (rnd(3) == 0) n->attrs.push_back({"class", rnd(2) ? "a" : "b"});
+            if (rnd(3) == 0) n->attrs.push_back({"style", kStyles[rnd(std::size(kStyles))]});
+            all[rnd(static_cast<uint32_t>(all.size()))]->insertBefore(n, nullptr);
+            all.push_back(n);
+        }
+        auto styles = std::make_unique<StyledDocument>(*doc, css::MediaContext{800, 600});
+        for (int step = 0; step < 20; ++step) {
+            std::vector<const Node*> changed;
+            const uint32_t how_many = 1 + rnd(3);
+            for (uint32_t k = 0; k < how_many; ++k) {
+                Node* n = all[rnd(static_cast<uint32_t>(all.size()))];
+                setAttribute(n, "style", kStyles[rnd(std::size(kStyles))]);
+                changed.push_back(n);
+            }
+            auto next = StyledDocument::withStyleAttributes(changed, *doc, css::MediaContext{800, 600}, {}, {}, nullptr, *styles);
+            ASSERT_EQ(next != nullptr, round % 7 != 0 && next) << round;
+            if (next) ++parts;
+            else next = std::make_unique<StyledDocument>(*doc, css::MediaContext{800, 600}, StyledDocument::SheetLoader{}, StyledDocument::ChMeasure{}, nullptr, styles.get());
+            const StyledDocument fresh(*doc, css::MediaContext{800, 600});
+            const bool all_same = next->allKept();
+            kept += all_same;
+            for (const Node* n : all) {
+                const ComputedStyle *a = next->styleOf(n), *b = fresh.styleOf(n);
+                ASSERT_EQ(a != nullptr, b != nullptr) << round << " " << step << " " << n->name;
+                if (all_same) ASSERT_EQ(a, styles->styleOf(n)) << round << " " << step;
+                if (!a) continue;
+                ASSERT_EQ(a->color, b->color) << round << " " << step << " " << n->name;
+                ASSERT_EQ(a->display, b->display) << round << " " << step << " " << n->name;
+                ASSERT_FLOAT_EQ(a->font_size, b->font_size) << round << " " << step << " " << n->name;
+                ASSERT_FLOAT_EQ(a->width.px, b->width.px) << round << " " << step << " " << n->name;
+                ASSERT_FLOAT_EQ(a->padding[3].px, b->padding[3].px) << round << " " << step << " " << n->name;
+                ASSERT_FLOAT_EQ(a->margin[0].px, b->margin[0].px) << round << " " << step << " " << n->name;
+                ASSERT_FLOAT_EQ(a->opacity, b->opacity) << round << " " << step << " " << n->name;
+                ASSERT_EQ(a->font_weight, b->font_weight) << round << " " << step << " " << n->name;
+                ASSERT_EQ(a->hidden, b->hidden) << round << " " << step << " " << n->name;
+                const ComputedStyle *pa = next->beforeOf(n), *pb = fresh.beforeOf(n);
+                ASSERT_EQ(pa != nullptr, pb != nullptr) << round << " " << step << " " << n->name;
+                if (pa) ASSERT_EQ(pa->color, pb->color) << round << " " << step << " " << n->name;
+            }
+            ASSERT_EQ(next->containers().size(), fresh.containers().size()) << round << " " << step;
+            styles = std::move(next);
+        }
+    }
+    EXPECT_GT(parts, static_cast<size_t>(rounds) * 10);
+    EXPECT_GT(kept, 0u);
+}
