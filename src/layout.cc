@@ -408,6 +408,7 @@ private:
     struct Rect {
         float x, y, w, h;
         float rx = 0, ry = 0;   // an overflow clip's rounded corners (all four alike)
+        bool operator==(const Rect&) const = default;
     };
 
     // ── Keeping what's unchanged from the last layout ──
@@ -5021,6 +5022,44 @@ private:
         out_->ops.push_back(std::move(op));
     }
 
+    // The clips around a positioned box, opened. Those just closed after the last one are
+    // left open if they're its too, and what had nothing in it isn't there: of 11st.co.kr's
+    // 41000 operations, 40000 were the same few clips closed and opened.
+    struct ClipsOpened {
+        size_t ops, kept, below, positioned;
+    };
+    ClipsOpened openClips(const std::vector<Rect>& clips) {
+        auto& ops = out_->ops;
+        size_t same = 0;
+        if (closed_at_ == ops.size())
+            while (same < clips.size() && same < closed_.size() && clips[same] == closed_[same]) ++same;
+        ops.resize(ops.size() - same);
+        closed_at_ = ~size_t{0};   // (the number may come round again)
+        for (size_t i = same; i < clips.size(); ++i) {
+            PaintOp& op = ops.emplace_back();
+            op.kind = PaintKind::ClipBegin;
+            op.x = clips[i].x;
+            op.y = clips[i].y;
+            op.w = clips[i].w;
+            op.h = clips[i].h;
+            op.radius = clips[i].rx;
+            op.radius_y = clips[i].ry;
+        }
+        return {ops.size(), clips.size() - same, below_content_.size(), positioned_.size()};
+    }
+    void closeClips(const std::vector<Rect>& clips, const ClipsOpened& opened) {
+        auto& ops = out_->ops;
+        size_t open = clips.size();
+        // (Not where something's to go in between later.)
+        if (ops.size() == opened.ops && below_content_.size() == opened.below && positioned_.size() <= opened.positioned) {
+            ops.resize(ops.size() - opened.kept);
+            open -= opened.kept;
+        }
+        for (size_t i = 0; i < open; ++i) ops.emplace_back().kind = PaintKind::ClipEnd;
+        closed_.assign(clips.begin(), clips.begin() + static_cast<std::ptrdiff_t>(open));
+        closed_at_ = ops.size();
+    }
+
     void flushPositioned() {
         // Painted over everything in flow, lowest z-index first, then in tree order. Each may
         // add more (its own positioned descendants), and those take their turn among the rest
@@ -5062,23 +5101,14 @@ private:
                 const size_t saved_ctx_ops = ctx_ops_, saved_ctx_boxes = ctx_boxes_;
                 if (below) {
                     main_ops.swap(out_->ops);
+                    closed_at_ = ~size_t{0};
                     main_boxes.swap(out_->boxes);
                     ++painting_below_;
                     ctx_ops_ = p.ctx_ops;
                     ctx_boxes_ = p.ctx_boxes;
                 }
                 if (p.in_flow) {
-                    for (const Rect& c : p.clips) {
-                        PaintOp op;
-                        op.kind = PaintKind::ClipBegin;
-                        op.x = c.x;
-                        op.y = c.y;
-                        op.w = c.w;
-                        op.h = c.h;
-                        op.radius = c.rx;
-                        op.radius_y = c.ry;
-                        out_->ops.push_back(std::move(op));
-                    }
+                    const ClipsOpened opened = openClips(p.clips);
                     const std::vector<Rect> saved = std::move(clip_stack_);
                     clip_stack_ = p.clips;
                     const size_t saved_depth = cb_clip_depth_;
@@ -5093,14 +5123,11 @@ private:
                     flushOwn();
                     clip_stack_ = saved;
                     cb_clip_depth_ = saved_depth;
-                    for (size_t i = 0; i < p.clips.size(); ++i) {
-                        PaintOp op;
-                        op.kind = PaintKind::ClipEnd;
-                        out_->ops.push_back(std::move(op));
-                    }
+                    closeClips(p.clips, opened);
                     if (below) {
                         below_content_.push_back({p.ctx_ops, p.ctx_boxes, below_content_.size(), std::move(out_->ops), std::move(out_->boxes)});
                         out_->ops = std::move(main_ops);
+                    closed_at_ = ~size_t{0};
                         out_->boxes = std::move(main_boxes);
                         --painting_below_;
                         ctx_ops_ = saved_ctx_ops;
@@ -5121,17 +5148,7 @@ private:
                 const bool transformed = beginTransform(k, x, y);
                 record(k, x, y);
                 // Inside the clips it was inside, as far as its containing block.
-                for (const Rect& c : p.clips) {
-                    PaintOp op;
-                    op.kind = PaintKind::ClipBegin;
-                    op.x = c.x;
-                    op.y = c.y;
-                    op.w = c.w;
-                    op.h = c.h;
-                    op.radius = c.rx;
-                    op.radius_y = c.ry;
-                    out_->ops.push_back(std::move(op));
-                }
+                const ClipsOpened opened = openClips(p.clips);
                 const std::vector<Rect> saved = std::move(clip_stack_);
                 clip_stack_ = p.clips;
                 const size_t saved_depth = cb_clip_depth_;
@@ -5140,15 +5157,12 @@ private:
                 flushOwn();
                 clip_stack_ = saved;
                 cb_clip_depth_ = saved_depth;
-                for (size_t i = 0; i < p.clips.size(); ++i) {
-                    PaintOp op;
-                    op.kind = PaintKind::ClipEnd;
-                    out_->ops.push_back(std::move(op));
-                }
+                closeClips(p.clips, opened);
                 if (transformed) endTransform();
                 if (below) {
                     below_content_.push_back({p.ctx_ops, p.ctx_boxes, below_content_.size(), std::move(out_->ops), std::move(out_->boxes)});
                     out_->ops = std::move(main_ops);
+                    closed_at_ = ~size_t{0};
                     out_->boxes = std::move(main_boxes);
                     --painting_below_;
                     ctx_ops_ = saved_ctx_ops;
@@ -5238,6 +5252,8 @@ private:
     std::vector<BelowContent> below_content_;
     size_t ctx_ops_ = 0, ctx_boxes_ = 0;   // the nearest stacking context's content start
     int painting_below_ = 0;               // inside a negative z-index box's paint
+    std::vector<Rect> closed_;       // the clips closed last, when that many operations were made
+    size_t closed_at_ = ~size_t{0};
     std::vector<Rect> clip_stack_;   // overflow clips around what's being painted
     std::vector<Matrix> transforms_; // the transforms around what's being painted, composed
     // How many of them (from the outside) are the containing block's own clip and its

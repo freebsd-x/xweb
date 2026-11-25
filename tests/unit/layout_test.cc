@@ -1051,6 +1051,12 @@ TEST(Keep, RandomChangesLayOutAsAfresh) {
                 ASSERT_NEAR(a.boxes[i].w, b.boxes[i].w, 0.01) << round << " " << step << " " << a.boxes[i].node->name << " " << (st ? *st : "");
                 ASSERT_NEAR(a.boxes[i].h, b.boxes[i].h, 0.01) << round << " " << step << " " << a.boxes[i].node->name << " " << (st ? *st : "");
             }
+            int clips = 0;
+            for (const PaintOp& op : a.ops) {
+                clips += (op.kind == PaintKind::ClipBegin) - (op.kind == PaintKind::ClipEnd);
+                ASSERT_GE(clips, 0);
+            }
+            ASSERT_EQ(clips, 0);
             for (size_t i = 0; i < a.ops.size(); ++i) {
                 ASSERT_EQ(a.ops[i].text, b.ops[i].text) << round << " " << step;
                 ASSERT_NEAR(a.ops[i].x, b.ops[i].x, 0.01) << round << " " << step;

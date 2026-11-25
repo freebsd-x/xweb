@@ -94,7 +94,9 @@ int main(int argc, char** argv) {
                 kept += ms(t);
             }
             t = Clock::now();
-            const PageLayout l = layoutPage(*doc, styles, text, &images, w, h);
+            // XWEB_LAYOUT_BENCH_KEEP=1: with what's unchanged (all of it) kept.
+            static LayoutState state;
+            const PageLayout l = layoutPage(*doc, styles, text, &images, w, h, nullptr, std::getenv("XWEB_LAYOUT_BENCH_KEEP") ? &state : nullptr);
             laid += ms(t);
         }
         std::fprintf(stderr, "bench: styling %.1f ms, restyling (all kept) %.1f ms, layout %.1f ms\n", fresh / n, kept / n, laid / n);
