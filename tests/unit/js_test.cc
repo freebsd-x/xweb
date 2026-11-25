@@ -874,3 +874,35 @@ TEST(Js, ParsedAheadRunsTheSame) {
     }
     forgetParsed();
 }
+
+// arguments made only when they're needed; functions' own properties likewise.
+TEST(Js, ArgumentsAndFunctionsPropertiesPutOff) {
+    Runtime rt;
+    const auto is = [&](const std::string& code, const std::string& want) {
+        auto r = rt.evaluate(code, "t");
+        ASSERT_TRUE(r.ok) << code << ": " << r.error;
+        EXPECT_EQ(utf8(*rt.toString(r.value)), want) << code;
+    };
+    is("(function(a) { var n = arguments.length, t = []; for (var i = 0; i < n; i++) t.push(arguments[i]); return t.join() })(1, 2, 3)", "1,2,3");
+    is("(function() { return typeof arguments[5] + typeof arguments[-1] + typeof arguments['x'] + arguments[0.5] + arguments['1'] })(1, 2)", "undefinedundefinedundefinedundefined2");
+    is("(function() { var x = arguments[0]; arguments[0] = 9; return x + arguments[0] + arguments.length })(1)", "11");
+    is("(function() { arguments.length = 7; return arguments.length })(1)", "7");
+    is("(function(a) { a = 5; return arguments[0] })(1)", "1");
+    is("(function() { return (function() { return arguments.length + [].slice.call(arguments).join() }).apply(null, arguments) })(4, 5)", "24,5");
+    is("(function() { return (() => arguments[1])() })(4, 5)", "5");
+    is("(function() { try { throw 1 } catch (e) { return arguments[0] + arguments.length } })(8)", "9");
+    is("(function() { return arguments[Symbol.iterator] === [].values && [...arguments].length })(8, 9)", "2");
+    is("(function() { return arguments.callee.name })()", "");
+    is("(function f() { return arguments[0] ? arguments[0] + f(arguments[0] - 1) : 0 })(4)", "10");
+    is("(function() { var k = { toString() { return '0' } }; return arguments[k] })(6)", "6");
+    is("(function() { arguments = 3; return arguments })(6)", "3");
+    is("(function() { if (arguments.length > 1) { var arguments; } return arguments[0] })(6)", "6");
+    is("(function*() { yield arguments[0]; yield arguments.length })(6, 7).next().value", "6");
+    is("function F(a, b) {} var p = F.prototype; '' + (p.constructor === F) + F.length + F.name + Object.getOwnPropertyNames(F)", "true2Flength,name,arguments,caller,prototype");
+    is("function G() {} G.x = 1; '' + Object.keys(G) + Object.getOwnPropertyNames(G).length + delete G.name + ('name' in G) + G.hasOwnProperty('name')", "x6truetruefalse");
+    is("function H() {} '' + (new H() instanceof H) + (Object.getPrototypeOf(new H()) === H.prototype)", "truetrue");
+    is("var A = (x, y) => x; '' + A.length + A.name + ('prototype' in A) + typeof A.call", "2Afalsefunction");
+    is("function *K() {} '' + typeof K.prototype + (K.prototype.constructor === Object) + Object.keys(K.prototype).length", "objectfalse0");
+    is("class C { m() {} static s() {} } '' + C.prototype.m.name + C.s.length + typeof C.prototype.m.prototype", "m0undefined");
+    is("var fs = []; for (let i = 0; i < 2000; i++) fs.push(function() { return i }); fs[7].prototype.q = 1; '' + fs[7].prototype.q + fs[8].prototype.q + fs[9]()", "1undefined9");
+}

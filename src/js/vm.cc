@@ -101,6 +101,9 @@ enum Opc : uint32_t {
     OpClass,         // d n
     OpDefineMethod,  // o n k               : a method, getter or setter (k a computed key, or none)
     OpArguments,     // d
+    OpNeedArguments, // d                   : made there, unless they have been (put off)
+    OpArgLen,        // d a                 : arguments.length, not making them for it
+    OpArgElem,       // d a k               : arguments[k]
     OpRestArgs,      // d from              : the arguments from `from` on, as an array
     OpJumpIfNotUndef,// s t
     OpCheckObjectCoercible, // s           : destructuring null or undefined is a TypeError
@@ -232,6 +235,11 @@ public:
                 emit(OpArguments, {t});
                 emit(OpInitCap, {capArg(l), t});
                 next_ = floor_;
+            } else if (!f.is_generator && !f.is_async) {
+                // Made when something but `arguments.length` and `arguments[i]` is asked of
+                // them: mostly a loop copies them (what compilers make of `...args`).
+                emit(OpEmpty, {l.reg});
+                later_arguments_ = &l;
             } else {
                 emit(OpArguments, {l.reg});
             }
@@ -485,11 +493,23 @@ private:
         ~TempMark() { c.next_ = std::max(saved, c.floor_); }
     };
 
-    const Local* findLocal(const std::u16string& name) const {
+    const Local* findLocalAsIs(const std::u16string& name) const {
         for (size_t i = scopes_.size(); i-- > 0;)
             if (auto it = scopes_[i].find(name); it != scopes_[i].end()) return &it->second;
         return nullptr;
     }
+    const Local* findLocal(const std::u16string& name) {
+        const Local* l = findLocalAsIs(name);
+        if (l && l == later_arguments_) emit(OpNeedArguments, {l->reg});
+        return l;
+    }
+    // Whether an expression is `arguments`, put off.
+    const Local* laterArguments(const Node* e) const {
+        if (!later_arguments_ || e->kind != N::Identifier || e->str != u"arguments") return nullptr;
+        const Local* l = findLocalAsIs(e->str);
+        return l == later_arguments_ ? l : nullptr;
+    }
+    const Local* later_arguments_ = nullptr;
 
     // A block's let, const (and their dead zones): registers of their own, below any temp.
     // Returns the block scope it made (an index in block_envs; it's entered now), or -1.
@@ -1331,6 +1351,17 @@ private:
                     emit(OpSuperGet, {dst, node(n), k});
                     return;
                 }
+                if (const Local* args = (n->flags & kOptional) ? nullptr : laterArguments(n->a)) {
+                    if (n->flags & kComputed) {
+                        const uint32_t k = value(n->b);
+                        emit(OpArgElem, {dst, args->reg, k});
+                        return;
+                    }
+                    if (n->str == u"length") {
+                        emit(OpArgLen, {dst, args->reg});
+                        return;
+                    }
+                }
                 const uint32_t o = value(n->a, false, {n->b});
                 if (n->flags & kOptional) shortIfNullish(o);
                 if (n->flags & kComputed) {
@@ -2096,6 +2127,28 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
         Node* c = call->a;
         if (c->kind == N::OptionalChain) c = c->a;
         return c->kind == N::Identifier ? utf8(c->str) : c->kind == N::Member && !(c->flags & kComputed) ? utf8(c->str) : std::string("expression");
+    };
+
+    const auto makeArguments = [&]() -> Object* {
+        static const std::vector<PropertyKey> k_index = [] {
+            std::vector<PropertyKey> out;
+            for (int i = 0; i < 16; ++i) out.emplace_back(utf16(std::to_string(i)));
+            return out;
+        }();
+        static const PropertyKey k_length(u"length"), k_callee(u"callee"), k_values(u"values"), k_caller(u"caller");
+        Object* a = rt_.allocate<Object>(rt_.object_prototype, ObjectClass::Arguments);
+        a->reserveProps(args.size() + 3);
+        for (size_t i = 0; i < args.size(); ++i) a->defineNew(i < k_index.size() ? k_index[i] : PropertyKey(utf16(std::to_string(i))), {args[i]});
+        a->defineNew(k_length, {Value::number(static_cast<double>(args.size())), nullptr, nullptr, kWritable | kConfigurable});
+        a->defineNew(PropertyKey(rt_.sym_iterator), {rt_.get(Value::object(rt_.array_prototype), k_values), nullptr, nullptr, kWritable | kConfigurable});
+        // callee: the function itself, in sloppy code with plain parameters (frameworks'
+        // `o.extend = arguments.callee`); in strict code, %ThrowTypeError% both ways.
+        if (!info->strict && info->simple_params) {
+            a->defineNew(k_callee, {Value::object(f), nullptr, nullptr, kWritable | kConfigurable});
+        } else if (const Property* caller = rt_.function_prototype->own(k_caller); caller && caller->getter) {
+            a->defineNew(k_callee, {Value::undefined(), caller->getter, caller->getter, kAccessor});
+        }
+        return a;
     };
 
     Value result;
@@ -3035,18 +3088,31 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                         pc += 4;
                         break;
                     }
-                    case OpArguments: {
-                        Object* a = rt_.allocate<Object>(rt_.object_prototype, ObjectClass::Arguments);
-                        for (size_t i = 0; i < args.size(); ++i) a->define(PropertyKey(utf16(std::to_string(i))), {args[i]});
-                        a->define(u"length", {Value::number(static_cast<double>(args.size())), nullptr, nullptr, kWritable | kConfigurable});
-                        a->define(PropertyKey(rt_.sym_iterator), {rt_.get(Value::object(rt_.array_prototype), u"values"), nullptr, nullptr, kWritable | kConfigurable});
-                        if (!info->strict && info->simple_params) {
-                            a->define(u"callee", {Value::object(f), nullptr, nullptr, kWritable | kConfigurable});
-                        } else if (const Property* caller = rt_.function_prototype->own(PropertyKey(u"caller")); caller && caller->getter) {
-                            a->define(u"callee", {Value::undefined(), caller->getter, caller->getter, kAccessor});
-                        }
-                        r[o[1]] = Value::object(a);
+                    case OpArguments: r[o[1]] = Value::object(makeArguments()); pc += 2; break;
+                    case OpNeedArguments:
+                        if (r[o[1]].isEmpty()) r[o[1]] = Value::object(makeArguments());
                         pc += 2;
+                        break;
+                    case OpArgLen: {
+                        if (r[o[2]].isEmpty()) r[o[1]].setNumber(static_cast<double>(args.size()));
+                        else r[o[1]] = rt_.get(r[o[2]], PropertyKey(u"length"));
+                        pc += 3;
+                        break;
+                    }
+                    case OpArgElem: {
+                        const Value& k = r[o[3]];
+                        if (r[o[2]].isEmpty()) {
+                            const double d = k.isNumber() ? k.asNumber() : -1;
+                            const auto at_arg = d >= 0 && d < static_cast<double>(args.size()) ? static_cast<size_t>(d) : args.size();
+                            if (at_arg < args.size() && static_cast<double>(at_arg) == d) {
+                                r[o[1]] = args[at_arg];
+                                pc += 4;
+                                break;
+                            }
+                            r[o[2]] = Value::object(makeArguments());
+                        }
+                        r[o[1]] = rt_.get(r[o[2]], rt_.toPropertyKey(k));
+                        pc += 4;
                         break;
                     }
                     default: rt_.throwError("InternalError", "bad bytecode");

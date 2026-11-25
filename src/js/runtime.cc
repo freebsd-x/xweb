@@ -140,6 +140,10 @@ size_t Object::keyHash(const PropertyKey& k) noexcept {
 }
 
 ptrdiff_t Object::find(const PropertyKey& key, size_t hash, bool hashed) const noexcept {
+    if (later_) {
+        if (!isFunctionsOwn(key)) return -1;
+        makeOwn();
+    }
     if (index_.empty()) {
         // By hash first (each key's is kept once worked out): one compare per property,
         // not a string compare.
@@ -208,6 +212,7 @@ const Property* Object::own(const PropertyKey& key) const {
 }
 
 Property& Object::define(const PropertyKey& key, Property p) {
+    if (later_) makeOwn();
     if (const ptrdiff_t at = find(key); at >= 0) {
         props_[static_cast<size_t>(at)].second = std::move(p);
         return props_[static_cast<size_t>(at)].second;
@@ -221,6 +226,7 @@ Property& Object::define(const PropertyKey& key, Property p) {
 Value NativeSlot::operator()(Runtime& rt, const Value& this_value, std::span<const Value> args) const { return (*fn_)(rt, this_value, args); }
 
 Property& Object::defineNew(const PropertyKey& key, Property p) {
+    if (later_) makeOwn();
     props_.emplace_back(key, std::move(p));
     if (props_.size() > kScanMax && index_.size() < props_.size() * 2) reindex();
     else if (!index_.empty()) place(static_cast<uint32_t>(props_.size() - 1));
@@ -228,6 +234,7 @@ Property& Object::defineNew(const PropertyKey& key, Property p) {
 }
 
 bool Object::remove(const PropertyKey& key) {
+    if (later_) makeOwn();
     const ptrdiff_t at = find(key);
     if (at < 0) return false;
     auto& [k, p] = props_[static_cast<size_t>(at)];
@@ -241,6 +248,7 @@ bool Object::remove(const PropertyKey& key) {
 }
 
 std::vector<PropertyKey> Object::ownKeys() const {
+    if (later_) makeOwn();
     std::vector<PropertyKey> out;
     std::vector<std::pair<int64_t, PropertyKey>> indexed;
     if (cls == ObjectClass::TypedArray)
@@ -1517,10 +1525,6 @@ std::string describeValue(Runtime& rt, const Value& thrown) {
 // ── The interpreter proper ────────────────────────────────────────────────────
 
 Object* Interpreter::makeFunction(FunctionInfo* info, Env* env, Object* home) {
-    // (Keys made once; a new function's properties added straight, room for them made
-    // first: a page makes closures by the hundred thousand.)
-    static const PropertyKey k_length(u"length"), k_name(u"name"), k_caller(u"caller"), k_arguments(u"arguments"),
-        k_prototype(u"prototype"), k_constructor(u"constructor");
     Object* f = rt_.allocate<Object>(rt_.function_prototype, ObjectClass::Function);
     f->code = std::make_shared<FunctionData>();
     f->code->info = info;
@@ -1528,6 +1532,30 @@ Object* Interpreter::makeFunction(FunctionInfo* info, Env* env, Object* home) {
     f->code->home = home;
     f->code->program = prog_;
     f->constructor = !info->arrow && !info->is_method && !info->is_async && !info->is_generator;
+    if (info->is_generator) f->prototype = info->is_async ? rt_.async_generator_function_prototype : rt_.generator_function_prototype;
+    else if (info->is_async) f->prototype = rt_.async_function_prototype;
+    f->ownPropertiesLater(rt_);
+    return f;
+}
+
+bool Object::isFunctionsOwn(const PropertyKey& key) noexcept {
+    if (key.isSymbol()) return false;
+    const std::u16string& n = key.name;
+    switch (n.size()) {
+        case 4: return n == u"name";
+        case 6: return n == u"length" || n == u"caller";
+        case 9: return n == u"prototype" || n == u"arguments";
+        default: return false;
+    }
+}
+
+void Object::makeOwn() const {
+    auto* f = const_cast<Object*>(this);
+    Runtime& rt = *f->later_;
+    f->later_ = nullptr;
+    FunctionInfo* info = f->code->info;
+    static const PropertyKey k_length(u"length"), k_name(u"name"), k_caller(u"caller"), k_arguments(u"arguments"),
+        k_prototype(u"prototype"), k_constructor(u"constructor");
     const bool sloppy_own = !info->strict && !info->arrow && !info->is_method && !info->is_async && !info->is_generator;
     f->reserveProps(2 + (sloppy_own ? 2 : 0) + (f->constructor || info->is_generator ? 1 : 0));
     f->defineNew(k_length, {Value::number(info->length), nullptr, nullptr, kConfigurable});
@@ -1535,22 +1563,18 @@ Object* Interpreter::makeFunction(FunctionInfo* info, Env* env, Object* home) {
     f->defineNew(k_name, {Value::string(info->name_value), nullptr, nullptr, kConfigurable});
     // A sloppy function's own caller and arguments: null, as browsers have them.
     if (sloppy_own) {
-        f->defineNew(k_caller, {Value::null(), nullptr, nullptr, 0});
         f->defineNew(k_arguments, {Value::null(), nullptr, nullptr, 0});
+        f->defineNew(k_caller, {Value::null(), nullptr, nullptr, 0});
     }
     if (f->constructor) {
-        Object* proto = rt_.newObject();
+        Object* proto = rt.newObject();
         proto->reserveProps(1);
         proto->defineNew(k_constructor, {Value::object(f), nullptr, nullptr, kWritable | kConfigurable});
         f->defineNew(k_prototype, {Value::object(proto), nullptr, nullptr, kWritable});
     } else if (info->is_generator) {
-        f->prototype = info->is_async ? rt_.async_generator_function_prototype : rt_.generator_function_prototype;
-        Object* proto = rt_.newObject(info->is_async ? rt_.async_generator_prototype : rt_.generator_prototype);
+        Object* proto = rt.newObject(info->is_async ? rt.async_generator_prototype : rt.generator_prototype);
         f->defineNew(k_prototype, {Value::object(proto), nullptr, nullptr, kWritable});
-    } else if (info->is_async) {
-        f->prototype = rt_.async_function_prototype;
     }
-    return f;
 }
 
 // ── Iteration ──

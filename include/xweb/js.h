@@ -314,6 +314,9 @@ public:
     Property& define(const PropertyKey& key, Property p);
     // A property it surely hasn't yet (a new object's), added without looking for it first.
     Property& defineNew(const PropertyKey& key, Property p);
+    // A script function's own (length, name, prototype...) are made when one's asked for, or
+    // another's added, or they're listed: most functions are only called.
+    void ownPropertiesLater(Runtime& rt) noexcept { later_ = &rt; }
     // Room for so many properties, made before they're added (one allocation, not several).
     void reserveProps(size_t n) { props_.reserve(n); }
     bool remove(const PropertyKey& key);
@@ -380,6 +383,9 @@ private:
     // Only once there are enough properties for a scan to be slow.
     std::vector<uint32_t> index_;
     uint32_t dead_ = 0;
+    Runtime* later_ = nullptr;
+    void makeOwn() const;   // those put off
+    [[nodiscard]] static bool isFunctionsOwn(const PropertyKey& key) noexcept;
     static constexpr uint8_t kTombstone = 0xFF;
     static constexpr size_t kScanMax = 8;
     [[nodiscard]] static size_t keyHash(const PropertyKey& k) noexcept;
