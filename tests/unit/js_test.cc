@@ -906,3 +906,12 @@ TEST(Js, ArgumentsAndFunctionsPropertiesPutOff) {
     is("class C { m() {} static s() {} } '' + C.prototype.m.name + C.s.length + typeof C.prototype.m.prototype", "m0undefined");
     is("var fs = []; for (let i = 0; i < 2000; i++) fs.push(function() { return i }); fs[7].prototype.q = 1; '' + fs[7].prototype.q + fs[8].prototype.q + fs[9]()", "1undefined9");
 }
+
+TEST(Js, DefinePropertiesTakesSymbols) {
+    Runtime rt;
+    auto r = rt.evaluate("var S = Symbol('s'), o = {a: 1, [S]: 2}; var t = Object.defineProperties({}, Object.getOwnPropertyDescriptors(o));"
+                         "var c = Object.create({}, {[S]: {value: 7}, b: {value: 1, enumerable: true}}); var n = {}; Object.defineProperty(n, S, {value: {value: 3}, enumerable: false});"
+                         "'' + t[S] + Object.keys(t) + c[S] + Object.keys(c) + Object.getOwnPropertySymbols(Object.defineProperties({}, n)).length", "t");
+    ASSERT_TRUE(r.ok) << r.error;
+    EXPECT_EQ(utf8(*rt.toString(r.value)), "2a7b0");
+}

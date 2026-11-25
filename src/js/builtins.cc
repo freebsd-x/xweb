@@ -781,6 +781,17 @@ void Runtime::installBuiltins() {
         }
         return Value::object(o);
     });
+    // Each own enumerable property's value a descriptor, symbols' too (what compilers make of
+    // object spreads goes by that: daum.net's class directives were lost).
+    static const auto defineAll = [](Runtime& rt, Object* o, Object* props) {
+        const Runtime::NoGc no_gc(rt);
+        std::vector<std::pair<PropertyKey, Value>> all;
+        for (const PropertyKey& k : ownKeysOf(rt, props)) {
+            Property p;
+            if (ownProperty(rt, props, k, p) && (p.flags & kEnumerable)) all.emplace_back(k, rt.get(props, k, Value::object(props)));
+        }
+        for (const auto& [k, d] : all) defineFromDescriptor(rt, o, k, d);
+    };
     method(object_ctor, u"assign", 2, [](Runtime& rt, const Value&, Args a) {
         Object* target = rt.toObject(arg(a, 0));
         for (size_t i = 1; i < a.size(); ++i) {
@@ -799,7 +810,7 @@ void Runtime::installBuiltins() {
         Object* o = rt.allocate<Object>(p.isObject() ? p.asObject() : nullptr);
         if (!arg(a, 1).isUndefined()) {
             Object* props = rt.toObject(arg(a, 1));
-            for (const PropertyKey& k : enumerableOwnKeys(rt, props)) defineFromDescriptor(rt, o, k, rt.get(props, k, Value::object(props)));
+            defineAll(rt, o, props);
         }
         return Value::object(o);
     });
@@ -811,7 +822,7 @@ void Runtime::installBuiltins() {
     method(object_ctor, u"defineProperties", 2, [](Runtime& rt, const Value&, Args a) {
         if (!arg(a, 0).isObject()) rt.throwError("TypeError", "Object.defineProperties needs an object");
         Object* props = rt.toObject(arg(a, 1));
-        for (const PropertyKey& k : enumerableOwnKeys(rt, props)) defineFromDescriptor(rt, arg(a, 0).asObject(), k, rt.get(props, k, Value::object(props)));
+        defineAll(rt, arg(a, 0).asObject(), props);
         return arg(a, 0);
     });
     method(object_ctor, u"getOwnPropertyNames", 1, [](Runtime& rt, const Value&, Args a) {

@@ -524,8 +524,9 @@ std::optional<web::PageScript::Host::CanvasText> canvasText(const std::string& t
     // Fallbacks: CJK text first (most pages' fonts lack it), then symbols.
     // (Korean text: the Korean font, Nanum; other CJK text the pan-CJK one.)
     FontFace* fallback = nullptr;
-    if (FontManager::hasHangul(text)) fallback = FontManager::getHangulFace();
-    if (!fallback) fallback = FontManager::getCjkFace();
+    const bool bold = weight >= FontWeight::SemiBold;
+    if (FontManager::hasHangul(text)) fallback = FontManager::getHangulFace(bold);
+    if (!fallback) fallback = FontManager::getCjkFace(bold);
     FontFace* symbols = FontManager::getLastResortFace();
     const uint32_t px = static_cast<uint32_t>(std::clamp(std::lround(size * scale), 1L, 1024L));
 
