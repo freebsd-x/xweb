@@ -266,7 +266,7 @@ void Runtime::installRegExp() {
     Runtime& rt = *this;
     regexp_prototype = newObject();
     const auto getter = [&](Object* o, const PropertyKey& key, NativeFunction fn) {
-        o->define(key, {Value::undefined(), newFunction(u"get " + key.name, 0, std::move(fn)), nullptr, kConfigurable | kAccessor});
+        o->define(key, {Value::undefined(), newFunction(u"get " + key.name.get(), 0, std::move(fn)), nullptr, kConfigurable | kAccessor});
     };
 
     // ── The constructor ──

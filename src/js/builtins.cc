@@ -81,7 +81,7 @@ using Args = std::span<const Value>;
 
 Value arg(Args a, size_t i) { return i < a.size() ? a[i] : Value::undefined(); }
 
-std::u16string keyString(const PropertyKey& k) { return k.isSymbol() ? u"Symbol(" + k.symbol->description + u")" : k.name; }
+std::u16string keyString(const PropertyKey& k) { return k.isSymbol() ? u"Symbol(" + k.symbol->description + u")" : k.name.get(); }
 
 // Relative index arguments (slice, splice...): negative counts from the end.
 uint64_t relative(Runtime& rt, const Value& v, uint64_t len, uint64_t if_undefined) {
@@ -548,12 +548,12 @@ struct JsonWriter {
         if (v.isObject() || v.isBigInt()) {
             const Value to_json = rt.get(v, u"toJSON");
             if (rt.isCallable(to_json)) {
-                const Value k = Value::string(key.name);
+                const Value k = Value::string(key.name.str());
                 v = rt.call(to_json, v, std::span<const Value>(&k, 1));
             }
         }
         if (!replacer_fn.isUndefined()) {
-            const Value a[2] = {Value::string(key.name), v};
+            const Value a[2] = {Value::string(key.name.str()), v};
             v = rt.call(replacer_fn, holder, a);
         }
         if (v.isObject()) {
@@ -757,7 +757,7 @@ void Runtime::installBuiltins() {
     method(object_ctor, u"keys", 1, [](Runtime& rt, const Value&, Args a) {
         Object* o = rt.toObject(arg(a, 0));
         std::vector<Value> out;
-        for (const PropertyKey& k : enumerableOwnKeys(rt, o)) out.push_back(Value::string(k.name));
+        for (const PropertyKey& k : enumerableOwnKeys(rt, o)) out.push_back(Value::string(k.name.str()));
         return Value::object(rt.newArray(std::move(out)));
     });
     method(object_ctor, u"values", 1, [](Runtime& rt, const Value&, Args a) {
@@ -770,7 +770,7 @@ void Runtime::installBuiltins() {
         Object* o = rt.toObject(arg(a, 0));
         std::vector<Value> out;
         for (const PropertyKey& k : enumerableOwnKeys(rt, o))
-            out.push_back(Value::object(rt.newArray({Value::string(k.name), rt.get(o, k, Value::object(o))})));
+            out.push_back(Value::object(rt.newArray({Value::string(k.name.str()), rt.get(o, k, Value::object(o))})));
         return Value::object(rt.newArray(std::move(out)));
     });
     method(object_ctor, u"fromEntries", 1, [](Runtime& rt, const Value&, Args a) {
@@ -818,7 +818,7 @@ void Runtime::installBuiltins() {
         Object* o = rt.toObject(arg(a, 0));
         std::vector<Value> out;
         for (const PropertyKey& k : ownKeysOf(rt, o))
-            if (!k.isSymbol()) out.push_back(Value::string(k.name));
+            if (!k.isSymbol()) out.push_back(Value::string(k.name.str()));
         return Value::object(rt.newArray(std::move(out)));
     });
     method(object_ctor, u"getOwnPropertySymbols", 1, [](Runtime& rt, const Value&, Args a) {
@@ -2476,7 +2476,7 @@ void Runtime::installBuiltins() {
                     else rt.set(val, k, nv, false);
                 }
             }
-            const Value args[2] = {Value::string(key.name), val};
+            const Value args[2] = {Value::string(key.name.str()), val};
             return rt.call(reviver, holder, args);
         };
         Object* root = rt.newObject();

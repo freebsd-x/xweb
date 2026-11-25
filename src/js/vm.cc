@@ -2781,7 +2781,7 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                                     if (k.isSymbol() || !seen.insert(k.name).second) continue;
                                     Property p;
                                     if (!rt_.getOwnProperty(cur, k, p) || !(p.flags & kEnumerable)) continue;
-                                    it->elements.push_back(Value::string(k.name));
+                                    it->elements.push_back(Value::string(k.name.str()));
                                 }
                             }
                         }

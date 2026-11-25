@@ -13,7 +13,7 @@ using Args = std::span<const Value>;
 
 Value arg(Args a, size_t i) { return i < a.size() ? a[i] : Value::undefined(); }
 
-Value keyValue(const PropertyKey& k) { return k.isSymbol() ? Value::symbol(k.symbol) : Value::string(k.name); }
+Value keyValue(const PropertyKey& k) { return k.isSymbol() ? Value::symbol(k.symbol) : Value::string(k.name.str()); }
 
 std::string keyText(const PropertyKey& k) { return k.isSymbol() ? std::string("a symbol") : "'" + utf8(k.name) + "'"; }
 

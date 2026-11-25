@@ -168,8 +168,37 @@ private:
 static_assert(sizeof(Value) == 16);
 
 // A property's name: a string, or a symbol.
+// A property's name, shared: an object's properties have the same one as the code that
+// made them (a copy each was 80 bytes a property, and a heap allocation past ten letters).
+class SharedName {
+public:
+    SharedName() = default;
+    SharedName(std::u16string s) : s_(s.empty() ? JSString() : JSString::make(std::move(s))) {}
+    SharedName(const char16_t* literal);
+    explicit SharedName(JSString s) : s_(s && !s->empty() ? std::move(s) : JSString()) {}
+    [[nodiscard]] const std::u16string& get() const noexcept {
+        static const std::u16string kEmpty;
+        return s_ ? *s_ : kEmpty;
+    }
+    operator const std::u16string&() const noexcept { return get(); }
+    operator std::u16string_view() const noexcept { return get(); }
+    // As a string value has it.
+    [[nodiscard]] JSString str() const { return s_ ? s_ : JSString::make(); }
+    [[nodiscard]] size_t size() const noexcept { return s_ ? s_->size() : 0; }
+    [[nodiscard]] bool empty() const noexcept { return !s_; }
+    char16_t operator[](size_t i) const noexcept { return (*s_)[i]; }
+    [[nodiscard]] auto begin() const noexcept { return get().begin(); }
+    [[nodiscard]] auto end() const noexcept { return get().end(); }
+    bool operator==(const SharedName& o) const noexcept { return s_ == o.s_ || get() == o.get(); }
+    bool operator==(const std::u16string& o) const noexcept { return get() == o; }
+    bool operator==(const char16_t* o) const noexcept { return get() == o; }
+
+private:
+    JSString s_;
+};
+
 struct PropertyKey {
-    std::u16string name;
+    SharedName name;
     Symbol* symbol = nullptr;
     // Object::keyHash's answer, worked out the first time it's asked (0: not yet). A key
     // looked up again and again (a member access's, kept on its node) isn't hashed again.
@@ -177,6 +206,7 @@ struct PropertyKey {
     PropertyKey() = default;
     PropertyKey(std::u16string n) : name(std::move(n)) {}
     PropertyKey(const char16_t* n) : name(n) {}
+    explicit PropertyKey(JSString n) : name(std::move(n)) {}
     explicit PropertyKey(Symbol* s) : symbol(s) {}
     bool operator==(const PropertyKey& o) const { return symbol == o.symbol && name == o.name; }
     [[nodiscard]] bool isSymbol() const noexcept { return symbol != nullptr; }

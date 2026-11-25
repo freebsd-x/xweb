@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <charconv>
+#include <array>
 #include <cmath>
 #include <map>
 #include <cstring>
@@ -125,6 +126,18 @@ std::u16string indexKey(uint64_t i) {
 // ── Objects ───────────────────────────────────────────────────────────────────
 
 Object::~Object() = default;
+
+// The same literal's name again and again (a built-in's u"next"): kept, by where it is,
+// and looked at too, in case something else is there now.
+SharedName::SharedName(const char16_t* literal) {
+    thread_local std::array<std::pair<const char16_t*, JSString>, 1024> kept;
+    auto& [at, s] = kept[(reinterpret_cast<uintptr_t>(literal) >> 1) * 0x9E3779B97F4A7C15ull >> 54];
+    if (at != literal || !s || *s != literal) {
+        at = literal;
+        s = JSString::make(std::u16string(literal));
+    }
+    if (!s->empty()) s_ = s;
+}
 
 size_t Object::keyHash(const PropertyKey& k) noexcept {
     if (k.hash) return k.hash;
@@ -861,10 +874,10 @@ PropertyKey Runtime::toPropertyKey(const Value& v) {
         const double d = v.asNumber();
         if (d >= 0 && d < 4294967295.0 && d == std::floor(d)) return PropertyKey(indexKey(static_cast<uint64_t>(d)));
     }
-    if (v.isString()) return PropertyKey(v.asString());
+    if (v.isString()) return PropertyKey(v.stringRef());
     const Value p = toPrimitive(v, "string");
     if (p.isSymbol()) return PropertyKey(p.asSymbol());
-    return PropertyKey(*toString(p));
+    return PropertyKey(toString(p));
 }
 
 bool Runtime::strictEquals(const Value& a, const Value& b) {
@@ -1286,12 +1299,12 @@ void Runtime::collect(bool mid_script) {
                 if (o->bound_target == c) what += " bound_target";
                 if (o->target == c) what += " target";
                 for (const auto& k : o->ownKeys())
-                    if (const Property* p = o->own(k); p && (p->getter == c || p->setter == c)) what += " accessor=" + utf8(k.isSymbol() ? std::u16string(u"<sym>") : k.name);
+                    if (const Property* p = o->own(k); p && (p->getter == c || p->setter == c)) what += " accessor=" + utf8(k.isSymbol() ? std::u16string(u"<sym>") : k.name.get());
                 what = " cls=" + std::to_string(static_cast<int>(o->cls)) + " host_kind=" + std::to_string(static_cast<int>(o->host_kind)) +
                        " keys=" + std::to_string(o->ownKeys().size()) + " elements=" + std::to_string(o->elements.size()) +
                        " slots=" + std::to_string(o->slots.size()) + " entries=" + std::to_string(o->entries.size());
                 for (const auto& k : o->ownKeys()) {
-                    if (const Property* p = o->own(k); p && p->value.isObject() && p->value.asObject() == c) what += " key=" + utf8(k.isSymbol() ? std::u16string(u"<sym>") : k.name);
+                    if (const Property* p = o->own(k); p && p->value.isObject() && p->value.asObject() == c) what += " key=" + utf8(k.isSymbol() ? std::u16string(u"<sym>") : k.name.get());
                 }
                 for (size_t i = 0; i < o->elements.size(); ++i)
                     if (o->elements[i].isObject() && o->elements[i].asObject() == c) { what += " element=" + std::to_string(i); break; }
@@ -2537,7 +2550,7 @@ Completion Interpreter::forInOf(Node* n, Env* env, bool strict, const std::u16st
                 if (k.isSymbol() || !seen.insert(k.name).second) continue;
                 Property p;
                 if (!rt_.getOwnProperty(cur, k, p) || !(p.flags & kEnumerable)) continue;
-                items.push_back(Value::string(k.name));
+                items.push_back(Value::string(k.name.str()));
             }
         }
     }
@@ -3237,7 +3250,7 @@ Value Interpreter::evalObject(Node* n, Env* env, bool strict) {
             // `[key]: function () {}` takes the key as its name.
             Property* nm = v.asObject()->own(u"name");
             if (nm && nm->value.isString() && nm->value.asString().empty())
-                nm->value = Value::string(key.isSymbol() ? u"[" + key.symbol->description + u"]" : key.name);
+                nm->value = Value::string(key.isSymbol() ? u"[" + key.symbol->description + u"]" : key.name.get());
         }
         o->define(key, {v});
     }
