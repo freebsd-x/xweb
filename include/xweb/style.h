@@ -488,6 +488,8 @@ private:
     friend class StyleResolver;
 };
 
+// A custom property's value as text, its var()s filled in; nothing if it hasn't one.
+[[nodiscard]] std::string customPropertyText(const ComputedStyle& style, const std::string& name);
 [[nodiscard]] bool parseColor(const std::vector<css::Token>& value, const Color& current, Color& out);
 
 }  // namespace fbx::xweb

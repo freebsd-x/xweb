@@ -1173,14 +1173,47 @@ public:
         return slot;
     }
 
+    static std::string pxText(float v) {
+        char b[32];
+        std::snprintf(b, sizeof b, "%gpx", v);
+        return b;
+    }
     // `only`: just that property (a script's getComputedStyle reads one or two of them),
     // else all of them.
     [[nodiscard]] std::unordered_map<std::string, std::string> computedStyleOf(const web::Node* n, std::string_view only = {},
-                                                                              const web::StyledDocument* from = nullptr) const {
+                                                                              const web::StyledDocument* from = nullptr,
+                                                                              const web::ComputedStyle* pseudo = nullptr) const {
         std::unordered_map<std::string, std::string> out;
-        const auto want = [only](std::string_view name) { return only.empty() || name == only; };
         const web::StyledDocument* current = from ? from : restyled_ ? restyled_.get() : styles_.get();
         const web::ComputedStyle* s = current ? current->styleOf(n) : nullptr;
+        if (only.starts_with("::")) {
+            // A ::before's or ::after's ("::before color"); an element without one's has no
+            // content, and is otherwise what's inherited, near enough.
+            const std::string asked(only);
+            const size_t sp = only.find(' ');
+            const std::string name(only.substr(sp + 1));
+            const web::ComputedStyle* p = !current ? nullptr : only.starts_with("::before") ? current->beforeOf(n) : current->afterOf(n);
+            if (name == "content") {
+                out[asked] = !p ? std::string("none") : "\"" + p->content + "\"";
+            } else if (p && (name == "width" || name == "height")) {
+                const web::Length& l = name == "width" ? p->width : p->height;
+                out[asked] = l.is_auto ? std::string("auto") : l.hasPercent() ? std::to_string(l.percent) + "%" : pxText(l.px);
+            } else if (name.starts_with("--")) {
+                out[asked] = p ? web::customPropertyText(*p, name) : s ? web::customPropertyText(*s, name) : std::string();
+            } else {
+                const auto values = computedStyleOf(n, name, from, p);
+                if (const auto it = values.find(name); it != values.end()) out[asked] = it->second;
+            }
+            return out;
+        }
+        if (pseudo) s = pseudo;
+        if (only.starts_with("--")) {
+            // (What isn't shown has those it would inherit.)
+            for (const web::Node* up = n; !s && up && current; up = up->parent) s = current->styleOf(up);
+            if (s) out[std::string(only)] = web::customPropertyText(*s, std::string(only));
+            return out;
+        }
+        const auto want = [only](std::string_view name) { return only.empty() || name == only; };
         // Not rendered (display: none, or inside one): every property still has a value.
         static const web::ComputedStyle kUnrendered = [] {
             web::ComputedStyle u;

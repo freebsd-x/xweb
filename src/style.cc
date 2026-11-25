@@ -6298,6 +6298,81 @@ std::unique_ptr<StyledDocument> StyledDocument::chainOf(const Node* target, cons
     return out;
 }
 
+namespace {
+// Tokens as they'd be written; false if a var() among them has nothing to be.
+bool tokensText(const Tokens& in, size_t begin, size_t end, const ComputedStyle& style, int depth, std::string& out) {
+    if (depth > 32) return false;
+    for (size_t i = begin; i < end; ++i) {
+        const Token& t = in[i];
+        char number[32];
+        std::snprintf(number, sizeof number, "%.6g", t.number);
+        if (out.size() > 100'000) return false;
+        switch (t.type) {
+            case TokenType::Function: {
+                if (t.text != "var") {
+                    out += t.text + "(";
+                    break;
+                }
+                size_t j = i + 1, nesting = 1, comma = 0;
+                for (; j < end; ++j) {
+                    if (in[j].type == TokenType::Function || in[j].type == TokenType::LeftParen) ++nesting;
+                    else if (in[j].type == TokenType::RightParen && --nesting == 0) break;
+                    else if (in[j].type == TokenType::Comma && nesting == 1 && !comma) comma = j;
+                }
+                size_t k = i + 1;
+                while (k < j && in[k].type == TokenType::Whitespace) ++k;
+                if (k >= j || in[k].type != TokenType::Ident) return false;
+                const Tokens* found = style.custom ? style.custom->find(in[k].text) : nullptr;
+                std::string value;
+                if (!found || !tokensText(*found, 0, found->size(), style, depth + 1, value)) {
+                    value.clear();
+                    if (!comma || !tokensText(in, comma + 1, j, style, depth + 1, value)) return false;
+                }
+                out += value;
+                i = j;
+                break;
+            }
+            case TokenType::AtKeyword: out += "@" + t.text; break;
+            case TokenType::Hash: out += "#" + t.text; break;
+            case TokenType::String: {
+                out += '"';
+                for (const char c : t.text) {
+                    if (c == '"' || c == '\\') out += '\\';
+                    out += c;
+                }
+                out += '"';
+                break;
+            }
+            case TokenType::Url: out += "url(" + t.text + ")"; break;
+            case TokenType::Number: out += number; break;
+            case TokenType::Percentage: out += std::string(number) + "%"; break;
+            case TokenType::Dimension: out += number + t.text; break;
+            case TokenType::Whitespace: out += ' '; break;
+            case TokenType::Colon: out += ':'; break;
+            case TokenType::Semicolon: out += ';'; break;
+            case TokenType::Comma: out += ','; break;
+            case TokenType::LeftBracket: out += '['; break;
+            case TokenType::RightBracket: out += ']'; break;
+            case TokenType::LeftParen: out += '('; break;
+            case TokenType::RightParen: out += ')'; break;
+            case TokenType::LeftBrace: out += '{'; break;
+            case TokenType::RightBrace: out += '}'; break;
+            case TokenType::Ident: case TokenType::Delim: out += t.text; break;
+            default: break;
+        }
+    }
+    return true;
+}
+}  // namespace
+
+std::string customPropertyText(const ComputedStyle& style, const std::string& name) {
+    const Tokens* found = style.custom ? style.custom->find(name) : nullptr;
+    std::string out;
+    if (!found || !tokensText(*found, 0, found->size(), style, 0, out)) return {};
+    const size_t a = out.find_first_not_of(' ');
+    return a == std::string::npos ? std::string() : out.substr(a, out.find_last_not_of(' ') - a + 1);
+}
+
 const ComputedStyle* StyledDocument::beforeOf(const Node* element) const {
     if (!overlay_[1].empty())
         if (const auto o = overlay_[1].find(element); o != overlay_[1].end()) return o->second.get();

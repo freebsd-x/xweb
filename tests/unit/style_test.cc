@@ -1361,3 +1361,18 @@ TEST(Restyle, StyleAttributesOnly) {
     EXPECT_GT(parts, static_cast<size_t>(rounds) * 10);
     EXPECT_GT(kept, 0u);
 }
+
+TEST(CustomProperties, AsText) {
+    auto doc = parseHtml(R"(<!doctype html><style>:root{--r: 5px; --bad: var(--none); --f: var(--none, 2em)}
+        #a{--c:red;--u:url(x.svg);--k: calc(1px + var(--r)) , "q\"t" #fff;--l:var(--l)}</style><p id=a>x</p>)");
+    const StyledDocument styles(*doc, css::MediaContext{800, 600});
+    const ComputedStyle& s = *styles.styleOf(elementById(*doc, "a"));
+    EXPECT_EQ(customPropertyText(s, "--r"), "5px");
+    EXPECT_EQ(customPropertyText(s, "--c"), "red");
+    EXPECT_EQ(customPropertyText(s, "--u"), "url(x.svg)");
+    EXPECT_EQ(customPropertyText(s, "--k"), "calc(1px + 5px) , \"q\\\"t\" #fff");
+    EXPECT_EQ(customPropertyText(s, "--bad"), "");
+    EXPECT_EQ(customPropertyText(s, "--f"), "2em");
+    EXPECT_EQ(customPropertyText(s, "--l"), "");   // (of itself)
+    EXPECT_EQ(customPropertyText(s, "--none"), "");
+}

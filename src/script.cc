@@ -1540,8 +1540,10 @@ void PageScript::Impl::installWindow() {
         Object* o = t.isObject() ? t.asObject() : nullptr;
         Node* n = o && !o->slots.empty() ? self->node(o->slots[0]) : nullptr;
         if (!n) return str("");
+        // (A pseudo-element's: "::before color".)
+        const bool pseudo = o->slots.size() > 1 && o->slots[1].isString();
         if (self->host.computed_value) {
-            if (const auto value = self->host.computed_value(n, name)) return str(*value);
+            if (const auto value = self->host.computed_value(n, pseudo ? js::utf8(o->slots[1].asString()) + " " + name : name)) return str(*value);
         } else if (self->host.computed_style) {
             if (const auto values = self->host.computed_style(n)) {
                 if (const auto it = values->find(name); it != values->end()) return str(it->second);
@@ -1574,6 +1576,11 @@ void PageScript::Impl::installWindow() {
         Object* o = rt.newObject();
         o->prototype = computed_proto;
         o->slots.push_back(arg(a, 0));
+        if (arg(a, 1).isString()) {
+            const std::u16string& of = arg(a, 1).asString();
+            if (of == u"::before" || of == u":before") o->slots.push_back(Value::string(u"::before"));
+            else if (of == u"::after" || of == u":after") o->slots.push_back(Value::string(u"::after"));
+        }
         return Value::object(o);
     });
     method(g, u"matchMedia", 1, [self](Runtime& rt, const Value&, Args a) {
