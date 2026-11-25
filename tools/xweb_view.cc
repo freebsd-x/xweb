@@ -1619,6 +1619,7 @@ private:
         }
         stale_ = false;   // styled whole now
         chain_styles_.reset();
+        const bool fonts_changed_before = fonts_changed_ || page_changed_;
         fonts_changed_ = page_changed_ = false;
         const web::StyledDocument& styles = *styles_;
         if (!page.fonts_known) {
@@ -1630,7 +1631,8 @@ private:
             web::setPageWebFonts(std::move(faces));
             if (on_fonts_) on_fonts_(page_, web::wantedWebFonts(*page.doc, styles));
         }
-        layout_ = web::layoutPage(*page.doc, styles, measurer_, &images_, width, height, &page_->forms);
+        if (fonts_changed_before) layout_state_.reset();
+        layout_ = web::layoutPage(*page.doc, styles, measurer_, &images_, width, height, &page_->forms, &layout_state_);
         styles_unbroken_ = true;
         // Containers laid out otherwise than they were styled by: again, by their sizes now
         // (and by those that come of it, but not for ever).
@@ -2469,6 +2471,7 @@ private:
     std::vector<std::string> restyled_missing_;
     uint64_t change_gen_ = 0, restyled_gen_ = 0;
     float restyled_w_ = 0, restyled_h_ = 0;
+    web::LayoutState layout_state_;
     web::css::ContainerSizes container_sizes_;
     int container_rounds_ = 0;
     web::Animator animator_;

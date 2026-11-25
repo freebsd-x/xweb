@@ -432,6 +432,14 @@ public:
     // Every element's style is the one it had in those it was made from, and the same
     // elements are styled: none of them (nor their attributes) has changed.
     [[nodiscard]] bool allKept() const noexcept { return all_kept_; }
+    // Holds what the styles are in, so that none of their places is another's meanwhile.
+    [[nodiscard]] std::vector<std::shared_ptr<const void>> keepAlive() const {
+        std::vector<std::shared_ptr<const void>> out(kept_.begin(), kept_.end());
+        out.push_back(storage_);
+        for (const auto& o : overlay_)
+            for (const auto& [node, style] : o) out.push_back(style);
+        return out;
+    }
     // What's a container, for its size to be asked (MediaContext::containers).
     [[nodiscard]] const std::vector<const Node*>& containers() const noexcept { return containers_; }
     // Whether any style was worked out from a font's measure (ch).

@@ -116,8 +116,25 @@ struct PageLayout {
 
 // `images` may be null: an image then takes its size from attributes and style only.
 // `forms`: what the page's controls hold now (null: what the page said).
+// A page's last layout, for the next to keep what's unchanged of: the boxes of what has the
+// same content and styles, and their sizes where they're asked for the same. reset() when
+// what isn't in those changes (fonts).
+class LayoutState {
+public:
+    LayoutState();
+    ~LayoutState();
+    LayoutState(const LayoutState&) = delete;
+    LayoutState& operator=(const LayoutState&) = delete;
+    void reset();
+    // Of the last layout: boxes made and kept, and how many times their contents were
+    // laid out, or were as they had been.
+    size_t made = 0, kept = 0, laid = 0, skipped = 0;
+    struct Impl;
+    std::unique_ptr<Impl> impl;
+};
+
 [[nodiscard]] PageLayout layoutPage(const Document& doc, const StyledDocument& styles, TextMeasurer& text,
                                     ImageSizes* images, float viewport_width, float viewport_height,
-                                    const class FormState* forms = nullptr);
+                                    const class FormState* forms = nullptr, LayoutState* state = nullptr);
 
 }  // namespace fbx::xweb

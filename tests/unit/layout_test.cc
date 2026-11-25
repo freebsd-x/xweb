@@ -936,3 +936,129 @@ TEST(Text, LettersToSpace) {
     EXPECT_EQ(spacedLetters("\xD8\xB3\xD9\x84").size(), 0u);   // letters that join
     EXPECT_EQ(spacedLetters("\xFF\xC3").size(), 2u);     // not UTF-8: no reading past it
 }
+
+// Pages changed at random, laid out with what's unchanged kept: every box and everything
+// painted as laying them out afresh gives.
+TEST(Keep, RandomChangesLayOutAsAfresh) {
+    // (FUZZ_SEED and FUZZ_ROUNDS: others, and more.)
+    uint32_t seed = std::getenv("FUZZ_SEED") ? static_cast<uint32_t>(std::atoi(std::getenv("FUZZ_SEED"))) : 12345;
+    const int rounds = std::getenv("FUZZ_ROUNDS") ? std::atoi(std::getenv("FUZZ_ROUNDS")) : 60;
+    size_t kept = 0, skipped = 0, made = 0;
+    const auto rnd = [&seed](uint32_t n) {
+        seed = seed * 1664525 + 1013904223;
+        return (seed >> 8) % n;
+    };
+    static const char* const kStyles[] = {"", "display:flex", "display:flex;flex-direction:column;height:80px", "display:flex;align-items:center;justify-content:space-between",
+        "display:grid;grid-template-columns:1fr 2fr", "display:inline-block;width:60px", "float:left;width:40%", "float:right", "position:absolute;left:5px;right:9px;top:50%",
+        "position:relative;top:3px", "margin:10px 5%", "padding:4%", "width:50%", "height:50%", "display:none", "display:contents", "overflow:hidden", "clear:both",
+        "display:table", "display:table-cell;vertical-align:middle;height:40px", "text-align:center", "font-size:20px", "min-height:30px;max-width:90px", "display:inline",
+        "display:inline-flex", "height:120px;display:grid", "flex:1;min-width:0", "margin-top:-5px", "position:absolute;width:50%;height:50%", "border:1px solid", "column-gap:7px;display:flex;flex-wrap:wrap",
+        "opacity:.5;z-index:0;position:relative", "aspect-ratio:2;width:30%", "position:sticky;top:0", "white-space:nowrap;text-overflow:ellipsis;overflow:hidden;width:70px", "text-wrap:balance", "display:list-item"};
+    static const char* const kTags[] = {"div", "span", "p", "button", "li", "a", "table", "td", "section", "input", "img"};
+    for (int round = 0; round < rounds; ++round) {
+        auto doc = parseHtml("<!doctype html><style>.r{color:red}.w{width:30px}.f:hover{width:9px}b::before{content:'q'} .r .w{padding:3px} ul{margin:0}</style><body><div id=top></div></body>");
+        std::vector<Node*> all;
+        for (Node* c : doc->body()->children)
+            if (c->isElement()) all.push_back(c);
+        ASSERT_EQ(all.size(), 1u);
+        const auto setAttribute = [](Node* n, const char* name, const char* value) {
+            for (Attribute& a : n->attrs)
+                if (a.name == name) {
+                    a.value = value;
+                    return;
+                }
+            n->attrs.push_back({name, value});
+        };
+        const auto add = [&](Node* parent) {
+            Node* n = doc->make(NodeType::Element);
+            n->name = kTags[rnd(std::size(kTags))];
+            n->ns = Namespace::Html;
+            if (rnd(2)) n->attrs.push_back(Attribute{"style", kStyles[rnd(std::size(kStyles))]});
+            parent->insertBefore(n, parent->children.empty() || rnd(2) ? nullptr : parent->children[rnd(static_cast<uint32_t>(parent->children.size()))]);
+            all.push_back(n);
+            if (rnd(3)) {
+                Node* t = doc->make(NodeType::Text);
+                t->data = rnd(2) ? "some words to wrap " : "word";
+                n->insertBefore(t, nullptr);
+            }
+        };
+        for (int i = 0; i < 25; ++i) add(all[rnd(static_cast<uint32_t>(all.size()))]);
+        LayoutState state;
+        std::unique_ptr<StyledDocument> styles;
+        FixedText text;
+        for (int step = 0; step < 30; ++step) {
+            Node* n = all[rnd(static_cast<uint32_t>(all.size()))];
+            switch (rnd(6)) {
+                case 0: case 1: setAttribute(n, "style", kStyles[rnd(std::size(kStyles))]); break;
+                case 2: setAttribute(n, "class", rnd(2) ? "r" : "w"); break;
+                case 3: add(n); break;
+                case 4:
+                    if (n->parent && n != all[0]) {
+                        // Somewhere else, or (as often as not) nowhere.
+                        Node* to = all[rnd(static_cast<uint32_t>(all.size()))];
+                        bool inside = false;
+                        for (Node* p = to; p; p = p->parent) inside = inside || p == n;
+                        if (!inside) {
+                            n->parent->remove(n);
+                            if (rnd(2)) to->insertBefore(n, nullptr);
+                        }
+                    }
+                    break;
+                case 5:
+                    for (Node* c : n->children)
+                        if (c->type == NodeType::Text) c->data += rnd(2) ? "more " : "x";
+                    break;
+            }
+            const float width = step % 11 == 10 ? 500.0f : 400.0f;
+            auto next = std::make_unique<StyledDocument>(*doc, css::MediaContext{width, 300}, StyledDocument::SheetLoader{}, StyledDocument::ChMeasure{}, nullptr, styles.get());
+            const PageLayout a = layoutPage(*doc, *next, text, nullptr, width, 300, nullptr, &state);
+            kept += state.kept;
+            made += state.made;
+            skipped += state.skipped;
+            styles = std::move(next);
+            const PageLayout b = layoutPage(*doc, *styles, text, nullptr, width, 300);
+            if (std::getenv("FUZZ_TELL")) {
+                // Which first differs, for finding why; and the page.
+                for (size_t i = 0; i < std::min(a.boxes.size(), b.boxes.size()); ++i)
+                    if (std::fabs(a.boxes[i].y - b.boxes[i].y) > 0.01 || std::fabs(a.boxes[i].h - b.boxes[i].h) > 0.01 || std::fabs(a.boxes[i].x - b.boxes[i].x) > 0.01 || std::fabs(a.boxes[i].w - b.boxes[i].w) > 0.01) {
+                        std::vector<std::pair<const Node*, int>> todo{{doc->body(), 0}};
+                        while (!todo.empty()) {
+                            const auto [m, d] = todo.back();
+                            todo.pop_back();
+                            const ElementBox *p = nullptr, *q = nullptr;
+                            for (const ElementBox& e : a.boxes) if (e.node == m) p = &e;
+                            for (const ElementBox& e : b.boxes) if (e.node == m) q = &e;
+                            const std::string* st = m->isElement() ? m->attr("style") : nullptr;
+                            std::printf("%*s%s%s {%s}", d * 2, "", m->name.c_str(), m->type == NodeType::Text ? m->data.c_str() : "", st ? st->c_str() : "");
+                            if (p && q) {
+                                std::printf(" %g,%g %gx%g", q->x, q->y, q->w, q->h);
+                                if (p->x != q->x || p->y != q->y || p->w != q->w || p->h != q->h) std::printf("   KEPT %g,%g %gx%g", p->x, p->y, p->w, p->h);
+                            }
+                            std::printf("\n");
+                            for (auto it = m->children.rbegin(); it != m->children.rend(); ++it) todo.push_back({*it, d + 1});
+                        }
+                        std::printf("at %d %d changed {%s}\n", round, step, n->attr("style") ? n->attr("style")->c_str() : "");
+                        break;
+                    }
+            }
+            ASSERT_EQ(a.boxes.size(), b.boxes.size()) << round << " " << step;
+            ASSERT_EQ(a.ops.size(), b.ops.size()) << round << " " << step;
+            for (size_t i = 0; i < a.boxes.size(); ++i) {
+                ASSERT_EQ(a.boxes[i].node, b.boxes[i].node) << round << " " << step;
+                const std::string* st = a.boxes[i].node->attr("style");
+                ASSERT_NEAR(a.boxes[i].x, b.boxes[i].x, 0.01) << round << " " << step << " " << a.boxes[i].node->name << " " << (st ? *st : "");
+                ASSERT_NEAR(a.boxes[i].y, b.boxes[i].y, 0.01) << round << " " << step << " " << a.boxes[i].node->name << " " << (st ? *st : "");
+                ASSERT_NEAR(a.boxes[i].w, b.boxes[i].w, 0.01) << round << " " << step << " " << a.boxes[i].node->name << " " << (st ? *st : "");
+                ASSERT_NEAR(a.boxes[i].h, b.boxes[i].h, 0.01) << round << " " << step << " " << a.boxes[i].node->name << " " << (st ? *st : "");
+            }
+            for (size_t i = 0; i < a.ops.size(); ++i) {
+                ASSERT_EQ(a.ops[i].text, b.ops[i].text) << round << " " << step;
+                ASSERT_NEAR(a.ops[i].x, b.ops[i].x, 0.01) << round << " " << step;
+                ASSERT_NEAR(a.ops[i].y, b.ops[i].y, 0.01) << round << " " << step;
+            }
+        }
+    }
+    EXPECT_GT(kept, 1000u);      // (something is)
+    EXPECT_GT(skipped, 1000u);
+    (void)made;
+}

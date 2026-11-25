@@ -2157,7 +2157,7 @@ public:
         // keyed by all that's under its parent. Any change restyles all of it anyway, the
         // keys costing a fifth more. So nothing kept for such a page.)
         out_.reusable_ = !has_any_anchor_;
-        constexpr size_t kMaxKeptGenerations = 8;
+        constexpr size_t kMaxKeptGenerations = 32;
         // XWEB_NO_STYLE_REUSE=1: everything styled afresh, for telling whether a wrong
         // style came from keeping one.
         static const bool no_reuse = std::getenv("XWEB_NO_STYLE_REUSE") != nullptr;

@@ -3,6 +3,10 @@
 #include "xweb/forms.h"
 
 #include <algorithm>
+#include <cstring>
+#include <unordered_set>
+#include <unordered_map>
+#include <chrono>
 #include <cmath>
 #include <deque>
 #include <functional>
@@ -67,6 +71,19 @@ struct Box {
                                    // picture's percentage height (an SVG at height: 100% of a 26px box)
     float last_baseline = -1;      // of the last line box, from the content box's top
     float percent_min_h = 0, percent_max_h = -1;
+
+    // What its contents were laid out for last, if nothing's been done to them since, and
+    // what came of it besides its height (which the callers leave alone).
+    struct Laid {
+        bool valid = false;
+        float width = 0, own_height = -1, hint = -1, min_h = 0, max_h = -1;
+        float margin[4] = {}, padding[4] = {}, border[4] = {};
+        bool bfc = false;
+        float out_width = 0, out_height = 0, out_top = 0, out_bottom = 0;
+        float out_margin[4] = {}, out_padding[4] = {}, out_border[4] = {};
+        bool out_through = false;
+    } laid;
+    uint64_t print = 0;   // of what it was made from (see LayoutState)
 
     struct Fragment {
         float x = 0, y = 0, w = 0, h = 0;
@@ -280,8 +297,9 @@ std::string markerText(ListStyle style, int number) {
 
 class Layouter {
 public:
-    Layouter(const StyledDocument& styles, TextMeasurer& text, ImageSizes* images, float vw, float vh, const FormState* forms)
-        : styles_(styles), text_(text), images_(images), forms_(forms), vw_(vw), vh_(vh) {}
+    Layouter(const StyledDocument& styles, TextMeasurer& text, ImageSizes* images, float vw, float vh, const FormState* forms,
+             LayoutState* state = nullptr)
+        : styles_(styles), text_(text), images_(images), forms_(forms), vw_(vw), vh_(vh), state_(state) {}
 
     PageLayout run(const Document& doc) {
         PageLayout page;
@@ -305,6 +323,11 @@ public:
             return page;
         }
         quirks_ = doc.quirks;
+        // XWEB_DEBUG_LAYOUT=1: how long each part of a layout took.
+        static const bool dbg = std::getenv("XWEB_DEBUG_LAYOUT") != nullptr;
+        using Clock = std::chrono::steady_clock;
+        const auto t0 = Clock::now();
+        startKeeping(root_el);
         auto root = build(root_el, *root_style, 0);
         if (!root) {
             page.height = vh_;
@@ -312,8 +335,10 @@ public:
         }
         if (root->kind != BoxKind::Block) root->kind = BoxKind::Block;
         root_ = root.get();
+        const auto t1 = Clock::now();
         Bfc none;
         layoutBlock(*root, vw_, vh_, Flow{&none, 0, 0}, 0);
+        const auto t2 = Clock::now();
 
         // The canvas takes the root's background, or else the body's.
         page.canvas = {255, 255, 255, 255};
@@ -358,6 +383,11 @@ public:
         roundClippedCorners(page.ops);
         page.height = std::max({vh_, max_bottom_, root_y + root->outerHeight() + root->margin_bottom_outer});
         last_ops = std::max<size_t>(1024, page.ops.size());
+        if (dbg) {
+            const auto ms = [](Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+            if (state_) std::fprintf(stderr, "[layout] boxes %zu made %zu kept; contents %zu laid out %zu not\n", state_->made, state_->kept, state_->laid, state_->skipped);
+            std::fprintf(stderr, "[layout] tree %.1f ms, sizes %.1f ms, painting %.1f ms; %zu ops, %zu boxes\n", ms(t0, t1), ms(t1, t2), ms(t2, Clock::now()), page.ops.size(), page.boxes.size());
+        }
         // The canvas's images, under everything: placed for their element, drawn everywhere.
         if (skip_bg && skip_bg->style->background_layers) {
             std::vector<PaintOp> painted = std::move(page.ops);
@@ -370,6 +400,7 @@ public:
             paintLayers(*skip_bg, bx, by, *skip_bg->style->background_layers, 1.0f, nullptr, Rect{0, 0, std::max(vw_, page.width), page.height}, true);
             page.ops.insert(page.ops.end(), std::make_move_iterator(painted.begin()), std::make_move_iterator(painted.end()));
         }
+        keepFor(std::move(root));
         return page;
     }
 
@@ -378,6 +409,19 @@ private:
         float x, y, w, h;
         float rx = 0, ry = 0;   // an overflow clip's rounded corners (all four alike)
     };
+
+    // ── Keeping what's unchanged from the last layout ──
+
+    std::deque<ComputedStyle>& anonStyles();
+    std::deque<Node>& syntheticNodes();
+    void startKeeping(const Node* root_el);
+    void keepFor(std::unique_ptr<Box> root);
+    uint64_t printOf(const Node* el);
+    std::unique_ptr<Box> kept(const Node* el, const ComputedStyle& parent);
+    uint64_t printFor(const Node* el, const ComputedStyle& parent) {
+        const auto it = prints_.find(el);
+        return it == prints_.end() ? 0 : (it->second ^ reinterpret_cast<uintptr_t>(&parent)) * 0x9E3779B97F4A7C15ull | 1;
+    }
 
     float lineHeightOf(const ComputedStyle& s) {
         if (s.line_height_factor > 0 || s.line_height > 0) return s.usedLineHeight();
@@ -388,8 +432,9 @@ private:
     // ── The box tree ──────────────────────────────────────────────────────────
 
     const ComputedStyle* anonymousStyle(const ComputedStyle& parent, Display display = Display::Block) {
-        anon_styles_.emplace_back();
-        ComputedStyle& s = anon_styles_.back();
+        auto& anon = anonStyles();
+        anon.emplace_back();
+        ComputedStyle& s = anon.back();
         s.color = parent.color;
         s.font_size = parent.font_size;
         s.font_weight = parent.font_weight;
@@ -462,8 +507,8 @@ private:
         box->style = &style;
         box->kind = kindFor(style.display);
         // content: url(icon.svg): a picture, as an <img> of its own would be.
-        if (!style.content_image.empty() && synthetic_nodes_.size() < 10000) {
-            Node& img = synthetic_nodes_.emplace_back();
+        if (!style.content_image.empty() && syntheticNodes().size() < 10000) {
+            Node& img = syntheticNodes().emplace_back();
             img.type = NodeType::Element;
             img.ns = Namespace::Html;
             img.name = "img";
@@ -522,7 +567,9 @@ private:
                     if (depth < kMaxBoxDepth) addChildren(c, *cs, box, depth + 1, counter);
                     continue;
                 }
-                auto kid = build(c, *cs, depth + 1);
+                auto kid = kept(c, *box.style);
+                if (!kid) kid = build(c, *cs, depth + 1);
+                if (kid && state_) kid->print = printFor(c, *box.style);
                 if (!kid) continue;
                 if (cs->display == Display::ListItem) {
                     if (const std::string* v = c->attr("value"))
@@ -831,7 +878,53 @@ private:
         layoutContents(b, own_height, inner);
     }
 
+    // Its contents laid out, unless they were, for the same, and nothing's been done to them
+    // since: in this layout (a flex item measured, then given the size it had) or the last.
+    // (What shares floats with what's around it goes by where they are: always laid out.)
     void layoutContents(Box& b, std::optional<float> own_height, Flow flow) {
+        const bool isolated = establishesBfc(b);
+        const bool alone = isolated || !flow.bfc || flow.bfc->floats.empty();
+        Box::Laid& l = b.laid;
+        const float own = own_height.value_or(-1.0f);
+        if (l.valid && alone && l.width == b.width && l.own_height == own && l.hint == b.cb_height_hint && l.min_h == b.percent_min_h &&
+            l.max_h == b.percent_max_h && l.bfc == isolated && std::equal(l.margin, l.margin + 4, b.margin) &&
+            std::equal(l.padding, l.padding + 4, b.padding) && std::equal(l.border, l.border + 4, b.border)) {
+            b.width = l.out_width;
+            b.height = l.out_height;
+            b.margin_top_outer = l.out_top;
+            b.margin_bottom_outer = l.out_bottom;
+            b.collapses_through = l.out_through;
+            std::copy(l.out_margin, l.out_margin + 4, b.margin);
+            std::copy(l.out_padding, l.out_padding + 4, b.padding);
+            std::copy(l.out_border, l.out_border + 4, b.border);
+            b.own_height = own;
+            if (state_) ++state_->skipped;
+            return;
+        }
+        if (state_) ++state_->laid;
+        l.valid = false;
+        l.width = b.width;
+        l.own_height = own;
+        l.hint = b.cb_height_hint;
+        l.min_h = b.percent_min_h;
+        l.max_h = b.percent_max_h;
+        l.bfc = isolated;
+        std::copy(b.margin, b.margin + 4, l.margin);
+        std::copy(b.padding, b.padding + 4, l.padding);
+        std::copy(b.border, b.border + 4, l.border);
+        layoutContentsAfresh(b, own_height, flow);
+        l.out_width = b.width;
+        l.out_height = b.height;
+        l.out_top = b.margin_top_outer;
+        l.out_bottom = b.margin_bottom_outer;
+        l.out_through = b.collapses_through;
+        std::copy(b.margin, b.margin + 4, l.out_margin);
+        std::copy(b.padding, b.padding + 4, l.out_padding);
+        std::copy(b.border, b.border + 4, l.out_border);
+        l.valid = alone && (isolated || !flow.bfc || flow.bfc->floats.empty());
+    }
+
+    void layoutContentsAfresh(Box& b, std::optional<float> own_height, Flow flow) {
         const ComputedStyle& s = *b.style;
         // What a percentage height inside it is of.
         std::optional<float> percent_base = own_height;
@@ -844,7 +937,13 @@ private:
         while (!todo.empty()) {
             Box* k = todo.back();
             todo.pop_back();
-            k->cb_height_hint = hint;
+            if (k->cb_height_hint != hint) {
+                k->cb_height_hint = hint;
+                // (A picture of a percentage of it measured by the other. Not all boxes:
+                // nested grids ask with one height and the next, and each would measure
+                // all in it again at each level.)
+                if (k->kind == BoxKind::Replaced && k->style && k->style->height.hasPercent()) k->pref_width = k->min_content = -1;
+            }
             if (k->kind == BoxKind::Inline)
                 for (auto& g : k->kids) todo.push_back(g.get());
         }
@@ -931,6 +1030,7 @@ private:
                     // Where there's room for it (its width, or the least its content takes):
                     // below a float too wide to go beside (CSS 2.1 9.5; weather.go.kr's
                     // full-width floated tabs).
+                    resolveSpacing(k, b.width);   // (its padding counts)
                     const float frame = k.frameWidth() + std::max(0.0f, k.style->margin[Left].resolve(b.width)) +
                                         std::max(0.0f, k.style->margin[Right].resolve(b.width));
                     const float needs = !widthIsAuto(*k.style, b.width) ? k.style->width.resolve(b.width) + (k.style->border_box ? 0 : frame)
@@ -1264,6 +1364,9 @@ private:
     }
 
     float intrinsicWidth(Box& b, bool max_content) {
+        // (Measuring lays out what's in it, at other widths.)
+        b.laid.valid = false;
+        b.laid_width = b.measured_width = -1;
         // A size container's is as if there were nothing in it.
         if (b.node && b.kind == BoxKind::Block && b.style && b.style->container_type) return 0;
         if (b.isTable()) {
@@ -5124,6 +5227,8 @@ private:
     [[nodiscard]] const FormState& forms() const { return forms_ ? *forms_ : no_forms_; }
     float vw_, vh_;
     std::deque<ComputedStyle> anon_styles_;
+    LayoutState* state_ = nullptr;
+    std::unordered_map<const Node*, uint64_t> prints_;
     std::deque<Node> synthetic_nodes_;   // pseudo-elements' pictures, for this layout only
     PageLayout* out_ = nullptr;
     const Box* skip_background_ = nullptr;
@@ -5157,9 +5262,196 @@ private:
 
 float chWidth(TextMeasurer& text, const ComputedStyle& style) { return text.width("0", fontOf(style)); }
 
+struct LayoutState::Impl {
+    float vw = 0, vh = 0;
+    bool quirks = false;
+    const Document* doc = nullptr;
+    std::unique_ptr<Box> root;
+    // Each element's box, where it's held; taken from there when it's kept.
+    std::unordered_map<const Node*, std::unique_ptr<Box>*> boxes;
+    std::deque<ComputedStyle> anon_styles;
+    std::deque<Node> synthetic_nodes;
+    std::vector<std::shared_ptr<const void>> alive;   // what the boxes' styles are in
+};
+
+LayoutState::LayoutState() : impl(std::make_unique<Impl>()) {}
+LayoutState::~LayoutState() = default;
+void LayoutState::reset() { impl = std::make_unique<Impl>(); }
+
+namespace {
+
+std::deque<ComputedStyle>& Layouter::anonStyles() { return state_ ? state_->impl->anon_styles : anon_styles_; }
+std::deque<Node>& Layouter::syntheticNodes() { return state_ ? state_->impl->synthetic_nodes : synthetic_nodes_; }
+
+// All that what's in an element lays out by, besides where it is: itself, its styles, its
+// text, and what's known of its pictures.
+uint64_t Layouter::printOf(const Node* el) {
+    const auto mix = [](uint64_t h, uint64_t v) {
+        h = (h ^ v) * 0x9E3779B97F4A7C15ull;
+        return h ^ h >> 29;
+    };
+    struct Walk {
+        const Node* el;
+        uint64_t h;
+        std::vector<const Node*> kids;
+        size_t next = 0;
+        bool whole;   // all in it counts, shown or not (a <select>'s options, an <svg>)
+    };
+    const auto own = [&](const Node* n, bool whole) {
+        uint64_t h = mix(0x1F83, reinterpret_cast<uintptr_t>(n));
+        h = mix(h, reinterpret_cast<uintptr_t>(n->attrs.data()) + n->attrs.size());
+        const ComputedStyle* st = styles_.styleOf(n);
+        h = mix(h, reinterpret_cast<uintptr_t>(st));
+        const ComputedStyle *before = styles_.beforeOf(n), *after = styles_.afterOf(n);
+        h = mix(h, reinterpret_cast<uintptr_t>(before));
+        h = mix(h, reinterpret_cast<uintptr_t>(after));
+        h = mix(h, reinterpret_cast<uintptr_t>(n->shadow_root));
+        const auto picture = [&](const std::string& src) {
+            if (!images_) return;
+            const auto size = images_->imageSize(src);
+            const auto ratio = images_->imageRatio(src);
+            uint32_t bits[3] = {};
+            if (size) {
+                std::memcpy(&bits[0], &size->first, 4);
+                std::memcpy(&bits[1], &size->second, 4);
+            }
+            if (ratio) std::memcpy(&bits[2], &*ratio, 4);
+            h = mix(mix(h, static_cast<uint64_t>(bits[0]) << 32 | bits[1]), static_cast<uint64_t>(bits[2]) << 3 | static_cast<uint64_t>(size.has_value()) << 2 | static_cast<uint64_t>(ratio.has_value()) << 1 | static_cast<uint64_t>(images_->imageLoading(src)));
+        };
+        for (const ComputedStyle* p : {before, after})
+            if (p && !p->content_image.empty()) picture(p->content_image);
+        static const std::unordered_set<std::string> kByAttributes = {"li", "ol", "ul", "td", "th", "table", "tr", "col", "colgroup", "details", "a", "option", "optgroup",
+                                                                      "button", "label", "br", "hr", "img", "video", "canvas", "iframe", "embed", "object", "input",
+                                                                      "textarea", "select", "progress", "meter", "svg", "source", "picture"};
+        if (whole || n->ns != Namespace::Html || kByAttributes.count(n->name)) {
+            for (const Attribute& a : n->attrs) {
+                h = mix(h, std::hash<std::string>{}(a.name));
+                h = mix(h, std::hash<std::string>{}(a.value));
+            }
+            if (n->isHtml("img")) {
+                if (const auto src = imageSourceOf(n, {vw_, vh_})) picture(*src);
+            } else if (n->ns == Namespace::Html) {
+                for (const char* name : {"src", "poster", "data"})
+                    if (const std::string* v = n->attr(name)) picture(*v);
+            }
+            if (forms_ && (n->isHtml("input") || n->isHtml("textarea") || n->isHtml("select"))) h = mix(h, forms_->focused == n);
+        }
+        return h;
+    };
+    std::vector<Walk> stack;
+    const auto enter = [&](const Node* n, bool whole) {
+        whole = whole || (n->ns == Namespace::Svg) || n->isHtml("select") || n->isHtml("textarea") || n->isHtml("object");
+        Walk w{n, own(n, whole), {}, 0, whole};
+        // (What isn't shown has no boxes, whatever's in it.)
+        const ComputedStyle* st = styles_.styleOf(n);
+        if (whole || (st && st->display != Display::None)) composedChildren(n, w.kids);
+        stack.push_back(std::move(w));
+    };
+    enter(el, false);
+    uint64_t result = 0;
+    while (!stack.empty()) {
+        Walk& w = stack.back();
+        if (w.next < w.kids.size()) {
+            const Node* c = w.kids[w.next++];
+            if (c->type == NodeType::Text) w.h = mix(mix(w.h, reinterpret_cast<uintptr_t>(c)), std::hash<std::string>{}(c->data));
+            else if (c->isElement()) enter(c, w.whole);
+            continue;
+        }
+        result = mix(w.h, w.kids.size());
+        prints_[w.el] = result;
+        stack.pop_back();
+        if (!stack.empty()) stack.back().h = mix(stack.back().h, result);
+    }
+    return result;
+}
+
+void Layouter::startKeeping(const Node* root_el) {
+    if (!state_) return;
+    LayoutState::Impl& st = *state_->impl;
+    state_->made = state_->kept = state_->laid = state_->skipped = 0;
+    // Another page or viewport; or too much made for boxes since gone: all afresh.
+    if (st.vw != vw_ || st.vh != vh_ || st.quirks != quirks_ || st.anon_styles.size() > 20'000 + 4 * st.boxes.size() || st.synthetic_nodes.size() > 5'000)
+        state_->reset();
+    state_->impl->vw = vw_;
+    state_->impl->vh = vh_;
+    state_->impl->quirks = quirks_;
+    prints_.reserve(state_->impl->boxes.size() + 1024);
+    (void)printOf(root_el);
+}
+
+std::unique_ptr<Box> Layouter::kept(const Node* el, const ComputedStyle& parent) {
+    if (!state_) return nullptr;
+    LayoutState::Impl& st = *state_->impl;
+    const auto it = st.boxes.find(el);
+    if (it != st.boxes.end() && *it->second && (*it->second)->print == printFor(el, parent)) {
+        std::unique_ptr<Box> b = std::move(*it->second);
+        // What its parent makes of it, it makes again.
+        b->quirky_no_top_margin = b->quirky_no_bottom_margin = false;
+        b->laid_width = b->measured_width = -1;
+        // (Where it is, its parent says: not all of them all of it.)
+        b->x = b->y = b->static_x = b->static_y = 0;
+        ++state_->kept;
+        return b;
+    }
+    ++state_->made;
+    return nullptr;
+}
+
+void Layouter::keepFor(std::unique_ptr<Box> root) {
+    if (!state_) return;
+    LayoutState::Impl& st = *state_->impl;
+    st.boxes.clear();
+    st.root = std::move(root);   // (the last one's go, those not kept)
+    std::vector<std::unique_ptr<Box>*> todo{&st.root};
+    while (!todo.empty()) {
+        std::unique_ptr<Box>* b = todo.back();
+        todo.pop_back();
+        // (An element's own box is the outermost of those that are its.)
+        if ((*b)->print && (*b)->node) st.boxes.emplace((*b)->node, b);
+        for (auto it = (*b)->kids.rbegin(); it != (*b)->kids.rend(); ++it) todo.push_back(&*it);
+    }
+    st.alive = styles_.keepAlive();
+}
+
+// XWEB_CHECK_LAYOUT=1: each layout that kept anything compared with one that didn't.
+void checkLayout(const PageLayout& a, const PageLayout& b) {
+    static size_t checks = 0, told = 0;
+    size_t differ = 0;
+    const auto off = [](float p, float q) { return std::fabs(p - q) > 0.02f; };
+    if (a.boxes.size() != b.boxes.size() || a.ops.size() != b.ops.size()) {
+        ++differ;
+        if (told++ < 30) std::fprintf(stderr, "[keep] %zu boxes and %zu ops, afresh %zu and %zu\n", a.boxes.size(), a.ops.size(), b.boxes.size(), b.ops.size());
+    }
+    for (size_t i = 0; i < std::min(a.boxes.size(), b.boxes.size()); ++i) {
+        const ElementBox &p = a.boxes[i], &q = b.boxes[i];
+        if (p.node == q.node && !off(p.x, q.x) && !off(p.y, q.y) && !off(p.w, q.w) && !off(p.h, q.h)) continue;
+        ++differ;
+        if (told++ < 30)
+            std::fprintf(stderr, "[keep] <%s class=\"%s\"> %.1f,%.1f %.1fx%.1f, afresh <%s> %.1f,%.1f %.1fx%.1f\n", p.node ? p.node->name.c_str() : "?",
+                         p.node && p.node->attr("class") ? p.node->attr("class")->substr(0, 50).c_str() : "", p.x, p.y, p.w, p.h, q.node ? q.node->name.c_str() : "?", q.x, q.y, q.w, q.h);
+    }
+    for (size_t i = 0; i < std::min(a.ops.size(), b.ops.size()); ++i) {
+        const PaintOp &p = a.ops[i], &q = b.ops[i];
+        if (p.kind == q.kind && !off(p.x, q.x) && !off(p.y, q.y) && !off(p.w, q.w) && !off(p.h, q.h) && p.text == q.text && p.color == q.color) continue;
+        ++differ;
+        if (told++ < 30)
+            std::fprintf(stderr, "[keep] op %zu kind %d %.1f,%.1f %.1fx%.1f '%s', afresh kind %d %.1f,%.1f %.1fx%.1f '%s'\n", i, static_cast<int>(p.kind), p.x, p.y, p.w, p.h,
+                         p.text.substr(0, 30).c_str(), static_cast<int>(q.kind), q.x, q.y, q.w, q.h, q.text.substr(0, 30).c_str());
+    }
+    if (++checks % 20 == 0 || differ) std::fprintf(stderr, "[keep] check %zu: %zu of %zu differ\n", checks, differ, b.boxes.size() + b.ops.size());
+}
+
+}  // namespace
+
 PageLayout layoutPage(const Document& doc, const StyledDocument& styles, TextMeasurer& text, ImageSizes* images,
-                      float viewport_width, float viewport_height, const FormState* forms) {
-    return Layouter(styles, text, images, viewport_width, viewport_height, forms).run(doc);
+                      float viewport_width, float viewport_height, const FormState* forms, LayoutState* state) {
+    // XWEB_NO_LAYOUT_STATE=1: each layout afresh.
+    static const bool off = std::getenv("XWEB_NO_LAYOUT_STATE") != nullptr;
+    static const bool check = std::getenv("XWEB_CHECK_LAYOUT") != nullptr;
+    if (off) state = nullptr;
+    PageLayout page = Layouter(styles, text, images, viewport_width, viewport_height, forms, state).run(doc);
+    if (check && state) checkLayout(page, Layouter(styles, text, images, viewport_width, viewport_height, forms).run(doc));
+    return page;
 }
 
 }  // namespace fbx::xweb
