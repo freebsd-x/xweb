@@ -1265,12 +1265,14 @@ void Runtime::collect(bool mid_script) {
             if (!known.count(todo[checked])) std::fprintf(stderr, "[gc-root] bad cell %p from %s\n", static_cast<void*>(todo[checked]), label);
     };
     // Every cell by address, for the conservative scans of machine stacks.
-    std::vector<Cell*> sorted;
+    // (Those since the last collection sorted and merged in: the rest stay in order.)
+    const std::vector<Cell*>& sorted = cells_;
     const auto sortCells = [&] {
-        if (sorted.empty()) {
-            sorted = cells_;
-            std::sort(sorted.begin(), sorted.end());
-        }
+        if (cells_sorted_ >= cells_.size()) return;
+        const auto mid = cells_.begin() + static_cast<ptrdiff_t>(cells_sorted_);
+        std::sort(mid, cells_.end());
+        std::inplace_merge(cells_.begin(), mid, cells_.end());
+        cells_sorted_ = cells_.size();
     };
     const auto markWord = [&](uintptr_t w) {
         auto it = std::upper_bound(sorted.begin(), sorted.end(), w, [](uintptr_t x, Cell* c) { return x < reinterpret_cast<uintptr_t>(c); });
@@ -1424,7 +1426,8 @@ void Runtime::collect(bool mid_script) {
         if (check) { from_cell = c; from = dynamic_cast<Env*>(c) ? "env" : dynamic_cast<Object*>(c) ? "object" : "cell"; }
         if (c->marked) continue;
         c->marked = true;
-        if (auto* e = dynamic_cast<Env*>(c)) {
+        if (c->cell_kind == Cell::Kind::Env) {
+            auto* e = static_cast<Env*>(c);
             markCell(e->outer);
             for (auto& en : e->vars) markValue(en.second.value);
             markValue(e->this_value);
@@ -1434,7 +1437,8 @@ void Runtime::collect(bool mid_script) {
             markCell(e->global_object);
             markCell(e->with_object);
             for (auto& en : e->vars) markCell(en.second.import_env);
-        } else if (auto* o = dynamic_cast<Object*>(c)) {
+        } else if (c->cell_kind == Cell::Kind::Object) {
+            auto* o = static_cast<Object*>(c);
             markCell(o->prototype);
             o->forEachOwn([&](const PropertyKey& k, const Property& p) {
                 if (k.symbol) markCell(k.symbol);
@@ -1499,23 +1503,27 @@ void Runtime::collect(bool mid_script) {
     // Coroutines nothing reaches unwind now, before what their frames refer to goes.
     // Unwinding runs no JavaScript and makes nothing new.
     for (size_t i = 0; i < cells_.size(); ++i) {
-        auto* o = dynamic_cast<Object*>(cells_[i]);
+        auto* o = cells_[i]->cell_kind == Cell::Kind::Object ? static_cast<Object*>(cells_[i]) : nullptr;
         if (o && !o->marked && o->co && o->co->state == CoState::Suspended) unwindCoroutine(*o->co);
     }
     std::vector<Cell*> live;
     live.reserve(cells_.size());
-    for (Cell* c : cells_) {
+    size_t sorted_kept = 0;
+    for (size_t i = 0; i < cells_.size(); ++i) {
+        Cell* c = cells_[i];
         // Mid-script, symbols stay: one may be in use as a key in a C++ list (an object's
         // keys being walked) that no root reaches. They're small; the next collection
         // between tasks frees them.
-        if (c->marked || (mid_script && dynamic_cast<Symbol*>(c))) {
+        if (c->marked || (mid_script && c->cell_kind == Cell::Kind::Symbol)) {
             c->marked = false;
             live.push_back(c);
+            if (i < cells_sorted_) ++sorted_kept;
         } else {
             delete c;
         }
     }
     cells_.swap(live);
+    cells_sorted_ = sorted_kept;
     // The scopes calls keep off the heap aren't swept, so their marks are cleared here.
     for (Env* e : owned_stack) e->marked = false;
     allocations_ = cells_.size();

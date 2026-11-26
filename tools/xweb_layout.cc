@@ -113,7 +113,7 @@ int main(int argc, char** argv) {
             const auto t = Clock::now();
             int did = 0;
             for (int i = 0; i < n * 20; ++i) {
-                at = StyledDocument::withStyleAttributes({last}, *doc, {w, h}, sheet_text, ch, nullptr, styles);
+                at = StyledDocument::withStyleAttributes({last}, {}, *doc, {w, h}, sheet_text, ch, nullptr, styles);
                 did += at != nullptr;
             }
             std::fprintf(stderr, "bench: a style attribute %.2f ms (%d of %d)\n", ms(t) / (n * 20), did, n * 20);

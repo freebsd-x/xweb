@@ -2079,6 +2079,9 @@ struct Notes {
     bool uses_has_ = false;   // a rule with :has(): what an element matches can depend on its descendants
     bool has_any_anchor_ = false;
     bool style_selector_ = false;   // a selector asks about style attributes ([style])
+    // A selector that looks at an element's earlier siblings (a + b, a ~ b, :nth-child(of S)):
+    // an attribute changed can change what those after it match.
+    bool sibling_matters_ = false;
     // Elements asked about siblings after them (:last-child, ...): any, or with these.
     std::map<std::string, const css::KeyframesRule*> keyframes_;
     std::unordered_map<std::string, const css::PropertyRule*> properties_;   // @property's
@@ -2101,6 +2104,7 @@ struct Notes {
         uses_has_ |= o.uses_has_;
         has_any_anchor_ |= o.has_any_anchor_;
         style_selector_ |= o.style_selector_;
+        sibling_matters_ |= o.sibling_matters_;
         for (const auto& [name, rule] : o.keyframes_) keyframes_[name] = rule;
         for (const auto& [name, rule] : o.properties_) properties_[name] = rule;
         state_any_ |= o.state_any_;
@@ -2300,8 +2304,64 @@ public:
         return !static_cast<const Cached*>(previous.index_kept_.get())->notes.style_selector_;
     }
     // False if it comes out that something else has changed.
-    bool restyle(const std::vector<const Node*>& changed) {
-        const std::unordered_set<const Node*> all(changed.begin(), changed.end());
+    // No styles for n and what's in it (out of the page, or now in what isn't shown).
+    void dropStyles(const Node* n) {
+        std::vector<const Node*> todo{n};
+        while (!todo.empty()) {
+            const Node* e = todo.back();
+            todo.pop_back();
+            out_.keys_.erase(e);
+            out_.styles_.erase(e);
+            out_.before_.erase(e);
+            out_.after_.erase(e);
+            out_.placeholder_.erase(e);
+            out_.has_prints_.erase(e);
+            todo.insert(todo.end(), e->children.begin(), e->children.end());
+        }
+    }
+    // `attributes`: elements with other attributes changed, or the text in them: they and what's
+    // in them too, and their later siblings (and what's in those) if a selector looks back.
+    bool restyle(const std::vector<const Node*>& changed, const std::vector<const Node*>& attributes = {}) {
+        std::unordered_set<const Node*> all(changed.begin(), changed.end());
+        if (!attributes.empty()) {
+            // A :has() whose anchors are told by their own tag, ID, class or attribute: those
+            // up from (or before) what changed are styled again with all that's in them. Any
+            // other :has() might match otherwise now anywhere.
+            std::vector<const Node*> roots(attributes.begin(), attributes.end());
+            if (uses_has_) {
+                if (has_any_anchor_ || !has_args_.empty() || !has_host_anchors_.empty()) return false;
+                std::unordered_set<const Node*> looked;
+                for (const Node* n : attributes)
+                    for (const Node* x = n; x && x->isElement(); x = x->parent) {
+                        if (!looked.insert(x).second) break;
+                        const auto anchor = [&](const Node* e) {
+                            return e->isElement() && (anchorIn(e, has_anchors_) || anchorIn(e, has_context_anchors_));
+                        };
+                        if (anchor(x)) roots.push_back(x);
+                        if (x->parent)
+                            for (const Node* sib : x->parent->children) {
+                                if (sib == x) break;
+                                if (anchor(sib)) roots.push_back(sib);
+                            }
+                        if (roots.size() > 20000) return false;
+                    }
+            }
+            for (const Node* n : roots) {
+                bool in_page = false;
+                for (const Node* p = n; p; p = p->parent)
+                    if (p == doc_.documentElement()) in_page = true;
+                if (!in_page) {
+                    dropStyles(n);   // taken out: no styles for it or what's in it
+                    continue;
+                }
+                all.insert(n);
+                if (!sibling_matters_ || !n->parent) continue;
+                const auto& sibs = n->parent->children;
+                for (auto it = std::find(sibs.begin(), sibs.end(), n); it != sibs.end(); ++it)
+                    if ((*it)->isElement()) all.insert(*it);
+                if (all.size() > 20000) return false;
+            }
+        }
         bool same = true;
         for (const Node* n : all) {
             std::vector<const Node*> chain;
@@ -2329,6 +2389,9 @@ public:
                 }
                 if (style->display == Display::None && chain[i]->ns != Namespace::Svg) {
                     shown = false;
+                    // (What's put in there, or was styled there before: not styled, as all
+                    // of it styled afresh would have it.)
+                    if (!attributes.empty()) dropStyles(n);
                     break;
                 }
                 if (!host_context_ && bloomCovers(chain[i])) {
@@ -2524,6 +2587,7 @@ private:
                 if (sel.parts.empty()) continue;
                 noteHasAnchors(sel);
                 if (!style_selector_) style_selector_ = asksForStyleAttribute(sel);
+                if (!sibling_matters_) sibling_matters_ = looksAtSiblings(sel);
                 noteFollowing(sel);
                 noteStates(sel);
                 index(sel, rule, origin);
@@ -5715,6 +5779,9 @@ private:
             if (c->isElement()) {
                 preceding_prints_[c] = h;
                 h = mix(h, ownPrint(c));
+                // One a :has() is asked of for those after it (`a:has(~ .b) + c`, `a:has(.b) ~ c`):
+                // all that :has() could see, too.
+                if (uses_has_ && contextAnchor(c)) h = mix(h, anchorPrint(c));
             }
         const auto it = preceding_prints_.find(el);
         return it != preceding_prints_.end() ? it->second : 0;
@@ -6000,6 +6067,18 @@ private:
         return hit;
     }
 
+    static bool looksAtSiblings(const ComplexSelector& sel) {
+        for (size_t i = 0; i < sel.parts.size(); ++i) {
+            const CompoundSelector& c = sel.parts[i];
+            if (i > 0 && (c.combinator == Combinator::NextSibling || c.combinator == Combinator::SubsequentSibling)) return true;
+            for (const SimpleSelector& x : c.simple) {
+                if (x.kind == SimpleKind::PseudoClass && x.name.starts_with("nth-") && !x.args.empty()) return true;
+                for (const ComplexSelector& a : x.args)
+                    if (looksAtSiblings(a)) return true;
+            }
+        }
+        return false;
+    }
     static bool asksForStyleAttribute(const ComplexSelector& sel) {
         for (const CompoundSelector& c : sel.parts)
             for (const SimpleSelector& x : c.simple) {
@@ -6272,14 +6351,15 @@ void StyledDocument::checkReuse(const Document& doc, const SheetLoader& loader) 
     if (++checks % 20 == 0 || differ) std::fprintf(stderr, "[reuse] check %zu: %zu of %zu differ\n", checks, differ, fresh.styles_.size());
 }
 
-std::unique_ptr<StyledDocument> StyledDocument::withStyleAttributes(const std::vector<const Node*>& changed, const Document& doc, css::MediaContext media,
+std::unique_ptr<StyledDocument> StyledDocument::withStyleAttributes(const std::vector<const Node*>& changed, const std::vector<const Node*>& attributes,
+                                                                    const Document& doc, css::MediaContext media,
                                                                     const SheetLoader& loader, const ChMeasure& measure_ch, const FormState* forms,
                                                                     const StyledDocument& previous) {
     static const bool no_reuse = std::getenv("XWEB_NO_STYLE_REUSE") != nullptr;
     std::unique_ptr<StyledDocument> out(new StyledDocument(media, measure_ch, forms));
     if (no_reuse || !StyleResolver::canStyleAgain(previous, *out)) return nullptr;
     StyleResolver resolver(doc, *out, loader, previous, StyleResolver::Again{});
-    if (!resolver.restyle(changed)) return nullptr;
+    if (!resolver.restyle(changed, attributes)) return nullptr;
     out->checkReuse(doc, loader);
     return out;
 }

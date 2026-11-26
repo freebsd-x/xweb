@@ -228,6 +228,35 @@ struct PageScript::Impl {
             if (style_attributes.size() >= 4096) other = true;
             else if (style_attributes.empty() || style_attributes.back() != n) style_attributes.push_back(n);
         }
+        // Another of its attributes, the text right in it, or which elements are in it; and
+        // elements taken out (their styles dropped). Not a style sheet's.
+        std::vector<const Node*> attributes;
+        void attribute(const Node* n) {
+            set = true;
+            if (!n || !n->isElement() || attributes.size() >= 4096 || sheetLike(n)) other = true;
+            else if (attributes.empty() || attributes.back() != n) attributes.push_back(n);
+        }
+        // An element put in or taken out of `parent`.
+        void children(const Node* parent, const Node* child) {
+            if (holdsSheet(child)) {
+                *this = true;
+                return;
+            }
+            attribute(parent);
+            if (child->parent != parent && !other) attribute(child);   // (out: dropped)
+        }
+        static bool sheetLike(const Node* n) { return n->name == "style" || n->name == "link" || n->name == "base" || n->name == "meta"; }
+        static bool holdsSheet(const Node* n) {
+            std::vector<const Node*> todo{n};
+            for (size_t k = 0; !todo.empty(); ++k) {
+                const Node* e = todo.back();
+                todo.pop_back();
+                if (k > 20000 || (e->isElement() && sheetLike(e)) || e->template_content || e->shadow_root) return true;
+                for (const Node* c : e->children)
+                    if (c->isElement()) todo.push_back(c);
+            }
+            return false;
+        }
     } dirty;
     std::string ready_state = "loading";
     Node* current_script = nullptr;
@@ -454,7 +483,9 @@ struct PageScript::Impl {
         }
         parent->insertBefore(child, before);
         if (names_known && noteNames(child)) ids_found.clear();
-        dirty = true;
+        if (child->type == NodeType::Text || child->type == NodeType::Comment) dirty.attribute(parent);
+        else if (child->isElement()) dirty.children(parent, child);
+        else dirty = true;
         afterInsert(parent, child, prev, before);
     }
 
@@ -467,7 +498,9 @@ struct PageScript::Impl {
         Node* next = it != parent->children.end() && it + 1 != parent->children.end() ? *(it + 1) : nullptr;
         const bool was_connected = inDocument(parent);
         parent->remove(child);
-        dirty = true;
+        if (child->type == NodeType::Text || child->type == NodeType::Comment) dirty.attribute(parent);
+        else if (child->isElement()) dirty.children(parent, child);
+        else dirty = true;
         afterRemove(parent, child, prev, next, was_connected);
     }
 
@@ -494,7 +527,8 @@ struct PageScript::Impl {
         if (!n->isElement() && n->type != NodeType::Fragment) {
             const std::string old = n->data;
             n->data = text;
-            dirty = true;
+            if (n->type == NodeType::Text || n->type == NodeType::Comment) dirty.attribute(n->parent);
+            else dirty = true;
             afterCharacterData(n, old);
             return;
         }
@@ -531,12 +565,12 @@ struct PageScript::Impl {
             if (a.name == name) {
                 const std::string old = a.value;
                 a.value = value;
-                if (name == "style") dirty.style(n); else dirty = true;
+                if (name == "style") dirty.style(n); else dirty.attribute(n);
                 afterAttr(n, name, &old);
                 return;
             }
         n->attrs.push_back({name, value});
-        if (name == "style") dirty.style(n); else dirty = true;
+        if (name == "style") dirty.style(n); else dirty.attribute(n);
         afterAttr(n, name, nullptr);
     }
 
@@ -546,7 +580,7 @@ struct PageScript::Impl {
         const std::string old = *had;
         const auto it = std::remove_if(n->attrs.begin(), n->attrs.end(), [&](const Attribute& a) { return a.name == name; });
         n->attrs.erase(it, n->attrs.end());
-        if (name == "style") dirty.style(n); else dirty = true;
+        if (name == "style") dirty.style(n); else dirty.attribute(n);
         afterAttr(n, name, &old);
     }
 

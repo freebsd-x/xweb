@@ -265,11 +265,14 @@ public:
     // Its size, for the collector's scan of suspended coroutines' stacks.
     [[nodiscard]] virtual size_t cellSize() const noexcept { return sizeof(Cell); }
     bool marked = false;
+    // Which kind it is, for the collector (no dynamic_cast per cell).
+    enum class Kind : uint8_t { Other, Object, Symbol, Env };
+    Kind cell_kind = Kind::Other;
 };
 
 class Symbol : public Cell {
 public:
-    explicit Symbol(std::u16string d, bool has) : description(std::move(d)), has_description(has) {}
+    explicit Symbol(std::u16string d, bool has) : description(std::move(d)), has_description(has) { cell_kind = Kind::Symbol; }
     [[nodiscard]] size_t cellSize() const noexcept override { return sizeof(Symbol); }
     std::u16string description;
     bool has_description;
@@ -354,7 +357,7 @@ struct BufferData {
 
 class Object : public Cell {
 public:
-    explicit Object(Object* proto, ObjectClass cls = ObjectClass::Ordinary) : prototype(proto), cls(cls) {}
+    explicit Object(Object* proto, ObjectClass cls = ObjectClass::Ordinary) : prototype(proto), cls(cls) { cell_kind = Kind::Object; }
     ~Object() override;
     [[nodiscard]] size_t cellSize() const noexcept override { return sizeof(Object); }
 
@@ -848,6 +851,7 @@ private:
     ModuleLoader module_loader_;
     std::unique_ptr<Modules, ModulesDeleter> modules_;
     std::vector<Cell*> cells_;
+    size_t cells_sorted_ = 0;   // so many of cells_, from the start, by address
     size_t allocations_ = 0;
     size_t gc_next_ = 500'000;   // the heap size at which a safe point collects
     void collectMidScript();

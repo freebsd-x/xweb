@@ -1294,6 +1294,111 @@ TEST(CustomProperties, Registered) {
     EXPECT_FLOAT_EQ(by("plain")->margin[3].px, 5);
 }
 
+// Classes, other attributes and text changed at random, styled again with only those
+// (and their later siblings where a selector looks back): as styling it all gives.
+TEST(Restyle, AttributesOnly) {
+    uint32_t seed = std::getenv("FUZZ_SEED") ? static_cast<uint32_t>(std::atoi(std::getenv("FUZZ_SEED"))) : 77;
+    const int rounds = std::getenv("FUZZ_ROUNDS") ? std::atoi(std::getenv("FUZZ_ROUNDS")) : 40;
+    const auto rnd = [&seed](uint32_t n) {
+        seed = seed * 1664525 + 1013904223;
+        return (seed >> 8) % n;
+    };
+    static const char* const kClasses[] = {"", "a", "b", "a b", "on", "b on"};
+    static const char* const kData[] = {"", "1", "2", "x y"};
+    static const char* const kText[] = {"", "t", "hello"};
+    size_t parts = 0;
+    for (int round = 0; round < rounds; ++round) {
+        const bool siblings = round % 2 == 1, has = round % 3 == 1, loose_has = round % 9 == 7;
+        std::string css = "p{padding-left:1px} .a .b{font-weight:700} .on{color:red} .a>.b{width:9px} [data-k='1']{opacity:.5} [data-k] u{font-size:30px}"
+                          " .b:empty{margin-top:4px} :not(.a)>i{width:3px} p:first-child{width:5em} [hidden]{display:none} .on b{display:none}";
+        if (siblings) css += " .on + b{color:blue} .a ~ i{margin-top:7px} :nth-child(2 of .b){width:11px} :is(.on ~ span) u{opacity:.25}";
+        if (has) css += " div:has(> .on) i{opacity:.3} p:has(+ .on){width:13px} .a:has(.on) u{font-size:20px} b:has(i.b){display:none} span:has(~ .b) + i{margin-top:2px}";
+        if (loose_has) css += " :has(> .b) > p{opacity:.75}";
+        auto doc = parseHtml("<!doctype html><style>" + css + "</style><div id=r></div>");
+        std::vector<Node*> all{const_cast<Node*>(elementById(*doc, "r"))};
+        std::vector<Node*> texts;
+        for (int i = 0; i < 40; ++i) {
+            static const char* const kTags[] = {"div", "p", "b", "i", "u", "span"};
+            Node* n = doc->make(NodeType::Element);
+            n->name = kTags[rnd(6)];
+            n->ns = Namespace::Html;
+            if (rnd(2) == 0) n->attrs.push_back({"class", kClasses[rnd(std::size(kClasses))]});
+            if (rnd(4) == 0) n->attrs.push_back({"data-k", kData[rnd(std::size(kData))]});
+            all[rnd(static_cast<uint32_t>(all.size()))]->insertBefore(n, nullptr);
+            all.push_back(n);
+            if (rnd(4) == 0) {
+                Node* t = doc->make(NodeType::Text);
+                t->data = kText[rnd(std::size(kText))];
+                n->insertBefore(t, nullptr);
+                texts.push_back(t);
+            }
+        }
+        auto styles = std::make_unique<StyledDocument>(*doc, css::MediaContext{800, 600});
+        for (int step = 0; step < 20; ++step) {
+            std::vector<const Node*> changed;
+            const uint32_t how_many = 1 + rnd(3);
+            for (uint32_t k = 0; k < how_many; ++k) {
+                Node* n = all[1 + rnd(static_cast<uint32_t>(all.size() - 1))];
+                switch (rnd(5)) {
+                    case 4: {
+                        // Taken out, and maybe put in somewhere else (not inside itself).
+                        Node* from = n->parent;
+                        if (!from) continue;
+                        from->remove(n);
+                        changed.push_back(from);
+                        changed.push_back(n);   // (as the page's script notes a removal)
+                        if (rnd(3)) {
+                            Node* to = all[rnd(static_cast<uint32_t>(all.size()))];
+                            bool inside = false;
+                            for (Node* p = to; p; p = p->parent) inside = inside || p == n;
+                            if (!inside && to->isElement()) {
+                                to->insertBefore(n, to->children.empty() || rnd(2) ? nullptr : to->children[rnd(static_cast<uint32_t>(to->children.size()))]);
+                                changed.push_back(to);
+                                continue;
+                            }
+                        }
+                        break;   // (n itself: out)
+                    }
+                    case 0: setAttribute(n, "class", kClasses[rnd(std::size(kClasses))]); break;
+                    case 1: setAttribute(n, "data-k", kData[rnd(std::size(kData))]); break;
+                    case 2:
+                        if (rnd(4) == 0) setAttribute(n, "hidden", "");
+                        else n->attrs.erase(std::remove_if(n->attrs.begin(), n->attrs.end(), [](const Attribute& a) { return a.name == "hidden"; }), n->attrs.end());
+                        break;
+                    default:
+                        if (texts.empty()) continue;
+                        Node* t = texts[rnd(static_cast<uint32_t>(texts.size()))];
+                        t->data = kText[rnd(std::size(kText))];
+                        n = t->parent;
+                        break;
+                }
+                changed.push_back(n);
+            }
+            // (TEST_FULL_RESTYLE=1: all of it styled again with the last styles, not just those.)
+            auto next = std::getenv("TEST_FULL_RESTYLE") ? nullptr : StyledDocument::withStyleAttributes({}, changed, *doc, css::MediaContext{800, 600}, {}, {}, nullptr, *styles);
+            if (loose_has && !changed.empty()) ASSERT_EQ(next, nullptr) << round;
+            const bool partial = next != nullptr;
+            if (next) ++parts;
+            else next = std::make_unique<StyledDocument>(*doc, css::MediaContext{800, 600}, StyledDocument::SheetLoader{}, StyledDocument::ChMeasure{}, nullptr, styles.get());
+            const StyledDocument fresh(*doc, css::MediaContext{800, 600});
+            for (const Node* n : all) {
+                const ComputedStyle *a = next->styleOf(n), *b = fresh.styleOf(n);
+                ASSERT_EQ(a != nullptr, b != nullptr) << round << " " << step << " " << n->name << " partial " << partial;
+                if (!a) continue;
+                ASSERT_EQ(a->color, b->color) << round << " " << step << " " << n->name << " partial " << partial;
+                ASSERT_EQ(a->display, b->display) << round << " " << step << " " << n->name << " partial " << partial;
+                ASSERT_FLOAT_EQ(a->font_size, b->font_size) << round << " " << step << " " << n->name << " partial " << partial;
+                ASSERT_FLOAT_EQ(a->width.px, b->width.px) << round << " " << step << " " << n->name << " partial " << partial;
+                ASSERT_FLOAT_EQ(a->margin[0].px, b->margin[0].px) << round << " " << step << " " << n->name << " partial " << partial;
+                ASSERT_FLOAT_EQ(a->opacity, b->opacity) << round << " " << step << " " << n->name << " partial " << partial;
+                ASSERT_EQ(a->font_weight, b->font_weight) << round << " " << step << " " << n->name << " partial " << partial;
+            }
+            styles = std::move(next);
+        }
+    }
+    EXPECT_GT(parts, static_cast<size_t>(rounds) * 10);
+}
+
 // Style attributes changed at random, styled again with only those: as styling it all gives.
 TEST(Restyle, StyleAttributesOnly) {
     uint32_t seed = std::getenv("FUZZ_SEED") ? static_cast<uint32_t>(std::atoi(std::getenv("FUZZ_SEED"))) : 99;
@@ -1329,7 +1434,7 @@ TEST(Restyle, StyleAttributesOnly) {
                 setAttribute(n, "style", kStyles[rnd(std::size(kStyles))]);
                 changed.push_back(n);
             }
-            auto next = StyledDocument::withStyleAttributes(changed, *doc, css::MediaContext{800, 600}, {}, {}, nullptr, *styles);
+            auto next = StyledDocument::withStyleAttributes(changed, {}, *doc, css::MediaContext{800, 600}, {}, {}, nullptr, *styles);
             ASSERT_EQ(next != nullptr, round % 7 != 0 && next) << round;
             if (next) ++parts;
             else next = std::make_unique<StyledDocument>(*doc, css::MediaContext{800, 600}, StyledDocument::SheetLoader{}, StyledDocument::ChMeasure{}, nullptr, styles.get());

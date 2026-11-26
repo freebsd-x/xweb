@@ -2830,8 +2830,23 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                     }
                     case OpDefineNamed: {
                         Node* p = nodes[o[2]];
+                        Object* obj = r[o[1]].asObject();
+                        // A literal's next key: the same shape on from the same shape as the last time.
+                        if (o[2] < code.set_cache.size()) {
+                            const VmCode::PropCache& c = code.set_cache[o[2]];
+                            if (c.added && obj->shape() == c.added->parent()) {
+                                obj->addShaped(const_cast<Shape*>(c.added), Property{r[o[3]]});
+                                pc += 4;
+                                break;
+                            }
+                        }
                         if (!p->key) p->key = std::make_unique<PropertyKey>(p->str);
-                        r[o[1]].asObject()->define(*p->key, {r[o[3]]});
+                        const Shape* before = obj->shape();
+                        obj->define(*p->key, {r[o[3]]});
+                        if (before && obj->shape() && obj->shape()->parent() == before && !obj->ownLater()) {
+                            if (code.set_cache.size() < code.nodes.size()) code.set_cache.resize(code.nodes.size());
+                            code.set_cache[o[2]].added = obj->shape();
+                        }
                         pc += 4;
                         break;
                     }

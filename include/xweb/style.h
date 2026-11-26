@@ -402,7 +402,9 @@ public:
     // `previous` with only these elements' style attributes changed since, and nothing else
     // of the page: they and what's in them styled, the rest as it was. Null when that can't
     // be done (then all of it must be).
-    [[nodiscard]] static std::unique_ptr<StyledDocument> withStyleAttributes(const std::vector<const Node*>& changed, const Document& doc, css::MediaContext media,
+    // `attributes`: elements whose other attributes (or the text right in them) changed.
+    [[nodiscard]] static std::unique_ptr<StyledDocument> withStyleAttributes(const std::vector<const Node*>& changed, const std::vector<const Node*>& attributes,
+                                                                             const Document& doc, css::MediaContext media,
                                                                              const SheetLoader& loader, const ChMeasure& measure_ch, const class FormState* forms,
                                                                              const StyledDocument& previous);
     // Only `target` and its ancestors styled, as a whole document's styling would (with

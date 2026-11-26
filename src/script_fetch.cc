@@ -192,7 +192,7 @@ Value PageScript::Impl::browserFetch(Args a) {
             rt.resolvePromise(promise, Value::object(parts));
         });
         self->drainMicrotasks();
-        self->dirty = true;
+        self->dirty.set = true;   // (what its handlers changed, they've said)
     };
     if (same || opaque || simple) {
         host.fetch(*req, finish);

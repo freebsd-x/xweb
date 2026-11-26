@@ -219,7 +219,7 @@ void PageScript::Impl::installCanvas() {
     // Something was drawn: the page shows it at the next paint.
     const auto changed = [self](CanvasSurface& s) {
         ++s.version;
-        self->dirty = true;
+        self->dirty.set = true;   // (painted again: nothing restyled for it)
     };
     // Draws `draw` onto the canvas, through its clip if it has one.
     const auto clipped = [](CanvasSurface& s, const std::function<void(Canvas&)>& draw) {

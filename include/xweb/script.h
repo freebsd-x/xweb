@@ -147,7 +147,8 @@ public:
     bool takeDirty();
     // Since it was last asked: the elements whose style attributes have changed, and whether
     // anything else has (for styling only those again).
-    bool takeChanges(std::vector<const Node*>& style_attributes);
+    // (`attributes`: elements with other attributes changed, or the text right in them.)
+    bool takeChanges(std::vector<const Node*>& style_attributes, std::vector<const Node*>& attributes);
     // As takeChanges would, leaving them: null if anything else has.
     [[nodiscard]] const std::vector<const Node*>* onlyStyleAttributes() const;
     // The same, without forgetting it (a script asking where something is now).

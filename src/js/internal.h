@@ -185,7 +185,7 @@ private:
 };
 
 struct Env : Cell {
-    explicit Env(Env* o) : outer(o) {}
+    explicit Env(Env* o) : outer(o) { cell_kind = Kind::Env; }
     // As new, to be made again (an owned scope's, from Runtime::env_pool): its names'
     // block kept.
     void reuse(Env* o) {

@@ -1544,15 +1544,15 @@ private:
         const web::css::MediaContext media{width, height, &container_sizes_};
         const auto ch = [this](const web::ComputedStyle& s) { return web::chWidth(measurer_, s); };
         // Nothing but some elements' style attributes since: those, and what's in them.
-        std::vector<const web::Node*> style_attributes;
+        std::vector<const web::Node*> style_attributes, attributes;
         bool other = std::exchange(styles_other_, false) || !page_->script;
-        if (page_->script && page_->script->takeChanges(style_attributes)) other = true;
+        if (page_->script && page_->script->takeChanges(style_attributes, attributes)) other = true;
         std::unique_ptr<web::StyledDocument> made;
         if (!other && before) {
-            made = web::StyledDocument::withStyleAttributes(style_attributes, *page.doc, media, sheetLoader(missing), ch, &page_->forms, *before);
+            made = web::StyledDocument::withStyleAttributes(style_attributes, attributes, *page.doc, media, sheetLoader(missing), ch, &page_->forms, *before);
             if (made) ++perf_.styled_parts;
         }
-        if (other) content_as_laid_out_ = false;
+        if (other || !attributes.empty()) content_as_laid_out_ = false;
         if (!made) made = std::make_unique<web::StyledDocument>(*page.doc, media, sheetLoader(missing), ch, &page_->forms, before);
         // What changed starts moving; what's moving is laid over them.
         if (animates()) animator_.styled(*made, before, seconds());
