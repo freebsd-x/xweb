@@ -217,13 +217,22 @@ struct PageScript::Impl {
     struct Dirty {
         bool set = false, other = false;
         std::vector<const Node*> style_attributes;
-        Dirty& operator=(bool v) {
+        // XWEB_DEBUG_DIRTY=1: what marks the page changed (for finding a page that's laid out
+        // again and again with nothing to show for it): a node's name, or for anything else
+        // the code's address (addr2line -f -C -i -e browser ADDR).
+        static bool debug() {
+            static const bool on = std::getenv("XWEB_DEBUG_DIRTY") != nullptr;
+            return on;
+        }
+        [[gnu::noinline]] Dirty& operator=(bool v) {
+            if (v && debug()) std::fprintf(stderr, "[dirty] all, from %p\n", __builtin_return_address(0));
             set = v;
             other = other || v;
             return *this;
         }
         operator bool() const { return set; }
         void style(const Node* n) {
+            if (debug()) std::fprintf(stderr, "[dirty] style of <%s>\n", n->name.c_str());
             set = true;
             if (style_attributes.size() >= 4096) other = true;
             else if (style_attributes.empty() || style_attributes.back() != n) style_attributes.push_back(n);
@@ -232,6 +241,7 @@ struct PageScript::Impl {
         // elements taken out (their styles dropped). Not a style sheet's.
         std::vector<const Node*> attributes;
         void attribute(const Node* n) {
+            if (debug()) std::fprintf(stderr, "[dirty] in <%s>\n", n ? n->name.c_str() : "?");
             set = true;
             if (!n || !n->isElement() || attributes.size() >= 4096 || sheetLike(n)) other = true;
             else if (attributes.empty() || attributes.back() != n) attributes.push_back(n);

@@ -2079,6 +2079,9 @@ struct Notes {
     bool uses_has_ = false;   // a rule with :has(): what an element matches can depend on its descendants
     bool has_any_anchor_ = false;
     bool style_selector_ = false;   // a selector asks about style attributes ([style])
+    // One asks about them of another than the element it styles (`[style*=none] p`, inside
+    // :not() or :has()): what's in or after an element sees its style attribute.
+    bool style_in_context_ = false;
     // A selector that looks at an element's earlier siblings (a + b, a ~ b, :nth-child(of S)):
     // an attribute changed can change what those after it match.
     bool sibling_matters_ = false;
@@ -2108,6 +2111,7 @@ struct Notes {
         uses_has_ |= o.uses_has_;
         has_any_anchor_ |= o.has_any_anchor_;
         style_selector_ |= o.style_selector_;
+        style_in_context_ |= o.style_in_context_;
         sibling_matters_ |= o.sibling_matters_;
         all(attr_names_, o.attr_names_);
         attr_function_ |= o.attr_function_;
@@ -2303,12 +2307,25 @@ public:
         out_.containers_ = previous.containers_;
     }
     // Whether that can be told of this one.
-    static bool canStyleAgain(const StyledDocument& previous, const StyledDocument& now) {
+    // (XWEB_DEBUG_RESTYLE: why canStyleAgain or restyle said no.)
+    static const char* whyNotAgain(const StyledDocument& previous, const StyledDocument& now) {
+        if (!previous.reusable_) return "the last styles can't be reused";
+        if (previous.has_hosts_) return "shadow trees";
+        if (!previous.index_kept_) return "no rules kept";
+        if (previous.kept_.size() + 1 >= kMaxKeptGenerations) return "too many generations";
+        if (previous.media_.width != now.media_.width || previous.media_.height != now.media_.height) return "another size";
+        if (previous.forms_ != now.forms_) return "other form state";
+        return "a selector asks about style attributes";
+    }
+    const char* why_not_ = "";
+    // `style_selectors`: whether one that asks about style attributes may be among the
+    // rules (restyle then takes their changes as any other attribute's).
+    static bool canStyleAgain(const StyledDocument& previous, const StyledDocument& now, bool style_selectors = false) {
         if (!previous.reusable_ || previous.has_hosts_ || !previous.index_kept_ || previous.kept_.size() + 1 >= kMaxKeptGenerations ||
             previous.media_.width != now.media_.width || previous.media_.height != now.media_.height || previous.forms_ != now.forms_)
             return false;
         // (A selector that asks for style attributes sees them from anywhere.)
-        return !static_cast<const Cached*>(previous.index_kept_.get())->notes.style_selector_;
+        return style_selectors || !static_cast<const Cached*>(previous.index_kept_.get())->notes.style_selector_;
     }
     // False if it comes out that something else has changed.
     // No styles for n and what's in it (out of the page, or now in what isn't shown).
@@ -2328,7 +2345,14 @@ public:
     }
     // `attributes`: elements with other attributes changed, or the text in them: they and what's
     // in them too, and their later siblings (and what's in those) if a selector looks back.
-    bool restyle(const std::vector<const Node*>& changed, const std::vector<const Node*>& attributes = {}) {
+    bool restyle(const std::vector<const Node*>& changed_in, const std::vector<const Node*>& attributes_in = {}) {
+        // A selector asks about style attributes ([style*=none]): their changes are any
+        // other attribute's (inven.co.kr's, restyled all of it twice a second).
+        std::vector<const Node*> changed = changed_in, attributes = attributes_in;
+        if (style_selector_) {
+            attributes.insert(attributes.end(), changed.begin(), changed.end());
+            changed.clear();
+        }
         std::unordered_set<const Node*> all(changed.begin(), changed.end());
         if (!attributes.empty()) {
             // A :has() whose anchors are told by their own tag, ID, class or attribute: those
@@ -2336,7 +2360,10 @@ public:
             // other :has() might match otherwise now anywhere.
             std::vector<const Node*> roots(attributes.begin(), attributes.end());
             if (uses_has_) {
-                if (has_any_anchor_ || !has_args_.empty() || !has_host_anchors_.empty()) return false;
+                if (has_any_anchor_ || !has_args_.empty() || !has_host_anchors_.empty()) {
+                    why_not_ = has_any_anchor_ ? ":has() with no anchor" : !has_args_.empty() ? ":has() told by what it looks for" : ":host:has()";
+                    return false;
+                }
                 std::unordered_set<const Node*> looked;
                 for (const Node* n : attributes)
                     for (const Node* x = n; x && x->isElement(); x = x->parent) {
@@ -2350,7 +2377,7 @@ public:
                                 if (sib == x) break;
                                 if (anchor(sib)) roots.push_back(sib);
                             }
-                        if (roots.size() > 20000) return false;
+                        if (roots.size() > 20000) { why_not_ = "too many"; return false; }
                     }
             }
             for (const Node* n : roots) {
@@ -2366,7 +2393,7 @@ public:
                 const auto& sibs = n->parent->children;
                 for (auto it = std::find(sibs.begin(), sibs.end(), n); it != sibs.end(); ++it)
                     if ((*it)->isElement()) all.insert(*it);
-                if (all.size() > 20000) return false;
+                if (all.size() > 20000) { why_not_ = "too many"; return false; }
             }
         }
         bool same = true;
@@ -2380,7 +2407,7 @@ public:
             }
             // Done with the one it's inside of; or not in the page; or somewhere deep.
             if (inside || !here) continue;
-            if (chain.size() > kMaxStyledDepth) return false;
+            if (chain.size() > kMaxStyledDepth) { why_not_ = "too deep"; return false; }
             std::reverse(chain.begin(), chain.end());
             ComputedStyle initial;
             const ComputedStyle* parent = &initial;
@@ -2392,6 +2419,7 @@ public:
                 const auto [style, key, children_key] = visit(chain[i], *parent, doc_p_, nullptr, parent_key, parent_full_key);
                 if (dbg_kept_ == kept) {
                     while (pushed--) bloomPop();
+                    why_not_ = "an ancestor's style changed";
                     return false;
                 }
                 if (style->display == Display::None && chain[i]->ns != Namespace::Svg) {
@@ -2531,7 +2559,7 @@ public:
                          has_context_, dbg_why_);
     }
     const char* dbg_why_ = "";   // why nothing could be kept (XWEB_DEBUG_RESTYLE)
-    size_t dbg_kept_ = 0, dbg_roots_ = 0, dbg_shared_ = 0;
+    size_t dbg_kept_ = 0, dbg_roots_ = 0, dbg_shared_ = 0, dbg_visited_ = 0;
 
 private:
     // A script's sheet: its text's looked up by where it is, not by what it is.
@@ -2594,6 +2622,7 @@ private:
                 if (sel.parts.empty()) continue;
                 noteHasAnchors(sel);
                 if (!style_selector_) style_selector_ = asksForStyleAttribute(sel);
+                if (!style_in_context_ && style_selector_) style_in_context_ = asksStyleInContext(sel);
                 if (!sibling_matters_) sibling_matters_ = looksAtSiblings(sel);
                 noteAttributes(sel);
                 noteFollowing(sel);
@@ -5758,7 +5787,7 @@ private:
         // (Nor what no selector asks about and has no look of its own: github.com's
         // data-turbo-loaded, put on <html>, restyled all of it.)
         for (const Attribute& a : el->attrs)
-            if ((style_selector_ || a.name != "style") && attributeMatters(a.name)) h = mixText(mixText(h, a.name), a.value);
+            if ((style_in_context_ || a.name != "style") && attributeMatters(a.name)) h = mixText(mixText(h, a.name), a.value);
         const bool empty = std::none_of(el->children.begin(), el->children.end(), [](const Node* c) {
             return c->isElement() || (c->type == NodeType::Text && !c->data.empty());
         });
@@ -6106,6 +6135,15 @@ private:
         }
         return false;
     }
+    static bool asksStyleInContext(const ComplexSelector& sel) {
+        for (size_t i = 0; i < sel.parts.size(); ++i)
+            for (const SimpleSelector& x : sel.parts[i].simple) {
+                if (i + 1 < sel.parts.size() && x.kind == SimpleKind::Attribute && lower(x.name) == "style") return true;
+                for (const ComplexSelector& a : x.args)
+                    if (asksForStyleAttribute(a)) return true;
+            }
+        return false;
+    }
     static bool asksForStyleAttribute(const ComplexSelector& sel) {
         for (const CompoundSelector& c : sel.parts)
             for (const SimpleSelector& x : c.simple) {
@@ -6184,6 +6222,7 @@ private:
     };
     Visited visit(const Node* el, const ComputedStyle& parent, const Scope* scope, const Node* slot, uint64_t parent_key,
                   uint64_t parent_full_key) {
+        ++dbg_visited_;
         // Measured from a font before, and fonts have come since: styled again (it and,
         // through its key, what's in it).
         if (previous_ && previous_->media_.fonts != out_.media_.fonts && previous_->font_users_.count(el))
@@ -6397,9 +6436,20 @@ std::unique_ptr<StyledDocument> StyledDocument::withStyleAttributes(const std::v
                                                                     const StyledDocument& previous) {
     static const bool no_reuse = std::getenv("XWEB_NO_STYLE_REUSE") != nullptr;
     std::unique_ptr<StyledDocument> out(new StyledDocument(media, measure_ch, forms));
-    if (no_reuse || !StyleResolver::canStyleAgain(previous, *out)) return nullptr;
+    static const bool dbg = std::getenv("XWEB_DEBUG_RESTYLE") != nullptr;
+    if (no_reuse || !StyleResolver::canStyleAgain(previous, *out, true)) {
+        if (dbg) std::fprintf(stderr, "[restyle] not in part: %s\n", StyleResolver::whyNotAgain(previous, *out));
+        return nullptr;
+    }
     StyleResolver resolver(doc, *out, loader, previous, StyleResolver::Again{});
-    if (!resolver.restyle(changed, attributes)) return nullptr;
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!resolver.restyle(changed, attributes)) {
+        if (dbg) std::fprintf(stderr, "[restyle] not in part: %s\n", resolver.why_not_);
+        return nullptr;
+    }
+    if (dbg)
+        std::fprintf(stderr, "[restyle] in part: %zu + %zu changed, %zu styled, %zu kept, %.1f ms\n", changed.size(), attributes.size(), resolver.dbg_visited_,
+                     resolver.dbg_kept_, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     out->checkReuse(doc, loader);
     return out;
 }

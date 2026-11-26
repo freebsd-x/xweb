@@ -1467,7 +1467,9 @@ TEST(Restyle, StyleAttributesOnly) {
                 changed.push_back(n);
             }
             auto next = StyledDocument::withStyleAttributes(changed, {}, *doc, css::MediaContext{800, 600}, {}, {}, nullptr, *styles);
-            ASSERT_EQ(next != nullptr, round % 7 != 0 && next) << round;
+            // (With a selector asking about style attributes, their changes are taken as any
+            // other attribute's: styled in part all the same.)
+            ASSERT_NE(next, nullptr) << round;
             if (next) ++parts;
             else next = std::make_unique<StyledDocument>(*doc, css::MediaContext{800, 600}, StyledDocument::SheetLoader{}, StyledDocument::ChMeasure{}, nullptr, styles.get());
             const StyledDocument fresh(*doc, css::MediaContext{800, 600});
