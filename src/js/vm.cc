@@ -724,8 +724,18 @@ private:
             } else if (lexical) {
                 emit(OpUndef, {l->reg});
             }
+            // Past its declaration, in the same block, it's surely made: read straight from its
+            // register, no dead zone to check (as a var). Not in a switch's cases, which can
+            // be jumped into past it.
+            if (lexical && !scopes_.empty()) {
+                const size_t at = scopes_.size() - 1;
+                if (auto it = scopes_[at].find(d->a->str); it != scopes_[at].end() && &it->second == l &&
+                    std::find(switch_scopes_.begin(), switch_scopes_.end(), at) == switch_scopes_.end())
+                    it->second.lexical = false;
+            }
         }
     }
+    std::vector<size_t> switch_scopes_;   // the scopes of the switches being compiled
 
     // Loops and switches: their breaks, continues, and labels.
     void loopLike(Node* n, std::vector<std::u16string> labels) {
@@ -909,6 +919,11 @@ private:
                 std::vector<Node*> all;
                 for (Node* c : n->kids) all.insert(all.end(), c->kids.begin(), c->kids.end());
                 enterLexical(n->lexical, all);
+                switch_scopes_.push_back(scopes_.size() - 1);
+                struct Popped {
+                    std::vector<size_t>& v;
+                    ~Popped() { v.pop_back(); }
+                } popped{switch_scopes_};
                 t.env_depth = env_depth_;   // (its break target is inside its scope, left after)
                 std::vector<Label*> bodies;
                 for (size_t i = 0; i < n->kids.size(); ++i) bodies.push_back(newLabel());

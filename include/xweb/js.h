@@ -81,25 +81,32 @@ public:
     enum class Type : uint8_t { Undefined, Null, Boolean, Number, String, Symbol, Object, Empty, BigInt };
 
     Value() noexcept = default;
-    Value(const Value& o) noexcept : type_(o.type_), bits_(o.bits_) { if (counted()) ++s_->refs; }
-    Value(Value&& o) noexcept : type_(o.type_), bits_(o.bits_) { o.type_ = Type::Undefined; }
-    Value& operator=(const Value& o) noexcept {
+    [[gnu::always_inline]] Value(const Value& o) noexcept : type_(o.type_), bits_(o.bits_) { if (counted()) ++s_->refs; }
+    [[gnu::always_inline]] Value(Value&& o) noexcept : type_(o.type_), bits_(o.bits_) { o.type_ = Type::Undefined; }
+    // (Numbers, objects and the like over the same: copied, no counts to keep. The
+    // interpreter's every register move is one.)
+    [[gnu::always_inline]] Value& operator=(const Value& o) noexcept {
+        if (!counts(type_) && !counts(o.type_)) [[likely]] {
+            type_ = o.type_;
+            bits_ = o.bits_;
+            return *this;
+        }
         if (o.counted()) ++o.s_->refs;
         release();
         type_ = o.type_;
         bits_ = o.bits_;
         return *this;
     }
-    Value& operator=(Value&& o) noexcept {
+    [[gnu::always_inline]] Value& operator=(Value&& o) noexcept {
         if (this != &o) {
-            release();
+            if (counts(type_)) release();
             type_ = o.type_;
             bits_ = o.bits_;
             o.type_ = Type::Undefined;
         }
         return *this;
     }
-    ~Value() { release(); }
+    [[gnu::always_inline]] ~Value() { if (counts(type_)) release(); }
     static Value undefined() { return {}; }
     static Value null() { Value v; v.type_ = Type::Null; return v; }
     static Value empty() { Value v; v.type_ = Type::Empty; return v; }   // an array's hole
@@ -150,7 +157,8 @@ public:
     [[nodiscard]] Symbol* asSymbol() const noexcept { return sym_; }
 
 private:
-    [[nodiscard]] bool counted() const noexcept { return (type_ == Type::String || type_ == Type::BigInt) && s_; }
+    [[nodiscard]] static bool counts(Type t) noexcept { return t == Type::String || t == Type::BigInt; }
+    [[nodiscard]] bool counted() const noexcept { return counts(type_) && s_; }
     void release() noexcept {
         if (counted() && --s_->refs == 0) delete s_;
         type_ = Type::Undefined;
