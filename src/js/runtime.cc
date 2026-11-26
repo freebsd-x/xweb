@@ -152,11 +152,80 @@ size_t Object::keyHash(const PropertyKey& k) noexcept {
     return h;
 }
 
+// ── Shapes ──
+
+void Shape::build() const {
+    if (keys_.size() == count_) return;
+    keys_.assign(count_, nullptr);
+    size_t i = count_;
+    for (const Shape* s = this; s && s->count_; s = s->parent_) keys_[--i] = &s->key_;
+    if (count_ > 8) {
+        size_t cap = 32;
+        while (cap < size_t{count_} * 2) cap *= 2;
+        index_.assign(cap, 0);
+        for (uint32_t k = 0; k < count_; ++k) {
+            size_t j = Object::keyHash(*keys_[k]) & (cap - 1);
+            while (index_[j]) j = (j + 1) & (cap - 1);
+            index_[j] = k + 1;
+        }
+    }
+}
+
+ptrdiff_t Shape::find(const PropertyKey& key, size_t hash) const {
+    if (!count_) return -1;
+    if (count_ <= 8) {
+        // From the last added back: the keys' hashes first, kept in the keys.
+        const Shape* s = this;
+        for (uint32_t i = count_; i-- > 0; s = s->parent_)
+            if (Object::keyHash(s->key_) == hash && s->key_ == key) return static_cast<ptrdiff_t>(i);
+        return -1;
+    }
+    build();
+    const size_t mask = index_.size() - 1;
+    for (size_t j = hash & mask;; j = (j + 1) & mask) {
+        const uint32_t at = index_[j];
+        if (!at) return -1;
+        const PropertyKey& k = *keys_[at - 1];
+        if (Object::keyHash(k) == hash && k == key) return at - 1;
+    }
+}
+
+Shape* Shape::with(const PropertyKey& key, size_t hash) {
+    for (auto& [h, next] : next_)
+        if (h == hash && next->key_ == key) return next.get();
+    // Too many keys, or too many ways on from here (an object used as a map, its keys
+    // whatever comes): the object holds its own.
+    thread_local size_t made = 0;
+    if (count_ >= kMaxKeys || next_.size() >= 64 || made >= 500'000) return nullptr;
+    ++made;
+    auto s = std::make_unique<Shape>();
+    s->parent_ = this;
+    s->key_ = key;
+    (void)Object::keyHash(s->key_);
+    s->count_ = count_ + 1;
+    next_.emplace_back(hash, std::move(s));
+    return next_.back().second.get();
+}
+
+void Object::ownKeysNow() {
+    if (!shape_) return;
+    props_.clear();
+    props_.reserve(values_.size() + 1);
+    for (size_t i = 0; i < values_.size(); ++i) props_.emplace_back(shape_->keyAt(i), std::move(values_[i]));
+    values_.clear();
+    values_.shrink_to_fit();
+    shape_ = nullptr;
+    index_.clear();
+    dead_ = 0;
+    if (props_.size() > kScanMax) reindex();
+}
+
 ptrdiff_t Object::find(const PropertyKey& key, size_t hash, bool hashed) const noexcept {
     if (later_) {
         if (!isFunctionsOwn(key)) return -1;
         makeOwn();
     }
+    if (shape_) return shape_->find(key, hashed ? hash : keyHash(key));
     if (index_.empty()) {
         // By hash first (each key's is kept once worked out): one compare per property,
         // not a string compare.
@@ -204,10 +273,16 @@ void Object::reindex() {
 
 Property* Object::own(const PropertyKey& key) {
     const ptrdiff_t at = find(key);
-    return at < 0 ? nullptr : &props_[static_cast<size_t>(at)].second;
+    if (at < 0) return nullptr;
+    return shape_ ? &values_[static_cast<size_t>(at)] : &props_[static_cast<size_t>(at)].second;
 }
 
 Property* Object::ownAt(size_t pos, const PropertyKey& key, size_t hash) noexcept {
+    if (shape_) {
+        if (pos >= values_.size()) return nullptr;
+        const PropertyKey& k = shape_->keyAt(pos);
+        return keyHash(k) == hash && k == key ? &values_[pos] : nullptr;
+    }
     if (pos >= props_.size()) return nullptr;
     auto& [k, p] = props_[pos];
     if (p.flags == kTombstone || k.isSymbol() != key.isSymbol() || keyHash(k) != hash || k.name.size() != key.name.size()) return nullptr;
@@ -216,16 +291,31 @@ Property* Object::ownAt(size_t pos, const PropertyKey& key, size_t hash) noexcep
 
 const Property* Object::ownHashed(const PropertyKey& key, size_t hash) const {
     const ptrdiff_t at = find(key, hash, true);
-    return at < 0 ? nullptr : &props_[static_cast<size_t>(at)].second;
+    if (at < 0) return nullptr;
+    return shape_ ? &values_[static_cast<size_t>(at)] : &props_[static_cast<size_t>(at)].second;
 }
 
 const Property* Object::own(const PropertyKey& key) const {
     const ptrdiff_t at = find(key);
-    return at < 0 ? nullptr : &props_[static_cast<size_t>(at)].second;
+    if (at < 0) return nullptr;
+    return shape_ ? &values_[static_cast<size_t>(at)] : &props_[static_cast<size_t>(at)].second;
 }
 
 Property& Object::define(const PropertyKey& key, Property p) {
     if (later_) makeOwn();
+    if (shape_) {
+        const size_t h = keyHash(key);
+        if (const ptrdiff_t at = shape_->find(key, h); at >= 0) {
+            values_[static_cast<size_t>(at)] = std::move(p);
+            return values_[static_cast<size_t>(at)];
+        }
+        if (Shape* next = shape_->with(key, h)) {
+            shape_ = next;
+            values_.push_back(std::move(p));
+            return values_.back();
+        }
+        ownKeysNow();
+    }
     if (const ptrdiff_t at = find(key); at >= 0) {
         props_[static_cast<size_t>(at)].second = std::move(p);
         return props_[static_cast<size_t>(at)].second;
@@ -240,6 +330,14 @@ Value NativeSlot::operator()(Runtime& rt, const Value& this_value, std::span<con
 
 Property& Object::defineNew(const PropertyKey& key, Property p) {
     if (later_) makeOwn();
+    if (shape_) {
+        if (Shape* next = shape_->with(key, keyHash(key))) {
+            shape_ = next;
+            values_.push_back(std::move(p));
+            return values_.back();
+        }
+        ownKeysNow();
+    }
     props_.emplace_back(key, std::move(p));
     if (props_.size() > kScanMax && index_.size() < props_.size() * 2) reindex();
     else if (!index_.empty()) place(static_cast<uint32_t>(props_.size() - 1));
@@ -248,6 +346,8 @@ Property& Object::defineNew(const PropertyKey& key, Property p) {
 
 bool Object::remove(const PropertyKey& key) {
     if (later_) makeOwn();
+    if (find(key) < 0) return false;
+    ownKeysNow();   // (a shape is only ever added to)
     const ptrdiff_t at = find(key);
     if (at < 0) return false;
     auto& [k, p] = props_[static_cast<size_t>(at)];
@@ -268,9 +368,10 @@ std::vector<PropertyKey> Object::ownKeys() const {
         for (size_t i = 0, n = typedLength(this); i < n; ++i) out.emplace_back(indexKey(i));
     for (size_t i = 0; i < elements.size(); ++i)
         if (!elements[i].isEmpty()) out.emplace_back(indexKey(i));
-    for (const auto& [k, p] : props_)
-        if (p.flags != kTombstone && !k.isSymbol())
+    forEachOwn([&](const PropertyKey& k, const Property&) {
+        if (!k.isSymbol())
             if (const int64_t i = arrayIndex(k.name); i >= 0) indexed.emplace_back(i, k);
+    });
     std::sort(indexed.begin(), indexed.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
     for (auto& [i, k] : indexed) out.push_back(k);
     if (cls == ObjectClass::String && primitive.isString()) {
@@ -279,10 +380,12 @@ std::vector<PropertyKey> Object::ownKeys() const {
         for (size_t i = 0; i < primitive.asString().size(); ++i) chars.emplace_back(indexKey(i));
         out.insert(out.begin(), chars.begin(), chars.end());
     }
-    for (const auto& [k, p] : props_)
-        if (p.flags != kTombstone && !k.isSymbol() && arrayIndex(k.name) < 0) out.push_back(k);
-    for (const auto& [k, p] : props_)
-        if (p.flags != kTombstone && k.isSymbol()) out.push_back(k);
+    forEachOwn([&](const PropertyKey& k, const Property&) {
+        if (!k.isSymbol() && arrayIndex(k.name) < 0) out.push_back(k);
+    });
+    forEachOwn([&](const PropertyKey& k, const Property&) {
+        if (k.isSymbol()) out.push_back(k);
+    });
     return out;
 }
 
@@ -1333,14 +1436,12 @@ void Runtime::collect(bool mid_script) {
             for (auto& en : e->vars) markCell(en.second.import_env);
         } else if (auto* o = dynamic_cast<Object*>(c)) {
             markCell(o->prototype);
-            for (const auto& k : o->ownKeys()) {
+            o->forEachOwn([&](const PropertyKey& k, const Property& p) {
                 if (k.symbol) markCell(k.symbol);
-                if (const Property* p = o->own(k)) {
-                    markValue(p->value);
-                    markCell(p->getter);
-                    markCell(p->setter);
-                }
-            }
+                markValue(p.value);
+                markCell(p.getter);
+                markCell(p.setter);
+            });
             for (const Value& v : o->elements) markValue(v);
             markCell(o->bound_target);
             if (o->bound) {

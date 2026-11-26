@@ -162,6 +162,22 @@ struct VmCode {
         uint32_t kind_reg = 0, fin_start = 0;
     };
     std::vector<Handler> handlers;   // innermost first
+    // A member access's last find, by its node: the shape of the object it was read from
+    // and where in it, or how far up the chain and those objects' shapes. Checked against
+    // the live objects each time (never read through a pointer kept here).
+    struct PropCache {
+        const Shape* shape = nullptr;      // the receiver's
+        const Shape* up1 = nullptr;        // its prototype's (when found there or further)
+        const Shape* up2 = nullptr;        // that one's prototype's
+        uint32_t depth = 0;                // 0: own, 1, 2
+        uint32_t slot = 0;
+        // A set that added the key: the receiver's shape after (shape before), its chain's.
+        const Shape* added = nullptr;
+        const Shape* chain[3] = {};
+    };
+    std::vector<PropCache> get_cache, set_cache;
+    // As a constructor: how many properties its objects had by its end (room made for them).
+    uint32_t ctor_props = 0;
     std::vector<uint32_t> stubs;     // where a finally's jumps out go on
     uint32_t nregs = 0;
     uint32_t nparams = 0;
@@ -1957,6 +1973,68 @@ Value Interpreter::callCompiled(Object* f, VmCode& code, const Value& this_value
     return callee.runVm(f, code, this_value, args, new_target);
 }
 
+namespace {
+
+// A key the shapes alone answer for on any object but a proxy: not an index, not "length",
+// nothing a typed array would read as a number.
+bool shapeKey(const PropertyKey& k) {
+    if (k.isSymbol()) return true;
+    const std::u16string& n = k.name;
+    if (n.empty() || n == u"length" || n == u"Infinity" || n == u"NaN") return false;
+    const char16_t c = n[0];
+    return !(c >= u'0' && c <= u'9') && c != u'-';
+}
+
+// Where key is, from o up at most two prototypes, by shapes: the cache to keep.
+bool fillGet(VmCode::PropCache& c, Object* o, const PropertyKey& key) {
+    const size_t h = Object::keyHash(key);
+    const Shape* shapes[3] = {};
+    Object* cur = o;
+    for (uint32_t d = 0; d < 3 && cur; ++d, cur = cur->prototype) {
+        if (!cur->shape() || cur->ownLater()) return false;
+        shapes[d] = cur->shape();
+        if (const ptrdiff_t at = cur->shape()->find(key, h); at >= 0) {
+            c.shape = shapes[0];
+            c.up1 = shapes[1];
+            c.up2 = shapes[2];
+            c.depth = d;
+            c.slot = static_cast<uint32_t>(at);
+            return true;
+        }
+    }
+    return false;
+}
+
+// The property a cache says o's key is, if it still is.
+inline Property* cachedGet(const VmCode::PropCache& c, Object* o) {
+    if (o->shape() != c.shape || !c.shape || o->ownLater()) return nullptr;
+    Object* h = o;
+    if (c.depth >= 1) {
+        h = h->prototype;
+        if (!h || h->shape() != c.up1 || h->ownLater()) return nullptr;
+        if (c.depth == 2) {
+            h = h->prototype;
+            if (!h || h->shape() != c.up2 || h->ownLater()) return nullptr;
+        }
+    }
+    return &h->slot(c.slot);
+}
+
+// A set that would add the key to o as a cache saw it before: o and its chain the same
+// shapes (so nothing on the chain has the key: no setter, nothing read-only).
+inline bool cachedAdd(const VmCode::PropCache& c, Object* o) {
+    if (!c.added || o->shape() != c.added->parent() || !o->extensible || o->ownLater()) return false;
+    // (The chain's shapes, then null where it ends: each one there has a shape.)
+    Object* p = o->prototype;
+    for (int i = 0; i < 3; ++i, p = p->prototype) {
+        if (!p) return c.chain[i] == nullptr;
+        if (!p->shape() || p->shape() != c.chain[i] || p->ownLater()) return false;
+    }
+    return p == nullptr;
+}
+
+}  // namespace
+
 Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::span<const Value> args, Object* new_target) {
     // As deep as the tree-walker lets calls go, and no deeper than the stack.
     struct Depth {
@@ -2014,8 +2092,12 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
         return this_value;
     };
     if (new_target && !derived_ctor) {
-        const Value proto = rt_.get(Value::object(new_target), u"prototype");
-        this_value = Value::object(rt_.newObject(proto.isObject() ? proto.asObject() : rt_.object_prototype));
+        thread_local const PropertyKey key{u"prototype"};
+        const Property* own = new_target->ownLater() ? nullptr : new_target->own(key);
+        const Value proto = own && !(own->flags & kAccessor) ? own->value : rt_.get(Value::object(new_target), key);
+        Object* obj = rt_.newObject(proto.isObject() ? proto.asObject() : rt_.object_prototype);
+        if (code.ctor_props) obj->reserveProps(code.ctor_props);
+        this_value = Value::object(obj);
         this_ready = true;
     }
     // A class's instance fields, on its new object (now, or at super() in a derived one).
@@ -2247,6 +2329,27 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                     case OpLoadThis: r[o[1]] = thisOf(); pc += 2; break;
                     case OpGetNamed: {
                         Node* m = nodes[o[3]];
+                        if (r[o[2]].isObject()) {
+                            Object* obj = r[o[2]].asObject();
+                            if (o[3] < code.get_cache.size())
+                                if (const Property* p = cachedGet(code.get_cache[o[3]], obj)) {
+                                    if (!(p->flags & kAccessor)) r[o[1]] = p->value;
+                                    else r[o[1]] = p->getter ? rt_.call(Value::object(p->getter), Value::object(obj), {}) : Value::undefined();
+                                    pc += 4;
+                                    break;
+                                }
+                            if (!m->key) m->key = std::make_unique<PropertyKey>(m->str);
+                            if (shapeKey(*m->key)) {
+                                if (code.get_cache.size() < code.nodes.size()) code.get_cache.resize(code.nodes.size());
+                                if (fillGet(code.get_cache[o[3]], obj, *m->key)) {
+                                    const Property* p = cachedGet(code.get_cache[o[3]], obj);
+                                    if (!(p->flags & kAccessor)) r[o[1]] = p->value;
+                                    else r[o[1]] = p->getter ? rt_.call(Value::object(p->getter), Value::object(obj), {}) : Value::undefined();
+                                    pc += 4;
+                                    break;
+                                }
+                            }
+                        }
                         if (!m->key) m->key = std::make_unique<PropertyKey>(m->str);
                         r[o[1]] = rt_.get(r[o[2]], *m->key);
                         pc += 4;
@@ -2273,8 +2376,50 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                     }
                     case OpSetNamed: {
                         Node* m = nodes[o[2]];
+                        Object* obj = r[o[1]].isObject() ? r[o[1]].asObject() : nullptr;
+                        if (obj && o[2] < code.set_cache.size()) {
+                            VmCode::PropCache& c = code.set_cache[o[2]];
+                            if (c.shape && obj->shape() == c.shape && !obj->ownLater()) {
+                                Property& p = obj->slot(c.slot);
+                                if ((p.flags & (kAccessor | kWritable)) == kWritable) {
+                                    p.value = r[o[3]];
+                                    pc += 4;
+                                    break;
+                                }
+                            }
+                            if (cachedAdd(c, obj)) {
+                                obj->addShaped(const_cast<Shape*>(c.added), Property{r[o[3]]});
+                                pc += 4;
+                                break;
+                            }
+                        }
                         if (!m->key) m->key = std::make_unique<PropertyKey>(m->str);
+                        const Shape* before = obj ? obj->shape() : nullptr;
                         rt_.set(r[o[1]], *m->key, r[o[3]], strict);
+                        // What it found, or what it added, kept for the next time.
+                        if (obj && obj->shape() && !obj->ownLater() && shapeKey(*m->key) &&
+                            (obj->cls == ObjectClass::Ordinary || obj->cls == ObjectClass::Function)) {
+                            if (code.set_cache.size() < code.nodes.size()) code.set_cache.resize(code.nodes.size());
+                            VmCode::PropCache& c = code.set_cache[o[2]];
+                            const ptrdiff_t at = obj->shape()->find(*m->key, Object::keyHash(*m->key));
+                            if (at >= 0 && before == obj->shape()) {
+                                c.shape = obj->shape();
+                                c.slot = static_cast<uint32_t>(at);
+                            } else if (at >= 0 && before && obj->shape()->parent() == before &&
+                                       static_cast<size_t>(at) + 1 == obj->shape()->count() && obj->slot(static_cast<size_t>(at)).flags == kDefaultFlags) {
+                                bool ok = true;
+                                Object* p = obj->prototype;
+                                const Shape* chain[3] = {};
+                                for (int i = 0; i < 3 && p; ++i, p = p->prototype) {
+                                    if (!p->shape() || p->ownLater()) ok = false;
+                                    chain[i] = p->shape();
+                                }
+                                if (ok && !p) {
+                                    c.added = obj->shape();
+                                    std::copy(chain, chain + 3, c.chain);
+                                }
+                            }
+                        }
                         pc += 4;
                         break;
                     }
@@ -2648,6 +2793,8 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                             if (!ci->is_async && !ci->is_generator)
                                 if (VmCode* cc = vmCodeFor(ci)) {
                                     Value v = callCompiled(fo, *cc, Value::undefined(), std::span<const Value>(r + o[3], o[4]), fo);
+                                    if (v.isObject())
+                                        cc->ctor_props = std::max<uint32_t>(cc->ctor_props, std::min<uint32_t>(static_cast<uint32_t>(v.asObject()->shapedCount()), 32));
                                     r[o[1]] = std::move(v);
                                     pc += 6;
                                     break;

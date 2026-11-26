@@ -228,6 +228,36 @@ struct Property {
     uint8_t flags = kDefaultFlags;
 };
 
+// The keys of objects made alike (the same keys added in the same order): shared, so
+// that each object holds only its values, and a place a name was found at once is where
+// it is in all of them (the interpreter's caches). A tree: each shape the one before it
+// with one more key. Owned by the runtime's root; never freed before it.
+class Shape {
+public:
+    Shape() = default;
+    Shape(const Shape&) = delete;
+    Shape& operator=(const Shape&) = delete;
+    [[nodiscard]] uint32_t count() const noexcept { return count_; }
+    [[nodiscard]] const PropertyKey& keyAt(size_t i) const { build(); return *keys_[i]; }
+    // Where a key is (-1: not here). `hash`: Object::keyHash's.
+    [[nodiscard]] ptrdiff_t find(const PropertyKey& key, size_t hash) const;
+    // This one with `key` added; null when there'd be too many (then the object holds
+    // its own keys).
+    Shape* with(const PropertyKey& key, size_t hash);
+    [[nodiscard]] const Shape* parent() const noexcept { return parent_; }
+    static constexpr uint32_t kMaxKeys = 64;
+
+private:
+    void build() const;
+    Shape* parent_ = nullptr;
+    PropertyKey key_;     // the last added
+    uint32_t count_ = 0;
+    // Its keys in order, and an index of them when there are many: made when first asked.
+    mutable std::vector<const PropertyKey*> keys_;
+    mutable std::vector<uint32_t> index_;
+    std::vector<std::pair<size_t, std::unique_ptr<Shape>>> next_;   // by the key's hash
+};
+
 // Whatever the heap holds: objects, and symbols.
 class Cell {
 public:
@@ -348,7 +378,34 @@ public:
     // another's added, or they're listed: most functions are only called.
     void ownPropertiesLater(Runtime& rt) noexcept { later_ = &rt; }
     // Room for so many properties, made before they're added (one allocation, not several).
-    void reserveProps(size_t n) { props_.reserve(n); }
+    void reserveProps(size_t n) {
+        if (shape_) values_.reserve(n);
+        else props_.reserve(n);
+    }
+    // Each own property, in order (no copy of the keys made, as ownKeys does).
+    template <typename F>
+    void forEachOwn(F&& f) const {
+        if (shape_) {
+            for (size_t i = 0; i < values_.size(); ++i) f(shape_->keyAt(i), values_[i]);
+        } else {
+            for (const auto& [k, p] : props_)
+                if (p.flags != kTombstone) f(k, p);
+        }
+    }
+    // A key's hash, worked out once and kept in it.
+    [[nodiscard]] static size_t keyHash(const PropertyKey& k) noexcept;
+    // Its shape (null: it holds its own keys, past many of them, or after a delete).
+    [[nodiscard]] const Shape* shape() const noexcept { return shape_; }
+    [[nodiscard]] Property& slot(size_t i) noexcept { return values_[i]; }
+    void setShape(Shape* s) noexcept { shape_ = s; }
+    // Shape s's own one more key (its next from this object's): its value added there.
+    void addShaped(Shape* s, Property p) {
+        shape_ = s;
+        values_.push_back(std::move(p));
+    }
+    [[nodiscard]] size_t shapedCount() const noexcept { return values_.size(); }
+    // Some of its own not made yet (a script function's length, name...).
+    [[nodiscard]] bool ownLater() const noexcept { return later_ != nullptr; }
     bool remove(const PropertyKey& key);
     [[nodiscard]] std::vector<PropertyKey> ownKeys() const;   // indexes, strings, then symbols, as the spec orders them
 
@@ -406,7 +463,11 @@ public:
     uint8_t host_kind = 0;
 
 private:
-    // In the order they were made. A removed one stays as a tombstone (flags
+    // With a shape: its values, in the shape's order.
+    Shape* shape_ = nullptr;
+    std::vector<Property> values_;
+    void ownKeysNow();   // from the shape into props_ (and no shape from then on)
+    // Without one: in the order they were made. A removed one stays as a tombstone (flags
     // kTombstone) until enough have piled up to compact, so a delete is O(1).
     std::vector<std::pair<PropertyKey, Property>> props_;
     // Positions in props_ (plus one; 0 is empty), by key hash with linear probing.
@@ -418,7 +479,6 @@ private:
     [[nodiscard]] static bool isFunctionsOwn(const PropertyKey& key) noexcept;
     static constexpr uint8_t kTombstone = 0xFF;
     static constexpr size_t kScanMax = 8;
-    [[nodiscard]] static size_t keyHash(const PropertyKey& k) noexcept;
     [[nodiscard]] ptrdiff_t find(const PropertyKey& key) const noexcept { return find(key, 0, false); }
     [[nodiscard]] ptrdiff_t find(const PropertyKey& key, size_t hash, bool hashed) const noexcept;
     void place(uint32_t pos) noexcept;
@@ -681,6 +741,8 @@ public:
     T* allocate(A&&... args) {
         if (++allocations_ > kMaxCells) throw Terminated{"out of memory"};
         auto* c = new T(std::forward<A>(args)...);
+        if constexpr (std::is_same_v<T, Object>)
+            if (c->cls != ObjectClass::Proxy) c->setShape(&root_shape_);
         cells_.push_back(c);
         return c;
     }
@@ -798,6 +860,7 @@ private:
     std::function<void(std::string_view, const std::string&)> console_;
     std::function<void(const std::string&)> error_reporter_;
     uint64_t step_budget_ = 200'000'000;
+    Shape root_shape_;   // (before anything with a shape goes; see allocate)
     uint64_t steps_ = 0;
     friend class Interpreter;
     friend struct Builtins;
