@@ -1412,6 +1412,25 @@ TEST(Restyle, AttributesOnly) {
     EXPECT_GT(parts, static_cast<size_t>(rounds) * 10);
 }
 
+// A data- attribute no selector asks about changes no style: everything's kept (one on
+// <html> restyled all of github.com). One a selector asks about isn't ignored.
+TEST(Restyle, UnaskedDataAttributesKeepStyles) {
+    auto doc = parseHtml("<!doctype html><style>[data-on] p{color:red} p{width:5ch}</style><div id=d><p id=p>x</p><p>y</p></div>");
+    StyledDocument first(*doc, css::MediaContext{800, 600});
+    Node* root = const_cast<Node*>(doc->documentElement());
+    setAttribute(root, "data-turbo-loaded", "");
+    StyledDocument second(*doc, css::MediaContext{800, 600}, {}, {}, nullptr, &first);
+    EXPECT_TRUE(second.allKept());
+    setAttribute(const_cast<Node*>(elementById(*doc, "d")), "data-on", "");
+    StyledDocument third(*doc, css::MediaContext{800, 600}, {}, {}, nullptr, &second);
+    EXPECT_FALSE(third.allKept());
+    EXPECT_EQ(third.styleOf(elementById(*doc, "p"))->color, (Color{255, 0, 0, 255}));
+    // Fonts come: only what was measured from one (ch) is styled again.
+    StyledDocument fourth(*doc, css::MediaContext{800, 600, nullptr, 1}, {}, {}, nullptr, &third);
+    EXPECT_NE(fourth.styleOf(elementById(*doc, "p")), third.styleOf(elementById(*doc, "p")));
+    EXPECT_EQ(fourth.styleOf(elementById(*doc, "d")), third.styleOf(elementById(*doc, "d")));
+}
+
 // Style attributes changed at random, styled again with only those: as styling it all gives.
 TEST(Restyle, StyleAttributesOnly) {
     uint32_t seed = std::getenv("FUZZ_SEED") ? static_cast<uint32_t>(std::atoi(std::getenv("FUZZ_SEED"))) : 99;

@@ -843,6 +843,7 @@ public:
     // A web font has come: styles measured in ch are measured again, not kept.
     void fontsChanged() {
         fonts_changed_ = true;
+        ++fonts_epoch_;
         invalidate();
     }
     [[nodiscard]] Page* page() const { return page_.get(); }
@@ -1558,9 +1559,9 @@ private:
         const Page& page = *page_;
         // The last styles, for what's unchanged: not another page's, nor, once fonts have
         // come since, ones worked out from a font's measure.
+        // (Since fonts came: those measured from a font are styled again, the rest kept.)
         const web::StyledDocument* before = page_changed_ ? nullptr : restyled_ ? restyled_.get() : styles_.get();
-        if (before && fonts_changed_ && before->asksFonts()) before = nullptr;
-        const web::css::MediaContext media{width, height, &container_sizes_};
+        const web::css::MediaContext media{width, height, &container_sizes_, fonts_epoch_};
         const auto ch = [this](const web::ComputedStyle& s) { return web::chWidth(measurer_, s); };
         // Nothing but some elements' style attributes since: those, and what's in them.
         std::vector<const web::Node*> style_attributes, attributes;
@@ -1598,7 +1599,7 @@ private:
         if (!previous) return false;
         ++perf_.script_chains;
         std::vector<std::string> missing;
-        auto chain = web::StyledDocument::chainOf(n, *page_->doc, web::css::MediaContext{laid_out_width_, laid_out_height_, &container_sizes_},
+        auto chain = web::StyledDocument::chainOf(n, *page_->doc, web::css::MediaContext{laid_out_width_, laid_out_height_, &container_sizes_, fonts_epoch_},
                                                   sheetLoader(missing),
                                                   [this](const web::ComputedStyle& s) { return web::chWidth(measurer_, s); },
                                                   &page_->forms, previous,
@@ -2585,6 +2586,7 @@ private:
     std::vector<std::string> restyled_missing_;
     uint64_t change_gen_ = 0, restyled_gen_ = 0;
     float restyled_w_ = 0, restyled_h_ = 0;
+    uint32_t fonts_epoch_ = 0;   // web fonts come (MediaContext::fonts)
     bool content_as_laid_out_ = false;   // nothing but style attributes since the layout
     bool styles_other_ = true;   // something besides what the page's script tells of, since the styles were made
     web::LayoutState layout_state_;

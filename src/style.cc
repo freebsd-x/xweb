@@ -2082,6 +2082,10 @@ struct Notes {
     // A selector that looks at an element's earlier siblings (a + b, a ~ b, :nth-child(of S)):
     // an attribute changed can change what those after it match.
     bool sibling_matters_ = false;
+    // The attributes selectors ask about (lower case), and whether a rule's value reads one
+    // (attr()): a data- or aria- attribute nothing asks about changes no style.
+    std::unordered_set<std::string> attr_names_;
+    bool attr_function_ = false;
     // Elements asked about siblings after them (:last-child, ...): any, or with these.
     std::map<std::string, const css::KeyframesRule*> keyframes_;
     std::unordered_map<std::string, const css::PropertyRule*> properties_;   // @property's
@@ -2105,6 +2109,8 @@ struct Notes {
         has_any_anchor_ |= o.has_any_anchor_;
         style_selector_ |= o.style_selector_;
         sibling_matters_ |= o.sibling_matters_;
+        all(attr_names_, o.attr_names_);
+        attr_function_ |= o.attr_function_;
         for (const auto& [name, rule] : o.keyframes_) keyframes_[name] = rule;
         for (const auto& [name, rule] : o.properties_) properties_[name] = rule;
         state_any_ |= o.state_any_;
@@ -2288,6 +2294,7 @@ public:
         previous_ = &previous;
         if (!again.maps) return;
         out_.styles_ = previous.styles_;
+        out_.font_users_ = previous.font_users_;
         out_.before_ = previous.before_;
         out_.after_ = previous.after_;
         out_.placeholder_ = previous.placeholder_;
@@ -2588,12 +2595,17 @@ private:
                 noteHasAnchors(sel);
                 if (!style_selector_) style_selector_ = asksForStyleAttribute(sel);
                 if (!sibling_matters_) sibling_matters_ = looksAtSiblings(sel);
+                noteAttributes(sel);
                 noteFollowing(sel);
                 noteStates(sel);
                 index(sel, rule, origin);
             }
-            for (const Declaration& d : rule.declarations)
+            for (const Declaration& d : rule.declarations) {
                 if (keyword(d.value) == "inherit") inherit_used_.insert(d.name);
+                if (!attr_function_)
+                    for (const Token& t : d.value)
+                        if (t.type == TokenType::Function && lower(t.text) == "attr") attr_function_ = true;
+            }
         }
     }
 
@@ -5743,8 +5755,10 @@ private:
         h = mix(h, static_cast<uint64_t>(el->custom_state));
         // (Not its style attribute, which no selector sees unless one asks for [style]: that's
         // in its key, by styleAttrPrint.)
+        // (Nor what no selector asks about and has no look of its own: github.com's
+        // data-turbo-loaded, put on <html>, restyled all of it.)
         for (const Attribute& a : el->attrs)
-            if (style_selector_ || a.name != "style") h = mixText(mixText(h, a.name), a.value);
+            if ((style_selector_ || a.name != "style") && attributeMatters(a.name)) h = mixText(mixText(h, a.name), a.value);
         const bool empty = std::none_of(el->children.begin(), el->children.end(), [](const Node* c) {
             return c->isElement() || (c->type == NodeType::Text && !c->data.empty());
         });
@@ -6067,6 +6081,19 @@ private:
         return hit;
     }
 
+    void noteAttributes(const ComplexSelector& sel) {
+        for (const CompoundSelector& c : sel.parts)
+            for (const SimpleSelector& x : c.simple) {
+                if (x.kind == SimpleKind::Attribute) attr_names_.insert(lower(x.name));
+                for (const ComplexSelector& a : x.args) noteAttributes(a);
+            }
+    }
+    // Whether an attribute can change a style: not a data- or aria- one nothing asks about.
+    [[nodiscard]] bool attributeMatters(const std::string& name) const {
+        if (attr_function_) return true;
+        if (!(name.starts_with("data-") || name.starts_with("aria-"))) return true;
+        return attr_names_.count(name) != 0;
+    }
     static bool looksAtSiblings(const ComplexSelector& sel) {
         for (size_t i = 0; i < sel.parts.size(); ++i) {
             const CompoundSelector& c = sel.parts[i];
@@ -6157,6 +6184,13 @@ private:
     };
     Visited visit(const Node* el, const ComputedStyle& parent, const Scope* scope, const Node* slot, uint64_t parent_key,
                   uint64_t parent_full_key) {
+        // Measured from a font before, and fonts have come since: styled again (it and,
+        // through its key, what's in it).
+        if (previous_ && previous_->media_.fonts != out_.media_.fonts && previous_->font_users_.count(el))
+            parent_key = mix(parent_key, 0xF047F047ull + out_.media_.fonts);
+        bool font_asked = false;
+        bool* const outer_asked = lengths_.ch_asked;
+        lengths_.ch_asked = &font_asked;
         uint64_t base = 0;
         bool anchored = false;
         const uint64_t key = elementKey(el, parent_key, parent_full_key, scope, slot, &base, &anchored);
@@ -6241,6 +6275,12 @@ private:
             resolvePseudo(el, s, ua_p_->rules->after, scope->rules->after, scope->host_el, out_.after_);
             if ((el->isHtml("input") || el->isHtml("textarea")) && el->attr("placeholder"))
                 resolvePseudo(el, s, ua_p_->rules->placeholder, scope->rules->placeholder, scope->host_el, out_.placeholder_, false);
+        }
+        lengths_.ch_asked = outer_asked;
+        if (kept && previous_->font_users_.count(el)) font_asked = true;
+        if (font_asked) {
+            out_.font_users_.insert(el);
+            if (outer_asked) *outer_asked = true;
         }
         return {&s, key, children_key};
     }

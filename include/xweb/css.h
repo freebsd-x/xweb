@@ -142,6 +142,9 @@ using ContainerSizes = std::unordered_map<const Node*, std::pair<float, float>>;
 struct MediaContext {
     float width = 0, height = 0;
     const ContainerSizes* containers = nullptr;
+    // Which web fonts have come (one more at each arrival): styles measured from a font
+    // (ch) are worked out again when it's changed, the rest kept.
+    uint32_t fonts = 0;
 };
 
 // One @media prelude, or a <link media=...>'s value once tokenized.

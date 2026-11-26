@@ -11,6 +11,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -479,6 +480,7 @@ private:
     bool asks_style_ = true;
     void checkReuse(const Document& doc, const SheetLoader& loader) const;
     bool asks_fonts_ = false;
+    std::unordered_set<const Node*> font_users_;   // those whose style a font's measure went into
     std::vector<const Node*> containers_;
     // A :has() anchor's rules that matched (a print of them): what its children's keys
     // are made from, instead of everything under it.
