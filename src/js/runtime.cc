@@ -162,11 +162,11 @@ void Shape::build() const {
     if (count_ > 8) {
         size_t cap = 32;
         while (cap < size_t{count_} * 2) cap *= 2;
-        index_.assign(cap, 0);
+        idx_.assign(cap, 0);
         for (uint32_t k = 0; k < count_; ++k) {
             size_t j = Object::keyHash(*keys_[k]) & (cap - 1);
-            while (index_[j]) j = (j + 1) & (cap - 1);
-            index_[j] = k + 1;
+            while (idx_[j]) j = (j + 1) & (cap - 1);
+            idx_[j] = k + 1;
         }
     }
 }
@@ -181,9 +181,9 @@ ptrdiff_t Shape::find(const PropertyKey& key, size_t hash) const {
         return -1;
     }
     build();
-    const size_t mask = index_.size() - 1;
+    const size_t mask = idx_.size() - 1;
     for (size_t j = hash & mask;; j = (j + 1) & mask) {
-        const uint32_t at = index_[j];
+        const uint32_t at = idx_[j];
         if (!at) return -1;
         const PropertyKey& k = *keys_[at - 1];
         if (Object::keyHash(k) == hash && k == key) return at - 1;
@@ -209,15 +209,15 @@ Shape* Shape::with(const PropertyKey& key, size_t hash) {
 
 void Object::ownKeysNow() {
     if (!shape_) return;
-    props_.clear();
-    props_.reserve(values_.size() + 1);
-    for (size_t i = 0; i < values_.size(); ++i) props_.emplace_back(shape_->keyAt(i), std::move(values_[i]));
+    dict().props.clear();
+    dict().props.reserve(values_.size() + 1);
+    for (size_t i = 0; i < values_.size(); ++i) dict().props.emplace_back(shape_->keyAt(i), std::move(values_[i]));
     values_.clear();
     values_.shrink_to_fit();
     shape_ = nullptr;
-    index_.clear();
-    dead_ = 0;
-    if (props_.size() > kScanMax) reindex();
+    dict().index.clear();
+    dict().dead = 0;
+    if (dict().props.size() > kScanMax) reindex();
 }
 
 ptrdiff_t Object::find(const PropertyKey& key, size_t hash, bool hashed) const noexcept {
@@ -226,23 +226,23 @@ ptrdiff_t Object::find(const PropertyKey& key, size_t hash, bool hashed) const n
         makeOwn();
     }
     if (shape_) return shape_->find(key, hashed ? hash : keyHash(key));
-    if (index_.empty()) {
+    if (dict().index.empty()) {
         // By hash first (each key's is kept once worked out): one compare per property,
         // not a string compare.
         const size_t h = hashed ? hash : keyHash(key);
-        for (size_t i = 0; i < props_.size(); ++i) {
-            const PropertyKey& k = props_[i].first;
+        for (size_t i = 0; i < dict().props.size(); ++i) {
+            const PropertyKey& k = dict().props[i].first;
             if (keyHash(k) != h) continue;
-            if (props_[i].second.flags != kTombstone && k == key) return static_cast<ptrdiff_t>(i);
+            if (dict().props[i].second.flags != kTombstone && k == key) return static_cast<ptrdiff_t>(i);
         }
         return -1;
     }
-    const size_t mask = index_.size() - 1;
+    const size_t mask = dict().index.size() - 1;
     const size_t h = hashed ? hash : keyHash(key);
     for (size_t i = h & mask;; i = (i + 1) & mask) {
-        const uint32_t at = index_[i];
+        const uint32_t at = dict().index[i];
         if (!at) return -1;
-        const auto& [k, p] = props_[at - 1];
+        const auto& [k, p] = dict().props[at - 1];
         // The stored keys' hashes were worked out when they were placed: most probes
         // that aren't it are turned down without comparing the names.
         if (k.hash && k.hash != h) continue;
@@ -251,30 +251,30 @@ ptrdiff_t Object::find(const PropertyKey& key, size_t hash, bool hashed) const n
 }
 
 void Object::place(uint32_t pos) noexcept {
-    const size_t mask = index_.size() - 1;
-    size_t i = keyHash(props_[pos].first) & mask;
-    while (index_[i]) i = (i + 1) & mask;
-    index_[i] = pos + 1;
+    const size_t mask = dict().index.size() - 1;
+    size_t i = keyHash(dict().props[pos].first) & mask;
+    while (dict().index[i]) i = (i + 1) & mask;
+    dict().index[i] = pos + 1;
 }
 
 // Drops the tombstones and, for a big object, builds the index afresh (at most half full).
 void Object::reindex() {
-    if (dead_) {
-        std::erase_if(props_, [](const auto& e) { return e.second.flags == kTombstone; });
-        dead_ = 0;
+    if (dict().dead) {
+        std::erase_if(dict().props, [](const auto& e) { return e.second.flags == kTombstone; });
+        dict().dead = 0;
     }
-    index_.clear();
-    if (props_.size() <= kScanMax) return;
+    dict().index.clear();
+    if (dict().props.size() <= kScanMax) return;
     size_t cap = 32;
-    while (cap < props_.size() * 2) cap *= 2;
-    index_.assign(cap, 0);
-    for (uint32_t i = 0; i < props_.size(); ++i) place(i);
+    while (cap < dict().props.size() * 2) cap *= 2;
+    dict().index.assign(cap, 0);
+    for (uint32_t i = 0; i < dict().props.size(); ++i) place(i);
 }
 
 Property* Object::own(const PropertyKey& key) {
     const ptrdiff_t at = find(key);
     if (at < 0) return nullptr;
-    return shape_ ? &values_[static_cast<size_t>(at)] : &props_[static_cast<size_t>(at)].second;
+    return shape_ ? &values_[static_cast<size_t>(at)] : &dict().props[static_cast<size_t>(at)].second;
 }
 
 Property* Object::ownAt(size_t pos, const PropertyKey& key, size_t hash) noexcept {
@@ -283,8 +283,8 @@ Property* Object::ownAt(size_t pos, const PropertyKey& key, size_t hash) noexcep
         const PropertyKey& k = shape_->keyAt(pos);
         return keyHash(k) == hash && k == key ? &values_[pos] : nullptr;
     }
-    if (pos >= props_.size()) return nullptr;
-    auto& [k, p] = props_[pos];
+    if (pos >= dict().props.size()) return nullptr;
+    auto& [k, p] = dict().props[pos];
     if (p.flags == kTombstone || k.isSymbol() != key.isSymbol() || keyHash(k) != hash || k.name.size() != key.name.size()) return nullptr;
     return &p;
 }
@@ -292,13 +292,13 @@ Property* Object::ownAt(size_t pos, const PropertyKey& key, size_t hash) noexcep
 const Property* Object::ownHashed(const PropertyKey& key, size_t hash) const {
     const ptrdiff_t at = find(key, hash, true);
     if (at < 0) return nullptr;
-    return shape_ ? &values_[static_cast<size_t>(at)] : &props_[static_cast<size_t>(at)].second;
+    return shape_ ? &values_[static_cast<size_t>(at)] : &dict().props[static_cast<size_t>(at)].second;
 }
 
 const Property* Object::own(const PropertyKey& key) const {
     const ptrdiff_t at = find(key);
     if (at < 0) return nullptr;
-    return shape_ ? &values_[static_cast<size_t>(at)] : &props_[static_cast<size_t>(at)].second;
+    return shape_ ? &values_[static_cast<size_t>(at)] : &dict().props[static_cast<size_t>(at)].second;
 }
 
 Property& Object::define(const PropertyKey& key, Property p) {
@@ -317,13 +317,13 @@ Property& Object::define(const PropertyKey& key, Property p) {
         ownKeysNow();
     }
     if (const ptrdiff_t at = find(key); at >= 0) {
-        props_[static_cast<size_t>(at)].second = std::move(p);
-        return props_[static_cast<size_t>(at)].second;
+        dict().props[static_cast<size_t>(at)].second = std::move(p);
+        return dict().props[static_cast<size_t>(at)].second;
     }
-    props_.emplace_back(key, std::move(p));
-    if (props_.size() > kScanMax && index_.size() < props_.size() * 2) reindex();
-    else if (!index_.empty()) place(static_cast<uint32_t>(props_.size() - 1));
-    return props_.back().second;
+    dict().props.emplace_back(key, std::move(p));
+    if (dict().props.size() > kScanMax && dict().index.size() < dict().props.size() * 2) reindex();
+    else if (!dict().index.empty()) place(static_cast<uint32_t>(dict().props.size() - 1));
+    return dict().props.back().second;
 }
 
 Value NativeSlot::operator()(Runtime& rt, const Value& this_value, std::span<const Value> args) const { return (*fn_)(rt, this_value, args); }
@@ -338,10 +338,10 @@ Property& Object::defineNew(const PropertyKey& key, Property p) {
         }
         ownKeysNow();
     }
-    props_.emplace_back(key, std::move(p));
-    if (props_.size() > kScanMax && index_.size() < props_.size() * 2) reindex();
-    else if (!index_.empty()) place(static_cast<uint32_t>(props_.size() - 1));
-    return props_.back().second;
+    dict().props.emplace_back(key, std::move(p));
+    if (dict().props.size() > kScanMax && dict().index.size() < dict().props.size() * 2) reindex();
+    else if (!dict().index.empty()) place(static_cast<uint32_t>(dict().props.size() - 1));
+    return dict().props.back().second;
 }
 
 bool Object::remove(const PropertyKey& key) {
@@ -350,13 +350,13 @@ bool Object::remove(const PropertyKey& key) {
     ownKeysNow();   // (a shape is only ever added to)
     const ptrdiff_t at = find(key);
     if (at < 0) return false;
-    auto& [k, p] = props_[static_cast<size_t>(at)];
+    auto& [k, p] = dict().props[static_cast<size_t>(at)];
     p = Property{};
     p.flags = kTombstone;
     k = PropertyKey();
-    ++dead_;
+    ++dict().dead;
     // The tombstone keeps its place in the probe chains until the next compaction.
-    if (dead_ > 8 && dead_ * 2 > props_.size()) reindex();
+    if (dict().dead > 8 && dict().dead * 2 > dict().props.size()) reindex();
     return true;
 }
 

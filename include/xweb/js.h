@@ -262,7 +262,7 @@ private:
     uint32_t count_ = 0;
     // Its keys in order, and an index of them when there are many: made when first asked.
     mutable std::vector<const PropertyKey*> keys_;
-    mutable std::vector<uint32_t> index_;
+    mutable std::vector<uint32_t> idx_;
     std::vector<std::pair<size_t, std::unique_ptr<Shape>>> next_;   // by the key's hash
 };
 
@@ -365,13 +365,31 @@ struct BufferData {
 
 class Object : public Cell {
 public:
-    explicit Object(Object* proto, ObjectClass cls = ObjectClass::Ordinary) : prototype(proto), cls(cls) { cell_kind = Kind::Object; }
+    explicit Object(Object* proto, ObjectClass cls = ObjectClass::Ordinary) : cls(cls), prototype(proto) { cell_kind = Kind::Object; }
     ~Object() override;
     [[nodiscard]] size_t cellSize() const noexcept override { return sizeof(Object); }
 
-    Object* prototype;
+    // The one-byte ones together, first: among the rest each was padded out to eight, and
+    // the first few go in the cell's own spare bytes (an object was 352 bytes; 304).
     ObjectClass cls;
     bool extensible = true;
+    // A built-in that keeps nothing in its own heap buffers while it calls back into
+    // JavaScript (or roots what it keeps): a collection may run inside it.
+    bool gc_safe = false;
+    bool constructor = false;         // can be called with new
+    bool class_constructor = false;   // can only be called with new
+    bool length_readonly = false;     // an array whose length was made non-writable
+    bool derived = false;             // a class that extends another
+    uint8_t iter_kind = 0;            // an iterator's
+    // [[IsHTMLDDA]] (document.all): false as a boolean, typeof "undefined", == null.
+    bool html_dda = false;
+    // A promise's state (pending, fulfilled, rejected), and whether it's been handled.
+    uint8_t promise_state = 0;
+    bool promise_handled = false;
+    uint8_t view_kind = 0;            // a typed array's or DataView's (see buffer)
+    bool view_tracking = false;
+    uint8_t host_kind = 0;            // the embedder's: which kind of thing `host` is
+    Object* prototype;
 
     // Own properties, in the order they were made.
     [[nodiscard]] Property* own(const PropertyKey& key);
@@ -391,7 +409,7 @@ public:
     // Room for so many properties, made before they're added (one allocation, not several).
     void reserveProps(size_t n) {
         if (shape_) values_.reserve(n);
-        else props_.reserve(n);
+        else dict().props.reserve(n);
     }
     // Each own property, in order (no copy of the keys made, as ownKeys does).
     template <typename F>
@@ -399,8 +417,9 @@ public:
         if (shape_) {
             for (size_t i = 0; i < values_.size(); ++i) f(shape_->keyAt(i), values_[i]);
         } else {
-            for (const auto& [k, p] : props_)
-                if (p.flags != kTombstone) f(k, p);
+            if (dict_)
+                for (const auto& [k, p] : dict_->props)
+                    if (p.flags != kTombstone) f(k, p);
         }
     }
     // A key's hash, worked out once and kept in it.
@@ -425,9 +444,6 @@ public:
 
     // Functions.
     NativeSlot native;
-    // A built-in that keeps nothing in its own heap buffers while it calls back into
-    // JavaScript (or roots what it keeps): a collection may run inside it.
-    bool gc_safe = false;
     std::shared_ptr<FunctionData> code;
     Object* bound_target = nullptr;
     // A bound function's this and leading arguments: out of line, as few objects are one
@@ -437,10 +453,6 @@ public:
         std::vector<Value> args;
     };
     std::unique_ptr<BoundData> bound;
-    bool constructor = false;   // can be called with new
-    bool class_constructor = false;   // can only be called with new
-    bool length_readonly = false;     // an array whose length was made non-writable
-    bool derived = false;       // a class that extends another
 
     // Boolean, Number, String and Symbol wrappers' value; an iterator's state.
     Value primitive;
@@ -448,30 +460,23 @@ public:
     LazyMap<std::unordered_map<Value, size_t, ValueHash, ValueSameZero>> index;   // a key's place in entries
     size_t cursor = 0;
     Object* target = nullptr;   // an iterator's subject
-    uint8_t iter_kind = 0;
-    // [[IsHTMLDDA]] (document.all): false as a boolean, typeof "undefined", == null.
-    bool html_dda = false;
+    // (iter_kind, html_dda: with the other small ones, above.)
     // A RegExp's compiled pattern; its source is `primitive`.
     std::shared_ptr<const regex::Program> regexp;
     // Internal slots: a built-in closure's captured values, a promise's reactions.
     std::vector<Value> slots;
-    // A promise's state (pending, fulfilled, rejected); its result is `primitive`.
-    uint8_t promise_state = 0;
-    bool promise_handled = false;
+    // (A promise's state: above; its result is `primitive`.)
     // An ArrayBuffer's bytes; a typed array's or DataView's window on its buffer (`target`):
     // its kind, where it starts, and its length (elements, or bytes for a DataView), or
     // all the rest of a resizable buffer when it tracks it.
     std::shared_ptr<BufferData> buffer;
-    uint8_t view_kind = 0;
-    bool view_tracking = false;
     size_t view_offset = 0;
     size_t view_length = 0;
     // A generator's or async function's suspended body.
     std::shared_ptr<Coroutine> co;
 
     // The embedder's: what a DOM wrapper stands for, and which kind of thing it is.
-    void* host = nullptr;
-    uint8_t host_kind = 0;
+    void* host = nullptr;   // (and host_kind, above)
 
 private:
     // With a shape: its values, in the shape's order.
@@ -480,11 +485,19 @@ private:
     void ownKeysNow();   // from the shape into props_ (and no shape from then on)
     // Without one: in the order they were made. A removed one stays as a tombstone (flags
     // kTombstone) until enough have piled up to compact, so a delete is O(1).
-    std::vector<std::pair<PropertyKey, Property>> props_;
-    // Positions in props_ (plus one; 0 is empty), by key hash with linear probing.
-    // Only once there are enough properties for a scan to be slow.
-    std::vector<uint32_t> index_;
-    uint32_t dead_ = 0;
+    // (Most objects have a shape: the rest's, out of line.)
+    struct Dict {
+        std::vector<std::pair<PropertyKey, Property>> props;
+        // Positions in props (plus one; 0 is empty), by key hash with linear probing.
+        // Only once there are enough properties for a scan to be slow.
+        std::vector<uint32_t> index;
+        uint32_t dead = 0;
+    };
+    mutable std::unique_ptr<Dict> dict_;
+    Dict& dict() const {
+        if (!dict_) dict_ = std::make_unique<Dict>();
+        return *dict_;
+    }
     Runtime* later_ = nullptr;
     void makeOwn() const;   // those put off
     [[nodiscard]] static bool isFunctionsOwn(const PropertyKey& key) noexcept;
