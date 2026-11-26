@@ -676,6 +676,27 @@ TEST(Positioned, NegativeZIndexStaysInAMovedList) {
     }
 }
 
+// And with what's around it as 11st.co.kr has it: the list relative (painted with the
+// positioned) or not, the picture's box inside a relative link that clips: still over the
+// white of the positioned section around it.
+TEST(Positioned, NegativeZIndexInANestedMovedList) {
+    for (const char* list : {"position:relative;transform:translate3d(-10px,0,0)", "transform:translate(-10px,0)", "position:relative;opacity:.99"}) {
+        const auto r = layout(std::string("<div style='position:relative;background:#fff'><div style='background:#fff;overflow:hidden;position:relative'><ul style='display:flex;margin:0;") +
+                              list + "'><li style='display:block;width:50px'><a style='display:block;position:relative;overflow:hidden'>"
+                                     "<div style='position:relative;z-index:-1;height:20px;background:#00f'></div></a></li></ul></div></div>");
+        int white = -1, blue = -1;
+        for (size_t i = 0; i < r.page.ops.size(); ++i) {
+            const auto& op = r.page.ops[i];
+            if (op.kind != PaintKind::Rect) continue;
+            if (op.color.r == 255 && op.color.g == 255 && op.color.b == 255) white = static_cast<int>(i);
+            if (op.color.b == 255 && op.color.r == 0) blue = static_cast<int>(i);
+        }
+        ASSERT_GE(white, 0) << list;
+        ASSERT_GE(blue, 0) << list;
+        EXPECT_LT(white, blue) << list;   // over both whites
+    }
+}
+
 TEST(Float, AClearfixAfterAFloatKeepsItsWidth) {
     // fmkorea.com's headings: a floated link, then h1::after { display: block; clear: both }.
     const auto r = layout("<style>.c:after{content:'';display:block;clear:both}</style>"

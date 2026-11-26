@@ -69,7 +69,8 @@ constexpr float kToolbarHeight = 44;
 constexpr float kChromiumButtonWidth = 136;
 constexpr size_t kMaxSheets = 256;          // stylesheets one page can make us fetch (theverge.com has 66)
 constexpr size_t kMaxImages = 2048;          // (inven.co.kr: 256 thumbnails first, then no logo; memory is kMaxPagePixels's)
-constexpr size_t kImageWorkers = 4;
+constexpr size_t kImageWorkers = 8;
+constexpr size_t kImagesAtOnce = 16;   // asked for at each layout, nearest first
 constexpr uint64_t kMaxImagePixels = 40'000'000;     // one image
 constexpr uint64_t kMaxPagePixels = 120'000'000;     // all of a page's, about 480 MB
 constexpr uint64_t kMaxRasterCachePixels = 32'000'000;   // SVG, gradients and masks we've drawn, about 128 MB
@@ -1719,10 +1720,36 @@ private:
         ++layout_gen_;
         computed_cache_.clear();
         computed_values_.clear();
+        // Those shown first, then the nearest (a carousel's 96 slides, its two shown the 35th
+        // and 36th: 11st.co.kr's were asked for in order, four at a time, seconds apart).
+        std::vector<std::pair<float, std::string>> by_distance;
+        {
+            int win_w = 0, win_h = 0;
+            XApplication::windowSize(win_w, win_h);
+            // (On the screen: the page's y plus where it is, scrolled.)
+            const float at = getAbsoluteOffset().y_;
+            const float top = viewportTop() - at, bottom = (win_h > 0 ? static_cast<float>(win_h) : 1000.0f) - at, right = laid_out_width_;
+            for (size_t i = 0; i < layout_.images_wanted.size(); ++i) {
+                std::string url = web::resolveUrl(page.base, layout_.images_wanted[i]);
+                if (page_->requested.count(url)) continue;
+                float far = 1e9f;
+                if (i < layout_.images_wanted_at.size()) {
+                    const auto [x, y] = layout_.images_wanted_at[i];
+                    const float dx = x < -400 ? -400 - x : x > right ? x - right : 0;   // (its left edge: a little before the left is shown)
+                    const float dy = y < top - 400 ? top - 400 - y : y > bottom ? y - bottom : 0;
+                    far = dx + dy;
+                }
+                by_distance.emplace_back(far, std::move(url));
+            }
+            std::stable_sort(by_distance.begin(), by_distance.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        }
+        // Only the nearest few at a time (and all that's shown): as each comes, the page is laid
+        // out again and the next nearest asked for, from where things are by then (a carousel
+        // laid out at its first slide, then moved to its 35th).
         std::vector<std::string> wanted;
-        for (const std::string& src : layout_.images_wanted) {
-            std::string url = web::resolveUrl(page.base, src);
-            if (!page_->requested.count(url)) wanted.push_back(std::move(url));
+        for (auto& [d, url] : by_distance) {
+            if (wanted.size() >= kImagesAtOnce && d > 0) break;
+            wanted.push_back(std::move(url));
         }
         if (!wanted.empty() && on_images_) on_images_(page_, std::move(wanted));
         if (!missing_sheets.empty() && on_sheets_) {

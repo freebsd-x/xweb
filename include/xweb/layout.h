@@ -104,6 +104,8 @@ struct PageLayout {
     std::vector<ElementBox> boxes;
     std::string title;
     std::vector<std::string> images_wanted;   // CSS images it would have drawn, not loaded yet
+    // Where each of those is drawn (its top left, transforms and all): what's shown is asked for first.
+    std::vector<std::pair<float, float>> images_wanted_at;
     struct LazyImage {
         std::string src;
         float y = 0, h = 0;

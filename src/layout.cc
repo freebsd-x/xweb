@@ -3922,9 +3922,7 @@ private:
                 } else if (const auto rr = images_->imageRatio(image.url)) {
                     ratio = *rr;
                 } else {
-                    if (std::find(out_->images_wanted.begin(), out_->images_wanted.end(), image.url) == out_->images_wanted.end() &&
-                        out_->images_wanted.size() < 512)
-                        out_->images_wanted.push_back(image.url);
+                    wantImage(image.url, origin.x, origin.y);
                     continue;
                 }
             } else if (tint) {
@@ -4289,6 +4287,19 @@ private:
         op.v1 = (y1 - dy) / dh;
     }
 
+    // An image not here yet, asked for; and where it's drawn, through the transforms it's in.
+    void wantImage(const std::string& src, float x, float y) {
+        if (out_->images_wanted.size() >= 512 || std::find(out_->images_wanted.begin(), out_->images_wanted.end(), src) != out_->images_wanted.end()) return;
+        out_->images_wanted.push_back(src);
+        if (!transforms_.empty()) {
+            const auto p = transforms_.back().apply({x, y});
+            x = p.x;
+            y = p.y;
+        }
+        out_->images_wanted_at.resize(out_->images_wanted.size() - 1, {0.0f, 1e9f});
+        out_->images_wanted_at.emplace_back(x, y);
+    }
+
     void paintReplaced(const Box& b, float x, float y, float opacity) {
         const ComputedStyle& s = *b.style;
         paintFrame(b, x, y, opacity);
@@ -4298,10 +4309,9 @@ private:
             if (b.node->isHtml("img") && images_ && loadsLazily(b.node)) {
                 if (const std::optional<std::string> src = imageSourceOf(b.node, {vw_, vh_}); src && !src->empty() && !images_->imageSize(*src) && out_->lazy_images.size() < 10000)
                     out_->lazy_images.push_back({*src, y, b.height});
-            } else if (b.node->isHtml("img") && images_ && out_->images_wanted.size() < 512)
-                if (const std::optional<std::string> src = imageSourceOf(b.node, {vw_, vh_}); src && !src->empty() && !images_->imageSize(*src) &&
-                                                                                        std::find(out_->images_wanted.begin(), out_->images_wanted.end(), *src) == out_->images_wanted.end())
-                    out_->images_wanted.push_back(*src);
+            } else if (b.node->isHtml("img") && images_)
+                if (const std::optional<std::string> src = imageSourceOf(b.node, {vw_, vh_}); src && !src->empty() && !images_->imageSize(*src))
+                    wantImage(*src, x, y);
             return;
         }
         const float cx = x + b.border[Left] + b.padding[Left];
@@ -4375,9 +4385,7 @@ private:
                 return;
             }
             // Not loaded: maybe one a script just added. Ask for it.
-            if (src && images_ && out_->images_wanted.size() < 512 &&
-                std::find(out_->images_wanted.begin(), out_->images_wanted.end(), *src) == out_->images_wanted.end())
-                out_->images_wanted.push_back(*src);
+            if (src && images_) wantImage(*src, cx, cy);
             if (is_img && !b.alt.empty() && !(src && images_ && images_->imageLoading(*src))) addText(cx, cy, b.alt, s, opacity);
             return;
         }
@@ -4861,6 +4869,13 @@ private:
             ctx_ops_ = out_->ops.size();
             ctx_boxes_ = out_->boxes.size();
         }
+        // One that isn't positioned (a transform, opacity, a filter, isolation) paints its
+        // positioned descendants inside it all the same, at its end: they didn't, and went in
+        // at the page's level (11st.co.kr's banner pictures, relative with z-index -1 in a
+        // moved carousel list, under the white of the page's sections).
+        const bool owns_positioned = stacking && &b != root_ && s.position == Position::Static;
+        std::vector<Positioned> outer_positioned;
+        if (owns_positioned) outer_positioned.swap(positioned_);
         // Floats paint above their context's in-flow blocks: later siblings' backgrounds
         // must not cover them. So they wait for the context's end.
         const bool context_root = establishesBfc(b);
@@ -4918,6 +4933,14 @@ private:
             if (!clip_stack_.empty()) clip_stack_.pop_back();
         }
         cb_clip_depth_ = outer_cb_clip_depth;
+        if (owns_positioned) {
+            flushPositioned();
+            positioned_.swap(outer_positioned);
+        }
+        if (stacking) {
+            ended_ctx_ops_ = ctx_ops_;
+            ended_ctx_boxes_ = ctx_boxes_;
+        }
         ctx_ops_ = outer_ctx_ops;
         ctx_boxes_ = outer_ctx_boxes;
     }
@@ -5085,9 +5108,23 @@ private:
                                      ps.position == Position::Fixed;
             std::vector<Positioned> outer;
             if (own_context) outer.swap(positioned_);
+            // Its own positioned descendants, in its stacking context: what they put under its
+            // content (z-index -1) goes in where its content starts, not where the context
+            // outside it does (11st.co.kr's banner pictures, in a moved relative list, went
+            // under the white of the sections around it).
+            size_t own_ops = ctx_ops_, own_boxes = ctx_boxes_;
+            const auto ended = [&] {
+                own_ops = ended_ctx_ops_;
+                own_boxes = ended_ctx_boxes_;
+            };
             const auto flushOwn = [&] {
                 if (!own_context) return;
+                const size_t saved_ops = ctx_ops_, saved_boxes = ctx_boxes_;
+                ctx_ops_ = own_ops;
+                ctx_boxes_ = own_boxes;
                 flushPositioned();
+                ctx_ops_ = saved_ops;
+                ctx_boxes_ = saved_boxes;
                 positioned_.swap(outer);   // the rest, a heap still
             };
             const size_t before = positioned_.size();
@@ -5114,6 +5151,7 @@ private:
                     const size_t saved_depth = cb_clip_depth_;
                     cb_clip_depth_ = clip_stack_.size();
                     paint(k, p.static_x, p.static_y, p.cb, p.opacity);
+                    ended();
                     // Its floats, whose context has been painted already: now, over it.
                     while (!pending_floats_.empty()) {
                         std::vector<PendingFloat> batch;
@@ -5154,6 +5192,7 @@ private:
                 const size_t saved_depth = cb_clip_depth_;
                 cb_clip_depth_ = clip_stack_.size();
                 paintContents(k, x, y, cb, p.opacity);
+                ended();
                 flushOwn();
                 clip_stack_ = saved;
                 cb_clip_depth_ = saved_depth;
@@ -5251,6 +5290,7 @@ private:
     std::vector<Positioned> positioned_;
     std::vector<BelowContent> below_content_;
     size_t ctx_ops_ = 0, ctx_boxes_ = 0;   // the nearest stacking context's content start
+    size_t ended_ctx_ops_ = 0, ended_ctx_boxes_ = 0;   // the last one painted's, as it ended
     int painting_below_ = 0;               // inside a negative z-index box's paint
     std::vector<Rect> closed_;       // the clips closed last, when that many operations were made
     size_t closed_at_ = ~size_t{0};
