@@ -1295,6 +1295,24 @@ public:
         }
         if (want("opacity")) out["opacity"] = std::to_string(s->opacity).substr(0, 4);
         if (want("z-index")) out["z-index"] = s->z_set ? std::to_string(s->z_index) : std::string("auto");
+        // As browsers give it: none, or the matrix it comes to (carousels read their track's
+        // to know where it is).
+        if (want("transform")) {
+            if (!s->transform_list) {
+                out["transform"] = "none";
+            } else {
+                const web::ElementBox* b = boxOf(n);
+                const float bw = b ? b->w : 0, bh = b ? b->h : 0;
+                const float tx = s->transform_shift[0].resolve(bw), ty = s->transform_shift[1].resolve(bh);
+                const auto num = [](float v) {
+                    char t[32];
+                    std::snprintf(t, sizeof t, "%g", std::fabs(v) < 1e-6f ? 0.0f : v);
+                    return std::string(t);
+                };
+                const float* m = s->transform_linear;
+                out["transform"] = "matrix(" + num(m[0]) + ", " + num(m[1]) + ", " + num(m[2]) + ", " + num(m[3]) + ", " + num(tx) + ", " + num(ty) + ")";
+            }
+        }
         // Lengths as specified: px, or the percentage when that's what was said.
         const auto len = [&px](const web::Length& l) {
             if (l.is_auto) return std::string("auto");

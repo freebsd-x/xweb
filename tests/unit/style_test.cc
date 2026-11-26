@@ -1105,6 +1105,19 @@ TEST(Motion, TransitionsGoFromWhatItWasAndTurnBack) {
     EXPECT_EQ(ends, 3);   // opacity's, opacity's back, width's back
 }
 
+// A transform's moves go through what's before them in the list, as a matrix product.
+TEST(Transform, MovesThroughWhatComesBefore) {
+    auto doc = parseHtml("<p id=a style='transform:scale(2) translate(10px,5px)'>a</p><p id=b style='transform:translate(10px) scale(2)'>b</p>"
+                         "<p id=c style='transform:rotate(90deg) translateX(10px)'>c</p>");
+    StyledDocument styles(*doc, css::MediaContext{800, 600});
+    const auto by = [&](const char* id) { return styles.styleOf(elementById(*doc, id)); };
+    EXPECT_FLOAT_EQ(by("a")->transform_shift[0].px, 20);
+    EXPECT_FLOAT_EQ(by("a")->transform_shift[1].px, 10);
+    EXPECT_FLOAT_EQ(by("b")->transform_shift[0].px, 10);
+    EXPECT_NEAR(by("c")->transform_shift[0].px, 0, 1e-4);
+    EXPECT_NEAR(by("c")->transform_shift[1].px, 10, 1e-4);   // turned onto y
+}
+
 TEST(Motion, KeyframesFillsDirectionsAndTurns) {
     auto doc = parseHtml(R"(<!doctype html><style>
         @keyframes fade { from { opacity: 0 } 50% { opacity: .8; animation-timing-function: linear } to { opacity: 1 } }

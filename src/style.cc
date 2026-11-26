@@ -6494,7 +6494,11 @@ void evaluateTransform(const std::vector<TransformFn>& list, Length shift[2], fl
     Length x, y;
     float m[4] = {1, 0, 0, 1};
     for (const TransformFn& t : list) {
-        x.px += t.x.px, x.percent += t.x.percent, y.px += t.y.px, y.percent += t.y.percent;
+        // Its move, through what came before it in the list (`scale(2) translate(10px)`
+        // moves 20px). A percentage keeps to its own axis (one turned onto the other has
+        // nothing to be a percentage of here; rare).
+        x.px += m[0] * t.x.px + m[2] * t.y.px, y.px += m[1] * t.x.px + m[3] * t.y.px;
+        x.percent += m[0] * t.x.percent, y.percent += m[3] * t.y.percent;
         // The linear part, applied after what came before it in the list.
         float f[4] = {1, 0, 0, 1};
         const auto rad = [](float deg) { return deg * M_PI / 180.0; };
