@@ -767,7 +767,7 @@ void PageScript::Impl::installElement() {
         } else {
             self->setAttr(n, "value", v);
         }
-        self->dirty = true;
+        if (self->inDocument(n)) self->dirty.attribute(n);   // (its look and what's in it)
         return Value::undefined();
     });
     accessor(p, u"checked", [self](Runtime&, const Value& t, Args) {
@@ -775,14 +775,14 @@ void PageScript::Impl::installElement() {
         return Value::boolean(self->host.forms ? self->host.forms->checked(n) : n->attr("checked") != nullptr);
     }, [self](Runtime& rt, const Value& t, Args a) {
         if (self->host.forms) self->host.forms->setChecked(self->thisElement(t), rt.toBoolean(arg(a, 0)));
-        self->dirty = true;
+        if (self->inDocument(self->thisElement(t))) self->dirty.attribute(self->thisElement(t));
         return Value::undefined();
     });
     accessor(p, u"selectedIndex", [self](Runtime&, const Value& t, Args) {
         return Value::number(self->host.forms ? self->host.forms->selected(self->thisElement(t)) : -1);
     }, [self](Runtime& rt, const Value& t, Args a) {
         if (self->host.forms) self->host.forms->select(self->thisElement(t), static_cast<int>(rt.toIntegerOrInfinity(arg(a, 0))));
-        self->dirty = true;
+        if (self->inDocument(self->thisElement(t))) self->dirty.attribute(self->thisElement(t));
         return Value::undefined();
     });
     accessor(p, u"options", [self](Runtime&, const Value& t, Args) {

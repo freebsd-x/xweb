@@ -149,6 +149,30 @@ TEST(Script, ChangesTheTree) {
     EXPECT_TRUE(p.script->takeDirty());
 }
 
+// What changes nothing shown changes nothing to lay out again: an attribute set to the
+// value it has, a <template> filled, an element out of the page changed.
+TEST(Script, UnshownChangesLeaveItClean) {
+    Page p(R"(<html lang=en><body><p id=t class=a>x</p><script>
+        window.step = 0;
+        const id = setInterval(() => {
+          const t = document.getElementById('t');
+          if (step == 0) { t.setAttribute('class', 'a'); document.documentElement.setAttribute('lang', 'en'); }
+          if (step == 1) { const tpl = document.createElement('template'); tpl.innerHTML = '<b>hi</b>'; const d = document.createElement('div'); d.className = 'x'; d.textContent = 'y'; d.appendChild(document.createElement('i')); }
+          if (step == 2) { t.className = 'b'; clearInterval(id); }
+          step++;
+        }, 1);
+        </script>)");
+    (void)p.script->takeDirty();
+    int dirty_ticks = 0;
+    for (int i = 0; i < 200 && p.script->busy(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        p.script->tick();
+        dirty_ticks += p.script->takeDirty();
+    }
+    EXPECT_FALSE(p.script->busy());
+    EXPECT_EQ(dirty_ticks, 1);   // only the class really changed
+}
+
 TEST(Script, ReadsTheTree) {
     Page p(R"(<head><title> My  page </title></head><body><div id=a><span>x</span><b>y</b>text</div><a id=l href="../up.html">l</a>
         <script>

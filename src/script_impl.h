@@ -483,7 +483,9 @@ struct PageScript::Impl {
         }
         parent->insertBefore(child, before);
         if (names_known && noteNames(child)) ids_found.clear();
-        if (child->type == NodeType::Text || child->type == NodeType::Comment) dirty.attribute(parent);
+        // (Into what's out of the page, a <template> being filled, nothing shown changes.)
+        if (!inDocument(parent)) {}
+        else if (child->type == NodeType::Text || child->type == NodeType::Comment) dirty.attribute(parent);
         else if (child->isElement()) dirty.children(parent, child);
         else dirty = true;
         afterInsert(parent, child, prev, before);
@@ -498,7 +500,8 @@ struct PageScript::Impl {
         Node* next = it != parent->children.end() && it + 1 != parent->children.end() ? *(it + 1) : nullptr;
         const bool was_connected = inDocument(parent);
         parent->remove(child);
-        if (child->type == NodeType::Text || child->type == NodeType::Comment) dirty.attribute(parent);
+        if (!was_connected) {}
+        else if (child->type == NodeType::Text || child->type == NodeType::Comment) dirty.attribute(parent);
         else if (child->isElement()) dirty.children(parent, child);
         else dirty = true;
         afterRemove(parent, child, prev, next, was_connected);
@@ -527,7 +530,8 @@ struct PageScript::Impl {
         if (!n->isElement() && n->type != NodeType::Fragment) {
             const std::string old = n->data;
             n->data = text;
-            if (n->type == NodeType::Text || n->type == NodeType::Comment) dirty.attribute(n->parent);
+            if (!inDocument(n)) {}
+            else if (n->type == NodeType::Text || n->type == NodeType::Comment) dirty.attribute(n->parent);
             else dirty = true;
             afterCharacterData(n, old);
             return;
@@ -538,7 +542,7 @@ struct PageScript::Impl {
             t->data = text;
             insert(n, t, nullptr);
         }
-        dirty = true;
+        if (inDocument(n)) dirty.set = true;   // (what changed, insert and detach have said)
     }
 
     void setInnerHtml(Node* n, const std::string& html) {
@@ -547,7 +551,7 @@ struct PageScript::Impl {
         while (!target->children.empty()) detach(target->children.back());
         if (const Node* holder = frag->documentElement())
             for (const Node* c : holder->children) insert(target, clone(c, true), nullptr);
-        dirty = true;
+        if (inDocument(n)) dirty.set = true;   // (as setText)
     }
 
     std::string outerHtml(const Node* n) {
@@ -565,13 +569,21 @@ struct PageScript::Impl {
             if (a.name == name) {
                 const std::string old = a.value;
                 a.value = value;
-                if (name == "style") dirty.style(n); else dirty.attribute(n);
+                // (The same value again, or out of the page: nothing to style or lay out
+                // again. microsoft.com's scripts set its <html> class and a style,
+                // unchanged, 20 times a second.)
+                if (old != value) attributeChanged(n, name);
                 afterAttr(n, name, &old);
                 return;
             }
         n->attrs.push_back({name, value});
-        if (name == "style") dirty.style(n); else dirty.attribute(n);
+        attributeChanged(n, name);
         afterAttr(n, name, nullptr);
+    }
+    void attributeChanged(const Node* n, const std::string& name) {
+        if (!inDocument(n)) return;
+        if (name == "style") dirty.style(n);
+        else dirty.attribute(n);
     }
 
     void removeAttr(Node* n, const std::string& name) {
@@ -580,7 +592,7 @@ struct PageScript::Impl {
         const std::string old = *had;
         const auto it = std::remove_if(n->attrs.begin(), n->attrs.end(), [&](const Attribute& a) { return a.name == name; });
         n->attrs.erase(it, n->attrs.end());
-        if (name == "style") dirty.style(n); else dirty.attribute(n);
+        attributeChanged(n, name);
         afterAttr(n, name, &old);
     }
 
