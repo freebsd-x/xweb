@@ -2099,6 +2099,9 @@ struct Notes {
     std::unordered_set<std::string> inherit_used_;   // properties a rule gives `inherit`
     std::vector<const CompoundSelector*> has_args_;   // what the :has()s with no anchor look for
     bool has_args_siblings_ = false;                  // one among later siblings
+    // A :has() looks at its element's later siblings (`:has(+ .x)`, `:has(~ .x)`): what
+    // it sees is all under the element's parent, not only under the element.
+    bool has_looks_aside_ = false;
     std::unordered_set<uint32_t> has_host_anchors_;   // tags of hosts a :host:has() is asked of
     bool has_context_ = false;   // a :has() asked for another element, of any element
     std::unordered_set<uint32_t> has_context_anchors_;   // of these (as has_anchors_)
@@ -2126,6 +2129,7 @@ struct Notes {
         all(inherit_used_, o.inherit_used_);
         has_args_.insert(has_args_.end(), o.has_args_.begin(), o.has_args_.end());
         has_args_siblings_ |= o.has_args_siblings_;
+        has_looks_aside_ |= o.has_looks_aside_;
         all(has_host_anchors_, o.has_host_anchors_);
         has_context_ |= o.has_context_;
         all(has_context_anchors_, o.has_context_anchors_);
@@ -6023,6 +6027,9 @@ private:
             for (const SimpleSelector& x : c.simple) {
                 if (x.kind == SimpleKind::PseudoClass && x.name == "has") {
                     uses_has_ = true;
+                    for (const ComplexSelector& a : x.args)
+                        if (a.parts.size() >= 2 && (a.parts[1].combinator == Combinator::NextSibling || a.parts[1].combinator == Combinator::SubsequentSibling))
+                            has_looks_aside_ = true;
                     if (of_host) has_host_anchors_.insert(featureHash('t', lower(target_host_->name)));
                     const bool asked_of_subject = is_subject && !of_another;
                     // Those asked for another element are noted twice: as anchors, and as
@@ -6207,7 +6214,9 @@ private:
 
     // What a :has() asked of this element could see; of a host, its shadow tree too.
     uint64_t anchorPrint(const Node* el) {
-        uint64_t h = subtreePrint(el->parent ? el->parent : el);
+        // (Only what's under it, when no :has() looks aside: inven.co.kr's 750 anchors were
+        // each styled again whenever anything beside them changed.)
+        uint64_t h = subtreePrint(has_looks_aside_ && el->parent ? el->parent : el);
         if (el->shadow_root && anchorIn(el, has_host_anchors_)) h = mix(h, subtreePrint(el->shadow_root));
         return h;
     }

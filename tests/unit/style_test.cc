@@ -1325,7 +1325,9 @@ TEST(Restyle, AttributesOnly) {
         std::string css = "p{padding-left:1px} .a .b{font-weight:700} .on{color:red} .a>.b{width:9px} [data-k='1']{opacity:.5} [data-k] u{font-size:30px}"
                           " .b:empty{margin-top:4px} :not(.a)>i{width:3px} p:first-child{width:5em} [hidden]{display:none} .on b{display:none}";
         if (siblings) css += " .on + b{color:blue} .a ~ i{margin-top:7px} :nth-child(2 of .b){width:11px} :is(.on ~ span) u{opacity:.25}";
-        if (has) css += " div:has(> .on) i{opacity:.3} p:has(+ .on){width:13px} .a:has(.on) u{font-size:20px} b:has(i.b){display:none} span:has(~ .b) + i{margin-top:2px}";
+        if (has) css += " div:has(> .on) i{opacity:.3} .a:has(.on) u{font-size:20px} b:has(i.b){display:none}";
+        // (Half of them with one that looks aside too: then all under the anchor's parent counts.)
+        if (has && round % 2 == 0) css += " p:has(+ .on){width:13px} span:has(~ .b) + i{margin-top:2px}";
         if (loose_has) css += " :has(> .b) > p{opacity:.75}";
         auto doc = parseHtml("<!doctype html><style>" + css + "</style><div id=r></div>");
         std::vector<Node*> all{const_cast<Node*>(elementById(*doc, "r"))};
