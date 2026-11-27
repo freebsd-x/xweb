@@ -751,6 +751,15 @@ TEST(Float, AShrinkToFitBoxHoldsItsInlinesAndARightFloatSideBySide) {
     EXPECT_FLOAT_EQ(r.box("c").w, r.box("a").w + 8 + 100);
 }
 
+TEST(Positioned, ARelativeBoxsPercentOffsetsAreOfItsParentsWidth) {
+    // w3.org's full-width sections: width 100vw; left: 50%; margin-left: -50vw in a <main>
+    // with padding: 50% of main's content width, so it starts at the page's edge.
+    const auto r = layout("<div style='padding:0 50px'><div id=full style='position:relative;width:400px;left:50%;margin-left:-200px;height:10px'></div>"
+                          "<div id=z style='position:relative;z-index:1;left:50%;height:10px;width:10px'></div></div>");
+    EXPECT_FLOAT_EQ(r.box("full").x, 0);         // 50 + (-200) + 50% of 300
+    EXPECT_FLOAT_EQ(r.box("z").x, 50 + 150);     // with a z-index too (painted in its turn)
+}
+
 TEST(Float, AClearfixAfterAFloatKeepsItsWidth) {
     // fmkorea.com's headings: a floated link, then h1::after { display: block; clear: both }.
     const auto r = layout("<style>.c:after{content:'';display:block;clear:both}</style>"

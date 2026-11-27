@@ -349,6 +349,34 @@ TEST(Svg, ImageThroughTheResolver) {
     EXPECT_EQ(at(renderSvg(*doc2->body()->children[0], 20, 20, nullptr, {}, nullptr, nullptr, &here), 10, 2).r, 200);
 }
 
+TEST(Svg, TextThroughTheResolver) {
+    // kyobobook.co.kr's tabs: <text x y dy=".5em" text-anchor="end" fill>. The embedder's
+    // glyphs (here a 10 by 10 block, 10 wide, 8 above the baseline), in the fill, placed
+    // by the anchor; the font as the attributes say where no rule does.
+    const auto doc = parseHtml("<svg viewBox='0 0 40 20' width='40' height='20'><text x='30' y='10' dy='.5em' font-size='20' "
+                               "font-weight='bold' text-anchor='end' fill='#ff0000'>Hi</text></svg>");
+    const Node& svg = *doc->body()->children[0];
+    std::string asked_text, asked_font;
+    const SvgTextResolver block = [&](const std::string& text, const std::string& font, float scale) -> std::optional<SvgTextRun> {
+        asked_text = text;
+        asked_font = font;
+        SvgTextRun r;
+        r.mask.width = r.mask.height = static_cast<uint32_t>(10 * scale);
+        r.mask.rgba.assign(static_cast<size_t>(r.mask.width) * r.mask.height * 4, 255);
+        r.advance = 10;
+        r.ascent = 8;
+        return r;
+    };
+    const Raster r = renderSvg(svg, 40, 20, nullptr, {}, nullptr, nullptr, nullptr, &block);
+    EXPECT_EQ(asked_text, "Hi");
+    EXPECT_EQ(asked_font, "700 20px sans-serif");
+    // Baseline at 10 + 0.5em = 20; the block from 12 to 22 down, from 20 (30 - 10) to 30 across.
+    EXPECT_EQ(at(r, 25, 15).r, 255);
+    EXPECT_EQ(at(r, 25, 15).g, 0);
+    EXPECT_EQ(at(r, 15, 15).a, 0);   // left of it: the anchor moved it to end at 30
+    EXPECT_EQ(at(r, 35, 15).a, 0);
+}
+
 TEST(Svg, StyleSheetInsideTheFile) {
     const Raster r = svgOf("<svg width='10' height='10'><style>.x{fill:#0f0}</style><rect class='x' width='10' height='10' fill='red'/></svg>", 10, 10);
     EXPECT_EQ(at(r, 5, 5).g, 255);

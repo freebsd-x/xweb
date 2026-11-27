@@ -6,7 +6,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
+#include <optional>
 #include <set>
 #include <unordered_map>
 
@@ -184,6 +186,7 @@ class Renderer {
 public:
     const SvgUseResolver* external_ = nullptr;
     const SvgImageResolver* images_ = nullptr;
+    const SvgTextResolver* texts_ = nullptr;
     Renderer(const Node& root, Canvas& canvas, const StyledDocument* styles) : canvas_(canvas), styles_(styles) {
         const Node* top = &root;
         while (top->parent) top = top->parent;
@@ -224,6 +227,179 @@ public:
         }
         const Matrix place = viewBoxTransform(n, ViewBox{0, 0, rw, rh}, *w, *h);
         into.drawRaster(*pixels, s.m.after(Matrix::translate(x, y)).after(place), opacity);
+    }
+
+    // ── Text ──
+    // A <text>: its characters (and its <tspan>s', each where it says, or on from the last),
+    // in its font, from x, y (and dx, dy) on its baseline, as text-anchor puts it; filled.
+    // The glyphs are the embedder's (texts_).
+    static float textLength(const std::string* v, float em, float percent_of, float fallback) {
+        if (!v) return fallback;
+        const std::string first = v->substr(0, v->find_first_of(" ,\t\n"));
+        if (first.empty()) return fallback;
+        char* end = nullptr;
+        const float n = std::strtof(first.c_str(), &end);
+        if (end == first.c_str() || !std::isfinite(n)) return fallback;
+        const std::string unit(end);
+        if (unit == "em") return n * em;
+        if (unit == "ex") return n * em / 2;
+        if (unit == "%") return n * percent_of / 100;
+        if (unit == "pt") return n * 4 / 3;
+        return n;
+    }
+    static std::string anchorOf(const Node* n) {
+        for (const Node* a = n; a && a->isElement(); a = a->parent) {
+            if (const std::string* v = a->attr("text-anchor")) return *v;
+            if (const std::string* st = a->attr("style")) {
+                const size_t at = st->find("text-anchor");
+                if (at != std::string::npos) {
+                    const size_t colon = st->find(':', at);
+                    if (colon != std::string::npos) {
+                        std::string v = st->substr(colon + 1, st->find(';', colon) - colon - 1);
+                        v.erase(0, v.find_first_not_of(' '));
+                        v.erase(v.find_last_not_of(' ') + 1);
+                        return v;
+                    }
+                }
+            }
+            if (isSvg(a, "svg")) break;
+        }
+        return "start";
+    }
+    // Its font: the cascade's, with the presentation attributes (font-size="24") where no
+    // style sheet set the property (it's then what the parent has, a presentation
+    // attribute being below any rule), and what such an attribute on an ancestor (a <g>, the
+    // <text> around a <tspan>) gave it otherwise.
+    struct Font {
+        float size = 16;
+        int weight = 400;
+        bool italic = false;
+        std::string family = "sans-serif";
+    };
+    Font fontParts(const Node* n, int depth = 0) const {
+        const ComputedStyle* st = styleOf(n);
+        Font f;
+        if (st) f = {st->font_size, st->font_weight, st->italic, st->font_family};
+        const bool svg_parent = n->parent && n->parent->isElement() && n->parent->ns == Namespace::Svg && !isSvg(n, "svg") && depth < 32;
+        if (!svg_parent) return f;
+        const ComputedStyle* up = styleOf(n->parent);
+        const Font inherited = fontParts(n->parent, depth + 1);
+        // (Unset by the cascade: the same as the parent's in it.)
+        if (!st || !up || st->font_size == up->font_size) f.size = inherited.size;
+        if (!st || !up || st->font_weight == up->font_weight) f.weight = inherited.weight;
+        if (!st || !up || st->italic == up->italic) f.italic = inherited.italic;
+        if (!st || !up || st->font_family == up->font_family) f.family = inherited.family;
+        if (const std::string* v = n->attr("font-size"); v && (!st || !up || st->font_size == up->font_size))
+            f.size = std::clamp(textLength(v, inherited.size, inherited.size, f.size), 1.0f, 1000.0f);
+        if (const std::string* v = n->attr("font-weight"); v && (!st || !up || st->font_weight == up->font_weight)) {
+            if (*v == "bold" || *v == "bolder") f.weight = 700;
+            else if (*v == "normal") f.weight = 400;
+            else if (*v == "lighter") f.weight = 300;
+            else if (const int w = std::atoi(v->c_str()); w >= 100 && w <= 900) f.weight = w;
+        }
+        if (const std::string* v = n->attr("font-style"); v && (!st || !up || st->italic == up->italic)) f.italic = *v == "italic" || *v == "oblique";
+        if (const std::string* v = n->attr("font-family"); v && !v->empty() && (!st || !up || st->font_family == up->font_family)) f.family = *v;
+        return f;
+    }
+    std::string fontOf(const Node* n, float& size) const {
+        const Font f = fontParts(n);
+        size = f.size;
+        char px[48];
+        std::snprintf(px, sizeof px, "%d %gpx ", f.weight, static_cast<double>(f.size));
+        return (f.italic ? std::string("italic ") : std::string()) + px + f.family;
+    }
+    void drawText(const Node* n, const State& s, Canvas& into, float opacity) {
+        if (!texts_ || !*texts_) return;
+        struct Run {
+            const Node* el;
+            std::string text;
+            std::optional<float> x, y;
+            float dx = 0, dy = 0;
+        };
+        std::vector<Run> runs;
+        float em = 16;
+        (void)fontOf(n, em);
+        runs.push_back({n, {}, textLength(n->attr("x"), em, s.vp_w, 0), textLength(n->attr("y"), em, s.vp_h, 0),
+                        textLength(n->attr("dx"), em, s.vp_w, 0), textLength(n->attr("dy"), em, s.vp_h, 0)});
+        const auto collect = [&](const auto& self, const Node* el) -> void {
+            for (const Node* c : el->children) {
+                if (c->type == NodeType::Text) {
+                    runs.back().text += c->data;
+                } else if (c->isElement() && c->ns == Namespace::Svg && (c->name == "tspan" || c->name == "a")) {
+                    float cem = em;
+                    (void)fontOf(c, cem);
+                    Run r{c, {}, std::nullopt, std::nullopt, textLength(c->attr("dx"), cem, s.vp_w, 0), textLength(c->attr("dy"), cem, s.vp_h, 0)};
+                    if (c->attr("x")) r.x = textLength(c->attr("x"), cem, s.vp_w, 0);
+                    if (c->attr("y")) r.y = textLength(c->attr("y"), cem, s.vp_h, 0);
+                    runs.push_back(std::move(r));
+                    self(self, c);
+                    runs.push_back({el, {}, std::nullopt, std::nullopt, 0, 0});   // the parent's again after it
+                }
+            }
+        };
+        collect(collect, n);
+        // Spaces as XML has them by default: runs of white space one, none at the ends.
+        bool space = true;
+        for (Run& r : runs) {
+            std::string out;
+            for (const char c : r.text) {
+                const bool white = c == ' ' || c == '\n' || c == '\t' || c == '\r';
+                if (white) {
+                    if (!space) out += ' ';
+                    space = true;
+                } else {
+                    out += c;
+                    space = false;
+                }
+            }
+            r.text = std::move(out);
+        }
+        for (auto it = runs.rbegin(); it != runs.rend(); ++it) {
+            if (it->text.empty()) continue;
+            if (it->text.back() == ' ') it->text.pop_back();
+            break;
+        }
+        const std::string anchor = anchorOf(n);
+        const float scale = std::clamp(s.m.scale(), 0.25f, 8.0f);
+        // Each run's glyphs first: an anchor moves a whole chunk (the runs from one with an x
+        // up to the next), so its width has to be known before any of it is placed.
+        std::vector<std::optional<SvgTextRun>> glyphs(runs.size());
+        for (size_t i = 0; i < runs.size(); ++i) {
+            if (runs[i].text.empty()) continue;
+            float size = 16;
+            glyphs[i] = (*texts_)(runs[i].text, fontOf(runs[i].el, size), scale);
+        }
+        float pen_x = 0, pen_y = 0;
+        for (size_t i = 0; i < runs.size(); ++i) {
+            Run& r = runs[i];
+            if (r.x) pen_x = *r.x;
+            if (r.y) pen_y = *r.y;
+            if ((i == 0 || r.x) && anchor != "start") {
+                float chunk = r.dx;
+                for (size_t k = i; k < runs.size() && (k == i || !runs[k].x); ++k) {
+                    if (k != i) chunk += runs[k].dx;
+                    if (glyphs[k]) chunk += glyphs[k]->advance;
+                }
+                pen_x -= anchor == "middle" ? chunk / 2 : anchor == "end" ? chunk : 0.0f;
+            }
+            pen_x += r.dx;
+            pen_y += r.dy;
+            if (r.text.empty() || !glyphs[i]) continue;
+            const std::optional<SvgTextRun>& got = glyphs[i];
+            State rs = s;
+            if (r.el != n) apply(r.el, rs);
+            const Shape none;
+            const std::optional<Paint> paint = paintFor(rs.fill, rs, none, rs.fill_opacity * opacity);
+            const float left = pen_x;
+            if (paint && !got->mask.empty()) {
+                Color color = paint->gradient && !paint->gradient->stops.empty() ? paint->gradient->stops.front().color : paint->color;
+                const float alpha = paint->opacity * static_cast<float>(color.a) / 255.0f;
+                color.a = 255;
+                const Matrix place{1 / scale, 0, 0, 1 / scale, left, pen_y - got->ascent};
+                into.drawRaster(got->mask, s.m.after(place), alpha, &color);
+            }
+            pen_x = left + got->advance;
+        }
     }
 
     void drawRoot(const Node& svg, float width, float height, Color color, const SvgSize* natural) {
@@ -320,7 +496,7 @@ private:
         const std::string& name = n->name;
         if (name == "defs" || name == "symbol" || name == "clipPath" || name == "mask" || name == "linearGradient" ||
             name == "radialGradient" || name == "pattern" || name == "marker" || name == "style" || name == "script" ||
-            name == "title" || name == "desc" || name == "metadata" || name == "filter" || name == "foreignObject" || name == "text")
+            name == "title" || name == "desc" || name == "metadata" || name == "filter" || name == "foreignObject")
             return;
         if (!displayed(n)) return;
         State s = parent;
@@ -387,6 +563,10 @@ private:
         }
         if (name == "image") {
             drawImage(n, s, into, opacity);
+            return;
+        }
+        if (name == "text") {
+            drawText(n, s, into, opacity);
             return;
         }
         if (name == "use") {
@@ -761,7 +941,7 @@ const Node* findSvgRoot(const Document& doc) {
 }
 
 Raster renderSvg(const Node& svg, uint32_t width, uint32_t height, const StyledDocument* styles, Color color, const SvgSize* natural,
-                 const SvgUseResolver* external, const SvgImageResolver* images) {
+                 const SvgUseResolver* external, const SvgImageResolver* images, const SvgTextResolver* texts) {
     if (width == 0 || height == 0 || width > kMaxRasterSide || height > kMaxRasterSide ||
         static_cast<uint64_t>(width) * height > kMaxRasterPixels)
         return {};
@@ -769,6 +949,7 @@ Raster renderSvg(const Node& svg, uint32_t width, uint32_t height, const StyledD
     Renderer r(svg, canvas, styles);
     r.external_ = external;
     r.images_ = images;
+    r.texts_ = texts;
     r.drawRoot(svg, static_cast<float>(width), static_cast<float>(height), color, natural);
     return canvas.toRaster();
 }

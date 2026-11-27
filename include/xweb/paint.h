@@ -192,9 +192,16 @@ using SvgUseResolver = std::function<const Node*(const std::string& href)>;
 // canvas (an SVG file drawn near that size, its own shape kept; 0 by 0: its own size), or
 // null while it isn't here.
 using SvgImageResolver = std::function<std::shared_ptr<const Raster>(const std::string& href, uint32_t width, uint32_t height)>;
+// What a <text> draws: its glyphs as a coverage mask (`scale` pixels to a px), how far it
+// goes and how far its top is above the baseline (in px). The embedder has the fonts.
+struct SvgTextRun {
+    Raster mask;
+    float advance = 0, ascent = 0;
+};
+using SvgTextResolver = std::function<std::optional<SvgTextRun>(const std::string& text, const std::string& font, float scale)>;
 [[nodiscard]] Raster renderSvg(const Node& svg, uint32_t width, uint32_t height, const StyledDocument* styles, Color color,
                                const SvgSize* natural = nullptr, const SvgUseResolver* external = nullptr,
-                               const SvgImageResolver* images = nullptr);
+                               const SvgImageResolver* images = nullptr, const SvgTextResolver* texts = nullptr);
 
 // The first <svg> in a parsed SVG file.
 [[nodiscard]] const Node* findSvgRoot(const Document& doc);

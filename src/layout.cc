@@ -4687,6 +4687,7 @@ private:
                 if (f.link) out_->links.push_back({cx + f.atomic->x, cy + f.atomic->y, f.atomic->outerWidth(), f.atomic->outerHeight(), *f.link});
                 Positioned later{f.atomic, cx, cy, cb, opacity, order_++, clip_stack_, ctx_ops_, ctx_boxes_};
                 later.in_flow = true;
+                later.parent_w = b.width;
                 positioned_.push_back(std::move(later));
                 continue;
             }
@@ -4922,10 +4923,11 @@ private:
                 transforms_.empty()) {
                 Positioned later{&k, cx, cy, cb, opacity, order_++, clip_stack_, ctx_ops_, ctx_boxes_};
                 later.in_flow = true;
+                later.parent_w = b.width;
                 positioned_.push_back(std::move(later));
                 continue;
             }
-            paint(k, cx, cy, cb, opacity);
+            paint(k, cx, cy, cb, opacity, b.width);
         }
 
         if (context_root) {
@@ -5009,12 +5011,16 @@ private:
         }
     }
 
-    void paint(const Box& b, float parent_x, float parent_y, const Rect& cb, float opacity) {
+    // `parent_w`: the content width of the block it's in, which a relative box's left and
+    // right percentages are of (w3.org's full-width sections, left: 50% in a padded <main>,
+    // came out a padding's width to the right); cb's when not known.
+    void paint(const Box& b, float parent_x, float parent_y, const Rect& cb, float opacity, float parent_w = -1) {
         const ComputedStyle& s = *b.style;
         float x = parent_x + b.x, y = parent_y + b.y;
         if (s.position == Position::Relative) {
-            if (!s.offset[Left].is_auto) x += s.offset[Left].resolve(cb.w);
-            else if (!s.offset[Right].is_auto) x -= s.offset[Right].resolve(cb.w);
+            const float across = parent_w >= 0 ? parent_w : cb.w;
+            if (!s.offset[Left].is_auto) x += s.offset[Left].resolve(across);
+            else if (!s.offset[Right].is_auto) x -= s.offset[Right].resolve(across);
             if (!s.offset[Top].is_auto) y += s.offset[Top].resolve(cb.h);
             else if (!s.offset[Bottom].is_auto) y -= s.offset[Bottom].resolve(cb.h);
         }
@@ -5163,7 +5169,7 @@ private:
                     clip_stack_ = p.clips;
                     const size_t saved_depth = cb_clip_depth_;
                     cb_clip_depth_ = clip_stack_.size();
-                    paint(k, p.static_x, p.static_y, p.cb, p.opacity);
+                    paint(k, p.static_x, p.static_y, p.cb, p.opacity, p.parent_w);
                     ended();
                     // Its floats, whose context has been painted already: now, over it.
                     while (!pending_floats_.empty()) {
@@ -5272,6 +5278,7 @@ private:
         // A relatively positioned block with a z-index, put off to take its turn among the
         // positioned: painted as in flow from (static_x, static_y), its parent's content box.
         bool in_flow = false;
+        float parent_w = -1;   // (in flow: the width its relative offsets' percentages are of)
     };
     // A negative z-index box's paint, to go in under its stacking context's content.
     struct BelowContent {

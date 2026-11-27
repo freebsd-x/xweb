@@ -2114,8 +2114,14 @@ private:
             if (img->width == 0 || img->height == 0 || img->pixels.empty()) return nullptr;
             return std::make_shared<web::Raster>(web::Raster{img->width, img->height, img->pixels});
         };
+        // Its <text>s' glyphs: the same fonts as a canvas's fillText.
+        const web::SvgTextResolver texts = [](const std::string& text, const std::string& font, float scale) -> std::optional<web::SvgTextRun> {
+            auto got = canvasText(text, font, scale, true);
+            if (!got) return std::nullopt;
+            return web::SvgTextRun{std::move(got->mask), got->advance, got->ascent};
+        };
         if (const CachedRaster* r = cached(key, [&, pw = pw, ph = ph] {
-                return web::renderSvg(*node, pw, ph, styles, color, nullptr, &external, &pictures);
+                return web::renderSvg(*node, pw, ph, styles, color, nullptr, &external, &pictures, &texts);
             }))
             drawRaster(dl, *r, x, y, op.w, op.h, op.opacity);
     }
