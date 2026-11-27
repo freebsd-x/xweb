@@ -47,7 +47,10 @@ struct Completion {
 struct ShortCircuit {};   // an optional chain's nullish link
 
 struct VmCode;
-VmCode* vmCodeFor(FunctionInfo* info);   // compiled for the VM, or null (vm.cc)
+VmCode* vmCodeForSlow(FunctionInfo* info);   // compiled for the VM, or null (vm.cc)
+inline VmCode* vmCodeFor(FunctionInfo* info) {
+    return info->vm_state == 1 ? info->vm.get() : vmCodeForSlow(info);
+}
 
 class Interpreter {
 public:

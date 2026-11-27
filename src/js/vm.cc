@@ -137,6 +137,10 @@ enum Opc : uint32_t {
     OpBGe,
     OpBStrictEq,
     OpBStrictNe,
+    OpBDiv,
+    OpBMod,
+    OpBEq,           // == and != of two numbers (anything else as OpBin)
+    OpBNe,
     // d a imm op: the same with a whole number for b (imm its int32 bits): `x >>> 7`, `i < 16`,
     // `h | 0` without loading the number into a register first.
     OpIAdd,
@@ -153,6 +157,7 @@ enum Opc : uint32_t {
     OpIGe,
     OpIStrictEq,
     OpIStrictNe,
+    OpIMod,
     // a b t (b a register) or a imm t (imm a whole number's int32 bits): to t when a OP b
     // is true (…T) or false (…F). A condition tested where it's worked out: no boolean
     // made to be tested by the next instruction.
@@ -1588,6 +1593,7 @@ private:
                 case Op::Ge: c = OpIGe; break;
                 case Op::StrictEq: c = OpIStrictEq; break;
                 case Op::StrictNe: c = OpIStrictNe; break;
+                case Op::Mod: c = OpIMod; break;
                 default: break;
             }
             if (c != OpCount) {
@@ -1617,6 +1623,10 @@ private:
             case Op::Ge: c = OpBGe; break;
             case Op::StrictEq: c = OpBStrictEq; break;
             case Op::StrictNe: c = OpBStrictNe; break;
+            case Op::Div: c = OpBDiv; break;
+            case Op::Mod: c = OpBMod; break;
+            case Op::Eq: c = OpBEq; break;
+            case Op::Ne: c = OpBNe; break;
             default: break;
         }
         emit(c, {d, a, b, static_cast<uint32_t>(op)});
@@ -2073,7 +2083,7 @@ bool vmStats() {
 
 }  // namespace
 
-VmCode* vmCodeFor(FunctionInfo* info) {
+VmCode* vmCodeForSlow(FunctionInfo* info) {
     if (info->vm_state == 1) return info->vm.get();
     if (info->vm_state == 2) return nullptr;
     info->vm_state = 2;
@@ -2100,6 +2110,14 @@ namespace {
 // ToInt32 for a number this side of ±2^63 (not NaN or infinite): truncated, then its low
 // 32 bits, as the tree-walker's binaryOp does; anything else goes the slow way.
 inline bool int32Exact(double d) { return d > -9.2e18 && d < 9.2e18; }
+// x % y as JavaScript has it (the sign of x, -0 kept): whole numbers the integer way.
+inline double numberMod(double x, double y) {
+    if (x >= 0 && y > 0 && x <= 2147483647.0 && y <= 2147483647.0) {
+        const auto xi = static_cast<int32_t>(x), yi = static_cast<int32_t>(y);
+        if (static_cast<double>(xi) == x && static_cast<double>(yi) == y) return static_cast<double>(xi % yi);
+    }
+    return std::fmod(x, y);
+}
 inline int32_t toI32(double d) { return static_cast<int32_t>(static_cast<uint32_t>(static_cast<int64_t>(d))); }
 bool vmProfiling() {
     static const bool on = std::getenv("XWEB_JS_PROFILE") != nullptr;
@@ -2123,11 +2141,11 @@ Value Interpreter::callCompiled(Object* f, VmCode& code, const Value& this_value
     callee.owned_base_ = rt_.owned_stack.size();
     struct Frame {
         size_t depth;
-        explicit Frame(const std::u16string* name) : depth(t_call_frames.size()) {
-            if (depth < 4096) t_call_frames.push_back({throwSite(), name});
+        explicit Frame(const std::u16string* name) : depth(callFrames().size()) {
+            if (depth < 4096) callFrames().push_back({throwSite(), name});
         }
         ~Frame() {
-            if (t_call_frames.size() > depth) t_call_frames.resize(depth);
+            if (callFrames().size() > depth) callFrames().resize(depth);
         }
     } frame(&info->name);
     rt_.safePoint();
@@ -2511,6 +2529,30 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                                 }
                             }
                         }
+                        // A string's method (s.charCodeAt, s.indexOf): its own are only its
+                        // indexes and length, so any other name is String.prototype's, found
+                        // and remembered from there as an object's would be.
+                        else if (r[o[2]].isString() && rt_.string_prototype) {
+                            Object* proto = rt_.string_prototype;
+                            if (o[3] < code.get_cache.size())
+                                if (const Property* p = cachedGet(code.get_cache[o[3]], proto)) {
+                                    if (!(p->flags & kAccessor)) r[o[1]] = p->value;
+                                    else r[o[1]] = p->getter ? rt_.call(Value::object(p->getter), r[o[2]], {}) : Value::undefined();
+                                    pc += 4;
+                                    break;
+                                }
+                            if (!m->key) m->key = std::make_unique<PropertyKey>(m->str);
+                            if (shapeKey(*m->key)) {
+                                if (code.get_cache.size() < code.nodes.size()) code.get_cache.resize(code.nodes.size());
+                                if (fillGet(code.get_cache[o[3]], proto, *m->key)) {
+                                    const Property* p = cachedGet(code.get_cache[o[3]], proto);
+                                    if (!(p->flags & kAccessor)) r[o[1]] = p->value;
+                                    else r[o[1]] = p->getter ? rt_.call(Value::object(p->getter), r[o[2]], {}) : Value::undefined();
+                                    pc += 4;
+                                    break;
+                                }
+                            }
+                        }
                         if (!m->key) m->key = std::make_unique<PropertyKey>(m->str);
                         r[o[1]] = rt_.get(r[o[2]], *m->key);
                         pc += 4;
@@ -2634,6 +2676,30 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                         } else {
                             r[o[1]] = binaryOp(Op::Sub, a, b);
                         }
+                        pc += 5;
+                        break;
+                    }
+                    case OpBDiv: case OpBMod: case OpBEq: case OpBNe: {
+                        const Value &a = r[o[2]], &b = r[o[3]];
+                        if (a.isNumber() && b.isNumber()) {
+                            const double x = a.asNumber(), y = b.asNumber();
+                            switch (o[0]) {
+                                case OpBDiv: r[o[1]].setNumber(x / y); break;
+                                case OpBMod: r[o[1]].setNumber(numberMod(x, y)); break;
+                                case OpBEq: r[o[1]].setBoolean(x == y); break;
+                                default: r[o[1]].setBoolean(x != y); break;
+                            }
+                        } else {
+                            r[o[1]] = binaryOp(static_cast<Op>(o[4]), a, b);
+                        }
+                        pc += 5;
+                        break;
+                    }
+                    case OpIMod: {
+                        const Value& a = r[o[2]];
+                        const int32_t yi = static_cast<int32_t>(o[3]);
+                        if (a.isNumber()) r[o[1]].setNumber(numberMod(a.asNumber(), static_cast<double>(yi)));
+                        else r[o[1]] = binaryOp(Op::Mod, a, Value::number(static_cast<double>(yi)));
                         pc += 5;
                         break;
                     }

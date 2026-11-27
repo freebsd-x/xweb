@@ -207,7 +207,10 @@ Shape* Shape::with(const PropertyKey& key, size_t hash) {
     // capping it at 64 like the rest put all but a page's first 64 kinds in their own
     // keys (react's fibers: every field a hash probe, no access remembered).
     thread_local size_t made = 0;
-    const size_t ways = count_ == 0 ? kMaxFirstKeys : 64;
+    // And the shapes one key in go many ways too: every prototype starts with its
+    // constructor, then its own first method (past 64 classes, String.prototype's and a
+    // page's own were holding their keys themselves).
+    const size_t ways = count_ == 0 ? kMaxFirstKeys : count_ == 1 ? kMaxSecondKeys : 64;
     if (count_ >= kMaxKeys || next_.size() >= ways || made >= 500'000) return nullptr;
     ++made;
     auto s = std::make_unique<Shape>();
@@ -468,12 +471,12 @@ std::u16string stackLine() {
     std::u16string out;
     const ThrowSite* here = &throwSite();
     size_t frames = 0;
-    for (size_t i = t_call_frames.size(); i-- > 0 && frames < 10; ++frames) {
+    for (size_t i = callFrames().size(); i-- > 0 && frames < 10; ++frames) {
         const std::u16string at = where(*here);
         if (at.empty()) break;
-        const std::u16string& name = *t_call_frames[i].name;
+        const std::u16string& name = *callFrames()[i].name;
         out += u"\n    at " + (name.empty() ? at : name + u" (" + at + u")");
-        here = &t_call_frames[i].site;
+        here = &callFrames()[i].site;
     }
     if (frames < 10) {
         const std::u16string at = where(*here);
@@ -521,7 +524,7 @@ void Runtime::stepSlow() {
             const std::string url = t.url ? t.url->substr(0, 70) : "?";
             ++at[url + ":" + std::to_string(t.line) + ":" + std::to_string(t.offset >= line ? t.offset - line : 0)];
             std::string calls;
-            for (size_t i = t_call_frames.size(), k = 0; i-- > 0 && k < 6; ++k) calls += (k ? " < " : "") + (t_call_frames[i].name ? utf8(*t_call_frames[i].name) : "");
+            for (size_t i = callFrames().size(), k = 0; i-- > 0 && k < 6; ++k) calls += (k ? " < " : "") + (callFrames()[i].name ? utf8(*callFrames()[i].name) : "");
             ++whose[calls];
             if (++n % 200 == 0)
                 for (const auto* m : {&at, &whose}) {
@@ -2116,10 +2119,10 @@ Value Interpreter::callScript(Object* f, const Value& this_value, std::span<cons
     // however we leave.)
     struct Frame {
         size_t depth;
-        explicit Frame(const std::u16string* name) : depth(t_call_frames.size()) {
-            if (depth < 4096) t_call_frames.push_back({throwSite(), name});
+        explicit Frame(const std::u16string* name) : depth(callFrames().size()) {
+            if (depth < 4096) callFrames().push_back({throwSite(), name});
         }
-        ~Frame() { if (t_call_frames.size() > depth) t_call_frames.resize(depth); }
+        ~Frame() { if (callFrames().size() > depth) callFrames().resize(depth); }
     } frame(&info->name);
     if (VmCode* code = vmCodeFor(info)) {
         rt_.safePoint();

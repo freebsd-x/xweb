@@ -255,6 +255,7 @@ public:
     [[nodiscard]] const Shape* parent() const noexcept { return parent_; }
     static constexpr uint32_t kMaxKeys = 64;
     static constexpr uint32_t kMaxFirstKeys = 8192;
+    static constexpr uint32_t kMaxSecondKeys = 2048;
 
 private:
     void build() const;

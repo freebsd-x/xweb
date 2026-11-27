@@ -2227,8 +2227,6 @@ void Runtime::installBuiltins() {
         return Value::number(s < o ? -1 : s > o ? 1 : 0);
     });
     method(string_prototype, u"normalize", 0, [thisString](Runtime& rt, const Value& t, Args) { return Value::string(thisString(rt, t)); });
-    method(string_prototype, u"codePoints", 0, [thisString](Runtime& rt, const Value& t, Args) { return Value::string(thisString(rt, t)); });
-    string_prototype->remove(u"codePoints");
     put(string_prototype, PropertyKey(sym_iterator), Value::object(newFunction(u"[Symbol.iterator]", 0, [thisString](Runtime& rt, const Value& t, Args) {
         Object* it = rt.allocate<Object>(rt.array_iterator_prototype, ObjectClass::Iterator);
         it->primitive = Value::string(thisString(rt, t));

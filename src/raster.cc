@@ -618,16 +618,19 @@ Raster Canvas::toRaster() const {
     r.width = width_;
     r.height = height_;
     r.rgba.resize(static_cast<size_t>(width_) * height_ * 4);
-    for (size_t i = 0; i < px_.size(); i += 4) {
-        const float a = px_[i + 3];
-        if (a <= 0) {
-            std::memset(&r.rgba[i], 0, 4);
-            continue;
-        }
-        r.rgba[i] = toByte(px_[i] / a);
-        r.rgba[i + 1] = toByte(px_[i + 1] / a);
-        r.rgba[i + 2] = toByte(px_[i + 2] / a);
-        r.rgba[i + 3] = toByte(a);
+    // One division a pixel, not three; nothing at all where nothing was drawn (the
+    // bytes are zero already). Branch-free clamping, which the compiler vectorizes.
+    const float* p = px_.data();
+    uint8_t* out = r.rgba.data();
+    const auto byte = [](float v) { return static_cast<uint8_t>(std::min(std::max(v * 255.0f + 0.5f, 0.0f), 255.0f)); };
+    for (size_t i = 0, n = px_.size(); i < n; i += 4) {
+        const float a = p[i + 3];
+        if (!(a > 0)) continue;
+        const float inv = 1.0f / a;
+        out[i] = byte(p[i] * inv);
+        out[i + 1] = byte(p[i + 1] * inv);
+        out[i + 2] = byte(p[i + 2] * inv);
+        out[i + 3] = byte(a);
     }
     return r;
 }

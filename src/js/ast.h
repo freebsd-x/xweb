@@ -196,7 +196,14 @@ struct CallFrame {
     ThrowSite site;                   // the call, in its caller
     const std::u16string* name;       // the function called
 };
-inline thread_local std::vector<CallFrame> t_call_frames;
+// (Reached through a pointer: a thread_local of a type with a constructor costs a call to
+// its initialization check at every use, and every call uses it twice.)
+inline thread_local std::vector<CallFrame>* t_call_frames_p = nullptr;
+inline std::vector<CallFrame>& callFrames() noexcept {
+    std::vector<CallFrame>* v = t_call_frames_p;
+    if (!v) [[unlikely]] v = t_call_frames_p = new std::vector<CallFrame>();   // (kept for the thread's life)
+    return *v;
+}
 // "\n    at url:line:1" for where that is, or nothing: what an error's stack ends with.
 std::u16string stackLine();
 
