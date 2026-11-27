@@ -346,6 +346,22 @@ TEST(FontFace, ManyAreCapped) {
     EXPECT_LE(facesOf(css).size(), 512u);
 }
 
+TEST(Colors, CalcInTheChannels) {
+    // JetBrains' buttons: rgb(calc(255 - 1 * 230), ...) (their var()s already in), and the
+    // last channel's calc() before the alpha's "/" isn't divided by it.
+    const auto c = [](const std::string& v) {
+        Color out{1, 2, 3, 4};
+        EXPECT_TRUE(parseColor(css::tokenize(v), Color{9, 9, 9, 255}, out)) << v;
+        return out;
+    };
+    EXPECT_EQ(c("rgb(calc(255 - 1*230), calc(10 + 5), 3)"), (Color{25, 15, 3, 255}));
+    EXPECT_EQ(c("rgb(255 255 calc(25 + 1*230) / .5)"), (Color{255, 255, 255, 128}));
+    EXPECT_EQ(c("rgb(1 2 3 / calc(0.5 * 1))"), (Color{1, 2, 3, 128}));
+    EXPECT_EQ(c("rgba(calc(100 + 100),0,0,calc(1 - .5))"), (Color{200, 0, 0, 128}));
+    EXPECT_EQ(c("hsl(calc(60 * 2) 50% 50%)"), (Color{64, 191, 64, 255}));
+    EXPECT_EQ(c("rgb(min(300, 100) max(1, 2) clamp(0, 5, 3))"), (Color{100, 2, 3, 255}));
+}
+
 TEST(Color, LightDarkTakesTheLight) {
     Color c;
     EXPECT_TRUE(parseColor(css::tokenize("light-dark(#102030, rgb(1,2,3))"), Color{}, c));

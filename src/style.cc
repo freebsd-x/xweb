@@ -296,6 +296,9 @@ std::optional<ColorSpace> spaceNamed(const std::string& n) {
 }
 
 bool colorFromTokens(const Tokens& v, size_t& i, const Color& current, Color& out, int depth = 0);
+// A colour function's arguments from `from`, each calc() (min(), max(), clamp()) worked out
+// to the number or percentage it comes to; `close` its closing bracket. False if one can't be.
+bool colorArgsWorkedOut(const Tokens& v, size_t from, size_t& close, Tokens& out);
 
 // oklch(L C H / A) and the like, color(space a b c / A): `v` from `i` to `close`.
 bool colorOfSpace(const std::string& fn, const Tokens& v, size_t i, size_t close, Color& out) {
@@ -479,16 +482,25 @@ bool colorFromTokens(const Tokens& v, size_t& i, const Color& current, Color& ou
             if (v[end].type == TokenType::Function || v[end].type == TokenType::LeftParen) ++nesting;
             else if (v[end].type == TokenType::RightParen && --nesting == 0) break;
         }
-        if (depth > 16 || !(fn == "color-mix" ? colorMix(v, i + 1, end, current, out, depth) : colorOfSpace(fn, v, i + 1, end, out))) return false;
+        if (depth > 16) return false;
+        if (fn == "color-mix") {
+            if (!colorMix(v, i + 1, end, current, out, depth)) return false;
+        } else {
+            size_t close = i + 1;
+            Tokens worked;
+            if (!colorArgsWorkedOut(v, i + 1, close, worked) || !colorOfSpace(fn, worked, 0, worked.size(), out)) return false;
+        }
         i = end < v.size() ? end + 1 : end;
         return true;
     }
     const bool rgb = t.text == "rgb" || t.text == "rgba";
     const bool hsl = t.text == "hsl" || t.text == "hsla";
     if (!rgb && !hsl) return false;
+    // (Its channels may be calc()s: JetBrains' buttons are rgb(calc(255 - var(--dark) * 230), ...).)
     size_t close = i + 1;
-    while (close < v.size() && v[close].type != TokenType::RightParen) ++close;
-    const auto args = colorArgs(v, i + 1, close);
+    Tokens worked;
+    if (!colorArgsWorkedOut(v, i + 1, close, worked)) return false;
+    const auto args = colorArgs(worked, 0, worked.size());
     if (args.size() < 3) return false;
     const auto alpha = [&] {
         if (args.size() < 4) return 255.0;
@@ -755,6 +767,47 @@ bool lengthAt(const Tokens& v, size_t& i, const LengthContext& c, Length& out, b
 
 void skipWs(const Tokens& v, size_t& i) {
     while (i < v.size() && v[i].type == TokenType::Whitespace) ++i;
+}
+
+bool colorArgsWorkedOut(const Tokens& v, size_t from, size_t& close, Tokens& out) {
+    size_t k = from;
+    while (k < v.size() && v[k].type != TokenType::RightParen) {
+        const Token& t = v[k];
+        if (t.type == TokenType::Function) {
+            const std::string fn = lower(t.text);
+            if (fn != "calc" && fn != "min" && fn != "max" && fn != "clamp") return false;   // (a relative colour, ...)
+            // The function alone: a channel's calc() before the alpha's "/" was otherwise
+            // taken on as dividing by it.
+            size_t end = k + 1;
+            for (int nesting = 1; end < v.size(); ++end) {
+                if (v[end].type == TokenType::Function || v[end].type == TokenType::LeftParen) ++nesting;
+                else if (v[end].type == TokenType::RightParen && --nesting == 0) break;
+            }
+            if (end >= v.size()) return false;
+            const Tokens one(v.begin() + static_cast<ptrdiff_t>(k), v.begin() + static_cast<ptrdiff_t>(end) + 1);
+            const LengthContext numbers;   // (kept: the parser holds on to it)
+            CalcParser calc(one, 0, numbers);
+            Length l;
+            bool unitless = false;
+            if (!calc.sum(l, 0, &unitless)) return false;
+            Token n;
+            if (l.percent != 0 && l.px == 0) {
+                n.type = TokenType::Percentage;
+                n.number = l.percent;
+            } else {
+                n.type = TokenType::Number;
+                n.number = l.px;
+            }
+            out.push_back(n);
+            k = end + 1;
+            continue;
+        }
+        if (t.type == TokenType::LeftParen) return false;
+        out.push_back(t);
+        ++k;
+    }
+    close = k;
+    return true;
 }
 
 // A transform's translations, summed: translate(), translateX/Y/3d() and an identity-scaled
