@@ -254,6 +254,7 @@ public:
     Shape* with(const PropertyKey& key, size_t hash);
     [[nodiscard]] const Shape* parent() const noexcept { return parent_; }
     static constexpr uint32_t kMaxKeys = 64;
+    static constexpr uint32_t kMaxFirstKeys = 8192;
 
 private:
     void build() const;
@@ -264,6 +265,7 @@ private:
     mutable std::vector<const PropertyKey*> keys_;
     mutable std::vector<uint32_t> idx_;
     std::vector<std::pair<size_t, std::unique_ptr<Shape>>> next_;   // by the key's hash
+    std::vector<uint32_t> next_idx_;   // next_ by hash (index + 1), once there are many
 };
 
 // Whatever the heap holds: objects, and symbols.

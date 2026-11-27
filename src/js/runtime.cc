@@ -191,12 +191,24 @@ ptrdiff_t Shape::find(const PropertyKey& key, size_t hash) const {
 }
 
 Shape* Shape::with(const PropertyKey& key, size_t hash) {
-    for (auto& [h, next] : next_)
-        if (h == hash && next->key_ == key) return next.get();
+    if (next_idx_.empty()) {
+        for (auto& [h, next] : next_)
+            if (h == hash && next->key_ == key) return next.get();
+    } else {
+        const size_t mask = next_idx_.size() - 1;
+        for (size_t j = hash & mask; next_idx_[j]; j = (j + 1) & mask) {
+            auto& [h, next] = next_[next_idx_[j] - 1];
+            if (h == hash && next->key_ == key) return next.get();
+        }
+    }
     // Too many keys, or too many ways on from here (an object used as a map, its keys
-    // whatever comes): the object holds its own.
+    // whatever comes): the object holds its own. The empty shape is every object's
+    // start, so it goes many ways (a page's every kind of object: its first key);
+    // capping it at 64 like the rest put all but a page's first 64 kinds in their own
+    // keys (react's fibers: every field a hash probe, no access remembered).
     thread_local size_t made = 0;
-    if (count_ >= kMaxKeys || next_.size() >= 64 || made >= 500'000) return nullptr;
+    const size_t ways = count_ == 0 ? kMaxFirstKeys : 64;
+    if (count_ >= kMaxKeys || next_.size() >= ways || made >= 500'000) return nullptr;
     ++made;
     auto s = std::make_unique<Shape>();
     s->parent_ = this;
@@ -204,6 +216,22 @@ Shape* Shape::with(const PropertyKey& key, size_t hash) {
     (void)Object::keyHash(s->key_);
     s->count_ = count_ + 1;
     next_.emplace_back(hash, std::move(s));
+    // Many ways on: found by hash, not one by one.
+    if (next_.size() > 16 && next_idx_.size() < next_.size() * 2) {
+        size_t cap = 64;
+        while (cap < next_.size() * 2) cap *= 2;
+        next_idx_.assign(cap, 0);
+        for (uint32_t i = 0; i < next_.size(); ++i) {
+            size_t j = next_[i].first & (cap - 1);
+            while (next_idx_[j]) j = (j + 1) & (cap - 1);
+            next_idx_[j] = i + 1;
+        }
+    } else if (!next_idx_.empty()) {
+        const size_t mask = next_idx_.size() - 1;
+        size_t j = hash & mask;
+        while (next_idx_[j]) j = (j + 1) & mask;
+        next_idx_[j] = static_cast<uint32_t>(next_.size());
+    }
     return next_.back().second.get();
 }
 
