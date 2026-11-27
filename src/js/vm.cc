@@ -137,6 +137,49 @@ enum Opc : uint32_t {
     OpBGe,
     OpBStrictEq,
     OpBStrictNe,
+    // d a imm op: the same with a whole number for b (imm its int32 bits): `x >>> 7`, `i < 16`,
+    // `h | 0` without loading the number into a register first.
+    OpIAdd,
+    OpISub,
+    OpIBitAnd,
+    OpIBitOr,
+    OpIBitXor,
+    OpIShl,
+    OpIShr,
+    OpIUShr,
+    OpILt,
+    OpIGt,
+    OpILe,
+    OpIGe,
+    OpIStrictEq,
+    OpIStrictNe,
+    // a b t (b a register) or a imm t (imm a whole number's int32 bits): to t when a OP b
+    // is true (…T) or false (…F). A condition tested where it's worked out: no boolean
+    // made to be tested by the next instruction.
+    OpJRStrictEqT,
+    OpJRStrictEqF,
+    OpJRLtT,
+    OpJRLtF,
+    OpJRLeT,
+    OpJRLeF,
+    OpJRGtT,
+    OpJRGtF,
+    OpJRGeT,
+    OpJRGeF,
+    OpJIStrictEqT,
+    OpJIStrictEqF,
+    OpJILtT,
+    OpJILtF,
+    OpJILeT,
+    OpJILeF,
+    OpJIGtT,
+    OpJIGtF,
+    OpJIGeT,
+    OpJIGeF,
+    OpJumpIfNotNullish, // s t
+    OpJumpIfNull,    // s t                 : s === null
+    OpJumpIfNotNull, // s t
+    OpReturnUndef,   //                     : return undefined
     OpYield,         // d s                 : a generator's yield: d is what next() sends
     OpYieldStar,     // d s                 : yield* s
     OpAwait,         // d s
@@ -283,9 +326,8 @@ public:
                 if (s->kind == N::FunctionDecl) continue;   // made at the start
                 stmt(s);
             }
-            emit(OpUndef, {0});   // (register 0 may be a parameter: the function is done with it)
             if (code_->nparams == 0 && next_ == 0) next_ = 1;
-            emit(OpReturn, {0});
+            emit(OpReturnUndef, {});
         }
         // A finally's jumps out, each on to the next finally or to where it was going.
         for (const Stub& s : stubs_) {
@@ -613,22 +655,26 @@ private:
             case N::VarDecl: site(n); declare(n); return;
             case N::Return: {
                 site(n);
+                if (!n->a && finallies_.empty()) {
+                    emit(OpReturnUndef, {});
+                    return;
+                }
                 const uint32_t r = n->a ? value(n->a) : constUndefined();
                 doReturn(r);
                 return;
             }
             case N::If: {
                 site(n);
-                const uint32_t c = value(n->a);
-                const uint32_t to_else = jumpFwd(OpJumpIfFalse, {c});
+                std::vector<uint32_t> to_else;
+                condJump(n->a, false, to_else);
                 stmt(n->b);
                 if (n->c) {
                     const uint32_t to_end = jumpFwd(OpJump);
-                    patchHere(to_else);
+                    for (uint32_t at : to_else) patchHere(at);
                     stmt(n->c);
                     patchHere(to_end);
                 } else {
-                    patchHere(to_else);
+                    for (uint32_t at : to_else) patchHere(at);
                 }
                 return;
             }
@@ -751,8 +797,11 @@ private:
                 site(n);
                 Label* top = newLabel();
                 place(top);
-                const uint32_t c = valueTemp(n->a);
-                patchTo(jumpFwd(OpJumpIfFalse, {c}), t.brk);
+                {
+                    std::vector<uint32_t> out;
+                    condJump(n->a, false, out);
+                    for (uint32_t at : out) patchTo(at, t.brk);
+                }
                 targets_.push_back(t);
                 stmt(n->b);
                 targets_.pop_back();
@@ -770,8 +819,11 @@ private:
                 targets_.pop_back();
                 place(t.cont);
                 emit(OpLoop, {});
-                const uint32_t c = valueTemp(n->b);
-                patchTo(jumpFwd(OpJumpIfTrue, {c}), top);
+                {
+                    std::vector<uint32_t> out;
+                    condJump(n->b, true, out);
+                    for (uint32_t at : out) patchTo(at, top);
+                }
                 place(t.brk);
                 return;
             }
@@ -790,9 +842,9 @@ private:
                 Label* top = newLabel();
                 place(top);
                 if (n->b) {
-                    TempMark m(*this);
-                    const uint32_t c = value(n->b);
-                    patchTo(jumpFwd(OpJumpIfFalse, {c}), t.brk);
+                    std::vector<uint32_t> out;
+                    condJump(n->b, false, out);
+                    for (uint32_t at : out) patchTo(at, t.brk);
                 }
                 targets_.push_back(t);
                 stmt(n->d);
@@ -931,10 +983,12 @@ private:
                     Node* c = n->kids[i];
                     if (!c->a) continue;
                     TempMark m(*this);
-                    const uint32_t v = value(c->a);
-                    const uint32_t eq = temp();
-                    emitBin(eq, d, v, Op::StrictEq);
-                    patchTo(jumpFwd(OpJumpIfTrue, {eq}), bodies[i]);
+                    if (smallInt(c->a)) {
+                        patchTo(jumpFwd(OpJIStrictEqT, {d, static_cast<uint32_t>(static_cast<int32_t>(c->a->number))}), bodies[i]);
+                    } else {
+                        const uint32_t v = value(c->a);
+                        patchTo(jumpFwd(OpJRStrictEqT, {d, v}), bodies[i]);
+                    }
                 }
                 Label* none = t.brk;
                 for (size_t i = 0; i < n->kids.size(); ++i)
@@ -1324,11 +1378,11 @@ private:
             case N::Assign: assign(n, dst); return;
             case N::Conditional: {
                 TempMark m(*this);
-                const uint32_t c = value(n->a);
-                const uint32_t to_else = jumpFwd(OpJumpIfFalse, {c});
+                std::vector<uint32_t> to_else;
+                condJump(n->a, false, to_else);
                 expr(n->b, dst);
                 const uint32_t to_end = jumpFwd(OpJump);
-                patchHere(to_else);
+                for (uint32_t at : to_else) patchHere(at);
                 expr(n->c, dst);
                 patchHere(to_end);
                 return;
@@ -1370,8 +1424,7 @@ private:
             case N::Binary: {
                 TempMark m(*this);
                 const uint32_t l = value(n->a, false, {n->b});
-                const uint32_t r = value(n->b);
-                emitBin(dst, l, r, n->op);
+                binWith(dst, l, n->b, n->op);
                 return;
             }
             case N::Member: {
@@ -1450,6 +1503,102 @@ private:
 
     // A binary operator: its own instruction for the usual ones (two numbers worked out
     // in place), OpBin for the rest.
+    // ── Conditions ──
+    // Code that jumps when `c` is `when` (truthy or falsy) and goes on otherwise: the
+    // jumps' target operands go in `out`. A comparison jumps as it compares; ! and
+    // && / || become jumps, not booleans.
+    static bool smallInt(const Node* b) {
+        return b->kind == N::Number && b->number == std::trunc(b->number) && std::abs(b->number) < 2147483648.0 &&
+               !(b->number == 0 && std::signbit(b->number));
+    }
+    void condJump(Node* c, bool when, std::vector<uint32_t>& out) {
+        if (c->kind == N::Unary && c->op == Op::Not) {
+            condJump(c->a, !when, out);
+            return;
+        }
+        if (c->kind == N::Logical && (c->op == Op::And || c->op == Op::Or)) {
+            // a && b is falsy if either is; a || b truthy if either is.
+            const bool either = (c->op == Op::And) != when;
+            if (either) {
+                condJump(c->a, when, out);
+                condJump(c->b, when, out);
+            } else {
+                std::vector<uint32_t> past;
+                condJump(c->a, !when, past);
+                condJump(c->b, when, out);
+                for (uint32_t at : past) patchHere(at);
+            }
+            return;
+        }
+        TempMark m(*this);
+        if (c->kind == N::Binary && (c->op == Op::Eq || c->op == Op::Ne) && c->b->kind == N::Null) {
+            const uint32_t a = value(c->a);
+            const bool nullish = when == (c->op == Op::Eq);
+            out.push_back(jumpFwd(nullish ? OpJumpIfNullish : OpJumpIfNotNullish, {a}));
+            return;
+        }
+        if (c->kind == N::Binary && (c->op == Op::StrictEq || c->op == Op::StrictNe) && c->b->kind == N::Null) {
+            const uint32_t a = value(c->a);
+            const bool is_null = when == (c->op == Op::StrictEq);
+            out.push_back(jumpFwd(is_null ? OpJumpIfNull : OpJumpIfNotNull, {a}));
+            return;
+        }
+        if (c->kind == N::Binary) {
+            int which = -1;
+            bool sense = when;
+            switch (c->op) {
+                case Op::StrictEq: which = 0; break;
+                case Op::StrictNe: which = 0; sense = !when; break;
+                case Op::Lt: which = 1; break;
+                case Op::Le: which = 2; break;
+                case Op::Gt: which = 3; break;
+                case Op::Ge: which = 4; break;
+                default: break;
+            }
+            if (which >= 0) {
+                const uint32_t a = value(c->a, false, {c->b});
+                const bool imm = smallInt(c->b);
+                const uint32_t b = imm ? static_cast<uint32_t>(static_cast<int32_t>(c->b->number)) : value(c->b);
+                const uint32_t first = imm ? OpJIStrictEqT : OpJRStrictEqT;
+                out.push_back(jumpFwd(static_cast<Opc>(first + which * 2 + (sense ? 0 : 1)), {a, b}));
+                return;
+            }
+        }
+        const uint32_t v = value(c);
+        out.push_back(jumpFwd(when ? OpJumpIfTrue : OpJumpIfFalse, {v}));
+    }
+
+    // a OP b, b an expression: a small whole number goes in the instruction.
+    void binWith(uint32_t d, uint32_t a, Node* b, Op op) {
+        if (b->kind == N::Number && b->number == std::trunc(b->number) && std::abs(b->number) < 2147483648.0 &&
+            !(b->number == 0 && std::signbit(b->number))) {
+            Opc c = OpCount;
+            switch (op) {
+                case Op::Add: c = OpIAdd; break;
+                case Op::Sub: c = OpISub; break;
+                case Op::BitAnd: c = OpIBitAnd; break;
+                case Op::BitOr: c = OpIBitOr; break;
+                case Op::BitXor: c = OpIBitXor; break;
+                case Op::Shl: c = OpIShl; break;
+                case Op::Shr: c = OpIShr; break;
+                case Op::UShr: c = OpIUShr; break;
+                case Op::Lt: c = OpILt; break;
+                case Op::Gt: c = OpIGt; break;
+                case Op::Le: c = OpILe; break;
+                case Op::Ge: c = OpIGe; break;
+                case Op::StrictEq: c = OpIStrictEq; break;
+                case Op::StrictNe: c = OpIStrictNe; break;
+                default: break;
+            }
+            if (c != OpCount) {
+                emit(c, {d, a, static_cast<uint32_t>(static_cast<int32_t>(b->number)), static_cast<uint32_t>(op)});
+                return;
+            }
+        }
+        const uint32_t r = value(b);
+        emitBin(d, a, r, op);
+    }
+
     void emitBin(uint32_t d, uint32_t a, uint32_t b, Op op) {
         Opc c = OpBin;
         switch (op) {
@@ -1610,8 +1759,7 @@ private:
                     emit(OpAddInPlace, {l->reg, r});
                 } else {
                     const uint32_t old = copyOf(l->reg);
-                    const uint32_t r = value(n->b);
-                    emitBin(l->reg, old, r, n->op);
+                    binWith(l->reg, old, n->b, n->op);
                 }
                 if (dst != l->reg) emit(OpMov, {dst, l->reg});
                 return;
@@ -1632,8 +1780,7 @@ private:
                 patchHere(skip);
                 return;
             }
-            const uint32_t r = value(n->b);
-            emitBin(dst, dst, r, n->op);
+            binWith(dst, dst, n->b, n->op);
             storeName(t, dst);
             return;
         }
@@ -1652,8 +1799,7 @@ private:
             skip = logicalSkip(n->op, dst);
             expr(n->b, dst);
         } else {
-            const uint32_t r = value(n->b);
-            emitBin(dst, dst, r, n->op);
+            binWith(dst, dst, n->b, n->op);
         }
         if (k != kNone) emit(OpSetElem, {o, k, dst});
         else emit(OpSetNamed, {o, node(t), dst});
@@ -2635,6 +2781,40 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                         break;
                     }
 
+#define XWEB_IMM(OPC, OPER, COND, FAST)                                                  \
+                    case OPC: {                                                          \
+                        const Value& a = r[o[2]];                                        \
+                        const int32_t yi = static_cast<int32_t>(o[3]);                   \
+                        if (a.isNumber() COND) {                                         \
+                            const double x = a.asNumber();                               \
+                            const double y = static_cast<double>(yi);                    \
+                            (void)y;                                                     \
+                            FAST;                                                        \
+                        } else {                                                         \
+                            r[o[1]] = binaryOp(OPER, a, Value::number(static_cast<double>(yi))); \
+                        }                                                                \
+                        pc += 5;                                                         \
+                        break;                                                           \
+                    }
+                    XWEB_IMM(OpIAdd, Op::Add, , r[o[1]].setNumber(x + y))
+                    XWEB_IMM(OpISub, Op::Sub, , r[o[1]].setNumber(x - y))
+                    XWEB_IMM(OpIBitAnd, Op::BitAnd, && int32Exact(a.asNumber()), r[o[1]].setNumber(static_cast<double>(toI32(x) & yi)))
+                    XWEB_IMM(OpIBitOr, Op::BitOr, && int32Exact(a.asNumber()), r[o[1]].setNumber(static_cast<double>(toI32(x) | yi)))
+                    XWEB_IMM(OpIBitXor, Op::BitXor, && int32Exact(a.asNumber()), r[o[1]].setNumber(static_cast<double>(toI32(x) ^ yi)))
+                    XWEB_IMM(OpIShl, Op::Shl, && int32Exact(a.asNumber()),
+                             r[o[1]].setNumber(static_cast<double>(static_cast<int32_t>(static_cast<uint32_t>(toI32(x)) << (static_cast<uint32_t>(yi) & 31)))))
+                    XWEB_IMM(OpIShr, Op::Shr, && int32Exact(a.asNumber()), r[o[1]].setNumber(static_cast<double>(toI32(x) >> (static_cast<uint32_t>(yi) & 31))))
+                    XWEB_IMM(OpIUShr, Op::UShr, && int32Exact(a.asNumber()),
+                             r[o[1]].setNumber(static_cast<double>(static_cast<uint32_t>(toI32(x)) >> (static_cast<uint32_t>(yi) & 31))))
+                    XWEB_IMM(OpILt, Op::Lt, , r[o[1]].setBoolean(x < y))
+                    XWEB_IMM(OpIGt, Op::Gt, , r[o[1]].setBoolean(x > y))
+                    XWEB_IMM(OpILe, Op::Le, , r[o[1]].setBoolean(x <= y))
+                    XWEB_IMM(OpIGe, Op::Ge, , r[o[1]].setBoolean(x >= y))
+#undef XWEB_IMM
+                    // Strict equality with a number: only a number can be.
+                    case OpIStrictEq: r[o[1]].setBoolean(r[o[2]].isNumber() && r[o[2]].asNumber() == static_cast<double>(static_cast<int32_t>(o[3]))); pc += 5; break;
+                    case OpIStrictNe: r[o[1]].setBoolean(!(r[o[2]].isNumber() && r[o[2]].asNumber() == static_cast<double>(static_cast<int32_t>(o[3])))); pc += 5; break;
+
                     case OpNot: r[o[1]].setBoolean(!rt_.toBoolean(r[o[2]])); pc += 3; break;
                     case OpNeg: case OpBitNot: {
                         Value v = r[o[2]];
@@ -2730,6 +2910,59 @@ Value Interpreter::runVm(Object* f, VmCode& code, const Value& this_in, std::spa
                     case OpJumpIfTrue: pc = rt_.toBoolean(r[o[1]]) ? o[2] : pc + 3; break;
                     case OpJumpIfFalse: pc = rt_.toBoolean(r[o[1]]) ? pc + 3 : o[2]; break;
                     case OpJumpIfNullish: pc = r[o[1]].isNullish() ? o[2] : pc + 3; break;
+                    case OpJumpIfNotNullish: pc = r[o[1]].isNullish() ? pc + 3 : o[2]; break;
+                    case OpJumpIfNull: pc = r[o[1]].isNull() ? o[2] : pc + 3; break;
+                    case OpJumpIfNotNull: pc = r[o[1]].isNull() ? pc + 3 : o[2]; break;
+                    case OpReturnUndef: result = Value::undefined(); goto done;
+#define XWEB_JCMP(NAME, OPER, B, CMP, SLOW)                                               \
+                    case OpJ##NAME##T: case OpJ##NAME##F: {                              \
+                        const Value& a = r[o[1]];                                        \
+                        const Value& bv = B;                                             \
+                        bool t;                                                          \
+                        if (a.isNumber() && bv.isNumber()) t = a.asNumber() CMP bv.asNumber(); \
+                        else t = SLOW;                                                   \
+                        pc = t == (o[0] == OpJ##NAME##T) ? o[3] : pc + 4;                \
+                        break;                                                           \
+                    }
+                    XWEB_JCMP(RLt, Op::Lt, r[o[2]], <, rt_.toBoolean(binaryOp(Op::Lt, a, bv)))
+                    XWEB_JCMP(RLe, Op::Le, r[o[2]], <=, rt_.toBoolean(binaryOp(Op::Le, a, bv)))
+                    XWEB_JCMP(RGt, Op::Gt, r[o[2]], >, rt_.toBoolean(binaryOp(Op::Gt, a, bv)))
+                    XWEB_JCMP(RGe, Op::Ge, r[o[2]], >=, rt_.toBoolean(binaryOp(Op::Ge, a, bv)))
+#undef XWEB_JCMP
+                    case OpJRStrictEqT: case OpJRStrictEqF: {
+                        const Value& a = r[o[1]];
+                        const Value& b = r[o[2]];
+                        bool t;
+                        if (a.isNumber() && b.isNumber()) t = a.asNumber() == b.asNumber();
+                        else if (a.type() != b.type()) t = false;
+                        else if (a.isObject()) t = a.asObject() == b.asObject();
+                        else if (a.isString()) t = a.sameString(b) || a.asString() == b.asString();
+                        else t = rt_.toBoolean(binaryOp(Op::StrictEq, a, b));
+                        pc = t == (o[0] == OpJRStrictEqT) ? o[3] : pc + 4;
+                        break;
+                    }
+                    case OpJIStrictEqT: case OpJIStrictEqF: {
+                        const Value& a = r[o[1]];
+                        const bool t = a.isNumber() && a.asNumber() == static_cast<double>(static_cast<int32_t>(o[2]));
+                        pc = t == (o[0] == OpJIStrictEqT) ? o[3] : pc + 4;
+                        break;
+                    }
+#define XWEB_JIMM(NAME, OPER, CMP)                                                       \
+                    case OpJI##NAME##T: case OpJI##NAME##F: {                            \
+                        const Value& a = r[o[1]];                                        \
+                        const double y = static_cast<double>(static_cast<int32_t>(o[2])); \
+                        bool t;                                                          \
+                        if (a.isNumber()) t = a.asNumber() CMP y;                        \
+                        else t = rt_.toBoolean(binaryOp(OPER, a, Value::number(y)));     \
+                        pc = t == (o[0] == OpJI##NAME##T) ? o[3] : pc + 4;               \
+                        break;                                                           \
+                    }
+                    XWEB_JIMM(Lt, Op::Lt, <)
+                    XWEB_JIMM(Le, Op::Le, <=)
+                    XWEB_JIMM(Gt, Op::Gt, >)
+                    XWEB_JIMM(Ge, Op::Ge, >=)
+#undef XWEB_JIMM
+
                     case OpCall: {
                         Node* call = nodes[o[6]];
                         here(call);
