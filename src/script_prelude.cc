@@ -1613,6 +1613,20 @@ const char* const kScriptPrelude = R"JS(
     for (const C of [DOMPointReadOnly, DOMPoint, DOMMatrixReadOnly, DOMMatrix])
       Object.defineProperty(global, C.name, { value: C, writable: true, configurable: true });
     Object.defineProperty(global, 'WebKitCSSMatrix', { value: DOMMatrix, writable: true, configurable: true });
+    // An <svg>'s own makers of geometry: Modernizr's SVG test is that createSVGRect is there
+    // (python.org's icons hide behind its .no-svg).
+    if (global.SVGSVGElement && global.SVGSVGElement.prototype) {
+      const proto = global.SVGSVGElement.prototype;
+      const methods = {
+        createSVGRect() { return typeof DOMRect === 'function' ? new DOMRect(0, 0, 0, 0) : { x: 0, y: 0, width: 0, height: 0 }; },
+        createSVGPoint() { return new DOMPoint(0, 0); },
+        createSVGMatrix() { return new DOMMatrix(); },
+        createSVGNumber() { return { value: 0 }; },
+        createSVGTransform() { return { type: 1, matrix: new DOMMatrix(), angle: 0, setMatrix(m) { this.matrix = new DOMMatrix([m.a, m.b, m.c, m.d, m.e, m.f]); } }; },
+      };
+      for (const [k, f] of Object.entries(methods))
+        if (!(k in proto)) Object.defineProperty(proto, k, { value: f, writable: true, configurable: true });
+    }
   }
 
   // DOMTokenLists over attributes other than class: iframe.sandbox, relList (MDN's live

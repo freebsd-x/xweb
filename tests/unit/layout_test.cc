@@ -742,6 +742,15 @@ TEST(Positioned, ATransformedBoxStaysInItsContainingBlocksClip) {
     EXPECT_LT(transform, rect);
 }
 
+TEST(Float, AShrinkToFitBoxHoldsItsInlinesAndARightFloatSideBySide) {
+    // python.org's header: a floated box with a padded link (and its margin) and a
+    // right float: as wide as all of it, the float on the link's line, not under it.
+    const auto r = layout("<div id=c style=float:left><a id=a style='padding:0 12px;margin-right:8px'>ab</a>"
+                          "<div id=f style='float:right;width:100px;height:10px'></div></div>");
+    EXPECT_FLOAT_EQ(r.box("f").y, 0);
+    EXPECT_FLOAT_EQ(r.box("c").w, r.box("a").w + 8 + 100);
+}
+
 TEST(Float, AClearfixAfterAFloatKeepsItsWidth) {
     // fmkorea.com's headings: a floated link, then h1::after { display: block; clear: both }.
     const auto r = layout("<style>.c:after{content:'';display:block;clear:both}</style>"

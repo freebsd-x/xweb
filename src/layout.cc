@@ -1435,9 +1435,19 @@ private:
             }
             result = max_content ? result : std::max(result, floats);
             if (max_content) {
-                float text = 0;
-                for (const auto& f : b.fragments) text = std::max(text, f.w);
-                result = std::max(result, text + floats);
+                // The inline content's whole span beside the floats, not its widest piece: a
+                // link with its padding and margin beside a floated search bar (python.org's
+                // Donate) left the bar too little room, and it went below.
+                // (How far the lines reach has the left floats they're beside in it already,
+                // and an inline's padding and margins: the right floats go on after.)
+                float right_floats = 0;
+                for (const FloatArea& f : scratch.floats)
+                    if (!f.left) right_floats += f.w;
+                float reach = 0;
+                for (const auto& f : b.fragments)
+                    if (f.x + f.w < kUnbounded / 2) reach = std::max(reach, f.x + f.w);
+                if (b.inline_extent < kUnbounded / 2) reach = std::max(reach, b.inline_extent);
+                result = std::max({result, reach + right_floats, floats});   // (floats alone: all of them side by side)
             }
             b.width = saved;
         } else {
