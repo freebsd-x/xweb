@@ -4660,12 +4660,12 @@ private:
                 positioned_.push_back(std::move(later));
             }
         }
-        // An inline-block (or -flex, -grid) positioned relatively likewise: z-index auto
+        // An inline-block (or -flex, -grid, or a picture) positioned relatively likewise: z-index auto
         // too, as positioned boxes paint after their context's flow, in tree order
         // (news.naver.com's header icons went under an absolute ::before painting the
         // header's colour, which comes earlier in the tree).
         const auto lifted_atomic = [&](const Box::Fragment& f) {
-            return !b.deferred_inline && f.atomic && f.atomic->node != b.node && f.atomic->kind != BoxKind::Replaced && f.atomic->style &&
+            return !b.deferred_inline && f.atomic && f.atomic->node != b.node && f.atomic->style &&
                    f.atomic->style->position == Position::Relative && f.atomic->style->z_index >= 0 && transforms_.empty();
         };
         for (const auto& f : b.fragments) {
@@ -5011,7 +5011,10 @@ private:
         shift(b, x, y);
         const bool transformed = beginTransform(b, x, y);
         record(b, x, y);
-        paintContents(b, x, y, cb, opacity);
+        // A picture (an <img> positioned relatively, lifted to take its z-index's turn:
+        // yes24.com's top banner went under its z-index:1 ::before, which it's z-index:5 over).
+        if (b.kind == BoxKind::Replaced) paintReplaced(b, x, y, opacity * s.opacity);
+        else paintContents(b, x, y, cb, opacity);
         if (transformed) endTransform();
     }
 
@@ -5183,21 +5186,23 @@ private:
                 if (!s.offset[Top].is_auto) y = cb.y + s.offset[Top].resolve(cb.h) + k.margin[Top];
                 else if (!s.offset[Bottom].is_auto) y = cb.y + cb.h - s.offset[Bottom].resolve(cb.h) - k.outerHeight() - k.margin[Bottom];
                 shift(k, x, y);
-                const bool transformed = beginTransform(k, x, y);
-                record(k, x, y);
-                // Inside the clips it was inside, as far as its containing block.
+                // Inside the clips it was inside, as far as its containing block, and its own
+                // transform inside those: the clips aren't turned with it (a rotated ::after
+                // in an overflow: hidden banner, yes24.com's, showed below the banner).
                 const ClipsOpened opened = openClips(p.clips);
                 const std::vector<Rect> saved = std::move(clip_stack_);
                 clip_stack_ = p.clips;
                 const size_t saved_depth = cb_clip_depth_;
                 cb_clip_depth_ = clip_stack_.size();
+                const bool transformed = beginTransform(k, x, y);
+                record(k, x, y);
                 paintContents(k, x, y, cb, p.opacity);
+                if (transformed) endTransform();
                 ended();
                 flushOwn();
                 clip_stack_ = saved;
                 cb_clip_depth_ = saved_depth;
                 closeClips(p.clips, opened);
-                if (transformed) endTransform();
                 if (below) {
                     below_content_.push_back({p.ctx_ops, p.ctx_boxes, below_content_.size(), std::move(out_->ops), std::move(out_->boxes)});
                     out_->ops = std::move(main_ops);

@@ -183,6 +183,7 @@ struct Shape {
 class Renderer {
 public:
     const SvgUseResolver* external_ = nullptr;
+    const SvgImageResolver* images_ = nullptr;
     Renderer(const Node& root, Canvas& canvas, const StyledDocument* styles) : canvas_(canvas), styles_(styles) {
         const Node* top = &root;
         while (top->parent) top = top->parent;
@@ -194,6 +195,35 @@ public:
                 if (const std::string* id = n->attr("id")) ids_.emplace(*id, n);
             todo.insert(todo.end(), n->children.rbegin(), n->children.rend());
         }
+    }
+
+    // A picture: a bitmap or another SVG file, which the embedder has fetched (images_),
+    // in its box (x, y, width, height; its own size where they're not given) as
+    // preserveAspectRatio places it.
+    void drawImage(const Node* n, const State& s, Canvas& into, float opacity) {
+        const std::string* href = hrefOf(n);
+        if (!href || href->empty() || !images_ || !*images_) return;
+        const float x = lengthAttr(n, "x", s.vp_w).value_or(0), y = lengthAttr(n, "y", s.vp_h).value_or(0);
+        std::optional<float> w = lengthAttr(n, "width", s.vp_w), h = lengthAttr(n, "height", s.vp_h);
+        if ((w && *w <= 0) || (h && *h <= 0)) return;
+        const float scale = s.m.scale();
+        const auto device = [scale](std::optional<float> v) {
+            return v ? static_cast<uint32_t>(std::clamp(std::ceil(*v * scale), 1.0f, 4096.0f)) : 0u;
+        };
+        std::shared_ptr<const Raster> pixels = (*images_)(*href, w && h ? device(w) : 0, w && h ? device(h) : 0);
+        if (!pixels || pixels->empty()) return;
+        const float rw = static_cast<float>(pixels->width), rh = static_cast<float>(pixels->height);
+        // Its own size where none is given (in its pixels, as the page's CSS pixels).
+        if (!w && !h) {
+            w = rw / std::max(scale, 1e-6f);
+            h = rh / std::max(scale, 1e-6f);
+        } else if (!w) {
+            w = *h * rw / rh;
+        } else if (!h) {
+            h = *w * rh / rw;
+        }
+        const Matrix place = viewBoxTransform(n, ViewBox{0, 0, rw, rh}, *w, *h);
+        into.drawRaster(*pixels, s.m.after(Matrix::translate(x, y)).after(place), opacity);
     }
 
     void drawRoot(const Node& svg, float width, float height, Color color, const SvgSize* natural) {
@@ -290,8 +320,7 @@ private:
         const std::string& name = n->name;
         if (name == "defs" || name == "symbol" || name == "clipPath" || name == "mask" || name == "linearGradient" ||
             name == "radialGradient" || name == "pattern" || name == "marker" || name == "style" || name == "script" ||
-            name == "title" || name == "desc" || name == "metadata" || name == "filter" || name == "foreignObject" || name == "text" ||
-            name == "image")
+            name == "title" || name == "desc" || name == "metadata" || name == "filter" || name == "foreignObject" || name == "text")
             return;
         if (!displayed(n)) return;
         State s = parent;
@@ -354,6 +383,10 @@ private:
                 s.vp_h = vb->h;
             }
             children(n, s, depth, into);
+            return;
+        }
+        if (name == "image") {
+            drawImage(n, s, into, opacity);
             return;
         }
         if (name == "use") {
@@ -728,13 +761,14 @@ const Node* findSvgRoot(const Document& doc) {
 }
 
 Raster renderSvg(const Node& svg, uint32_t width, uint32_t height, const StyledDocument* styles, Color color, const SvgSize* natural,
-                 const SvgUseResolver* external) {
+                 const SvgUseResolver* external, const SvgImageResolver* images) {
     if (width == 0 || height == 0 || width > kMaxRasterSide || height > kMaxRasterSide ||
         static_cast<uint64_t>(width) * height > kMaxRasterPixels)
         return {};
     Canvas canvas(width, height);
     Renderer r(svg, canvas, styles);
     r.external_ = external;
+    r.images_ = images;
     r.drawRoot(svg, static_cast<float>(width), static_cast<float>(height), color, natural);
     return canvas.toRaster();
 }

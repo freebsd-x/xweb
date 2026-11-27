@@ -319,6 +319,36 @@ TEST(Svg, UseOfAnotherFileThroughTheResolver) {
     EXPECT_EQ(at(r, 5, 5).g, 128);
 }
 
+TEST(Svg, ImageThroughTheResolver) {
+    // yes24.com's logo: <svg><image xlink:href="logo.svg" width height/></svg>. Nothing
+    // until the embedder has it; then its pixels in the box, its shape kept (meet: a 2:1
+    // picture in a 20 by 20 box is 20 by 10, in the middle).
+    const auto doc = parseHtml("<svg viewBox='0 0 20 20' width='20' height='20'><image xlink:href='/a.png' x='0' y='0' width='20' height='20'/></svg>");
+    const Node& svg = *doc->body()->children[0];
+    std::string asked;
+    const SvgImageResolver none = [&](const std::string& href, uint32_t, uint32_t) -> std::shared_ptr<const Raster> {
+        asked = href;
+        return nullptr;
+    };
+    EXPECT_EQ(at(renderSvg(svg, 20, 20, nullptr, {}, nullptr, nullptr, &none), 10, 10).a, 0);
+    EXPECT_EQ(asked, "/a.png");
+    auto red = std::make_shared<Raster>();
+    red->width = 4;
+    red->height = 2;
+    for (int i = 0; i < 8; ++i) red->rgba.insert(red->rgba.end(), {200, 0, 0, 255});
+    const SvgImageResolver here = [&](const std::string& href, uint32_t, uint32_t) -> std::shared_ptr<const Raster> {
+        return href == "/a.png" ? red : nullptr;
+    };
+    const Raster r = renderSvg(svg, 20, 20, nullptr, {}, nullptr, nullptr, &here);
+    EXPECT_EQ(at(r, 10, 10).r, 200);
+    EXPECT_EQ(at(r, 10, 10).a, 255);
+    EXPECT_EQ(at(r, 10, 2).a, 0);    // above it: the box's top quarter is empty
+    EXPECT_EQ(at(r, 10, 17).a, 0);   // and below
+    // preserveAspectRatio none: stretched over the whole box.
+    const auto doc2 = parseHtml("<svg viewBox='0 0 20 20' width='20' height='20'><image href='/a.png' width='20' height='20' preserveAspectRatio='none'/></svg>");
+    EXPECT_EQ(at(renderSvg(*doc2->body()->children[0], 20, 20, nullptr, {}, nullptr, nullptr, &here), 10, 2).r, 200);
+}
+
 TEST(Svg, StyleSheetInsideTheFile) {
     const Raster r = svgOf("<svg width='10' height='10'><style>.x{fill:#0f0}</style><rect class='x' width='10' height='10' fill='red'/></svg>", 10, 10);
     EXPECT_EQ(at(r, 5, 5).g, 255);

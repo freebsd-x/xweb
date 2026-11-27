@@ -188,8 +188,13 @@ struct SvgSize {
 // What a <use> pointing into another file (href="sprite.svg#icon") draws: the element,
 // once that file is here (the embedder fetches and keeps it), else nothing.
 using SvgUseResolver = std::function<const Node*(const std::string& href)>;
+// What an <image href="..."> draws: its pixels for about `width` by `height` pixels on the
+// canvas (an SVG file drawn near that size, its own shape kept; 0 by 0: its own size), or
+// null while it isn't here.
+using SvgImageResolver = std::function<std::shared_ptr<const Raster>(const std::string& href, uint32_t width, uint32_t height)>;
 [[nodiscard]] Raster renderSvg(const Node& svg, uint32_t width, uint32_t height, const StyledDocument* styles, Color color,
-                               const SvgSize* natural = nullptr, const SvgUseResolver* external = nullptr);
+                               const SvgSize* natural = nullptr, const SvgUseResolver* external = nullptr,
+                               const SvgImageResolver* images = nullptr);
 
 // The first <svg> in a parsed SVG file.
 [[nodiscard]] const Node* findSvgRoot(const Document& doc);

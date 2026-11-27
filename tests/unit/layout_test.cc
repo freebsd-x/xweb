@@ -697,6 +697,51 @@ TEST(Positioned, NegativeZIndexInANestedMovedList) {
     }
 }
 
+TEST(Positioned, APictureTakesItsZIndexsTurn) {
+    // yes24.com's top banner: <a><img style='position:relative;z-index:5'></a> with an
+    // absolute a::before at z-index 1 painting the banner's colour. The picture is over it.
+    const auto r = layout("<style>a:before{content:'';position:absolute;left:0;top:0;width:300px;height:50px;background:#0f0;z-index:1}"
+                          "img{position:relative;z-index:5}</style><div style=position:relative><a><img src=wide.png></a></div>");
+    int green = -1, picture = -1;
+    for (size_t i = 0; i < r.page.ops.size(); ++i) {
+        const auto& op = r.page.ops[i];
+        if (op.kind == PaintKind::Rect && op.color.g == 255 && op.color.r == 0) green = static_cast<int>(i);
+        if (op.kind == PaintKind::Image && op.text == "wide.png") picture = static_cast<int>(i);
+    }
+    ASSERT_GE(green, 0);
+    ASSERT_GE(picture, 0);
+    EXPECT_LT(green, picture);
+    // And one with a lower z-index than the ::before still goes under it.
+    const auto under = layout("<style>a:before{content:'';position:absolute;left:0;top:0;width:300px;height:50px;background:#0f0;z-index:9}"
+                              "img{position:relative;z-index:5}</style><div style=position:relative><a><img src=wide.png></a></div>");
+    green = picture = -1;
+    for (size_t i = 0; i < under.page.ops.size(); ++i) {
+        const auto& op = under.page.ops[i];
+        if (op.kind == PaintKind::Rect && op.color.g == 255 && op.color.r == 0) green = static_cast<int>(i);
+        if (op.kind == PaintKind::Image && op.text == "wide.png") picture = static_cast<int>(i);
+    }
+    ASSERT_GE(green, 0);
+    ASSERT_GE(picture, 0);
+    EXPECT_GT(green, picture);
+}
+
+TEST(Positioned, ATransformedBoxStaysInItsContainingBlocksClip) {
+    // The clip opens outside the box's transform: it isn't turned with it.
+    const auto r = layout("<div style='position:relative;height:50px;overflow:hidden'>"
+                          "<span style='position:absolute;width:100px;height:100px;background:#00f;transform:rotate(10deg)'></span></div>");
+    int clip = -1, transform = -1, rect = -1;
+    for (size_t i = 0; i < r.page.ops.size(); ++i) {
+        const auto& op = r.page.ops[i];
+        if (op.kind == PaintKind::ClipBegin && clip < 0) clip = static_cast<int>(i);
+        if (op.kind == PaintKind::TransformBegin) transform = static_cast<int>(i);
+        if (op.kind == PaintKind::Rect && op.color.b == 255 && op.color.r == 0) rect = static_cast<int>(i);
+    }
+    ASSERT_GE(clip, 0);
+    ASSERT_GE(transform, 0);
+    EXPECT_LT(clip, transform);
+    EXPECT_LT(transform, rect);
+}
+
 TEST(Float, AClearfixAfterAFloatKeepsItsWidth) {
     // fmkorea.com's headings: a floated link, then h1::after { display: block; clear: both }.
     const auto r = layout("<style>.c:after{content:'';display:block;clear:both}</style>"

@@ -2050,6 +2050,20 @@ private:
                 mix(a.name);
                 mix(a.value);
             }
+            // A picture in it (<image href>, yes24.com's logo): fetched as any image is, and
+            // drawn again once it's here.
+            if (n->name == "image" && n->ns == web::Namespace::Svg && page_) {
+                const std::string* href = n->attr("href");
+                if (!href) href = n->attr("xlink:href");
+                if (href && !href->empty() && (*href)[0] != '#') {
+                    const LoadedImage* img = images_.find(*href);
+                    mix(img ? "here" : "coming");
+                    if (!img && on_images_) {
+                        std::string url = web::resolveUrl(page_->base, *href);
+                        if (!page_->requested.count(url)) on_images_(page_, {std::move(url)});
+                    }
+                }
+            }
             if (n->name == "use") {
                 uses = true;
                 // One pointing into another file (namu.wiki's icons: <use href="fa.svg#icon">):
@@ -2079,8 +2093,29 @@ private:
             const LoadedImage* doc = images_.find(href.substr(0, hash_at));
             return doc && doc->svg ? doc->svg->elementById(std::string_view(href).substr(hash_at + 1)) : nullptr;
         };
+        const web::SvgImageResolver pictures = [this](const std::string& href, uint32_t w, uint32_t h) -> std::shared_ptr<const web::Raster> {
+            const LoadedImage* img = images_.find(href);
+            if (!img) return nullptr;
+            if (img->svg) {
+                // Its own shape kept, near the size it's drawn at.
+                const web::SvgSize& size = img->svg->size();
+                float nw = size.width.value_or(0), nh = size.height.value_or(0);
+                if ((nw <= 0 || nh <= 0) && size.ratio > 0) nw = 300, nh = 300 / size.ratio;
+                if (nw <= 0 || nh <= 0) nw = 300, nh = 150;
+                if (w && h) {
+                    const float k = std::max(static_cast<float>(w) / nw, static_cast<float>(h) / nh);
+                    nw *= k;
+                    nh *= k;
+                }
+                const auto px = [](float v) { return static_cast<uint32_t>(std::clamp(std::ceil(v), 1.0f, 4096.0f)); };
+                auto r = std::make_shared<web::Raster>(img->svg->render(px(nw), px(nh)));
+                return r->empty() ? nullptr : r;
+            }
+            if (img->width == 0 || img->height == 0 || img->pixels.empty()) return nullptr;
+            return std::make_shared<web::Raster>(web::Raster{img->width, img->height, img->pixels});
+        };
         if (const CachedRaster* r = cached(key, [&, pw = pw, ph = ph] {
-                return web::renderSvg(*node, pw, ph, styles, color, nullptr, &external);
+                return web::renderSvg(*node, pw, ph, styles, color, nullptr, &external, &pictures);
             }))
             drawRaster(dl, *r, x, y, op.w, op.h, op.opacity);
     }
