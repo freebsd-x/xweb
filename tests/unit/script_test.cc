@@ -429,6 +429,27 @@ TEST(Script, CryptoAndIntl) {
         EXPECT_NE(p.console.find(want), std::string::npos) << want << "\n" << p.console;
 }
 
+TEST(Script, IntlInKoreanWhenAskedFor) {
+    // A Korean page's own dates, as Chrome writes them (yna.co.kr's "2026.11.28 (토)" came
+    // out "(Sat)"). The expected strings are Node's (the same ICU data as Chrome).
+    Page p(R"(<body><script>
+const d = Date.UTC(2026, 10, 8, 15, 4, 5), z = {timeZone: 'UTC'};
+const f = o => new Intl.DateTimeFormat('ko-KR', {...z, ...o}).format(d);
+const out = [new Date(d).toLocaleDateString('ko-KR', z), f({weekday: 'short'}), f({year: 'numeric', month: 'long', day: 'numeric', weekday: 'long'}),
+  f({year: 'numeric', month: 'numeric', day: 'numeric', weekday: 'short'}), f({month: 'long', day: 'numeric'}), f({year: 'numeric', month: 'numeric'}),
+  f({month: 'numeric', day: 'numeric'}), new Date(d).toLocaleTimeString('ko-KR', z), new Date(d).toLocaleString('ko-KR', z), f({hour: 'numeric', minute: '2-digit'}),
+  f({hour: 'numeric', minute: '2-digit', hour12: false}), f({dateStyle: 'medium'}), f({dateStyle: 'full'}), f({dateStyle: 'short'}), f({year: 'numeric', month: '2-digit', day: '2-digit'}),
+  f({month: 'short'}), f({year: 'numeric'}), f({hour: 'numeric'}), f({timeStyle: 'short'})];
+const rtf = new Intl.RelativeTimeFormat('ko', {numeric: 'auto'}), rt2 = new Intl.RelativeTimeFormat('ko');
+out.push(rtf.format(-1, 'day'), rt2.format(-3, 'hour'), rt2.format(2, 'month'), rtf.format(0, 'year'), new Intl.DateTimeFormat('ko').resolvedOptions().locale);
+console.log(out.join(' | '));
+        </script>)");
+    const std::string want = "log:2026. 11. 8. | 일 | 2026년 11월 8일 일요일 | 2026. 11. 8. (일) | 11월 8일 | 2026. 11. | 11. 8. | 오후 3:04:05 | "
+                             "2026. 11. 8. 오후 3:04:05 | 오후 3:04 | 15:04 | 2026. 11. 8. | 2026년 11월 8일 일요일 | 26. 11. 8. | 2026. 11. 08. | 11월 | "
+                             "2026년 | 오후 3시 | 오후 3:04 | 어제 | 3시간 전 | 2개월 후 | 올해 | ko\n";
+    EXPECT_NE(p.console.find(want), std::string::npos) << want << "\n" << p.console;
+}
+
 TEST(Script, CrossOriginRequestsFollowCors) {
     Page p(R"(<body><script>
         const log = (...a) => console.log(...a);

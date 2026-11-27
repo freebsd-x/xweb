@@ -2023,8 +2023,64 @@ const char* const kScriptPrelude = R"JS(
       const h = Math.trunc(Math.abs(info.offset) / 60), m = Math.abs(info.offset) % 60;
       return 'GMT' + (info.offset < 0 ? '-' : '+') + h + (m ? ':' + pad2(m) : '');
     };
+    // Korean, when it's asked for (a Korean page's own dates: yna.co.kr's "2026.11.28 (토)"),
+    // as Chrome writes them; anything else in English.
+    const korean = locales => { const first = [].concat(locales === undefined || locales === null ? [] : locales)[0]; return first !== undefined && /^ko(?:[-_]|$)/i.test(String(first)); };
+    const koDays = ['일', '월', '화', '수', '목', '금', '토'];
+    const koParts = (f, o) => {
+      const parts = [];
+      const add = (type, value) => parts.push({ type, value: String(value) });
+      const lit = value => parts.push({ type: 'literal', value });
+      const weekday = o.weekday ? (o.weekday === 'long' ? koDays[f.w] + '요일' : koDays[f.w]) : null;
+      const textMonth = o.month === 'long' || o.month === 'short' || o.month === 'narrow';
+      const yv = o.year === '2-digit' ? pad2(f.y % 100) : f.y, mv = o.month === '2-digit' ? pad2(f.m + 1) : f.m + 1, dv = o.day === '2-digit' ? pad2(f.d) : f.d;
+      const dated = o.year || o.month || o.day;
+      if (textMonth || (dated && !(o.month && (o.year || o.day)))) {
+        // 2026년 11월 28일 토요일: each with its word.
+        const bits = [];
+        if (o.year) bits.push(['year', yv, '년']);
+        if (o.month) bits.push(['month', textMonth ? f.m + 1 : mv, '월']);
+        if (o.day) bits.push(['day', dv, '일']);
+        bits.forEach(([t, v, word], i) => { if (i) lit(' '); add(t, v); lit(word); });
+        if (weekday) { if (parts.length) lit(' '); if (o.weekday === 'long' || !parts.length) add('weekday', weekday); else { lit('('); add('weekday', weekday); lit(')'); } }
+      } else if (dated) {
+        // 2026. 11. 28. (토)
+        const bits = [];
+        if (o.year) bits.push(['year', yv]);
+        if (o.month) bits.push(['month', mv]);
+        if (o.day) bits.push(['day', dv]);
+        bits.forEach(([t, v], i) => { if (i) lit(' '); add(t, v); lit('.'); });
+        if (weekday) { lit(' '); if (o.weekday === 'long') add('weekday', weekday); else { lit('('); add('weekday', weekday); lit(')'); } }
+      } else if (weekday) {
+        add('weekday', weekday);
+      }
+      if (o.hour || o.minute || o.second) {
+        const h12 = o.hour12 !== undefined ? o.hour12 !== false : o.hourCycle ? o.hourCycle === 'h12' || o.hourCycle === 'h11' : true;
+        if (parts.length) lit(' ');
+        if (h12 && o.hour) { add('dayPeriod', f.h < 12 ? '오전' : '오후'); lit(' '); }
+        const hv = h12 ? (f.h % 12 || 12) : f.h;
+        if (o.hour && !o.minute && !o.second) { add('hour', o.hour === '2-digit' ? pad2(hv) : hv); lit('시'); }
+        else {
+          const tbits = [];
+          if (o.hour) tbits.push(['hour', o.hour === '2-digit' || !h12 ? pad2(hv) : hv]);
+          if (o.minute) tbits.push(['minute', pad2(f.mi)]);
+          if (o.second) tbits.push(['second', pad2(f.s)]);
+          tbits.forEach(([t, v], i) => { if (i) lit(':'); add(t, v); });
+        }
+      }
+      if (o.timeZoneName) { lit(' '); add('timeZoneName', zoneName(f.zone) || 'GMT+9'); }
+      return parts;
+    };
     class DateTimeFormat {
       constructor(locales, o = {}) {
+        this._ko = korean(locales);
+        if (this._ko) this._locale = String([].concat(locales)[0]).replace('_', '-');
+        if (this._ko && o.dateStyle) {
+          // Korean's medium and short are numbers: 2026. 11. 28. and 26. 11. 28.
+          const st = { full: { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }, long: { year: 'numeric', month: 'long', day: 'numeric' },
+                       medium: { year: 'numeric', month: 'numeric', day: 'numeric' }, short: { year: '2-digit', month: 'numeric', day: 'numeric' } }[o.dateStyle];
+          if (st) { o = { ...o, ...st }; delete o.dateStyle; }
+        }
         this._o = { ...o };
         this._utc = o.timeZone && /^(utc|gmt|etc\/utc)$/i.test(o.timeZone);
         const any = ['weekday', 'era', 'year', 'month', 'day', 'hour', 'minute', 'second', 'dateStyle', 'timeStyle'].some(k => o[k] !== undefined);
@@ -2045,6 +2101,7 @@ const char* const kScriptPrelude = R"JS(
                  s: u ? w.getUTCSeconds() : d.getSeconds(), date: d, zone };
       }
       formatToParts(date) {
+        if (this._ko) return koParts(this._fields(date), this._o);
         const f = this._fields(date), o = this._o, parts = [];
         const add = (type, value) => { if (parts.length) parts.push({ type: 'literal', value: type === 'dayPeriod' ? ' ' : parts[parts.length - 1].sep || ', ' }); parts.push({ type, value: String(value) }); };
         const textMonth = o.month === 'long' || o.month === 'short' || o.month === 'narrow';
@@ -2079,13 +2136,22 @@ const char* const kScriptPrelude = R"JS(
       }
       format(date) { return this.formatToParts(date).map(p => p.value).join(''); }
       formatRange(a, b) { return this.format(a) + ' – ' + this.format(b); }
-      resolvedOptions() { return { locale, calendar: 'gregory', numberingSystem: 'latn', timeZone: this._o.timeZone || (this._utc ? 'UTC' : 'UTC'), ...this._o }; }
+      resolvedOptions() { return { locale: this._ko ? this._locale : locale, calendar: 'gregory', numberingSystem: 'latn', timeZone: this._o.timeZone || (this._utc ? 'UTC' : 'UTC'), ...this._o }; }
       static supportedLocalesOf(l) { return [].concat(l || []).length ? [locale] : []; }
     }
     class RelativeTimeFormat {
-      constructor(locales, o = {}) { this._numeric = o.numeric || 'always'; this._style = o.style || 'long'; }
+      constructor(locales, o = {}) { this._numeric = o.numeric || 'always'; this._style = o.style || 'long'; this._ko = korean(locales); }
       format(v, unit) {
         v = Number(v); unit = String(unit).replace(/s$/, '');
+        if (this._ko) {
+          if (this._numeric === 'auto') {
+            const words = { day: { '-2': '그저께', '-1': '어제', '0': '오늘', '1': '내일', '2': '모레' }, year: { '-1': '작년', '0': '올해', '1': '내년' },
+                            month: { '-1': '지난달', '0': '이번 달', '1': '다음 달' }, week: { '-1': '지난주', '0': '이번 주', '1': '다음 주' }, second: { '0': '지금' } };
+            if (words[unit] && words[unit][String(v)] !== undefined) return words[unit][String(v)];
+          }
+          const word = { second: '초', minute: '분', hour: '시간', day: '일', week: '주', month: '개월', quarter: '분기', year: '년' }[unit] || unit;
+          return new NumberFormat().format(Math.abs(v)) + word + (v < 0 || Object.is(v, -0) ? ' 전' : ' 후');
+        }
         if (this._numeric === 'auto') {
           const words = { day: { '-1': 'yesterday', '0': 'today', '1': 'tomorrow' }, year: { '-1': 'last year', '0': 'this year', '1': 'next year' },
                           month: { '-1': 'last month', '0': 'this month', '1': 'next month' }, week: { '-1': 'last week', '0': 'this week', '1': 'next week' },
