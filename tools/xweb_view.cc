@@ -2714,6 +2714,20 @@ public:
 
     void setAddressField(std::shared_ptr<TextInputWidget> field) { address_ = std::move(field); }
 
+    // Started to carry on from another process ("xweb-handoff:<token>"): its history,
+    // and the page it was going to.
+    void takeOver(const std::string& token) {
+        XApplication::setTitle("Loading...");
+        fbx::xkit::takeBrowsing(token, [this](std::optional<std::string> state) {
+            if (!state || !restore(*state)) {
+                XApplication::setTitle("Web");
+                return;
+            }
+            keep_bounces_ = true;
+            navigate(history_[index_].url, Mode::History);
+        });
+    }
+
     void go(const std::string& typed) {
         const std::string url = normalize(typed);
         if (url.empty()) return;
@@ -2856,6 +2870,86 @@ private:
         return web::resolveUrl("https://" + typed, "");
     }
 
+    // ── One process per site ──────────────────────────────────────────────────────
+    // This process is the first site it went to: the compositor sends cookies for no
+    // other (fetch_broker.cc), so that a page's script that took this process over
+    // still can't read what another site shows its user. Going to another site starts
+    // a new process with our history, which takes this window; this one then ends.
+    static constexpr const char* kHandoffMagic = "xweb-handoff 1";
+    static constexpr int kMaxBounces = 3;   // sites redirecting to each other: stay put
+
+    [[nodiscard]] bool otherSite(const std::string& url) const {
+        if (site_url_.empty() || handing_off_ || std::getenv("XWEB_NO_HANDOFF") || !XApplication::getBus()) return false;
+        const web::Url u = web::parseUrl(url);
+        return (u.scheme == "http" || u.scheme == "https") && !web::sameSite(site_url_, url);
+    }
+
+    // "xweb-handoff 1\n<bounces>\n<index>\n" then "<scroll> <url>\n" an entry.
+    [[nodiscard]] std::string state(const std::vector<Entry>& history, size_t index, int bounces) const {
+        std::string out = std::string(kHandoffMagic) + "\n" + std::to_string(bounces) + "\n" + std::to_string(index) + "\n";
+        for (const Entry& e : history) out += std::to_string(static_cast<long>(e.scroll)) + " " + e.url + "\n";
+        return out;
+    }
+
+    bool restore(const std::string& text) {
+        std::vector<std::string> lines;
+        for (size_t at = 0; at < text.size();) {
+            size_t eol = text.find('\n', at);
+            if (eol == std::string::npos) eol = text.size();
+            lines.push_back(text.substr(at, eol - at));
+            at = eol + 1;
+        }
+        if (lines.size() < 4 || lines[0] != kHandoffMagic) return false;
+        std::vector<Entry> history;
+        for (size_t i = 3; i < lines.size() && history.size() < 1000; ++i) {
+            const size_t space = lines[i].find(' ');
+            if (space == std::string::npos) return false;
+            history.push_back({lines[i].substr(space + 1), static_cast<float>(std::atol(lines[i].c_str()))});
+        }
+        const size_t index = static_cast<size_t>(std::strtoul(lines[2].c_str(), nullptr, 10));
+        if (index >= history.size()) return false;
+        const web::Url u = web::parseUrl(history[index].url);
+        if (u.scheme != "http" && u.scheme != "https") return false;
+        bounces_ = std::atoi(lines[1].c_str());
+        history_ = std::move(history);
+        index_ = index;
+        return true;
+    }
+
+    // Going to `url` in a new process (for Mode::History it's history_[index_] already;
+    // `bounced`: a redirect took us there). If none can be started, here, as before,
+    // just without that site's cookies.
+    void handOff(const std::string& url, Mode mode, bool bounced) {
+        std::vector<Entry> history = history_;
+        size_t index = index_;
+        if (mode == Mode::New) {
+            if (index < history.size()) history[index].scroll = node_->scrollY();
+            if (index < history.size()) history.resize(index + 1), ++index;
+            else index = 0, history.clear();
+            history.push_back({url, 0});
+        }
+        handing_off_ = true;
+        showAddress(url);
+        XApplication::setTitle("Loading...");
+        const uint64_t mine = ++generation_;   // what this process was loading stops
+        const auto stay = [this, url, mode, mine] {
+            if (!handing_off_ || generation_.load() != mine) return;
+            handing_off_ = false;
+            bounces_ = kMaxBounces;   // and no more trying: it would only come back here
+            keep_bounces_ = true;
+            navigate(url, mode, std::nullopt, true);
+        };
+        fbx::xkit::handOffBrowsing(state(history, index, bounced ? bounces_ + 1 : 0), [stay](bool taken) {
+            if (taken) std::_Exit(0);   // the new process has the window now
+            stay();
+        });
+        // Nothing came of it (no shell to start it): carry on here.
+        std::thread([stay] {
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+            XApplication::post(stay);
+        }).detach();
+    }
+
     void pushHistory(const std::string& url) {
         if (index_ < history_.size()) {
             history_[index_].scroll = node_->scrollY();
@@ -2889,7 +2983,22 @@ private:
     }
 
     // A form's request is the next page.
-    void navigate(const std::string& url, Mode mode, std::optional<web::FormSubmission> post = std::nullopt) {
+    // `here`: in this process whatever the site (a new one couldn't be started).
+    void navigate(const std::string& url, Mode mode, std::optional<web::FormSubmission> post = std::nullopt, bool here = false) {
+        if (!here && !post && otherSite(url)) {
+            handOff(url, mode, false);
+            return;
+        }
+        if (keep_bounces_) keep_bounces_ = false;
+        else bounces_ = 0;   // somewhere the user went, not a redirect
+        if (site_url_.empty()) {
+            const web::Url u = web::parseUrl(url);
+            if (u.scheme == "http" || u.scheme == "https") site_url_ = url;
+        }
+        // Whether a redirect to another site goes on to a new process (decided now: the
+        // load runs on another thread).
+        const std::string site_url = site_url_;
+        const bool may_bounce = !site_url.empty() && bounces_ < kMaxBounces && !std::getenv("XWEB_NO_HANDOFF") && XApplication::getBus();
         if (mode == Mode::New) pushHistory(url);
         showAddress(url);
         XApplication::setTitle("Loading...");
@@ -2897,7 +3006,7 @@ private:
         web::js::forgetParsed();   // the last page's, never run
         load_started_ = std::chrono::steady_clock::now();
         const float restore = mode == Mode::History ? history_[index_].scroll : (mode == Mode::Reload ? node_->scrollY() : 0);
-        std::thread([this, url, mine, restore, post = std::move(post)] {
+        std::thread([this, url, mine, restore, post = std::move(post), site_url, may_bounce] {
             // XWEB_DEBUG_PERF: how long each step of the load took.
             static const bool perf = std::getenv("XWEB_DEBUG_PERF") != nullptr;
             const auto t0 = std::chrono::steady_clock::now();
@@ -2909,6 +3018,19 @@ private:
             Resource got = post ? loadPost(*post) : load(url, true);
             mark("page fetched");
             if (generation_.load() != mine) return;
+            // Sent on to another site: what it answered came without its cookies, so
+            // it's loaded again in a process of its own.
+            if (got.ok && !post && may_bounce && !got.final_url.empty() && !web::sameSite(site_url, got.final_url)) {
+                const web::Url f = web::parseUrl(got.final_url);
+                if (f.scheme == "http" || f.scheme == "https") {
+                    XApplication::post([this, mine, final_url = got.final_url] {
+                        if (generation_.load() != mine) return;
+                        if (index_ < history_.size()) history_[index_].url = final_url;
+                        handOff(final_url, Mode::History, true);
+                    });
+                    return;
+                }
+            }
             page->url = got.ok ? got.final_url : url;
             if (got.ok) page->charset = web::detectCharset(got.body, got.content_type);
             page->doc = web::parseHtml(htmlFor(got, url), web::ParseOptions{.scripting = true});
@@ -3356,6 +3478,10 @@ private:
     std::shared_ptr<TextInputWidget> address_;
     std::vector<Entry> history_;
     size_t index_ = 0;
+    std::string site_url_;            // the first page's: this process's site
+    bool handing_off_ = false;
+    int bounces_ = 0;                 // redirects to another site, process to process
+    bool keep_bounces_ = false;       // the next navigate() is the one handed over
     std::atomic<uint64_t> generation_{0};
     std::string pending_fragment_;
     bool relayout_wanted_ = false;
@@ -3885,7 +4011,8 @@ int webViewMain(int argc, char** argv) {
             for (const int weight : {100, 200, 300, 400, 500, 600, 700, 800, 900})
                 for (const FontStyle style : {FontStyle::Normal, FontStyle::Italic})
                     (void)FontManager::getFace(family, static_cast<FontWeight>(weight), style);
-        if (!start.empty()) XApplication::post([start] { browser.go(start); });
+        if (start.starts_with("xweb-handoff:")) XApplication::post([token = start.substr(13)] { browser.takeOver(token); });
+        else if (!start.empty()) XApplication::post([start] { browser.go(start); });
     });
     // Loads may still be running on other threads, using what would be destroyed here.
     std::_Exit(status);
