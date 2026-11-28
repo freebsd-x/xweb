@@ -4211,7 +4211,10 @@ private:
             to.height = from.height;
             to.height_fit = from.height_fit;
         }
-        else if (p == "min-width") to.min_width = from.min_width;
+        else if (p == "min-width") {
+            to.min_width = from.min_width;
+            to.min_width_keyword = from.min_width_keyword;
+        }
         else if (p == "min-height") to.min_height = from.min_height;
         else if (p == "max-width") to.max_width = from.max_width;
         else if (p == "max-height") to.max_height = from.max_height;
@@ -5096,7 +5099,17 @@ private:
             noNegative(s.height);
             return;
         }
-        if (p == "min-width") { oneLength(s.min_width, true); noNegative(s.min_width); return; }
+        if (p == "min-width") {
+            using Keyword = ComputedStyle::WidthKeyword;
+            s.min_width_keyword = kw == "max-content" ? Keyword::MaxContent : kw == "min-content" ? Keyword::MinContent : kw == "fit-content" ? Keyword::FitContent : Keyword::None;
+            if (s.min_width_keyword != Keyword::None) {
+                s.min_width = Length::autoLength();
+                return;
+            }
+            oneLength(s.min_width, true);
+            noNegative(s.min_width);
+            return;
+        }
         if (p == "min-height") { oneLength(s.min_height, true); noNegative(s.min_height); return; }
         if (p == "max-width") { if (kw == "none") s.max_width = Length::autoLength(); else { oneLength(s.max_width, false); noNegative(s.max_width); } return; }
         if (p == "max-height") { if (kw == "none") s.max_height = Length::autoLength(); else { oneLength(s.max_height, false); noNegative(s.max_height); } return; }

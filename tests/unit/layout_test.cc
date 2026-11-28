@@ -212,6 +212,19 @@ TEST(Positioned, FixedOverlayAndFitContentDialog) {
     EXPECT_NEAR(r.box("d").x, (400 - r.box("d").w) / 2, 0.5);
 }
 
+TEST(Block, MinWidthFitContentBeatsMaxWidth) {
+    // bbc.com's card grids: width 100%, a max-width under it, min-width: fit-content; the
+    // minimum wins, so the box is as wide as its content (or the room).
+    const auto r = layout("<div id=m style='width:100%;max-width:20px;min-width:fit-content'>aaaaaaaa bbbbbbbb</div>"
+                          "<div id=n style='width:100%;max-width:20px;min-width:min-content'>aaaaaaaa bbbbbbbb</div>"
+                          "<div id=w style='width:100%;max-width:20px;min-width:fit-content'>" + std::string(60, 'a') + " " + std::string(60, 'b') + "</div>");
+    EXPECT_GT(r.box("m").w, 20);
+    EXPECT_LT(r.box("m").w, 400);
+    EXPECT_GT(r.box("n").w, 20);
+    EXPECT_LT(r.box("n").w, r.box("m").w);
+    EXPECT_FLOAT_EQ(r.box("w").w, 400);   // no wider than the room, but no narrower either
+}
+
 TEST(Paint, BackgroundsBordersLinksAndCanvas) {
     const auto r = layout("<style>body{background:#00f}</style><div style='background:red;height:5px'></div><p><a href=/x>go</a></p>");
     EXPECT_EQ(r.page.canvas, (Color{0, 0, 255, 255}));

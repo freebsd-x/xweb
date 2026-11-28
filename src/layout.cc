@@ -813,6 +813,22 @@ private:
         if (!s.max_width.is_auto && (!s.max_width.hasPercent() || base > 0))
             content = std::min(content, std::max(0.0f, s.max_width.resolve(base) - extra));
         content = std::max(content, std::max(0.0f, s.min_width.resolve(base) - extra));
+        // min-width: fit-content and the like: at least its content's width (bbc.com's card
+        // grids, wider than their max-width leaves; a minimum wins over a maximum).
+        if (s.min_width_keyword != ComputedStyle::WidthKeyword::None) {
+            auto& self = const_cast<Layouter&>(*this);
+            Box& box = const_cast<Box&>(b);
+            float least = 0;
+            switch (s.min_width_keyword) {
+                case ComputedStyle::WidthKeyword::MinContent: least = self.minContentWidth(box); break;
+                case ComputedStyle::WidthKeyword::MaxContent: least = self.preferredWidth(box); break;
+                default: {
+                    const float room = base - b.frameWidth() - b.margin[Left] - b.margin[Right];
+                    least = std::min(self.preferredWidth(box), std::max(self.minContentWidth(box), room));
+                }
+            }
+            content = std::max(content, least);
+        }
         return content;
     }
 

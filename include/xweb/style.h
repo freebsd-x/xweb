@@ -295,6 +295,7 @@ struct ComputedStyle {
     bool height_fit = false;   // height: fit-content, min- or max-content: auto, but not stretched between offsets
     // auto (the initial value) resolves to 0, but a flex item's is its content.
     Length min_width = Length::autoLength(), min_height = Length::autoLength();
+    WidthKeyword min_width_keyword = WidthKeyword::None;   // min-width: fit-content and so on (min_width is auto then)
     Length max_width = Length::autoLength(), max_height = Length::autoLength();
     int z_index = 0;
     bool z_set = false;   // not auto: a stacking context, even of 0
