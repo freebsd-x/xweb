@@ -589,6 +589,48 @@ void PageScript::Impl::installDom() {
         }
         return self->wrap(el->template_content);
     });
+    // Popovers ([popover]): shown and hidden, with beforetoggle and toggle; :popover-open
+    // matches while it's shown (and the UA style sheet hides it otherwise).
+    {
+        Object* h = proto_html_element;
+        const auto setOpen = [self](Runtime& rt, Node* el, bool open) {
+            if (!el->attr("popover") || el->popover_open == open) return;
+            if (!self->fire(el, u"beforetoggle", false, open)) return;   // (showing may be called off)
+            el->popover_open = open;
+            self->dirty = true;   // (which selectors care isn't known to the partial restyles)
+            self->fire(el, u"toggle", false, false);
+            (void)rt;
+        };
+        method(h, u"showPopover", 0, [self, setOpen](Runtime& rt, const Value& t, Args) {
+            Node* el = self->thisElement(t);
+            if (!el->attr("popover")) domError(rt, "NotSupportedError", "this element isn't a popover");
+            setOpen(rt, el, true);
+            return Value::undefined();
+        });
+        method(h, u"hidePopover", 0, [self, setOpen](Runtime& rt, const Value& t, Args) {
+            setOpen(rt, self->thisElement(t), false);
+            return Value::undefined();
+        });
+        method(h, u"togglePopover", 1, [self, setOpen](Runtime& rt, const Value& t, Args a) {
+            Node* el = self->thisElement(t);
+            if (!el->attr("popover")) domError(rt, "NotSupportedError", "this element isn't a popover");
+            const Value force = arg(a, 0);
+            const bool open = force.isBoolean() ? force.asBoolean() : (force.isObject() ? rt.toBoolean(rt.get(force, u"force")) || !el->popover_open : !el->popover_open);
+            setOpen(rt, el, open);
+            return Value::boolean(el->popover_open);
+        });
+        accessor(h, u"popover",
+                 [self](Runtime&, const Value& t, Args) {
+                     const std::string* v = self->thisElement(t)->attr("popover");
+                     if (!v) return Value::null();
+                     return str(*v == "manual" ? "manual" : *v == "hint" ? "hint" : "auto");
+                 },
+                 [self](Runtime& rt, const Value& t, Args a) {
+                     if (arg(a, 0).isNull()) self->removeAttr(self->thisElement(t), "popover");
+                     else self->setAttr(self->thisElement(t), "popover", js::utf8(*rt.toString(arg(a, 0))));
+                     return Value::undefined();
+                 });
+    }
     // <dialog>.
     {
         Object* d = interface_protos["HTMLDialogElement"];

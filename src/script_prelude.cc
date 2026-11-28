@@ -2335,6 +2335,31 @@ const char* const kScriptPrelude = R"JS(
     };
   }
 
+  // Popovers' own behaviour: a button with popovertarget shows, hides or toggles its
+  // popover when clicked (unless the click was called off); an auto popover goes away at a
+  // click outside it (and its button) or Escape (notion.com's language menu).
+  if (typeof document !== 'undefined' && document.addEventListener) {
+    const invoker = t => { for (let e = t; e && e.nodeType === 1; e = e.parentNode) if (e.hasAttribute && e.hasAttribute('popovertarget')) return e; return null; };
+    const openAuto = () => Array.from(document.querySelectorAll('[popover]:popover-open')).filter(p => (p.getAttribute('popover') || 'auto') !== 'manual');
+    document.addEventListener('click', e => {
+      const b = invoker(e.target);
+      const target = b && document.getElementById(b.getAttribute('popovertarget'));
+      if (!e.defaultPrevented && target && target.hasAttribute('popover') && !(b.disabled)) {
+        const action = (b.getAttribute('popovertargetaction') || 'toggle').toLowerCase();
+        try {
+          if (action === 'show') target.showPopover();
+          else if (action === 'hide') target.hidePopover();
+          else target.togglePopover();
+        } catch (x) {}
+      }
+      for (const p of openAuto())
+        if (!p.contains(e.target) && p !== target && !(b && document.getElementById(b.getAttribute('popovertarget')) === p)) p.hidePopover();
+    });
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Escape' && !e.defaultPrevented) for (const p of openAuto()) p.hidePopover();
+    });
+  }
+
   // A link's address in parts, as HTMLAnchorElement and HTMLAreaElement have them.
   for (const name of ['HTMLAnchorElement', 'HTMLAreaElement']) {
     const proto = global[name] && global[name].prototype;

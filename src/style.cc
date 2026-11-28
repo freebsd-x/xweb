@@ -3067,6 +3067,7 @@ private:
             in_host_arg_ = saved_arg;
             return hit;
         }
+        if (n == "popover-open") return el->popover_open;
         if (n == "defined") {
             // Custom element names aren't defined until upgraded.
             return !(el->ns == Namespace::Html && el->name.find('-') != std::string::npos && el->custom_state != 2);

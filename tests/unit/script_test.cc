@@ -410,6 +410,31 @@ TEST(Script, CustomElementsShadowRootsAndObservers) {
     EXPECT_EQ(p.console.find("error"), std::string::npos) << p.console;
 }
 
+TEST(Script, Popovers) {
+    // notion.com's language menu: <div popover> hidden until shown, by showPopover() or a
+    // popovertarget button; :popover-open while it is; Escape puts an auto one away.
+    Page p(R"(<body><button id=b popovertarget=p>menu</button><div id=p popover>items</div><script>
+        const p = document.getElementById('p'), log = [];
+        p.addEventListener('beforetoggle', () => log.push('before'));
+        p.addEventListener('toggle', () => log.push('toggle'));
+        console.log('hidden', p.matches(':popover-open'), p.popover);
+        p.showPopover();
+        console.log('shown', p.matches(':popover-open'), log.join(','));
+        document.getElementById('b').click();
+        console.log('clicked', p.matches(':popover-open'));
+        document.getElementById('b').click();
+        console.log('again', p.matches(':popover-open'));
+        document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape'}));
+        console.log('escape', p.matches(':popover-open'), p.togglePopover(true), p.matches(':popover-open'));
+        let threw = false;
+        try { document.body.showPopover(); } catch (e) { threw = e.name; }
+        console.log('not one', threw);
+        </script>)");
+    for (const char* want : {"log:hidden false auto\n", "log:shown true before,toggle\n", "log:clicked false\n", "log:again true\n",
+                             "log:escape false true true\n", "log:not one NotSupportedError\n"})
+        EXPECT_NE(p.console.find(want), std::string::npos) << want << "\n" << p.console;
+}
+
 TEST(Script, CryptoAndIntl) {
     Page p(R"(<body><script>
         const a = crypto.getRandomValues(new Uint8Array(32));

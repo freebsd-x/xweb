@@ -18,6 +18,9 @@ th { font-weight: bold; text-align: center; }
 head, link, meta, script, style, title, template, area, base, basefont, datalist, noembed, noframes, param, rp,
 source, track, option, dialog:not([open]), [hidden] { display: none; }
 slot { display: contents; }
+[popover]:not(:popover-open) { display: none; }
+[popover] { position: fixed; inset: 0; width: fit-content; height: fit-content; margin: auto; border: solid; padding: 0.25em;
+            overflow: auto; color: black; background-color: white; }
 li { display: list-item; }
 details > summary:first-of-type { display: list-item; list-style-type: disclosure-closed; }
 details[open] > summary:first-of-type { list-style-type: disclosure-open; }
