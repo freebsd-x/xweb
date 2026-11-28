@@ -205,6 +205,7 @@ private:
         if (n == "disabled") return el->attr("disabled") != nullptr;
         if (n == "enabled") return (el->isHtml("input") || el->isHtml("button") || el->isHtml("select") || el->isHtml("textarea")) && !el->attr("disabled");
         if (n == "popover-open") return el->popover_open;
+        if (n == "modal") return el->dialog_modal;
         return false;
     }
 

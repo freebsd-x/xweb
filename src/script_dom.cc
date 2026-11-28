@@ -636,20 +636,33 @@ void PageScript::Impl::installDom() {
         Object* d = interface_protos["HTMLDialogElement"];
         accessor(d, u"open", [self](Runtime&, const Value& t, Args) { return Value::boolean(self->thisElement(t)->attr("open") != nullptr); },
                  [self](Runtime& rt, const Value& t, Args a) {
-                     if (rt.toBoolean(arg(a, 0))) self->setAttr(self->thisElement(t), "open", "");
-                     else self->removeAttr(self->thisElement(t), "open");
+                     Node* el = self->thisElement(t);
+                     if (rt.toBoolean(arg(a, 0))) self->setAttr(el, "open", "");
+                     else {
+                         el->dialog_modal = false;
+                         self->removeAttr(el, "open");
+                     }
                      return Value::undefined();
                  });
         rt.put(d, u"returnValue", str(""), js::kWritable | js::kConfigurable | js::kEnumerable);
-        for (const char16_t* name : {u"show", u"showModal"})
-            method(d, name, 0, [self](Runtime&, const Value& t, Args) {
-                self->setAttr(self->thisElement(t), "open", "");
-                return Value::undefined();
-            });
+        method(d, u"show", 0, [self](Runtime&, const Value& t, Args) {
+            self->setAttr(self->thisElement(t), "open", "");
+            return Value::undefined();
+        });
+        method(d, u"showModal", 0, [self](Runtime& rt, const Value& t, Args) {
+            Node* el = self->thisElement(t);
+            if (el->attr("open") && !el->dialog_modal) domError(rt, "InvalidStateError", "The dialog is already open as a non-modal dialog.");
+            if (!self->inDocument(el)) domError(rt, "InvalidStateError", "The dialog isn't in a document.");
+            el->dialog_modal = true;
+            self->setAttr(el, "open", "");
+            self->dirty = true;
+            return Value::undefined();
+        });
         method(d, u"close", 1, [self](Runtime& rt, const Value& t, Args a) {
             Node* el = self->thisElement(t);
             if (!el->attr("open")) return Value::undefined();
             if (!arg(a, 0).isUndefined()) rt.put(t.asObject(), u"returnValue", Value::string(rt.toString(arg(a, 0))), js::kWritable | js::kConfigurable | js::kEnumerable);
+            el->dialog_modal = false;
             self->removeAttr(el, "open");
             self->fire(el, u"close", false, false);
             return Value::undefined();

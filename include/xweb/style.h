@@ -292,6 +292,7 @@ struct ComputedStyle {
     Color outline_color;           // (currentColor unless set)
     enum class WidthKeyword { None, MinContent, MaxContent, FitContent } width_keyword = WidthKeyword::None;   // width is auto then
     Length width = Length::autoLength(), height = Length::autoLength();
+    bool height_fit = false;   // height: fit-content, min- or max-content: auto, but not stretched between offsets
     // auto (the initial value) resolves to 0, but a flex item's is its content.
     Length min_width = Length::autoLength(), min_height = Length::autoLength();
     Length max_width = Length::autoLength(), max_height = Length::autoLength();
@@ -422,6 +423,8 @@ public:
     [[nodiscard]] const ComputedStyle* afterOf(const Node* element) const;
     // An <input> or <textarea>'s ::placeholder, if a rule styles it.
     [[nodiscard]] const ComputedStyle* placeholderOf(const Node* element) const;
+    // A modal <dialog>'s ::backdrop.
+    [[nodiscard]] const ComputedStyle* backdropOf(const Node* element) const;
     // The elements that have (or may take up) something moving, and their styles as the
     // cascade has them; and an Animator's values laid over those.
     struct Moving {
@@ -466,7 +469,7 @@ private:
     ChMeasure measure_ch_;
     const class FormState* forms_ = nullptr;
     std::unordered_map<const Node*, const ComputedStyle*> styles_;
-    std::unordered_map<const Node*, const ComputedStyle*> before_, after_, placeholder_;
+    std::unordered_map<const Node*, const ComputedStyle*> before_, after_, placeholder_, backdrop_;
     std::shared_ptr<std::deque<ComputedStyle>> storage_ = std::make_shared<std::deque<ComputedStyle>>();
     // Earlier documents' storage that styles here were kept from.
     std::vector<std::shared_ptr<const std::deque<ComputedStyle>>> kept_;

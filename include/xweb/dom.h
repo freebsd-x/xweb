@@ -48,6 +48,7 @@ public:
     // A custom element's state: 0 none (or not yet looked at), 1 undefined (a custom
     // element name waiting for its definition), 2 custom (upgraded), 3 failed.
     uint8_t custom_state = 0;
+    bool dialog_modal = false;   // a <dialog> opened by showModal(): in the top layer, with a ::backdrop
     bool popover_open = false;   // a [popover] element shown (showPopover, a popovertarget button)
     std::shared_ptr<const XmlName> xml;   // an element of an XML document
 

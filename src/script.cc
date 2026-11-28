@@ -909,6 +909,9 @@ void PageScript::Impl::installElement() {
         setProp(t, name.starts_with("--") ? name : lower(name), arg(a, 1).isNullish() ? "" : js::utf8(rt.toStringValue(arg(a, 1))));
         return Value::undefined();
     });
+    // Inline declarations here keep no priority (an !important set through setProperty
+    // is kept as its value): "" as for a declaration without one.
+    method(st, u"getPropertyPriority", 1, [](Runtime&, const Value&, Args) { return str(""); });
     method(st, u"removeProperty", 1, [getProp, setProp, propName](Runtime& rt, const Value& t, Args a) {
         const std::string name = propName(js::utf8(rt.toStringValue(arg(a, 0))));
         const std::string old = getProp(t, name);
@@ -1567,6 +1570,7 @@ void PageScript::Impl::installWindow() {
         method(computed_proto, u"getPropertyValue", 1, [computedValue](Runtime& rt, const Value& t, Args args) {
             return computedValue(rt, t, js::utf8(rt.toStringValue(arg(args, 0))));
         });
+        method(computed_proto, u"getPropertyPriority", 1, [](Runtime&, const Value&, Args) { return str(""); });
         // Kept alive by the global, out of sight.
         rt.put(g, u"__xwebComputedStyle", Value::object(computed_proto), js::kConfigurable);
     }

@@ -2113,7 +2113,7 @@ struct PartRule {
 // The rules of one tree: the user agent's, the document's, or a shadow root's. A shadow
 // tree's rules only reach into it, and to its host through :host.
 struct ScopeRules {
-    Buckets normal, before, after, placeholder;
+    Buckets normal, before, after, placeholder, backdrop;
     std::vector<IndexedSelector> host;      // rules whose subject is :host(...)
     std::deque<SlottedRule> slotted;
     std::deque<PartRule> parts;             // aimed at shadow trees of this tree's elements
@@ -2215,6 +2215,8 @@ public:
         // What's for browsers without scripts isn't shown where they run.
         if (doc.scripting) addSheet("noscript { display: none }", Origin::UserAgent, 0);
         addSheet("::placeholder { color: #757575 }", Origin::UserAgent, 0);
+        // A modal dialog's backdrop: the viewport, just under it in the top layer.
+        addSheet("::backdrop { display: block; position: fixed; inset: 0; z-index: 2147483647 } dialog::backdrop { background: rgba(0, 0, 0, 0.1) }", Origin::UserAgent, 0);
         to_ua_ = false;
         collectSheets(doc_.root());
         for (const auto& css : doc_.root()->adopted_css) addSheet(css, Origin::Author);   // document.adoptedStyleSheets
@@ -2359,6 +2361,7 @@ public:
         out_.before_ = previous.before_;
         out_.after_ = previous.after_;
         out_.placeholder_ = previous.placeholder_;
+        out_.backdrop_ = previous.backdrop_;
         out_.keys_ = previous.keys_;
         out_.has_prints_ = previous.has_prints_;
         out_.containers_ = previous.containers_;
@@ -2396,6 +2399,7 @@ public:
             out_.before_.erase(e);
             out_.after_.erase(e);
             out_.placeholder_.erase(e);
+            out_.backdrop_.erase(e);
             out_.has_prints_.erase(e);
             todo.insert(todo.end(), e->children.begin(), e->children.end());
         }
@@ -2507,6 +2511,7 @@ public:
                         out_.before_.erase(e);
                         out_.after_.erase(e);
                         out_.placeholder_.erase(e);
+                        out_.backdrop_.erase(e);
                         out_.has_prints_.erase(e);
                     }
                     todo.insert(todo.end(), e->children.begin(), e->children.end());
@@ -2703,6 +2708,7 @@ private:
             if (s.name == "before") buckets = &target_->before;
             else if (s.name == "after") buckets = &target_->after;
             else if (s.name == "placeholder") buckets = &target_->placeholder;
+            else if (s.name == "backdrop") buckets = &target_->backdrop;
             else if (s.name == "slotted" && target_host_) {
                 SlottedRule r{sel, &s, &rule, origin, ++order_};
                 auto& simple = r.slot_side.parts.back().simple;
@@ -3068,6 +3074,7 @@ private:
             return hit;
         }
         if (n == "popover-open") return el->popover_open;
+        if (n == "modal") return el->dialog_modal;
         if (n == "defined") {
             // Custom element names aren't defined until upgraded.
             return !(el->ns == Namespace::Html && el->name.find('-') != std::string::npos && el->custom_state != 2);
@@ -4200,7 +4207,10 @@ private:
         else if (p == "container-name") to.container_names = from.container_names;
         else if (p == "container") to.container_type = from.container_type, to.container_names = from.container_names;
         else if (p == "width") { to.width = from.width; to.width_keyword = from.width_keyword; }
-        else if (p == "height") to.height = from.height;
+        else if (p == "height") {
+            to.height = from.height;
+            to.height_fit = from.height_fit;
+        }
         else if (p == "min-width") to.min_width = from.min_width;
         else if (p == "min-height") to.min_height = from.min_height;
         else if (p == "max-width") to.max_width = from.max_width;
@@ -5076,7 +5086,16 @@ private:
             noNegative(s.width);
             return;
         }
-        if (p == "height") { oneLength(s.height, true); noNegative(s.height); return; }
+        if (p == "height") {
+            s.height_fit = kw == "fit-content" || kw == "max-content" || kw == "min-content";
+            if (s.height_fit) {
+                s.height = Length::autoLength();
+                return;
+            }
+            oneLength(s.height, true);
+            noNegative(s.height);
+            return;
+        }
         if (p == "min-width") { oneLength(s.min_width, true); noNegative(s.min_width); return; }
         if (p == "min-height") { oneLength(s.min_height, true); noNegative(s.min_height); return; }
         if (p == "max-width") { if (kw == "none") s.max_width = Length::autoLength(); else { oneLength(s.max_width, false); noNegative(s.max_width); } return; }
@@ -5464,6 +5483,12 @@ private:
             }
         }
         applyMatched(el, parent, s, matched);
+        // The top layer is over everything, whatever z-index says (nature.com's cookie
+        // dialog has 99999, under its own ::backdrop otherwise).
+        if (el->dialog_modal) {
+            s.z_index = std::numeric_limits<int>::max();
+            s.z_set = true;
+        }
         if (shareable) shared_styles_.emplace(share_key, &s);
     }
 
@@ -5812,6 +5837,10 @@ private:
         resolving_pseudo_ = true;
         applyMatched(el, s, pseudo, matched);
         resolving_pseudo_ = false;
+        if (&into == &out_.backdrop_) {
+            pseudo.z_index = std::numeric_limits<int>::max();   // the top layer: just under its dialog
+            pseudo.z_set = true;
+        }
         if (needs_content && (!pseudo.has_content || pseudo.display == Display::None)) return;
         out_.storage_->push_back(std::move(pseudo));
         into[el] = &out_.storage_->back();
@@ -6333,7 +6362,7 @@ private:
                 lengths_.root_line_height = kept->usedLineHeight();
             }
             for (auto [from, to] : {std::pair{&previous_->before_, &out_.before_}, std::pair{&previous_->after_, &out_.after_},
-                                    std::pair{&previous_->placeholder_, &out_.placeholder_}})
+                                    std::pair{&previous_->placeholder_, &out_.placeholder_}, std::pair{&previous_->backdrop_, &out_.backdrop_}})
                 if (const auto it = from->find(el); it != from->end()) (*to)[el] = keep(it->second);
         }
         static const bool dbg = std::getenv("XWEB_DEBUG_RESTYLE") != nullptr;
@@ -6377,6 +6406,8 @@ private:
             resolvePseudo(el, s, ua_p_->rules->after, scope->rules->after, scope->host_el, out_.after_);
             if ((el->isHtml("input") || el->isHtml("textarea")) && el->attr("placeholder"))
                 resolvePseudo(el, s, ua_p_->rules->placeholder, scope->rules->placeholder, scope->host_el, out_.placeholder_, false);
+            if (el->dialog_modal)
+                resolvePseudo(el, s, ua_p_->rules->backdrop, scope->rules->backdrop, scope->host_el, out_.backdrop_, false);
         }
         lengths_.ch_asked = outer_asked;
         if (kept && previous_->font_users_.count(el)) font_asked = true;
@@ -6611,6 +6642,11 @@ const ComputedStyle* StyledDocument::beforeOf(const Node* element) const {
         if (const auto o = overlay_[1].find(element); o != overlay_[1].end()) return o->second.get();
     const auto it = before_.find(element);
     return it == before_.end() ? nullptr : it->second;
+}
+
+const ComputedStyle* StyledDocument::backdropOf(const Node* element) const {
+    const auto it = backdrop_.find(element);
+    return it == backdrop_.end() ? nullptr : it->second;
 }
 
 const ComputedStyle* StyledDocument::placeholderOf(const Node* element) const {

@@ -568,6 +568,10 @@ private:
                     if (depth < kMaxBoxDepth) addChildren(c, *cs, box, depth + 1, counter);
                     continue;
                 }
+                // A modal dialog's ::backdrop: the viewport under it (nature.com's cookie choice).
+
+                if (c->dialog_modal && cs->display != Display::None)
+                    if (const ComputedStyle* backdrop = styles_.backdropOf(c)) box.kids.push_back(pseudoBox(*backdrop));
                 auto kid = kept(c, *box.style);
                 if (!kid) kid = build(c, *cs, depth + 1);
                 if (kid && state_) kid->print = printFor(c, *box.style);
@@ -1187,6 +1191,9 @@ private:
 
     void layoutOutOfFlow(Box& k, float cb_width, std::optional<float> cb_height = std::nullopt) {
         const ComputedStyle& s = *k.style;
+        // A fixed box's containing block is the viewport, known from the start: `inset: 0`
+        // and nothing inside is the whole viewport (an overlay, a dialog's ::backdrop).
+        if (s.position == Position::Fixed) cb_height = vh_;
         const float base = s.position == Position::Fixed ? vw_ : cb_width;
         const float base_h = s.position == Position::Fixed ? vh_ : cb_height.value_or(vh_);
         resolveSpacing(k, base);
@@ -1200,6 +1207,9 @@ private:
             if (s.border_box) width -= frame;
         } else if (!replaced && !s.offset[Left].is_auto && !s.offset[Right].is_auto) {
             width = base - s.offset[Left].resolve(base) - s.offset[Right].resolve(base) - frame - k.margin[Left] - k.margin[Right];
+            // width: fit-content between offsets (an open <dialog>, a popover): its content's
+            // width, no more than the room, and the auto margins take the rest.
+            if (s.width_keyword != ComputedStyle::WidthKeyword::None) width = shrinkToFit(k, std::max(0.0f, width));
         } else if (replaced) {
             width = shrinkToFit(k, kUnbounded);   // its natural width, however little room
         } else {
@@ -1215,7 +1225,7 @@ private:
             float h = s.height.resolve(base_h);
             if (s.border_box) h -= k.frameHeight();
             own = std::max(0.0f, h);
-        } else if (cb_height && !replaced && !s.offset[Top].is_auto && !s.offset[Bottom].is_auto) {
+        } else if (cb_height && !replaced && !s.height_fit && !s.offset[Top].is_auto && !s.offset[Bottom].is_auto) {
             // Both edges given: as tall as they leave.
             own = std::max(0.0f, base_h - s.offset[Top].resolve(base_h) - s.offset[Bottom].resolve(base_h) - k.frameHeight() - k.margin[Top] - k.margin[Bottom]);
         } else if (!replaced && s.height.is_auto) {
@@ -2099,7 +2109,9 @@ private:
             float used = 0;
             for (FlexItem& it : items) {
                 const float hyp = std::clamp(it.base, it.min_main, it.max_main) + it.frame_main;
-                if (!line.empty() && used + gap_main + hyp > *main_avail) {
+                // A hair over is rounding, not overflow: a wrapping box as wide as its items'
+                // max-content (nature.com's header menu) summed them in another order.
+                if (!line.empty() && used + gap_main + hyp > *main_avail + 0.01f) {
                     lines.push_back(std::move(line));
                     line.clear();
                     used = 0;

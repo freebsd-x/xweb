@@ -18,6 +18,10 @@ th { font-weight: bold; text-align: center; }
 head, link, meta, script, style, title, template, area, base, basefont, datalist, noembed, noframes, param, rp,
 source, track, option, dialog:not([open]), [hidden] { display: none; }
 slot { display: contents; }
+dialog { position: absolute; inset-inline: 0; width: fit-content; height: fit-content; margin: auto; border: solid; padding: 1em;
+         color: black; background-color: white; }
+dialog:modal { position: fixed; inset-block: 0; max-width: calc(100% - 6px - 2em); max-height: calc(100% - 6px - 2em);
+               overflow: auto; z-index: 2147483647; }
 [popover]:not(:popover-open) { display: none; }
 [popover] { position: fixed; inset: 0; width: fit-content; height: fit-content; margin: auto; border: solid; padding: 0.25em;
             overflow: auto; color: black; background-color: white; }

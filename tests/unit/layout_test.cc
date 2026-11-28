@@ -197,6 +197,21 @@ TEST(Positioned, OutOfFlow) {
     EXPECT_FLOAT_EQ(r.box("r").y, 125);
 }
 
+TEST(Positioned, FixedOverlayAndFitContentDialog) {
+    // A fixed `inset: 0` box with nothing in it is the viewport (an overlay, a ::backdrop);
+    // an open <dialog> is as wide and tall as its content, centred between its offsets.
+    const auto r = layout("<div id=o style='position:fixed;inset:0'></div>"
+                          "<div id=p style='position:fixed;inset:0;width:fit-content;height:fit-content;margin:auto;padding:0'>xx</div>"
+                          "<dialog id=d open>hello</dialog>");
+    EXPECT_FLOAT_EQ(r.box("o").h, 300);
+    EXPECT_FLOAT_EQ(r.box("o").w, 400);
+    EXPECT_LT(r.box("p").w, 100);
+    EXPECT_NEAR(r.box("p").x, (400 - r.box("p").w) / 2, 0.5);
+    EXPECT_NEAR(r.box("p").y, (300 - r.box("p").h) / 2, 0.5);
+    EXPECT_LT(r.box("d").w, 200);
+    EXPECT_NEAR(r.box("d").x, (400 - r.box("d").w) / 2, 0.5);
+}
+
 TEST(Paint, BackgroundsBordersLinksAndCanvas) {
     const auto r = layout("<style>body{background:#00f}</style><div style='background:red;height:5px'></div><p><a href=/x>go</a></p>");
     EXPECT_EQ(r.page.canvas, (Color{0, 0, 255, 255}));

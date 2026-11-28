@@ -385,7 +385,7 @@ TEST(Script, CustomElementsShadowRootsAndObservers) {
           console.log(document.createElement('dialog') instanceof HTMLDialogElement, document.createElement('img') instanceof HTMLImageElement,
                       document.createElement('video') instanceof HTMLMediaElement, document.createElement('foo') instanceof HTMLUnknownElement,
                       document.createElement('article').constructor === HTMLElement, Object.prototype.toString.call(new DocumentFragment()));
-          const dlg = document.createElement('dialog'); dlg.showModal(); const was = dlg.open; dlg.close('ok');
+          const dlg = document.documentElement.appendChild(document.createElement('dialog')); dlg.showModal(); const was = dlg.open; dlg.close('ok');
           console.log('dialog', was, dlg.open, dlg.returnValue);
           const tpl = document.createElement('template'); tpl.innerHTML = '<b>x</b>';
           console.log('template', tpl.content.firstChild.tagName, tpl.childNodes.length);
@@ -432,6 +432,33 @@ TEST(Script, Popovers) {
         </script>)");
     for (const char* want : {"log:hidden false auto\n", "log:shown true before,toggle\n", "log:clicked false\n", "log:again true\n",
                              "log:escape false true true\n", "log:not one NotSupportedError\n"})
+        EXPECT_NE(p.console.find(want), std::string::npos) << want << "\n" << p.console;
+}
+
+TEST(Script, ModalDialogs) {
+    // nature.com's cookie choice: showModal() puts a dialog in the top layer (:modal, a
+    // ::backdrop); Escape cancels it unless the page calls that off; close() ends it.
+    Page p(R"(<body><dialog id=d>choose</dialog><dialog id=e>other</dialog><script>
+        const d = document.getElementById('d'), e = document.getElementById('e'), log = [];
+        d.addEventListener('cancel', () => log.push('cancel'));
+        d.addEventListener('close', () => log.push('close'));
+        d.showModal();
+        console.log('modal', d.open, d.matches(':modal'), e.matches(':modal'), document.querySelectorAll('dialog:modal').length);
+        e.show();
+        let threw = false;
+        try { e.showModal(); } catch (x) { threw = x.name; }
+        console.log('already open', threw, e.matches(':modal'));
+        document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape'}));
+        console.log('escape', d.open, d.matches(':modal'), log.join(','));
+        d.showModal();
+        d.addEventListener('cancel', x => x.preventDefault());
+        document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape'}));
+        console.log('kept', d.open);
+        d.close('done');
+        console.log('closed', d.open, d.returnValue, d.style.getPropertyPriority('color') === '', getComputedStyle(d).getPropertyPriority('color') === '');
+        </script>)");
+    for (const char* want : {"log:modal true true false 1\n", "log:already open InvalidStateError false\n", "log:escape false false cancel,close\n",
+                             "log:kept true\n", "log:closed false done true true\n"})
         EXPECT_NE(p.console.find(want), std::string::npos) << want << "\n" << p.console;
 }
 

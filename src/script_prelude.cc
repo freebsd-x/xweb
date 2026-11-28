@@ -2357,6 +2357,11 @@ const char* const kScriptPrelude = R"JS(
     });
     document.addEventListener('keydown', e => {
       if (e.key === 'Escape' && !e.defaultPrevented) for (const p of openAuto()) p.hidePopover();
+      // Escape asks the topmost modal dialog to go: a cancel it may call off, then close.
+      if (e.key === 'Escape' && !e.defaultPrevented) {
+        const modal = Array.from(document.querySelectorAll('dialog:modal')).pop();
+        if (modal && modal.dispatchEvent(new Event('cancel', {cancelable: true}))) modal.close();
+      }
     });
   }
 
